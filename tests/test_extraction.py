@@ -1,8 +1,11 @@
 from decimal import Decimal
 from pathlib import Path
 
+import cv2
+import numpy as np
+
 from gmoney.contracts.extraction import RowRole
-from gmoney.extraction.offline import _cached_prediction
+from gmoney.extraction.offline import VlAsset, _cached_prediction, _safe_box, _vertical_vl_tiles
 from gmoney.extraction.otsl import parse_otsl, split_otsl_tables
 from gmoney.extraction.rows import extract_candidate_rows
 from gmoney.extraction.typed_values import parse_decimal
@@ -112,7 +115,9 @@ def test_continuation_subtotals_and_zero_placeholders_are_separate_roles() -> No
     assert rows[0].rate == Decimal("100.00")
     assert rows[0].amount == Decimal("100.00")
     assert rows[1].role is RowRole.SECTION_TOTAL
-    assert rows[2].role is RowRole.METADATA
+    # A printed zero-valued line remains an auditable charge row; zero is not
+    # evidence that the row is metadata.
+    assert rows[2].role is RowRole.DETAIL
 
 
 def test_collapsed_pharmacy_header_maps_columns_and_derives_missing_amount() -> None:
@@ -149,11 +154,33 @@ def test_inference_cache_is_bound_to_artifact_options_and_model(tmp_path: Path) 
     )
     first, first_hit = _cached_prediction(tmp_path / "stage.json", request, adapter)
     second, second_hit = _cached_prediction(tmp_path / "stage.json", request, adapter)
-    changed = request.model_copy(
-        update={"request_id": "changed", "artifact_sha256": "b" * 64}
-    )
+    changed = request.model_copy(update={"request_id": "changed", "artifact_sha256": "b" * 64})
     third, third_hit = _cached_prediction(tmp_path / "stage.json", changed, adapter)
+    changed_options = changed.model_copy(
+        update={"request_id": "changed-options", "options": {"prompt": "new prompt"}}
+    )
+    fourth, fourth_hit = _cached_prediction(
+        tmp_path / "stage.json",
+        changed_options,
+        adapter,
+    )
 
-    assert first.output == second.output == third.output
-    assert (first_hit, second_hit, third_hit) == (False, True, False)
-    assert adapter.calls == 2
+    assert first.output == second.output == third.output == fourth.output
+    assert (first_hit, second_hit, third_hit, fourth_hit) == (False, True, False, False)
+    assert adapter.calls == 3
+
+
+def test_table_box_has_extra_vertical_tolerance_for_trailing_rows() -> None:
+    assert _safe_box((100, 200, 900, 1000), 1200, 1400) == (80, 100, 920, 1100)
+
+
+def test_dense_vlm_asset_is_split_into_overlapping_vertical_tiles(tmp_path: Path) -> None:
+    source = tmp_path / "table.png"
+    assert cv2.imwrite(str(source), np.zeros((3300, 100, 3), dtype=np.uint8))
+    tiles = _vertical_vl_tiles(
+        VlAsset(source, "a" * 64, "fixture"),
+        tmp_path,
+        "p1-t1",
+    )
+    assert len(tiles) == 3
+    assert all(tile.path.exists() and len(tile.artifact_sha256) == 64 for tile in tiles)

@@ -4,12 +4,21 @@ import re
 from dataclasses import dataclass
 from decimal import Decimal
 
-from gmoney.contracts.extraction import RowRole
+from gmoney.contracts.extraction import RowRole, TableType
 from gmoney.extraction.otsl import OtslCell, OtslTable
 from gmoney.extraction.typed_values import parse_decimal
 
 ROLE_TERMS: dict[str, tuple[str, ...]] = {
-    "description": ("description", "particular", "service name", "item", "services"),
+    "description": (
+        "description",
+        "particular",
+        "service name",
+        "item name",
+        "item",
+        "services",
+        "test name",
+        "investigation",
+    ),
     "quantity": ("quantity", "qty", "nos", "units", "unit/days"),
     "rate": ("rate", "unit price", "unit rate"),
     "discount": ("discount", "disco", "disc amt"),
@@ -37,6 +46,9 @@ class CandidateLedgerRow:
     discount: Decimal | None = None
     amount: Decimal | None = None
     amount_derived: bool = False
+    table_type: TableType = TableType.UNKNOWN
+    category: str | None = None
+    source_route: str = "provider_otsl"
 
 
 def _normalized(value: str) -> str:
@@ -202,10 +214,9 @@ def _merge_continuation_rows(
                         None,
                     )
                     tail_roles = [item for item in numeric_roles if item != quantity_role]
-                    selected_roles = (
-                        ([quantity_role] if quantity_role else [])
-                        + tail_roles[-(len(values) - (1 if quantity_role else 0)) :]
-                    )
+                    selected_roles = ([quantity_role] if quantity_role else []) + tail_roles[
+                        -(len(values) - (1 if quantity_role else 0)) :
+                    ]
                     assignments = zip(selected_roles, values, strict=True)
                 for (column, _), value in assignments:
                     combined[column] = value
@@ -221,8 +232,7 @@ def extract_candidate_rows(table: OtslTable) -> tuple[CandidateLedgerRow, ...]:
     if len(table.rows) < 2:
         return ()
     header_index = max(
-        range(min(3, len(table.rows))),
-        key=lambda index: len(infer_columns(table.rows[index])),
+        range(len(table.rows)), key=lambda index: len(infer_columns(table.rows[index]))
     )
     columns = infer_columns(table.rows[header_index])
     if "description" not in columns:
@@ -246,11 +256,6 @@ def extract_candidate_rows(table: OtslTable) -> tuple[CandidateLedgerRow, ...]:
             amount_text = cells[numeric[-1][0]] if numeric else None
             amount = parse_decimal(amount_text)
         role = _row_role(cells, description)
-        if (
-            role is RowRole.DETAIL
-            and amount == 0
-        ):
-            role = RowRole.METADATA
         if not description and amount is None:
             continue
         if role is RowRole.DETAIL and amount is None:

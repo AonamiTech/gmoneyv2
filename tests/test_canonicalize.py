@@ -26,6 +26,49 @@ def test_grounded_detail_becomes_accepted_canonical_row() -> None:
     assert rows[0].review_disposition is ReviewDisposition.ACCEPTED
     assert rows[0].net_amount == Decimal("500")
     assert rows[0].evidence[0].token_ids == ("t1", "t2")
+    assert rows[0].contract_version == "canonical_row_v2"
+    assert set(rows[0].field_evidence) == {"description", "amount"}
+
+
+def test_ungrounded_optional_provider_values_are_not_published() -> None:
+    candidate = CandidateLedgerRow(
+        source_row=1,
+        role=RowRole.DETAIL,
+        cells=("Blood Test", "2", "250", "500"),
+        description="Blood Test",
+        quantity=Decimal("2"),
+        rate=Decimal("250"),
+        amount=Decimal("500"),
+    )
+    aligned = AlignedLedgerRow(
+        candidate=candidate,
+        field_token_ids={"description": ("t1",), "amount": ("t2",)},
+        evidence_token_ids=("t1", "t2"),
+        evidence_box=(10, 20, 200, 40),
+        grounding_ratio=0.5,
+    )
+    row = canonicalize_rows("document", 1, "table", "a" * 64, (aligned,))[0]
+    assert row.review_disposition is ReviewDisposition.ACCEPTED
+    assert row.quantity is None
+    assert row.unit_price is None
+
+
+def test_row_with_ungrounded_amount_is_not_published() -> None:
+    candidate = CandidateLedgerRow(
+        source_row=1,
+        role=RowRole.DETAIL,
+        cells=("Blood Test", "500"),
+        description="Blood Test",
+        amount=Decimal("500"),
+    )
+    aligned = AlignedLedgerRow(
+        candidate=candidate,
+        field_token_ids={"description": ("t1",)},
+        evidence_token_ids=("t1",),
+        evidence_box=(10, 20, 200, 40),
+        grounding_ratio=1,
+    )
+    assert canonicalize_rows("document", 1, "table", "a" * 64, (aligned,)) == ()
 
 
 def test_totals_never_enter_canonical_detail_ledger() -> None:

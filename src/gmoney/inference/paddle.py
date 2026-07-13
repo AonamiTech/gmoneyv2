@@ -171,12 +171,14 @@ class PaddleOcrVlAdapter:
                 "Table Recognition:",
             )
         )
+        max_tokens = int(request.options.get("max_tokens", 16384))
         started = time.perf_counter()
         response = self._client.post(
             "/v1/chat/completions",
             json={
                 "model": self.spec.model_name,
                 "temperature": 0,
+                "max_tokens": max_tokens,
                 "messages": [
                     {
                         "role": "user",
@@ -199,11 +201,30 @@ class PaddleOcrVlAdapter:
         content = choices[0].get("message", {}).get("content")
         if not content:
             raise RuntimeError("PaddleOCR-VL returned empty content")
+        finish_reason = choices[0].get("finish_reason")
+        usage = payload.get("usage") or {}
+        completion_tokens = int(usage.get("completion_tokens") or 0)
+        repeated_tail = bool(
+            len(content) >= 512
+            and content[-256:].strip()
+            and content[-256:].strip() in content[:-256]
+        )
+        truncated = bool(
+            finish_reason in {"length", "max_tokens"}
+            or (completion_tokens and completion_tokens >= max_tokens)
+            or repeated_tail
+        )
         elapsed = round((time.perf_counter() - started) * 1000)
         return InferenceResponse(
             request_id=request.request_id,
             spec=self.spec,
-            output={"content": content, "usage": payload.get("usage") or {}},
+            output={
+                "content": content,
+                "usage": usage,
+                "finish_reason": finish_reason,
+                "truncated": truncated,
+                "repeated_tail": repeated_tail,
+            },
             latency_ms=elapsed,
             peak_rss_bytes=None,
             memory_scope="remote_unmeasured",

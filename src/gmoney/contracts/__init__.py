@@ -7,7 +7,15 @@ from gmoney.contracts.evidence import (
     TableRegion,
     TransformChain,
 )
-from gmoney.contracts.extraction import CanonicalRow, EvidenceRef, ProviderCandidate
+from gmoney.contracts.extraction import (
+    CanonicalRow,
+    EvidenceRef,
+    PageType,
+    ProviderCandidate,
+    ReviewDisposition,
+    RowRole,
+    TableType,
+)
 from gmoney.contracts.gold import GoldAnnotation, GoldRow
 
 __all__ = [
@@ -18,9 +26,13 @@ __all__ = [
     "OcrToken",
     "PageAsset",
     "PageQuality",
+    "PageType",
     "Point",
     "Polygon",
     "ProviderCandidate",
+    "ReviewDisposition",
+    "RowRole",
     "TableRegion",
+    "TableType",
     "TransformChain",
 ]

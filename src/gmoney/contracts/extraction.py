@@ -10,6 +10,9 @@ from gmoney.contracts.evidence import Polygon
 
 class RowRole(StrEnum):
     DETAIL = "detail"
+    CONTINUATION = "continuation"
+    SECTION_HEADER = "section_header"
+    CATEGORY_ROLLUP = "category_rollup"
     SECTION_TOTAL = "section_total"
     DOCUMENT_TOTAL = "document_total"
     PAYMENT = "payment"
@@ -18,6 +21,31 @@ class RowRole(StrEnum):
     METADATA = "metadata"
     FOOTER_NOISE = "footer_noise"
     UNREADABLE = "unreadable"
+    UNRESOLVED = "unresolved"
+
+
+class PageType(StrEnum):
+    ITEMIZED_CHARGES = "itemized_charges"
+    PHARMACY = "pharmacy"
+    LABORATORY = "laboratory"
+    RECEIPT_PAYMENT = "receipt_payment"
+    CATEGORY_SUMMARY = "category_summary"
+    NARRATIVE = "narrative"
+    METADATA = "metadata"
+    MIXED = "mixed"
+    BLANK = "blank"
+    UNREADABLE = "unreadable"
+
+
+class TableType(StrEnum):
+    ITEM_LEDGER = "item_ledger"
+    PHARMACY = "pharmacy"
+    LABORATORY = "laboratory"
+    CATEGORY_SUMMARY = "category_summary"
+    PACKAGE_SUMMARY = "package_summary"
+    PAYMENT = "payment"
+    METADATA = "metadata"
+    UNKNOWN = "unknown"
 
 
 class ReviewDisposition(StrEnum):
@@ -53,6 +81,8 @@ class CanonicalRow(VersionedContract):
     document_id: str
     page_number: int = Field(ge=1)
     table_id: str | None = None
+    page_type: PageType | None = None
+    table_type: TableType | None = None
     row_order: int = Field(ge=0)
     role: RowRole = RowRole.DETAIL
     review_disposition: ReviewDisposition = ReviewDisposition.PENDING
@@ -74,6 +104,7 @@ class CanonicalRow(VersionedContract):
     net_amount_raw: str | None = None
     net_amount: Decimal | None = None
     evidence: tuple[EvidenceRef, ...]
+    field_evidence: dict[str, tuple[EvidenceRef, ...]] = Field(default_factory=dict)
     candidate_ids: tuple[str, ...] = ()
+    source_routes: tuple[str, ...] = ()
     validation_flags: tuple[str, ...] = ()
-

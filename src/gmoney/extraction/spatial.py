@@ -49,6 +49,7 @@ class AlignedLedgerRow:
     evidence_token_ids: tuple[str, ...]
     evidence_box: tuple[float, float, float, float] | None
     grounding_ratio: float
+    source_routes: tuple[str, ...] = ("provider_otsl",)
 
 
 def _description_anchor(
@@ -247,6 +248,7 @@ def align_candidate_rows(
                 evidence_token_ids=tuple(tokens[index].token_id for index in sorted(selected)),
                 evidence_box=evidence_box,
                 grounding_ratio=len(fields) / expected_fields,
+                source_routes=(aligned_candidate.source_route,),
             )
         )
     return tuple(aligned)
