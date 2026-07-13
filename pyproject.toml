@@ -42,6 +42,7 @@ gmoney-geometry = "gmoney.geometry.cli:app"
 gmoney-benchmark = "gmoney.inference.benchmark:app"
 gmoney-layout-bakeoff = "gmoney.inference.layout_bakeoff:app"
 gmoney-ocr-fallback = "gmoney.inference.ocr_fallback_cli:app"
+gmoney-offline-extract = "gmoney.extraction.offline:app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/gmoney"]

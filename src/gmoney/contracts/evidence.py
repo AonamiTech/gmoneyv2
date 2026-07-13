@@ -90,3 +90,14 @@ class TableRegion(ContractModel):
     confidence: float = Field(ge=0, le=1)
     artifact_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     evidence_token_ids: tuple[str, ...] = ()
+
+
+class OcrToken(ContractModel):
+    token_id: str
+    page_number: int = Field(ge=1)
+    text: str
+    confidence: float = Field(ge=0, le=1)
+    polygon: Polygon
+    artifact_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    model_name: str
+    model_version: str

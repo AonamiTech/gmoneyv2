@@ -1,4 +1,5 @@
 from gmoney.contracts.evidence import (
+    OcrToken,
     PageAsset,
     PageQuality,
     Point,
@@ -14,6 +15,7 @@ __all__ = [
     "EvidenceRef",
     "GoldAnnotation",
     "GoldRow",
+    "OcrToken",
     "PageAsset",
     "PageQuality",
     "Point",
