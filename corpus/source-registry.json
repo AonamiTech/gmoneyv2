@@ -1,0 +1,40 @@
+{
+  "version": "corpus_registry_v1",
+  "legacy_root_env": "GMONEY_LEGACY_ROOT",
+  "default_legacy_root": "/home/azureuser/gmoney",
+  "sources": [
+    {
+      "name": "july_2026_gold",
+      "kind": "gold_directory",
+      "path": "backend/benchmark_outputs/best_quality_guarded_20260710T0454Z/gold_drafts",
+      "pattern": "*.gold.json"
+    },
+    {
+      "name": "july_2026_documents",
+      "kind": "document_manifest",
+      "path": "backend/benchmark_outputs/best_quality_guarded_20260710T0454Z/document_manifest.json"
+    },
+    {
+      "name": "sample_bills",
+      "kind": "pdf_directory",
+      "path": "Sample Bills",
+      "pattern": "*.pdf"
+    }
+  ],
+  "forbidden_imports": [
+    "schemas",
+    "profiles",
+    "layout_bands",
+    "rule_packs",
+    "activation_state",
+    "legacy_confidence"
+  ],
+  "split": {
+    "seed": "gmoney-v2-frozen-split-v1",
+    "train": 0.6,
+    "validation": 0.2,
+    "holdout": 0.2,
+    "group_by": "hospital_id"
+  }
+}
+

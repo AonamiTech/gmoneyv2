@@ -1,0 +1,16 @@
+{
+  "version": "baseline_registry_v1",
+  "baselines": [
+    {
+      "name": "legacy_seed_2_lifecycle",
+      "metric": "legacy_metric_v1",
+      "gold_rows": 523,
+      "visible_extracted_rows": 688,
+      "matched_rows": 327,
+      "row_precision": 0.4753,
+      "row_recall": 0.6252,
+      "source": "service_architecture_review.md",
+      "frozen": true
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "rows": [
+    {
+      "page_number": 1,
+      "table_id": "table-1",
+      "row_order": 0,
+      "description": "Complete Blood Count",
+      "request_no": "REQ-1",
+      "net_amount": 50.00
+    },
+    {
+      "page_number": 1,
+      "table_id": "table-1",
+      "row_order": 1,
+      "description": "Serum Creatinine",
+      "request_no": "REQ-2",
+      "net_amount": 25.00
+    }
+  ]
+}
+

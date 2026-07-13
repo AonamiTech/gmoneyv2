@@ -1,0 +1,29 @@
+{
+  "bill_file": "synthetic.pdf",
+  "document_total": 75.00,
+  "rows": [
+    {
+      "page_number": 1,
+      "table_id": "table-1",
+      "row_order": 0,
+      "section": "LAB",
+      "description": "Complete Blood Count",
+      "request_no": "REQ-1",
+      "rate": 50.00,
+      "quantity": 1,
+      "amount": 50.00
+    },
+    {
+      "page_number": 1,
+      "table_id": "table-1",
+      "row_order": 1,
+      "section": "LAB",
+      "description": "Serum Creatinine",
+      "request_no": "REQ-2",
+      "rate": 25.00,
+      "quantity": 1,
+      "amount": 25.00
+    }
+  ]
+}
+
