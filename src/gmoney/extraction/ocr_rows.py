@@ -503,9 +503,15 @@ def _is_total_description(normalized: str) -> bool:
             "subtotal",
             "total for",
             "grand total",
+            "total bill amount",
+            "total discount amount",
             "net amount",
+            "net tpa corporate amount",
             "bill amount",
             "amount paid",
+            "amount to be received",
+            "balance amount",
+            "balance due",
         )
     )
 
@@ -845,7 +851,13 @@ def reconstruct_ocr_rows(
             }
             or any(
                 term in normalized_description
-                for term in ("amount received", "amount refunded", "payment mode", "receipt ref")
+                for term in (
+                    "advance received",
+                    "amount received",
+                    "amount refunded",
+                    "payment mode",
+                    "receipt ref",
+                )
             )
         ):
             role = RowRole.PAYMENT

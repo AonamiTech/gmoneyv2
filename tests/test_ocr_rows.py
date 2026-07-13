@@ -279,3 +279,31 @@ def test_demographic_fragments_and_payments_are_not_detail_rows() -> None:
     assert payment_result.schema is not None
     assert payment_result.schema.table_type is TableType.PAYMENT
     assert {row.candidate.role for row in payment_result.rows} == {RowRole.PAYMENT}
+
+
+def test_document_totals_and_advance_are_not_detail_rows() -> None:
+    tokens = (
+        token(0, "Description", (100, 30, 300, 45)),
+        token(1, "Amount", (850, 30, 950, 45)),
+        token(2, "Angiography", (100, 70, 300, 85)),
+        token(3, "1000.00", (850, 70, 940, 85)),
+        token(4, "Total Bill Amount", (100, 100, 350, 115)),
+        token(5, "1000.00", (850, 100, 940, 115)),
+        token(6, "Total Discount Amount", (100, 130, 380, 145)),
+        token(7, "0.00", (850, 130, 940, 145)),
+        token(8, "Advance Received", (100, 160, 350, 175)),
+        token(9, "500.00", (850, 160, 940, 175)),
+        token(10, "Amount To Be Received", (100, 190, 400, 205)),
+        token(11, "500.00", (850, 190, 940, 205)),
+    )
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 20, 980, 220),
+    )
+    assert [row.candidate.description for row in result.rows] == [
+        "Angiography",
+        "Advance Received",
+    ]
+    assert result.rows[1].candidate.role is RowRole.PAYMENT

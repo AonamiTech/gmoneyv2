@@ -13,6 +13,7 @@ class ModelKind(StrEnum):
     LAYOUT = "layout"
     TABLE = "table"
     DOCUMENT_VLM = "document_vlm"
+    ADJUDICATION = "adjudication"
 
 
 class ModelSpec(ContractModel):

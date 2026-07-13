@@ -138,6 +138,54 @@ def build_catalog(config_path: Path) -> dict[str, Any]:
     }
 
 
+def freeze_phase3_candidates(
+    catalog: dict[str, Any],
+    *,
+    exposed_sha256: str,
+    required_hospitals: int = 10,
+) -> dict[str, Any]:
+    samples = [
+        entry
+        for entry in catalog.get("entries", [])
+        if entry.get("kind") == "pdf" and entry.get("source") == "sample_bills"
+    ]
+    if not samples:
+        raise ValueError("catalog contains no sample bills")
+    if sum(entry.get("sha256") == exposed_sha256 for entry in samples) != 1:
+        raise ValueError("exposed sample hash must identify exactly one bill")
+    candidates = []
+    for entry in sorted(samples, key=lambda item: item["relative_path"]):
+        exposed = entry["sha256"] == exposed_sha256
+        candidates.append(
+            {
+                "relative_path": entry["relative_path"],
+                "sha256": entry["sha256"],
+                "status": "exposed_regression" if exposed else "candidate_unseen",
+                "hospital_id": None,
+                "identity_status": "not_applicable" if exposed else "pending_review",
+                "annotation_status": "not_required" if exposed else "required",
+                "eligible_for_frozen_gate": False,
+            }
+        )
+    candidate_count = sum(item["status"] == "candidate_unseen" for item in candidates)
+    return {
+        "manifest_version": "phase3_sealed_candidates_v1",
+        "source_catalog_version": catalog.get("catalog_version"),
+        "required_distinct_hospitals": required_hospitals,
+        "entries": candidates,
+        "summary": {
+            "candidate_documents": candidate_count,
+            "confirmed_distinct_hospitals": 0,
+            "frozen_gold_documents": 0,
+            "gate_ready": False,
+            "blocking_reasons": [
+                "hospital_identity_review_required",
+                "frozen_gold_annotation_required",
+            ],
+        },
+    }
+
+
 @app.command("build")
 def build(
     config: Annotated[Path, typer.Option(exists=True, dir_okay=False)],
@@ -162,3 +210,20 @@ def validate(
     if leaked:
         raise typer.Exit(f"hospital split leakage: {leaked}")
     typer.echo(f"valid catalog: {len(gold)} gold annotations, no hospital leakage")
+
+
+@app.command("freeze-phase3-candidates")
+def freeze_phase3(
+    catalog: Annotated[Path, typer.Option(exists=True, dir_okay=False)],
+    output: Annotated[Path, typer.Option(dir_okay=False)],
+    exposed_sha256: Annotated[str, typer.Option()],
+    required_hospitals: int = 10,
+) -> None:
+    manifest = freeze_phase3_candidates(
+        json.loads(catalog.read_text()),
+        exposed_sha256=exposed_sha256,
+        required_hospitals=required_hospitals,
+    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    typer.echo(json.dumps(manifest["summary"], sort_keys=True))

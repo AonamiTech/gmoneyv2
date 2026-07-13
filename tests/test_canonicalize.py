@@ -28,6 +28,9 @@ def test_grounded_detail_becomes_accepted_canonical_row() -> None:
     assert rows[0].evidence[0].token_ids == ("t1", "t2")
     assert rows[0].contract_version == "canonical_row_v2"
     assert set(rows[0].field_evidence) == {"description", "amount"}
+    repeated = canonicalize_rows("document", 1, "table", "a" * 64, (aligned,))
+    assert repeated[0].id == rows[0].id
+    assert repeated[0].candidate_ids == rows[0].candidate_ids
 
 
 def test_ungrounded_optional_provider_values_are_not_published() -> None:

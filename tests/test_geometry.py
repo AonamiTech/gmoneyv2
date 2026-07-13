@@ -3,9 +3,10 @@ from pathlib import Path
 import cv2
 import fitz
 import numpy as np
+import pytest
 
 from gmoney.evaluation.corpus import sha256_file
-from gmoney.geometry.crop import crop_region
+from gmoney.geometry.crop import crop_region, render_pdf_region
 from gmoney.geometry.normalize import normalize_page
 from gmoney.geometry.quality import estimate_skew
 from gmoney.geometry.render import render_pdf
@@ -90,6 +91,27 @@ def test_crop_retains_inverse_page_mapping(tmp_path: Path) -> None:
     assert crop_points[0] == (0.0, 0.0)
     restored = apply_matrix(result.transform.inverse_matrix, crop_points)
     assert restored == page_points
+
+
+def test_400_dpi_region_rerender_round_trips_to_300_dpi_page(tmp_path: Path) -> None:
+    pdf = tmp_path / "bill.pdf"
+    document = fitz.open()
+    page = document.new_page(width=300, height=400)
+    page.insert_text((30, 50), "DESCRIPTION AMOUNT")
+    document.save(pdf)
+    document.close()
+    result = render_pdf_region(
+        pdf,
+        tmp_path / "region.png",
+        1,
+        (100, 150, 600, 900),
+    )
+    page_points = ((100.0, 150.0), (600.0, 900.0), (250.0, 300.0))
+    crop_points = apply_matrix(result.transform.forward_matrix, page_points)
+    assert crop_points[0] == pytest.approx((0, 0))
+    restored = apply_matrix(result.transform.inverse_matrix, crop_points)
+    for expected, actual in zip(page_points, restored, strict=True):
+        assert actual == pytest.approx(expected)
 
 
 def test_all_right_angle_orientations_round_trip_and_swap_dimensions() -> None:

@@ -5,6 +5,7 @@ from pydantic import ValidationError
 
 from gmoney.contracts.evidence import Point, Polygon, TransformChain
 from gmoney.contracts.gold import GoldAnnotation
+from gmoney.settings import Settings
 
 
 def test_gold_annotation_rejects_unknown_fields() -> None:
@@ -42,3 +43,9 @@ def test_gold_amount_is_decimal() -> None:
     )
     assert annotation.rows[0].amount == Decimal("10.25")
 
+
+def test_settings_accepts_standard_gemini_key_without_exposing_it(monkeypatch) -> None:
+    monkeypatch.setenv("GEMINI_API_KEY", "secret-key")
+    settings = Settings(_env_file=None)
+    assert settings.gemini_api_key == "secret-key"
+    assert "secret-key" not in repr(settings)

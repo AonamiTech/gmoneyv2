@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from uuid import NAMESPACE_URL, uuid5
 
 from gmoney.contracts.evidence import Point, Polygon
 from gmoney.contracts.extraction import (
@@ -121,6 +122,7 @@ def canonicalize_rows(
 
         output.append(
             CanonicalRow(
+                id=uuid5(NAMESPACE_URL, f"gmoney:canonical-row:{identity}"),
                 contract_version="canonical_row_v2",
                 document_id=document_id,
                 page_number=page_number,

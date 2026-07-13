@@ -16,3 +16,27 @@ docker compose config --quiet
 
 Copy `.env.example` to `.env` only for local execution. Secrets must not be committed.
 
+## Phase 3 offline tools
+
+Phase 3 remains file-backed and offline. Gemini is off by default; use challenger
+mode only with de-identified crops, and use enabled mode only after generating a
+passing frozen promotion decision.
+
+```bash
+# Reserve candidate unseen bills without treating filename hashes as hospital IDs.
+.venv/bin/gmoney-corpus freeze-phase3-candidates \
+  --catalog data/catalog.json \
+  --output corpus/phase3-sealed-candidates.json \
+  --exposed-sha256 5d73bbe431954ae6183cb6d34b52c3dd491aae90776956b07c0d5cfab6486c35
+
+# Inspect profile-registry capacity for 5,000 hospitals / 20,000 variants.
+.venv/bin/gmoney-profiles benchmark --variants 20000 --queries 100
+
+# Evaluate a frozen local, challenger, or profile manifest.
+.venv/bin/gmoney-phase3-evaluate run \
+  --manifest data/phase3/evaluation-manifest.json \
+  --output artifacts/phase3/quality.json
+```
+
+See [phase-3-plan.md](phase-3-plan.md) and
+[docs/reviews/phase-3.md](docs/reviews/phase-3.md) for the gates and current status.

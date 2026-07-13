@@ -1,7 +1,8 @@
 from functools import lru_cache
+from pathlib import Path
 from typing import Literal
 
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -16,9 +17,22 @@ class Settings(BaseSettings):
     s3_access_key: str = "gmoney"
     s3_secret_key: str = Field(default="change-me", repr=False)
     s3_bucket: str = "gmoney-v2"
+    gemini_api_key: str = Field(
+        default="",
+        repr=False,
+        validation_alias=AliasChoices("GEMINI_API_KEY", "GMONEY_GEMINI_API_KEY"),
+    )
+    gemini_model: str = "gemini-3.5-flash"
+    gemini_timeout_seconds: float = Field(default=120, gt=0, le=900)
+    gemini_max_calls_per_document: int = Field(default=4, ge=0, le=100)
+    gemini_max_cost_usd_per_document: float = Field(default=0.25, ge=0)
+    gemini_input_cost_usd_per_million: float = Field(default=0, ge=0)
+    gemini_output_cost_usd_per_million: float = Field(default=0, ge=0)
+    gemini_prompt_version: str = "phase3-grounded-v1"
+    gemini_redaction_version: str = "phase3-redaction-v1"
+    gemini_promotion_path: Path | None = None
 
 
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
-

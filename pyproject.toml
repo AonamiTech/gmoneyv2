@@ -9,6 +9,7 @@ description = "Evidence-grounded hospital bill extraction platform"
 requires-python = ">=3.11,<3.13"
 dependencies = [
   "fastapi>=0.115,<1",
+  "google-genai>=1.56,<2",
   "httpx>=0.28,<1",
   "numpy>=2.2,<3",
   "opencv-python-headless>=4.11,<5",
@@ -45,6 +46,8 @@ gmoney-layout-bakeoff = "gmoney.inference.layout_bakeoff:app"
 gmoney-ocr-fallback = "gmoney.inference.ocr_fallback_cli:app"
 gmoney-offline-extract = "gmoney.extraction.offline:app"
 gmoney-demo-worker = "gmoney.demo.worker:main"
+gmoney-profiles = "gmoney.profiles.cli:app"
+gmoney-phase3-evaluate = "gmoney.evaluation.phase3_cli:app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/gmoney"]

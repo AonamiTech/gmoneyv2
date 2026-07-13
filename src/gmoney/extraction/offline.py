@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
+from decimal import Decimal
 from pathlib import Path
 from typing import Annotated, Any
 from uuid import uuid4
@@ -11,7 +12,17 @@ from uuid import uuid4
 import cv2
 import typer
 
-from gmoney.contracts.extraction import CanonicalRow, RowRole, TableType
+from gmoney.contracts.extraction import CanonicalRow, PageType, RowRole, TableType
+from gmoney.contracts.phase3 import (
+    AdjudicationRequest,
+    GeminiMode,
+    LayoutObservation,
+    ProfileLifecycle,
+    ProfileMatch,
+    RecoveryAttempt,
+    RecoveryReason,
+    RecoveryStage,
+)
 from gmoney.evaluation.corpus import sha256_file
 from gmoney.extraction.canonicalize import canonicalize_rows
 from gmoney.extraction.ocr_rows import (
@@ -23,17 +34,34 @@ from gmoney.extraction.ocr_rows import (
 )
 from gmoney.extraction.ocr_tokens import paddle_ocr_tokens
 from gmoney.extraction.otsl import parse_otsl, split_otsl_tables
+from gmoney.extraction.recovery import (
+    decide_recovery,
+    ground_adjudication,
+    is_implausibly_low_yield,
+    map_crop_tokens_to_page,
+)
 from gmoney.extraction.rows import extract_candidate_rows
 from gmoney.extraction.spatial import align_candidate_rows
-from gmoney.geometry.crop import crop_region
+from gmoney.geometry.crop import clahe_variant, crop_region, render_pdf_region
 from gmoney.geometry.render import render_pdf
 from gmoney.inference.contracts import InferenceRequest, InferenceResponse
+from gmoney.inference.gemini import (
+    AdjudicationAdapter,
+    GeminiAdjudicationAdapter,
+    cached_adjudication,
+    validate_promotion,
+)
 from gmoney.inference.ocr_table_fallback import propose_tables_from_ocr
 from gmoney.inference.paddle import (
     PaddleDocLayoutV3Adapter,
     PaddleOcrV6Adapter,
     PaddleOcrVlAdapter,
 )
+from gmoney.inference.redaction import redact_crop
+from gmoney.profiles.lifecycle import deterministic_shadow_sample
+from gmoney.profiles.matching import match_profile, profile_to_schema
+from gmoney.profiles.repository import JsonProfileRepository
+from gmoney.settings import Settings, get_settings
 
 app = typer.Typer(no_args_is_help=True)
 
@@ -53,6 +81,18 @@ class VlAsset:
     path: Path
     artifact_sha256: str
     identity: str
+
+
+def _page_type(table_type: TableType) -> PageType:
+    return {
+        TableType.PHARMACY: PageType.PHARMACY,
+        TableType.LABORATORY: PageType.LABORATORY,
+        TableType.CATEGORY_SUMMARY: PageType.CATEGORY_SUMMARY,
+        TableType.PACKAGE_SUMMARY: PageType.CATEGORY_SUMMARY,
+        TableType.PAYMENT: PageType.RECEIPT_PAYMENT,
+        TableType.METADATA: PageType.METADATA,
+        TableType.ITEM_LEDGER: PageType.ITEMIZED_CHARGES,
+    }.get(table_type, PageType.MIXED)
 
 
 def _cached_prediction(
@@ -266,11 +306,318 @@ def _apply_document_role_policy(rows: list[CanonicalRow]) -> list[CanonicalRow]:
     return [row.model_copy(update={"row_order": order}) for order, row in enumerate(selected)]
 
 
+def _apply_profile_constraints(reconstruction, profile):
+    schema = reconstruction.schema
+    if schema is not None:
+        schema = replace(
+            schema,
+            table_type=profile.table_type,
+            confidence=max(schema.confidence, profile.retrieval_threshold),
+        )
+    optional_fields = {
+        "service_date",
+        "request_no",
+        "service_code",
+        "hsn_code",
+        "quantity",
+        "rate",
+        "discount",
+    }
+    rows = []
+    for row in reconstruction.rows:
+        candidate = row.candidate
+        role = candidate.role
+        if profile.table_type in {TableType.CATEGORY_SUMMARY, TableType.PACKAGE_SUMMARY}:
+            role = RowRole.CATEGORY_ROLLUP
+        elif profile.table_type is TableType.PAYMENT:
+            role = RowRole.PAYMENT
+        elif candidate.amount is not None and candidate.amount < 0:
+            role = RowRole.REFUND
+        elif role in {RowRole.CATEGORY_ROLLUP, RowRole.PAYMENT}:
+            role = RowRole.DETAIL
+        updates = {
+            field: None
+            for field in optional_fields & set(profile.unsupported_fields)
+        }
+        rows.append(
+            replace(
+                row,
+                candidate=replace(
+                    candidate,
+                    role=role,
+                    table_type=profile.table_type,
+                    **updates,
+                ),
+                field_token_ids={
+                    name: ids
+                    for name, ids in row.field_token_ids.items()
+                    if name not in profile.unsupported_fields
+                },
+            )
+        )
+    return replace(reconstruction, rows=tuple(rows), schema=schema)
+
+
+def _heavy_disagrees(reconstruction, provider_candidates) -> bool:
+    local = {
+        (
+            re.sub(r"[^a-z0-9]+", " ", (row.candidate.description or "").casefold()).strip(),
+            row.candidate.amount,
+        )
+        for row in reconstruction.rows
+    }
+    heavy = {
+        (
+            re.sub(r"[^a-z0-9]+", " ", (row.description or "").casefold()).strip(),
+            row.amount,
+        )
+        for row in provider_candidates
+        if row.description and row.amount is not None
+    }
+    return bool(heavy and heavy != local)
+
+
 class OfflineExtractor:
-    def __init__(self, vl_url: str) -> None:
+    def __init__(
+        self,
+        vl_url: str,
+        *,
+        hospital_id: str | None = None,
+        profile_registry: Path | None = None,
+        gemini_mode: GeminiMode = GeminiMode.OFF,
+        gemini_adapter: AdjudicationAdapter | None = None,
+        settings: Settings | None = None,
+    ) -> None:
+        self.settings = settings or get_settings()
+        self.hospital_id = hospital_id
+        self.gemini_mode = gemini_mode
+        self.gemini_promotion = None
+        if gemini_mode is GeminiMode.ENABLED:
+            promotion_path = self.settings.gemini_promotion_path
+            if promotion_path is None:
+                raise ValueError("enabled Gemini mode requires a frozen promotion decision")
+            self.gemini_promotion = validate_promotion(
+                promotion_path,
+                model=self.settings.gemini_model,
+                prompt_version=self.settings.gemini_prompt_version,
+                redaction_version=self.settings.gemini_redaction_version,
+            )
         self.ocr = PaddleOcrV6Adapter()
         self.layout = PaddleDocLayoutV3Adapter()
         self.vl = PaddleOcrVlAdapter(base_url=vl_url)
+        self.profiles = (
+            JsonProfileRepository(profile_registry).list_profiles()
+            if profile_registry is not None and profile_registry.exists()
+            else ()
+        )
+        self.gemini = gemini_adapter
+        if (
+            self.gemini is None
+            and gemini_mode is not GeminiMode.OFF
+            and self.settings.gemini_api_key
+        ):
+            self.gemini = GeminiAdjudicationAdapter(
+                api_key=self.settings.gemini_api_key,
+                model=self.settings.gemini_model,
+                timeout_seconds=self.settings.gemini_timeout_seconds,
+                input_cost_usd_per_million=self.settings.gemini_input_cost_usd_per_million,
+                output_cost_usd_per_million=self.settings.gemini_output_cost_usd_per_million,
+            )
+
+    def _profile_match(
+        self,
+        *,
+        document_id: str,
+        page_number: int,
+        page_width: int,
+        page_height: int,
+        box: tuple[int, int, int, int],
+        reconstruction,
+        tokens,
+        profiles=None,
+        include_shadow: bool = False,
+    ) -> ProfileMatch | None:
+        candidates = self.profiles if profiles is None else profiles
+        if not candidates:
+            return None
+        table_type = (
+            reconstruction.schema.table_type
+            if reconstruction.schema is not None
+            else TableType(str(reconstruction.diagnostics.get("table_type") or "unknown"))
+        )
+        token_by_id = {token.token_id: token for token in tokens}
+        header_ids = reconstruction.schema.header_token_ids if reconstruction.schema else ()
+        header_tokens = tuple(
+            token_by_id[token_id].text for token_id in header_ids if token_id in token_by_id
+        )
+        if not header_tokens:
+            scoped = tokens_in_box(tokens, box)
+            top_limit = box[1] + (box[3] - box[1]) * 0.2
+            header_tokens = tuple(
+                token.text
+                for token in scoped
+                if min(point.y for point in token.polygon.points) <= top_limit
+            )
+        left, top, right, bottom = box
+        observation = LayoutObservation(
+            document_id=document_id,
+            hospital_id=self.hospital_id,
+            page_number=page_number,
+            page_type=_page_type(table_type),
+            table_type=table_type,
+            page_aspect_ratio=page_width / page_height,
+            table_box=(
+                left / page_width,
+                top / page_height,
+                right / page_width,
+                bottom / page_height,
+            ),
+            header_tokens=header_tokens,
+            column_centers=(
+                reconstruction.schema.column_centers if reconstruction.schema is not None else {}
+            ),
+        )
+        return match_profile(candidates, observation, include_shadow=include_shadow)
+
+    def _recover_crop_ocr(
+        self,
+        *,
+        source: Path,
+        artifact_root: Path,
+        work: TableWork,
+        prior_schemas,
+        page_artifact_sha256: str,
+        minimum_rows: int = 0,
+    ):
+        attempts: list[RecoveryAttempt] = []
+        try:
+            high_resolution = render_pdf_region(
+                source,
+                artifact_root / "crops" / f"{work.table_id}-400dpi.png",
+                work.page_number,
+                work.box,
+            )
+        except Exception as error:
+            attempts.append(
+                RecoveryAttempt(
+                    stage=RecoveryStage.HIGH_RESOLUTION,
+                    status="failed",
+                    reason=f"render_error:{type(error).__name__}",
+                )
+            )
+            return None, tuple(attempts)
+        attempts.append(
+            RecoveryAttempt(
+                stage=RecoveryStage.HIGH_RESOLUTION,
+                artifact_sha256=high_resolution.artifact_sha256,
+                status="rendered",
+            )
+        )
+        assets = [
+            (
+                "high_resolution",
+                high_resolution.output_path,
+                high_resolution.artifact_sha256,
+                f"{work.table_id}.400dpi.ocr.json",
+            )
+        ]
+        try:
+            photometric = clahe_variant(
+                high_resolution.output_path,
+                artifact_root / "crops" / f"{work.table_id}-400dpi-clahe.png",
+            )
+        except Exception as error:
+            attempts.append(
+                RecoveryAttempt(
+                    stage=RecoveryStage.PHOTOMETRIC,
+                    status="failed",
+                    reason=f"variant_error:{type(error).__name__}",
+                )
+            )
+        else:
+            attempts.append(
+                RecoveryAttempt(
+                    stage=RecoveryStage.PHOTOMETRIC,
+                    artifact_sha256=photometric.artifact_sha256,
+                    status="prepared",
+                )
+            )
+            assets.append(
+                (
+                    "photometric",
+                    photometric.output_path,
+                    photometric.artifact_sha256,
+                    f"{work.table_id}.400dpi-clahe.ocr.json",
+                )
+            )
+        selected = None
+        for variant, image_path, artifact_sha256, cache_name in assets:
+            request = InferenceRequest(
+                request_id=str(uuid4()),
+                artifact_sha256=artifact_sha256,
+                image_path=str(image_path.resolve()),
+                page_number=work.page_number,
+                options={
+                    "recovery_stage": RecoveryStage.CROP_OCR.value,
+                    "input_variant": variant,
+                    "source_crop_sha256": work.crop_sha256,
+                },
+            )
+            try:
+                response, cache_hit = _cached_prediction(
+                    artifact_root / "inference" / cache_name,
+                    request,
+                    self.ocr,
+                )
+            except Exception as error:
+                attempts.append(
+                    RecoveryAttempt(
+                        stage=RecoveryStage.CROP_OCR,
+                        artifact_sha256=artifact_sha256,
+                        status="failed",
+                        reason=f"{variant}:ocr_error:{type(error).__name__}",
+                    )
+                )
+                continue
+            local_tokens = paddle_ocr_tokens(response.output, work.page_number, artifact_sha256)
+            image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+            if image is None:
+                raise ValueError(f"cannot read recovered crop: {image_path}")
+            mapped_tokens = map_crop_tokens_to_page(
+                local_tokens,
+                work.box,
+                image.shape[1],
+                image.shape[0],
+                page_artifact_sha256,
+            )
+            reconstruction = reconstruct_ocr_rows(
+                mapped_tokens,
+                page_number=work.page_number,
+                table_id=work.table_id,
+                box=work.box,
+                prior_schemas=prior_schemas,
+            )
+            improved = len(reconstruction.rows) > minimum_rows
+            attempts.append(
+                RecoveryAttempt(
+                    stage=RecoveryStage.CROP_OCR,
+                    artifact_sha256=artifact_sha256,
+                    cache_hit=cache_hit,
+                    latency_ms=response.latency_ms,
+                    produced_rows=len(reconstruction.rows),
+                    accepted_rows=len(reconstruction.rows) if improved else 0,
+                    status=(
+                        "recovered"
+                        if improved
+                        else ("no_improvement" if reconstruction.rows else "no_rows")
+                    ),
+                    reason=f"input_variant:{variant}",
+                )
+            )
+            if improved:
+                selected = reconstruction
+                break
+        return selected, tuple(attempts)
 
     def extract(
         self,
@@ -285,6 +632,9 @@ class OfflineExtractor:
         all_rows: list[CanonicalRow] = []
         diagnostics: list[dict[str, Any]] = []
         schema_states: list[TableSchemaState] = []
+        gemini_calls = 0
+        gemini_cost = Decimal("0")
+        gemini_provider_disabled_reason: str | None = None
         for page_asset in manifest.pages:
             page_path = artifact_root / "pages" / page_asset.relative_path
             ocr_request = InferenceRequest(
@@ -372,6 +722,72 @@ class OfflineExtractor:
                     box=work.box,
                     prior_schemas=tuple(schema_states),
                 )
+                profile_match = self._profile_match(
+                    document_id=document_id,
+                    page_number=work.page_number,
+                    page_width=page_asset.width,
+                    page_height=page_asset.height,
+                    box=work.box,
+                    reconstruction=reconstruction,
+                    tokens=tokens,
+                )
+                shadow_profile_match = self._profile_match(
+                    document_id=document_id,
+                    page_number=work.page_number,
+                    page_width=page_asset.width,
+                    page_height=page_asset.height,
+                    box=work.box,
+                    reconstruction=reconstruction,
+                    tokens=tokens,
+                    profiles=tuple(
+                        profile
+                        for profile in self.profiles
+                        if profile.lifecycle is ProfileLifecycle.SHADOW
+                    ),
+                    include_shadow=True,
+                )
+                selected_profile = None
+                if profile_match is not None and profile_match.selected:
+                    selected_profile = next(
+                        profile
+                        for profile in self.profiles
+                        if profile.profile_key == profile_match.profile_key
+                        and profile.profile_version == profile_match.profile_version
+                    )
+                    guided = reconstruct_ocr_rows(
+                        tokens,
+                        page_number=work.page_number,
+                        table_id=work.table_id,
+                        box=work.box,
+                        prior_schemas=(
+                            *schema_states,
+                            profile_to_schema(selected_profile, work.page_number, work.table_id),
+                        ),
+                    )
+                    guided = _apply_profile_constraints(guided, selected_profile)
+                    route_name = (
+                        f"profile_guided:{selected_profile.profile_key}"
+                        f"@{selected_profile.profile_version}"
+                    )
+                    reconstruction = replace(
+                        guided,
+                        rows=tuple(
+                            replace(
+                                row,
+                                source_routes=tuple(
+                                    dict.fromkeys((*row.source_routes, route_name))
+                                ),
+                            )
+                            for row in guided.rows
+                        ),
+                    )
+                profile_heavy_sample = bool(
+                    selected_profile is not None
+                    and deterministic_shadow_sample(
+                        document_id,
+                        selected_profile.profile_key,
+                    )
+                )
                 if reconstruction.schema is not None:
                     schema_states.append(reconstruction.schema)
                 parsed_rows = list(
@@ -383,15 +799,46 @@ class OfflineExtractor:
                         reconstruction.rows,
                     )
                 )
+                recovery_attempts: list[RecoveryAttempt] = []
+                if not parsed_rows or is_implausibly_low_yield(reconstruction):
+                    recovered, attempts = self._recover_crop_ocr(
+                        source=source,
+                        artifact_root=artifact_root,
+                        work=work,
+                        prior_schemas=tuple(schema_states),
+                        page_artifact_sha256=work.page_artifact_sha256,
+                        minimum_rows=len(reconstruction.rows),
+                    )
+                    recovery_attempts.extend(attempts)
+                    if recovered is not None:
+                        reconstruction = recovered
+                        if reconstruction.schema is not None:
+                            schema_states.append(reconstruction.schema)
+                        parsed_rows = list(
+                            canonicalize_rows(
+                                document_id,
+                                work.page_number,
+                                work.table_id,
+                                work.page_artifact_sha256,
+                                reconstruction.rows,
+                            )
+                        )
                 content = ""
                 candidate_count = 0
                 provider_candidates = []
                 vl_latency_ms = 0
                 vl_cache_hit = False
                 vl_finish_reason: str | None = None
+                vl_error: str | None = None
                 vl_truncated = False
                 vl_tile_count = 0
                 vl_retry_reason: str | None = None
+                gemini_invoked = False
+                gemini_cache_hit = False
+                gemini_grounded_rows = 0
+                gemini_rejected_reasons: tuple[str, ...] = ()
+                gemini_redaction_safe: bool | None = None
+                gemini_masked_tokens = 0
                 # OCR is the deterministic primary route. The heavy parser is
                 # invoked only when OCR could not reconstruct a trustworthy
                 # table, avoiding context pressure on dense, already-readable
@@ -409,7 +856,14 @@ class OfflineExtractor:
                 use_vl = bool(
                     advisor_eligible
                     and (
+                        profile_heavy_sample
+                        or not (profile_match and profile_match.selected and parsed_rows)
+                    )
+                    and (
+                        profile_heavy_sample
+                        or
                         not parsed_rows
+                        or is_implausibly_low_yield(reconstruction)
                         or reconstruction.diagnostics.get("orientation") != "upright"
                         or (
                             not reconstruction.diagnostics.get("header_found")
@@ -417,6 +871,7 @@ class OfflineExtractor:
                         )
                     )
                 )
+                rows_before_vl = len(parsed_rows)
                 if use_vl:
                     scoped_tokens = tokens_in_box(tokens, work.box)
                     vl_cache_hits: list[bool] = []
@@ -445,11 +900,16 @@ class OfflineExtractor:
                                 "tile_index": tile_index,
                             },
                         )
-                        vl_response, cache_hit = _cached_prediction(
-                            artifact_root / "inference" / cache_name,
-                            vl_request,
-                            self.vl,
-                        )
+                        try:
+                            vl_response, cache_hit = _cached_prediction(
+                                artifact_root / "inference" / cache_name,
+                                vl_request,
+                                self.vl,
+                            )
+                        except Exception as error:
+                            vl_error = f"provider_error:{type(error).__name__}"
+                            vl_retry_reason = vl_error
+                            break
                         vl_cache_hits.append(cache_hit)
                         vl_latency_ms += vl_response.latency_ms
                         response_content = str(vl_response.output.get("content") or "")
@@ -481,17 +941,18 @@ class OfflineExtractor:
                                 )
                             provider_candidates.extend(candidates)
                             response_candidate_count += len(candidates)
-                            aligned = align_candidate_rows(candidates, scoped_tokens)
-                            parsed_rows.extend(
-                                canonicalize_rows(
-                                    document_id,
-                                    work.page_number,
-                                    work.table_id,
-                                    work.page_artifact_sha256,
-                                    aligned,
-                                    starting_order=len(parsed_rows),
+                            if not profile_heavy_sample:
+                                aligned = align_candidate_rows(candidates, scoped_tokens)
+                                parsed_rows.extend(
+                                    canonicalize_rows(
+                                        document_id,
+                                        work.page_number,
+                                        work.table_id,
+                                        work.page_artifact_sha256,
+                                        aligned,
+                                        starting_order=len(parsed_rows),
+                                    )
                                 )
-                            )
                         candidate_count += response_candidate_count
                         response_truncated = bool(vl_response.output.get("truncated"))
                         vl_truncated = vl_truncated or response_truncated
@@ -519,9 +980,40 @@ class OfflineExtractor:
 
                     vl_cache_hit = bool(vl_cache_hits) and all(vl_cache_hits)
                     content = "\n".join(vl_contents)
-                fused_rows = fuse_provider_descriptions(
-                    reconstruction.rows,
-                    tuple(provider_candidates),
+                    recovery_attempts.append(
+                        RecoveryAttempt(
+                            stage=RecoveryStage.LOCAL_VLM,
+                            cache_hit=vl_cache_hit,
+                            latency_ms=vl_latency_ms,
+                            produced_rows=candidate_count,
+                            accepted_rows=(
+                                0
+                                if profile_heavy_sample
+                                else max(0, len(parsed_rows) - rows_before_vl)
+                            ),
+                            status=(
+                                "provider_failed"
+                                if vl_error
+                                else (
+                                    "truncated"
+                                    if vl_truncated
+                                    else ("recovered" if candidate_count else "no_rows")
+                                )
+                            ),
+                            reason=vl_retry_reason,
+                        )
+                    )
+                profile_heavy_disagreement = bool(
+                    profile_heavy_sample
+                    and _heavy_disagrees(reconstruction, provider_candidates)
+                )
+                fused_rows = (
+                    reconstruction.rows
+                    if profile_heavy_sample
+                    else fuse_provider_descriptions(
+                        reconstruction.rows,
+                        tuple(provider_candidates),
+                    )
                 )
                 if fused_rows != reconstruction.rows:
                     parsed_rows.extend(
@@ -532,6 +1024,218 @@ class OfflineExtractor:
                             work.page_artifact_sha256,
                             fused_rows,
                             starting_order=len(parsed_rows),
+                        )
+                    )
+                table_type = (
+                    reconstruction.schema.table_type
+                    if reconstruction.schema is not None
+                    else TableType.UNKNOWN
+                )
+                route_decision = decide_recovery(
+                    reconstruction,
+                    gemini_mode=self.gemini_mode,
+                    vlm_truncated=vl_truncated,
+                    profile_match=profile_match,
+                )
+                needs_gemini_recovery = bool(
+                    not parsed_rows or is_implausibly_low_yield(reconstruction)
+                )
+                gemini_block_reason: str | None = None
+                if needs_gemini_recovery and self.gemini_mode is not GeminiMode.OFF:
+                    if self.gemini is None:
+                        gemini_block_reason = "adapter_unavailable"
+                    elif gemini_provider_disabled_reason:
+                        gemini_block_reason = gemini_provider_disabled_reason
+                    elif gemini_calls >= self.settings.gemini_max_calls_per_document:
+                        gemini_block_reason = "call_budget_exhausted"
+                    elif gemini_cost >= Decimal(
+                        str(self.settings.gemini_max_cost_usd_per_document)
+                    ):
+                        gemini_block_reason = "cost_budget_exhausted"
+                eligible_for_gemini = bool(
+                    needs_gemini_recovery
+                    and self.gemini_mode is not GeminiMode.OFF
+                    and gemini_block_reason is None
+                )
+                if eligible_for_gemini:
+                    try:
+                        redaction = redact_crop(
+                            work.crop_path,
+                            artifact_root / "crops" / f"{work.table_id}-redacted.png",
+                            tokens,
+                            work.box,
+                        )
+                    except Exception as error:
+                        gemini_block_reason = f"redaction_error:{type(error).__name__}"
+                        recovery_attempts.append(
+                            RecoveryAttempt(
+                                stage=RecoveryStage.GEMINI,
+                                status="redaction_blocked",
+                                reason=gemini_block_reason,
+                            )
+                        )
+                    else:
+                        gemini_redaction_safe = redaction.safe
+                        gemini_masked_tokens = len(redaction.masked_token_ids)
+                        if redaction.safe:
+                            request = AdjudicationRequest(
+                                request_id=str(uuid4()),
+                                document_id=document_id,
+                                page_number=work.page_number,
+                                table_id=work.table_id,
+                                masked_crop_path=str(redaction.path.resolve()),
+                                masked_crop_sha256=redaction.artifact_sha256,
+                                page_type=_page_type(table_type),
+                                table_type=table_type,
+                                tokens=redaction.tokens,
+                                unresolved_reasons=route_decision.reasons,
+                                candidate_rows=tuple(asdict(row) for row in provider_candidates),
+                                prompt_version=self.settings.gemini_prompt_version,
+                                redaction_version=self.settings.gemini_redaction_version,
+                            )
+                            try:
+                                response, gemini_cache_hit = cached_adjudication(
+                                    artifact_root
+                                    / "inference"
+                                    / f"{work.table_id}.gemini.json",
+                                    request,
+                                    self.gemini,
+                                )
+                            except Exception as error:
+                                gemini_invoked = True
+                                gemini_calls += 1
+                                gemini_provider_disabled_reason = (
+                                    f"provider_error:{type(error).__name__}"
+                                )
+                                gemini_block_reason = gemini_provider_disabled_reason
+                                recovery_attempts.append(
+                                    RecoveryAttempt(
+                                        stage=RecoveryStage.GEMINI,
+                                        artifact_sha256=redaction.artifact_sha256,
+                                        status="provider_failed",
+                                        reason=gemini_block_reason,
+                                    )
+                                )
+                            else:
+                                gemini_invoked = True
+                                gemini_calls += 0 if gemini_cache_hit else 1
+                                if not gemini_cache_hit:
+                                    gemini_cost += response.measured_cost_usd
+                                try:
+                                    image = cv2.imread(
+                                        str(redaction.path), cv2.IMREAD_COLOR
+                                    )
+                                    if image is None:
+                                        raise ValueError("cannot read redacted crop")
+                                    grounded = ground_adjudication(
+                                        response,
+                                        validation_tokens=redaction.tokens,
+                                        evidence_tokens=tokens_in_box(tokens, work.box),
+                                        crop_width=image.shape[1],
+                                        crop_height=image.shape[0],
+                                        table_type=table_type,
+                                        column_centers=(
+                                            reconstruction.schema.column_centers
+                                            if reconstruction.schema is not None
+                                            else None
+                                        ),
+                                    )
+                                except Exception as error:
+                                    gemini_block_reason = (
+                                        f"grounding_error:{type(error).__name__}"
+                                    )
+                                    recovery_attempts.append(
+                                        RecoveryAttempt(
+                                            stage=RecoveryStage.GEMINI,
+                                            artifact_sha256=redaction.artifact_sha256,
+                                            cache_hit=gemini_cache_hit,
+                                            latency_ms=response.latency_ms,
+                                            produced_rows=len(response.rows),
+                                            status="grounding_failed",
+                                            reason=gemini_block_reason,
+                                        )
+                                    )
+                                else:
+                                    gemini_grounded_rows = len(grounded.rows)
+                                    gemini_rejected_reasons = grounded.rejected_reasons
+                                    if (
+                                        self.gemini_mode is GeminiMode.ENABLED
+                                        and grounded.rows
+                                    ):
+                                        parsed_rows.extend(
+                                            canonicalize_rows(
+                                                document_id,
+                                                work.page_number,
+                                                work.table_id,
+                                                work.page_artifact_sha256,
+                                                grounded.rows,
+                                                starting_order=len(parsed_rows),
+                                            )
+                                        )
+                                    recovery_attempts.append(
+                                        RecoveryAttempt(
+                                            stage=RecoveryStage.GEMINI,
+                                            artifact_sha256=redaction.artifact_sha256,
+                                            cache_hit=gemini_cache_hit,
+                                            latency_ms=response.latency_ms,
+                                            produced_rows=len(response.rows),
+                                            accepted_rows=(
+                                                gemini_grounded_rows
+                                                if self.gemini_mode is GeminiMode.ENABLED
+                                                else 0
+                                            ),
+                                            status=(
+                                                "challenger"
+                                                if self.gemini_mode
+                                                is GeminiMode.CHALLENGER
+                                                else (
+                                                    "recovered"
+                                                    if grounded.rows
+                                                    else "rejected"
+                                                )
+                                            ),
+                                            reason=(
+                                                ",".join(grounded.rejected_reasons)
+                                                if grounded.rejected_reasons
+                                                else None
+                                            ),
+                                        )
+                                    )
+                        else:
+                            gemini_rejected_reasons = redaction.reasons
+                            gemini_block_reason = "redaction_blocked"
+                            recovery_attempts.append(
+                                RecoveryAttempt(
+                                    stage=RecoveryStage.GEMINI,
+                                    status="redaction_blocked",
+                                    reason=",".join(redaction.reasons),
+                                )
+                            )
+                elif (
+                    needs_gemini_recovery
+                    and self.gemini_mode is not GeminiMode.OFF
+                    and gemini_block_reason
+                ):
+                    recovery_attempts.append(
+                        RecoveryAttempt(
+                            stage=RecoveryStage.GEMINI,
+                            status="not_invoked",
+                            reason=gemini_block_reason,
+                        )
+                    )
+                terminal_unresolved = bool(
+                    not parsed_rows
+                    or (
+                        RecoveryReason.LOW_YIELD in route_decision.reasons
+                        and len(parsed_rows) <= len(reconstruction.rows)
+                    )
+                )
+                if terminal_unresolved and route_decision.reasons:
+                    recovery_attempts.append(
+                        RecoveryAttempt(
+                            stage=RecoveryStage.REVIEW,
+                            status="pending",
+                            reason=",".join(reason.value for reason in route_decision.reasons),
                         )
                     )
                 all_rows.extend(parsed_rows)
@@ -553,8 +1257,31 @@ class OfflineExtractor:
                         "vl_truncated": vl_truncated,
                         "vl_tile_count": vl_tile_count,
                         "vl_retry_reason": vl_retry_reason,
+                        "vl_error": vl_error,
                         "candidate_count": candidate_count,
                         "canonical_count": len(parsed_rows),
+                        "phase3_route": route_decision.model_dump(mode="json"),
+                        "profile_match": (
+                            profile_match.model_dump(mode="json") if profile_match else None
+                        ),
+                        "shadow_profile_match": (
+                            shadow_profile_match.model_dump(mode="json")
+                            if shadow_profile_match
+                            else None
+                        ),
+                        "profile_heavy_sample": profile_heavy_sample,
+                        "profile_heavy_disagreement": profile_heavy_disagreement,
+                        "recovery_attempts": [
+                            attempt.model_dump(mode="json") for attempt in recovery_attempts
+                        ],
+                        "gemini_mode": self.gemini_mode.value,
+                        "gemini_invoked": gemini_invoked,
+                        "gemini_cache_hit": gemini_cache_hit,
+                        "gemini_grounded_rows": gemini_grounded_rows,
+                        "gemini_rejected_reasons": gemini_rejected_reasons,
+                        "gemini_redaction_safe": gemini_redaction_safe,
+                        "gemini_masked_tokens": gemini_masked_tokens,
+                        "gemini_block_reason": gemini_block_reason,
                         "content": content,
                         **reconstruction.diagnostics,
                     }
@@ -564,8 +1291,9 @@ class OfflineExtractor:
 
         rows = _apply_document_role_policy(_deduplicate(all_rows))
         return {
-            "output_version": "offline_accuracy_spine_v2",
+            "output_version": "offline_accuracy_spine_v3",
             "document_id": document_id,
+            "hospital_id": self.hospital_id,
             "source_sha256": sha256_file(source),
             "source_name": source.name,
             "pages": len(manifest.pages),
@@ -581,6 +1309,17 @@ class OfflineExtractor:
             ],
             "rows": [row.model_dump(mode="json") for row in rows],
             "diagnostics": diagnostics,
+            "provider_usage": {
+                "gemini_mode": self.gemini_mode.value,
+                "gemini_calls": gemini_calls,
+                "gemini_measured_cost_usd": str(gemini_cost),
+                "gemini_provider_disabled_reason": gemini_provider_disabled_reason,
+                "gemini_promotion_manifest_sha256": (
+                    self.gemini_promotion.frozen_manifest_sha256
+                    if self.gemini_promotion
+                    else None
+                ),
+            },
         }
 
 
@@ -590,8 +1329,16 @@ def run(
     artifact_root: Annotated[Path, typer.Option(file_okay=False)],
     output: Annotated[Path, typer.Option(dir_okay=False)],
     vl_url: str = "http://127.0.0.1:8111",
+    hospital_id: str | None = None,
+    profile_registry: Annotated[Path | None, typer.Option(dir_okay=False)] = None,
+    gemini_mode: GeminiMode = GeminiMode.OFF,
 ) -> None:
-    result = OfflineExtractor(vl_url).extract(source, artifact_root)
+    result = OfflineExtractor(
+        vl_url,
+        hospital_id=hospital_id,
+        profile_registry=profile_registry,
+        gemini_mode=gemini_mode,
+    ).extract(source, artifact_root)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
     typer.echo(
