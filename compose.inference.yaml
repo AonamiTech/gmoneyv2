@@ -1,0 +1,31 @@
+name: gmoney-v2-inference
+
+services:
+  paddleocr-vl:
+    image: ghcr.io/ggml-org/llama.cpp:server@sha256:84d3d48839dc645bd85affa2738f447179fbda4e356c5b40942cf2a9463fe779
+    command:
+      - --model
+      - /models/PaddleOCR-VL-1.6-GGUF.gguf
+      - --mmproj
+      - /models/PaddleOCR-VL-1.6-GGUF-mmproj.gguf
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8111"
+      - --ctx-size
+      - "${GMONEY_HEAVY_CONTEXT_TOTAL:-24576}"
+      - --parallel
+      - "${GMONEY_HEAVY_CONCURRENCY:-1}"
+      - --threads
+      - "${GMONEY_HEAVY_THREADS:-14}"
+      - --temp
+      - "0"
+    volumes:
+      - ${PADDLEOCR_VL_MODEL_DIR:-./model-cache/paddleocr-vl-1.6}:/models:ro
+    ports:
+      - "8111:8111"
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 56G

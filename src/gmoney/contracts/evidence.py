@@ -1,3 +1,5 @@
+from enum import StrEnum
+
 from pydantic import Field, model_validator
 
 from gmoney.contracts.common import ContractModel
@@ -35,3 +37,56 @@ class TransformChain(ContractModel):
                 raise ValueError("transform matrices must be 3x3")
         return self
 
+
+class PageQualityFlag(StrEnum):
+    BLUR = "blur"
+    LOW_CONTRAST = "low_contrast"
+    UNDEREXPOSED = "underexposed"
+    OVEREXPOSED = "overexposed"
+    LOW_EDGE_DENSITY = "low_edge_density"
+    SKEWED = "skewed"
+    ORIENTATION_UNVERIFIED = "orientation_unverified"
+
+
+class PageQuality(ContractModel):
+    page_number: int = Field(ge=1)
+    artifact_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    width: int = Field(gt=0)
+    height: int = Field(gt=0)
+    dpi: int = Field(gt=0)
+    mean_luminance: float = Field(ge=0, le=255)
+    contrast_stddev: float = Field(ge=0)
+    laplacian_variance: float = Field(ge=0)
+    edge_density: float = Field(ge=0, le=1)
+    estimated_skew_degrees: float
+    orientation_degrees: int = 0
+    flags: tuple[PageQualityFlag, ...] = ()
+
+
+class PageAsset(ContractModel):
+    document_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    page_number: int = Field(ge=1)
+    artifact_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    relative_path: str
+    width: int = Field(gt=0)
+    height: int = Field(gt=0)
+    dpi: int = Field(gt=0)
+    renderer: str
+    renderer_version: str
+
+
+class TableRegionSource(StrEnum):
+    LAYOUT_MODEL = "layout_model"
+    OCR_GEOMETRY = "ocr_geometry"
+    HEAVY_MODEL = "heavy_model"
+    REVIEWER = "reviewer"
+
+
+class TableRegion(ContractModel):
+    region_version: str = "table_region_v1"
+    page_number: int = Field(ge=1)
+    source: TableRegionSource
+    polygon: Polygon
+    confidence: float = Field(ge=0, le=1)
+    artifact_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    evidence_token_ids: tuple[str, ...] = ()

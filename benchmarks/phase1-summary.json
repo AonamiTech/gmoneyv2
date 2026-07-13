@@ -1,0 +1,61 @@
+{
+  "summary_version": "phase1_component_summary_v1",
+  "host": {
+    "purpose": "conservative local CPU feasibility canary",
+    "vcpus": 4,
+    "memory_gib": 15,
+    "d16ds_v6_rebenchmark_required": true
+  },
+  "geometry": {
+    "maximum_round_trip_error_pixels": 0.000001,
+    "orientations_tested": [0, 90, 180, 270],
+    "perspective_and_deskew_order_tested": true,
+    "source_immutability_tested": true
+  },
+  "layout": {
+    "model": "PP-DocLayoutV3",
+    "gold_row_bearing_pages": 91,
+    "pages_with_layout_table": 89,
+    "page_table_recall": 0.978021978021978,
+    "ocr_geometry_recovered_pages": 2,
+    "effective_pages_with_table": 91,
+    "effective_page_table_recall": 1.0,
+    "manual_overlay_hospitals_reviewed": 12,
+    "manual_overlay_hospitals_accepted": 12,
+    "total_latency_ms": 500287,
+    "maximum_page_latency_ms": 6393,
+    "peak_process_rss_bytes": 1379786752
+  },
+  "ocr": {
+    "model": "PP-OCRv6_medium_det+PP-OCRv6_medium_rec",
+    "paddlepaddle_version": "3.2.2",
+    "paddleocr_version": "3.7.0",
+    "representative_page_latency_ms": 27615,
+    "layout_miss_latency_ms": {"minimum": 6669, "maximum": 29489},
+    "peak_process_rss_bytes": 1924411392
+  },
+  "wireless_table": {
+    "model": "SLANeXt_wireless",
+    "representative_crop_latency_ms": 7413,
+    "peak_process_rss_bytes": 991068160,
+    "structure_columns": 6,
+    "coordinate_policy": "structure proposal only; ground cells with OCR and transform evidence"
+  },
+  "heavy_parser": {
+    "model": "PaddleOCR-VL-1.6-GGUF",
+    "backend": "llama.cpp",
+    "single_crop_latency_ms": 84325,
+    "three_crop_wall_elapsed_ms": 246107,
+    "three_crop_latency_ms": {"minimum": 246042, "maximum": 246093},
+    "three_crop_throughput_per_minute": 0.7313891925056988,
+    "concurrent_outputs_identical": true,
+    "observed_server_memory_gib_max": 1.79,
+    "slots": 3,
+    "tokens_per_slot": 8192
+  },
+  "images": {
+    "inference_cpu": "sha256:a8621a5d3eed7d99fe54ebef190ae79414d1051d827ec45b07ea7367984c9146",
+    "llama_cpp": "sha256:84d3d48839dc645bd85affa2738f447179fbda4e356c5b40942cf2a9463fe779"
+  }
+}
+

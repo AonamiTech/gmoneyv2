@@ -9,8 +9,13 @@ description = "Evidence-grounded hospital bill extraction platform"
 requires-python = ">=3.11,<3.13"
 dependencies = [
   "fastapi>=0.115,<1",
+  "httpx>=0.28,<1",
+  "numpy>=2.2,<3",
+  "opencv-python-headless>=4.11,<5",
+  "pillow>=11,<13",
   "pydantic>=2.10,<3",
   "pydantic-settings>=2.7,<3",
+  "pymupdf>=1.26,<2",
   "typer>=0.15,<1",
   "uvicorn[standard]>=0.34,<1",
 ]
@@ -22,10 +27,21 @@ dev = [
   "pytest-cov>=6,<7",
   "ruff>=0.9,<1",
 ]
+inference-cpu = [
+  "huggingface-hub>=1,<2",
+  "paddleocr==3.7.0",
+  "paddlepaddle==3.2.2",
+  "paddlex[ocr]==3.7.2",
+  "psutil>=7,<8",
+]
 
 [project.scripts]
 gmoney-corpus = "gmoney.evaluation.corpus:app"
 gmoney-evaluate = "gmoney.evaluation.cli:app"
+gmoney-geometry = "gmoney.geometry.cli:app"
+gmoney-benchmark = "gmoney.inference.benchmark:app"
+gmoney-layout-bakeoff = "gmoney.inference.layout_bakeoff:app"
+gmoney-ocr-fallback = "gmoney.inference.ocr_fallback_cli:app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/gmoney"]
