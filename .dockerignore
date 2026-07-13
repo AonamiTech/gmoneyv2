@@ -9,5 +9,7 @@ data
 model-cache
 docs
 tests
+frontend/node_modules
+frontend/.next
 *.log
 .env

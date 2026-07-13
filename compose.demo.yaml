@@ -1,0 +1,108 @@
+name: gmoney-v2-demo
+
+services:
+  paddleocr-vl:
+    image: ghcr.io/ggml-org/llama.cpp:server@sha256:84d3d48839dc645bd85affa2738f447179fbda4e356c5b40942cf2a9463fe779
+    command:
+      - --model
+      - /models/PaddleOCR-VL-1.6-GGUF.gguf
+      - --mmproj
+      - /models/PaddleOCR-VL-1.6-GGUF-mmproj.gguf
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8111"
+      - --ctx-size
+      - "24576"
+      - --parallel
+      - "3"
+      - --threads
+      - "14"
+      - --temp
+      - "0"
+    volumes:
+      - /home/azureuser/gmoneyv2-runtime/model-cache/paddleocr-vl-1.6:/models:ro
+    ports:
+      - "127.0.0.1:8111:8111"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent http://127.0.0.1:8111/health >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 90s
+    deploy:
+      resources:
+        limits:
+          memory: 56G
+
+  api:
+    image: gmoney-v2-api:${GMONEY_IMAGE_TAG:-local}
+    build:
+      context: .
+      dockerfile: infra/docker/api.Dockerfile
+    command: ["uvicorn", "gmoney.demo.api:app", "--host", "0.0.0.0", "--port", "8000"]
+    user: "10001:10001"
+    environment:
+      GMONEY_DEMO_ROOT: /runtime
+    volumes:
+      - /home/azureuser/gmoneyv2-runtime/jobs:/runtime/jobs
+    ports:
+      - "127.0.0.1:8100:8000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v2/health/ready')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  worker:
+    image: gmoney-v2-worker:${GMONEY_IMAGE_TAG:-local}
+    build:
+      context: .
+      dockerfile: infra/docker/inference-cpu.Dockerfile
+    entrypoint: ["python", "-m", "gmoney.demo.worker"]
+    user: "10001:10001"
+    depends_on:
+      paddleocr-vl:
+        condition: service_healthy
+    environment:
+      HOME: /home/modelworker
+      FLAGS_use_mkldnn: "0"
+      PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK: "True"
+      OMP_NUM_THREADS: "4"
+      MKL_NUM_THREADS: "4"
+      FLAGS_paddle_num_threads: "4"
+      GMONEY_DEMO_ROOT: /runtime
+      GMONEY_VL_URL: http://paddleocr-vl:8111
+      GMONEY_WORKER_CONCURRENCY: "3"
+      GMONEY_RETENTION_HOURS: "6"
+    volumes:
+      - /home/azureuser/gmoneyv2-runtime/jobs:/runtime/jobs
+      - /home/azureuser/gmoneyv2-runtime/model-cache:/home/modelworker/.paddlex
+    restart: unless-stopped
+    stop_grace_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 24G
+
+  frontend:
+    image: gmoney-v2-frontend:${GMONEY_IMAGE_TAG:-local}
+    build:
+      context: .
+      dockerfile: infra/docker/frontend.Dockerfile
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:1.27-alpine
+    depends_on:
+      api:
+        condition: service_healthy
+      frontend:
+        condition: service_started
+    volumes:
+      - ./infra/nginx/demo.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "3100:8080"
+    restart: unless-stopped

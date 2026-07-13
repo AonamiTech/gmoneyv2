@@ -16,5 +16,5 @@ data/
 artifacts/
 model-cache/
 *.log
+*.tsbuildinfo
 .DS_Store
-
