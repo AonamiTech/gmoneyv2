@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from decimal import Decimal
 from difflib import SequenceMatcher
 from statistics import median
 
@@ -76,18 +77,66 @@ def _numeric_token(
     tokens: tuple[OcrToken, ...],
     anchor_y: float,
     used: set[int],
+    minimum_x: float = 0.0,
 ) -> int | None:
     if value is None:
         return None
     candidates: list[tuple[float, int]] = []
     for index, token in enumerate(tokens):
-        if index in used or parse_decimal(token.text) != value:
+        if index in used or value not in _numeric_values(token.text):
             continue
-        tolerance = max(12.0, _height(token) * 1.5)
+        tolerance = max(8.0, _height(token) * 0.6)
         distance = abs(_center_y(token) - anchor_y)
-        if distance <= tolerance:
-            candidates.append((distance, index))
+        left, _, _, _ = _bounds(token)
+        if distance <= tolerance and left >= minimum_x - 5:
+            candidates.append((distance + left / 1_000_000, index))
     return min(candidates)[1] if candidates else None
+
+
+def _numeric_values(text: str) -> tuple[Decimal, ...]:
+    values: list[Decimal] = []
+    whole = parse_decimal(text)
+    if whole is not None:
+        values.append(whole)
+    parts = re.findall(r"\d[\d,]*(?:\.\d+)?", text)
+    if len(parts) >= 2:
+        values.extend(value for part in parts if (value := parse_decimal(part)) is not None)
+    return tuple(dict.fromkeys(values))
+
+
+def _derived_amount_token(
+    tokens: tuple[OcrToken, ...],
+    anchor_y: float,
+    description_index: int,
+    quantity_index: int | None,
+    rate_index: int | None,
+) -> tuple[int, Decimal] | None:
+    if quantity_index is not None:
+        quantity_values = _numeric_values(tokens[quantity_index].text)
+        if len(quantity_values) >= 2:
+            return quantity_index, quantity_values[-1]
+        _, _, after_x, _ = _bounds(tokens[quantity_index])
+    elif rate_index is not None:
+        _, _, after_x, _ = _bounds(tokens[rate_index])
+    else:
+        _, _, after_x, _ = _bounds(tokens[description_index])
+
+    candidates: list[tuple[float, int, Decimal]] = []
+    for index, token in enumerate(tokens):
+        values = _numeric_values(token.text)
+        if not values:
+            continue
+        tolerance = max(8.0, _height(token) * 0.6)
+        if abs(_center_y(token) - anchor_y) > tolerance:
+            continue
+        left, _, _, _ = _bounds(token)
+        if left < after_x - 5:
+            continue
+        candidates.append((left, index, values[-1]))
+    if not candidates:
+        return None
+    _, index, value = min(candidates)
+    return index, value
 
 
 def align_candidate_rows(
@@ -98,6 +147,7 @@ def align_candidate_rows(
     minimum_y = 0.0
     used_description_tokens: set[int] = set()
     for candidate in candidates:
+        aligned_candidate = candidate
         fields: dict[str, tuple[str, ...]] = {}
         selected: set[int] = set()
         anchor = None
@@ -118,17 +168,60 @@ def align_candidate_rows(
                 fields["description"] = (tokens[token_index].token_id,)
                 minimum_y = anchor_y
         if anchor:
-            _, anchor_y = anchor
+            description_index, anchor_y = anchor
+            _, _, description_right, _ = _bounds(tokens[description_index])
+            minimum_x = description_right
             for field, value in (
-                ("quantity", candidate.quantity),
-                ("rate", candidate.rate),
-                ("discount", candidate.discount),
-                ("amount", candidate.amount),
+                ("rate", aligned_candidate.rate),
+                ("quantity", aligned_candidate.quantity),
+                ("discount", aligned_candidate.discount),
             ):
-                token_index = _numeric_token(value, tokens, anchor_y, selected)
+                token_index = _numeric_token(
+                    value,
+                    tokens,
+                    anchor_y,
+                    selected,
+                    minimum_x=minimum_x,
+                )
                 if token_index is not None:
                     selected.add(token_index)
                     fields[field] = (tokens[token_index].token_id,)
+                    if field in {"rate", "quantity"}:
+                        _, _, minimum_x, _ = _bounds(tokens[token_index])
+            if candidate.amount_derived:
+                quantity_id = fields.get("quantity", (None,))[0]
+                rate_id = fields.get("rate", (None,))[0]
+                quantity_index = next(
+                    (i for i, token in enumerate(tokens) if token.token_id == quantity_id),
+                    None,
+                )
+                rate_index = next(
+                    (i for i, token in enumerate(tokens) if token.token_id == rate_id),
+                    None,
+                )
+                derived = _derived_amount_token(
+                    tokens,
+                    anchor_y,
+                    description_index,
+                    quantity_index,
+                    rate_index,
+                )
+                if derived:
+                    token_index, value = derived
+                    aligned_candidate = replace(candidate, amount=value)
+                    selected.add(token_index)
+                    fields["amount"] = (tokens[token_index].token_id,)
+            else:
+                token_index = _numeric_token(
+                    aligned_candidate.amount,
+                    tokens,
+                    anchor_y,
+                    selected,
+                    minimum_x=minimum_x,
+                )
+                if token_index is not None:
+                    selected.add(token_index)
+                    fields["amount"] = (tokens[token_index].token_id,)
         evidence_box = None
         if selected:
             boxes = [_bounds(tokens[index]) for index in selected]
@@ -140,11 +233,16 @@ def align_candidate_rows(
             )
         expected_fields = 1 + sum(
             value is not None
-            for value in (candidate.quantity, candidate.rate, candidate.discount, candidate.amount)
+            for value in (
+                aligned_candidate.quantity,
+                aligned_candidate.rate,
+                aligned_candidate.discount,
+                aligned_candidate.amount,
+            )
         )
         aligned.append(
             AlignedLedgerRow(
-                candidate=candidate,
+                candidate=aligned_candidate,
                 field_token_ids=fields,
                 evidence_token_ids=tuple(tokens[index].token_id for index in sorted(selected)),
                 evidence_box=evidence_box,

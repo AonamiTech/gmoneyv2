@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -109,14 +110,39 @@ def _deduplicate(rows: list[CanonicalRow]) -> list[CanonicalRow]:
     return sorted(selected.values(), key=lambda row: (row.page_number, row.row_order))
 
 
+def _remove_cross_page_rollups(rows: list[CanonicalRow]) -> list[CanonicalRow]:
+    output: list[CanonicalRow] = []
+    for row in rows:
+        later = [
+            candidate
+            for candidate in rows
+            if candidate.page_number > row.page_number and candidate.net_amount is not None
+        ]
+        is_rollup = bool(
+            row.net_amount is not None
+            and len(later) >= 2
+            and sum((candidate.net_amount for candidate in later), start=0) == row.net_amount
+        )
+        if not is_rollup:
+            output.append(row)
+    return output
+
+
 class OfflineExtractor:
     def __init__(self, vl_url: str) -> None:
         self.ocr = PaddleOcrV6Adapter()
         self.layout = PaddleDocLayoutV3Adapter()
         self.vl = PaddleOcrVlAdapter(base_url=vl_url)
 
-    def extract(self, source: Path, artifact_root: Path) -> dict[str, Any]:
+    def extract(
+        self,
+        source: Path,
+        artifact_root: Path,
+        progress: Callable[[int, int], None] | None = None,
+    ) -> dict[str, Any]:
         manifest = render_pdf(source, artifact_root / "pages", dpi=300)
+        if progress:
+            progress(0, len(manifest.pages))
         document_id = manifest.document_sha256
         all_rows: list[CanonicalRow] = []
         diagnostics: list[dict[str, Any]] = []
@@ -238,14 +264,26 @@ class OfflineExtractor:
                         **table_diagnostic,
                     }
                 )
+            if progress:
+                progress(page_asset.page_number, len(manifest.pages))
 
-        rows = _deduplicate(all_rows)
+        rows = _deduplicate(_remove_cross_page_rollups(all_rows))
         return {
             "output_version": "offline_accuracy_spine_v1",
             "document_id": document_id,
             "source_sha256": sha256_file(source),
             "source_name": source.name,
             "pages": len(manifest.pages),
+            "page_assets": [
+                {
+                    "page_number": page.page_number,
+                    "artifact_sha256": page.artifact_sha256,
+                    "width": page.width,
+                    "height": page.height,
+                    "relative_path": str(Path("pages") / page.relative_path),
+                }
+                for page in manifest.pages
+            ],
             "rows": [row.model_dump(mode="json") for row in rows],
             "diagnostics": diagnostics,
         }

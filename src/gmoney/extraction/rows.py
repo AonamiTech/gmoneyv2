@@ -36,13 +36,70 @@ class CandidateLedgerRow:
     rate: Decimal | None = None
     discount: Decimal | None = None
     amount: Decimal | None = None
+    amount_derived: bool = False
 
 
 def _normalized(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", value.casefold()).strip()
 
 
+def _compound_header_columns(header: tuple[OtslCell, ...]) -> dict[str, int]:
+    nonempty = [cell for cell in header if cell.text.strip()]
+    if len(nonempty) != 1 or len(header) < 3:
+        return {}
+    tokens = re.findall(r"#|[a-z0-9]+", nonempty[0].text.casefold())
+    columns: dict[str, int] = {}
+    column = 0
+    index = 0
+    phrases: tuple[tuple[tuple[str, ...], str | None], ...] = (
+        (("service", "name"), "description"),
+        (("item", "name"), "description"),
+        (("total", "amount"), "amount"),
+        (("net", "amount"), "amount"),
+        (("unit", "price"), "rate"),
+        (("unit", "rate"), "rate"),
+        (("qty", "days"), "quantity"),
+        (("sr", "no"), None),
+    )
+    single_roles = {
+        "particular": "description",
+        "particulars": "description",
+        "description": "description",
+        "item": "description",
+        "qty": "quantity",
+        "quantity": "quantity",
+        "rate": "rate",
+        "amount": "amount",
+        "discount": "discount",
+    }
+    while index < len(tokens):
+        matched = False
+        for phrase, role in phrases:
+            if tuple(tokens[index : index + len(phrase)]) != phrase:
+                continue
+            if role:
+                columns[role] = column
+            index += len(phrase)
+            column += 1
+            matched = True
+            break
+        if matched:
+            continue
+        token = tokens[index]
+        role = single_roles.get(token)
+        if role:
+            columns[role] = column
+        index += 1
+        column += 1
+    if "description" in columns and ({"rate", "amount", "quantity"} & columns.keys()):
+        return columns
+    return {}
+
+
 def infer_columns(header: tuple[OtslCell, ...]) -> dict[str, int]:
+    compound = _compound_header_columns(header)
+    if compound:
+        return compound
     columns: dict[str, int] = {}
     for index, cell in enumerate(header):
         normalized = _normalized(cell.text)
@@ -83,6 +140,8 @@ def _row_role(cells: tuple[str, ...], description: str | None) -> RowRole:
     if any(term in text for term in ("grand total", "net bill amount", "total bill amount")):
         return RowRole.DOCUMENT_TOTAL
     normalized_description = _normalized(description or "")
+    if normalized_description in {"discount", "discounts"}:
+        return RowRole.SECTION_TOTAL
     if normalized_description == "total" or normalized_description.startswith(
         ("sub total", "subtotal")
     ):
@@ -172,21 +231,24 @@ def extract_candidate_rows(table: OtslTable) -> tuple[CandidateLedgerRow, ...]:
     data_rows = _merge_continuation_rows(table.rows[header_index + 1 :], columns)
     for source_row, cells in enumerate(data_rows, header_index + 1):
         description = _value(cells, columns, "description")
+        quantity = parse_decimal(_value(cells, columns, "quantity"))
+        rate = parse_decimal(_value(cells, columns, "rate"))
+        discount = parse_decimal(_value(cells, columns, "discount"))
         amount_text = _value(cells, columns, "amount")
-        if amount_text is None:
+        amount = parse_decimal(amount_text)
+        amount_derived = False
+        if amount is None and quantity is not None and rate is not None and "amount" in columns:
+            amount = quantity * rate
+            amount_derived = True
+        elif amount is None:
             numeric = [(index, parse_decimal(cell)) for index, cell in enumerate(cells)]
             numeric = [(index, value) for index, value in numeric if value is not None]
             amount_text = cells[numeric[-1][0]] if numeric else None
-        amount = parse_decimal(amount_text)
+            amount = parse_decimal(amount_text)
         role = _row_role(cells, description)
-        financial_values = tuple(
-            parse_decimal(_value(cells, columns, field))
-            for field in ("quantity", "rate", "discount", "amount")
-        )
         if (
             role is RowRole.DETAIL
             and amount == 0
-            and all(value in {None, Decimal("0")} for value in financial_values)
         ):
             role = RowRole.METADATA
         if not description and amount is None:
@@ -203,10 +265,11 @@ def extract_candidate_rows(table: OtslTable) -> tuple[CandidateLedgerRow, ...]:
                 request_no=_value(cells, columns, "request_no"),
                 service_code=_value(cells, columns, "service_code"),
                 hsn_code=_value(cells, columns, "hsn_code"),
-                quantity=parse_decimal(_value(cells, columns, "quantity")),
-                rate=parse_decimal(_value(cells, columns, "rate")),
-                discount=parse_decimal(_value(cells, columns, "discount")),
+                quantity=quantity,
+                rate=rate,
+                discount=discount,
                 amount=amount,
+                amount_derived=amount_derived,
             )
         )
     return tuple(rows)

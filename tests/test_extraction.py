@@ -115,6 +115,19 @@ def test_continuation_subtotals_and_zero_placeholders_are_separate_roles() -> No
     assert rows[2].role is RowRole.METADATA
 
 
+def test_collapsed_pharmacy_header_maps_columns_and_derives_missing_amount() -> None:
+    table = parse_otsl(
+        "# Particulars Batch Expiry Rate Qty Amount<lcel><lcel><lcel><lcel><lcel><nl>"
+        "<fcel>2<fcel>Ondet 2ML<fcel>A26<fcel>Dec-2027<fcel>12.70<fcel>2<nl>"
+    )
+    rows = extract_candidate_rows(table)
+    assert rows[0].description == "Ondet 2ML"
+    assert rows[0].rate == Decimal("12.70")
+    assert rows[0].quantity == Decimal("2")
+    assert rows[0].amount == Decimal("25.40")
+    assert rows[0].amount_derived is True
+
+
 def test_numeric_parser_is_strict_and_supports_indian_financial_forms() -> None:
     assert parse_decimal("₹ 1,23,456.75") == Decimal("123456.75")
     assert parse_decimal("(1,000.00)") == Decimal("-1000.00")
