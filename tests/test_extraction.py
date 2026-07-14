@@ -8,7 +8,7 @@ from gmoney.contracts.extraction import RowRole
 from gmoney.extraction.offline import VlAsset, _cached_prediction, _safe_box, _vertical_vl_tiles
 from gmoney.extraction.otsl import parse_otsl, split_otsl_tables
 from gmoney.extraction.rows import extract_candidate_rows
-from gmoney.extraction.typed_values import parse_decimal
+from gmoney.extraction.typed_values import parse_decimal, parse_service_date
 from gmoney.inference.contracts import (
     InferenceRequest,
     InferenceResponse,
@@ -141,6 +141,13 @@ def test_numeric_parser_is_strict_and_supports_indian_financial_forms() -> None:
     assert parse_decimal("26/06/2026") is None
     assert parse_decimal("IP/12345") is None
     assert parse_decimal("999999999999999999") is None
+
+
+def test_service_date_parser_supports_numeric_and_alphabetic_indian_dates() -> None:
+    assert parse_service_date("12-Feb-2026") == "2026-02-12"
+    assert parse_service_date("12/02/2026") == "2026-02-12"
+    assert parse_service_date("12 February 2026") == "2026-02-12"
+    assert parse_service_date("2026-02-12") is None
 
 
 def test_inference_cache_is_bound_to_artifact_options_and_model(tmp_path: Path) -> None:

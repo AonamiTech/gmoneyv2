@@ -42,6 +42,7 @@ RAW_FIELD = {
 ALLOWED_ROLES = {"detail", "category_rollup", "refund"}
 ALLOWED_DISPOSITIONS = {"accepted", "pending", "rejected", "unreadable"}
 EXPORT_FIELDS = (
+    "hospital_name",
     "id",
     "page_number",
     "role",
@@ -176,6 +177,30 @@ def project_rows(result: dict[str, Any], review: dict[str, Any]) -> list[dict[st
     return projected
 
 
+def project_hospital(result: dict[str, Any], review: dict[str, Any]) -> dict[str, Any] | None:
+    machine = result.get("hospital")
+    override = review.get("document_overrides", {}).get("hospital")
+    if override:
+        evidence = override["evidence"]
+        return {
+            "name": override["name"],
+            "source": "reviewer",
+            "machine_name": machine.get("name") if machine else None,
+            "confidence": machine.get("confidence") if machine else None,
+            "page_number": evidence["page_number"],
+            "evidence": evidence,
+            "reason": override.get("reason"),
+        }
+    if not machine:
+        return None
+    return {
+        **machine,
+        "source": "machine",
+        "machine_name": machine.get("name"),
+        "reason": None,
+    }
+
+
 def structural_issues(result: dict[str, Any], review: dict[str, Any]) -> list[dict[str, Any]]:
     issues: list[dict[str, Any]] = []
     overrides = review.get("issue_overrides", {})
@@ -222,6 +247,7 @@ def review_summary(result: dict[str, Any], review: dict[str, Any]) -> dict[str, 
         "rows_pending": sum(row.get("review_disposition") != "accepted" for row in active),
         "issues_open": sum(issue["status"] == "open" for issue in issues),
         "issues": issues,
+        "hospital": project_hospital(result, review),
         "approval": review.get("approval"),
     }
 
@@ -351,6 +377,7 @@ def export_payload(result: dict[str, Any], review: dict[str, Any]) -> dict[str, 
         "export_version": "demo_review_export_v1",
         "document_id": result["document_id"],
         "source_name": result.get("source_name"),
+        "hospital": project_hospital(result, review),
         "pages": result["pages"],
         "review_revision": review["revision"],
         "approval": review["approval"],
@@ -372,10 +399,15 @@ def export_csv(result: dict[str, Any], review: dict[str, Any]) -> str:
     output = io.StringIO(newline="")
     writer = csv.DictWriter(output, fieldnames=EXPORT_FIELDS, extrasaction="ignore")
     writer.writeheader()
+    hospital = project_hospital(result, review)
     for row in export_payload(result, review)["rows"]:
         writer.writerow(
             {
-                field: _safe_spreadsheet_text(row.get(field))
+                field: _safe_spreadsheet_text(
+                    hospital.get("name")
+                    if hospital and field == "hospital_name"
+                    else row.get(field)
+                )
                 if field not in EDITABLE_DECIMAL_FIELDS
                 else row.get(field)
                 for field in EXPORT_FIELDS
@@ -405,6 +437,7 @@ def create_evidence_bundle(
                 "document_id": result.get("document_id"),
                 "source_sha256": result.get("source_sha256"),
                 "source_name": result.get("source_name"),
+                "hospital": result.get("hospital"),
                 "pages": result.get("pages"),
                 "page_assets": public_page_assets(result),
                 "rows": result.get("rows", []),

@@ -47,7 +47,10 @@ The demo Compose project exposes the Next.js evidence desk and FastAPI review AP
 port 3100 while keeping model and API diagnostics on loopback. It processes two bills
 concurrently, preserves immutable machine rows, and stores reviewer corrections in a
 revisioned filesystem overlay. Its shared queue lets a fresh browser discover active and
-recent bills without retaining browser-local job IDs.
+recent bills without retaining browser-local job IDs. Completed documents are labelled by
+their evidence-grounded hospital identity; reviewers can correct that identity, service dates,
+rows, and evidence without changing the machine result. The evidence workspace provides an
+independently scrolling ledger plus resize, fit, zoom, focus, and fullscreen page controls.
 
 ```bash
 GMONEY_IMAGE_TAG=$(git rev-parse --short=12 HEAD) \

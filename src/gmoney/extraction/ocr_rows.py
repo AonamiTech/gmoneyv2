@@ -33,13 +33,24 @@ HEADER_TERMS: dict[str, tuple[str, ...]] = {
     "batch": ("batch no", "bath no", "batch"),
     "expiry": ("expiry", "exp"),
     "quantity": ("quantity", "qty", "nos", "unit days", "units"),
-    "rate": ("unit price", "unit rate", "rate"),
+    "rate": ("unit price", "unitprice", "unit rate", "unitrate", "rate"),
     "discount": ("discount", "disc amt", "disc"),
     "amount": ("net amount", "total amount", "line total", "amount", "total"),
 }
 
+DATE_VALUE = (
+    r"\d{1,2}(?:[/.-]\d{1,2}[/.-]\d{2,4}"
+    r"|[-\s](?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
+    r"Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
+    r"[-\s]\d{2,4})"
+)
 DATE_PREFIX = re.compile(
-    r"^\s*\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?\s*[-:]?\s*",
+    rf"^\s*(?P<date>{DATE_VALUE})(?:\s+\d{{1,2}}:\d{{2}}(?::\d{{2}})?)?\s*[-:]?\s*",
+    re.IGNORECASE,
+)
+DATE_RANGE_SUFFIX = re.compile(
+    rf"\s*-\s*{DATE_VALUE}(?:\s+\d{{1,2}}:\d{{2}}(?::\d{{2}})?)?"
+    rf"\s+to\s+(?:{DATE_VALUE}|\d{{1,2}})(?:\s+\d{{1,2}}:\d{{2}}(?::\d{{2}})?)?\s*$",
     re.IGNORECASE,
 )
 REQUEST_PREFIX = re.compile(r"^[A-Z][A-Z0-9-]{2,}/[A-Z0-9-]+\s*", re.IGNORECASE)
@@ -479,7 +490,7 @@ def row_category(description: str, table_type: TableType) -> str | None:
 def _clean_description(text: str) -> tuple[str, str | None, str | None]:
     raw = re.sub(r"\s+", " ", text).strip(" -:")
     date_match = DATE_PREFIX.match(raw)
-    service_date = date_match.group(0).strip(" -:") if date_match else None
+    service_date = date_match.group("date").strip(" -:") if date_match else None
     if date_match:
         raw = raw[date_match.end() :]
     request_match = REQUEST_PREFIX.match(raw)
@@ -488,6 +499,7 @@ def _clean_description(text: str) -> tuple[str, str | None, str | None]:
         raw = raw[request_match.end() :].lstrip(" -:")
     raw = LEADING_BATCH_FRAGMENT.sub("", raw)
     raw = BATCH_SUFFIX.sub("", raw)
+    raw = DATE_RANGE_SUFFIX.sub("", raw)
     raw = re.sub(r"\s+", " ", raw).strip(" -:[]")
     return raw, service_date, request_no
 
@@ -536,6 +548,17 @@ def _is_metadata_description(description: str) -> bool:
                 "in words",
                 "print date time",
                 "receipt details",
+                "doctor appointments",
+                "free home sample",
+                "book appointment",
+                "call for appointment",
+                "customer care",
+                "helpline",
+                "website",
+                "email",
+                "e mail",
+                "phone no",
+                "mobile no",
             )
         )
         or normalized in {"cgst", "sgst", "net bill", "upi", "expdate", "exp date"}

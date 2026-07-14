@@ -13,6 +13,7 @@ from gmoney.contracts.extraction import (
     TableType,
 )
 from gmoney.extraction.spatial import AlignedLedgerRow
+from gmoney.extraction.typed_values import parse_service_date
 
 LEDGER_ROLES = {RowRole.DETAIL, RowRole.REFUND, RowRole.CATEGORY_ROLLUP}
 
@@ -135,6 +136,7 @@ def canonicalize_rows(
                 section=candidate.category or candidate.section,
                 description=candidate.description,
                 service_date_raw=service_date,
+                service_date_iso=parse_service_date(service_date),
                 request_no=request_no,
                 service_code=service_code,
                 hsn_code=hsn_code,

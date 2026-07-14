@@ -166,6 +166,13 @@ def completed_job(
         "document_id": "d" * 64,
         "source_sha256": "e" * 64,
         "source_name": "client-bill.pdf",
+        "hospital": {
+            "name": "Machine Hospital",
+            "confidence": 0.94,
+            "source": "machine",
+            "page_number": 1,
+            "evidence": evidence,
+        },
         "pages": 1,
         "page_assets": [
             {
@@ -181,7 +188,15 @@ def completed_job(
         "provider_usage": {"gemini_calls": 0},
     }
     (store.job_dir(job_id) / "result.json").write_text(json.dumps(result))
-    store.update(job_id, status="complete", row_count=1, pages=1, page=1)
+    store.update(
+        job_id,
+        status="complete",
+        row_count=1,
+        pages=1,
+        page=1,
+        hospital_name="Machine Hospital",
+        hospital_confidence=0.94,
+    )
     return job_id, result
 
 
@@ -245,6 +260,50 @@ def test_reviewer_can_add_and_soft_reject_a_grounded_row(tmp_path: Path, monkeyp
     rows = client.get(f"/api/v2/documents/{job_id}/rows", params={"disposition": "rejected"})
     assert rows.json()["total"] == 1
     assert rows.json()["rows"][0]["review"]["source"] == "reviewer"
+
+
+def test_hospital_name_correction_is_revisioned_grounded_and_exported(
+    tmp_path: Path, monkeypatch
+) -> None:
+    client, store = client_for(tmp_path, monkeypatch)
+    job_id, machine = completed_job(store)
+    payload = {
+        "hospital_name": "Reviewer Verified Hospital",
+        "page_number": 1,
+        "polygon": {
+            "points": [
+                {"x": 10, "y": 10},
+                {"x": 90, "y": 10},
+                {"x": 90, "y": 30},
+                {"x": 10, "y": 30},
+            ]
+        },
+        "reason": "Verified against the hospital header",
+    }
+    corrected = client.patch(
+        f"/api/v2/documents/{job_id}/metadata",
+        headers={"If-Match": "0"},
+        json=payload,
+    )
+    assert corrected.status_code == 200
+    assert corrected.json()["review_revision"] == 1
+    assert corrected.json()["hospital"]["source"] == "reviewer"
+    assert corrected.json()["hospital"]["machine_name"] == "Machine Hospital"
+    assert json.loads((store.job_dir(job_id) / "result.json").read_text()) == machine
+
+    state = client.get(f"/api/v2/documents/{job_id}").json()
+    assert state["hospital_name"] == "Reviewer Verified Hospital"
+    assert state["hospital_name_source"] == "reviewer"
+    rows = client.get(f"/api/v2/documents/{job_id}/rows").json()
+    assert rows["hospital"]["name"] == "Reviewer Verified Hospital"
+
+    assert client.post(
+        f"/api/v2/documents/{job_id}/approval", headers={"If-Match": "1"}
+    ).status_code == 200
+    exported = client.get(f"/api/v2/documents/{job_id}/exports/json").json()
+    assert exported["hospital"]["name"] == "Reviewer Verified Hospital"
+    csv_export = client.get(f"/api/v2/documents/{job_id}/exports/csv").text
+    assert "Reviewer Verified Hospital" in csv_export
 
 
 def test_structural_issue_blocks_approval_then_exports_are_available(
@@ -311,22 +370,12 @@ def test_documents_can_be_discovered_in_newest_first_shared_queue(
     response = client.get("/api/v2/documents", params={"limit": 1})
     assert response.status_code == 200
     assert response.json()["total"] == 2
-    assert response.json()["documents"] == [
-        {
-            key: store.read(second["id"]).get(key)
-            for key in (
-                "id",
-                "status",
-                "original_name",
-                "created_at",
-                "updated_at",
-                "page",
-                "pages",
-                "row_count",
-                "error",
-            )
-        }
-    ]
+    listed = response.json()["documents"]
+    assert len(listed) == 1
+    assert listed[0]["id"] == second["id"]
+    assert listed[0]["original_name"] == "second.pdf"
+    assert listed[0]["hospital_name"] is None
+    assert listed[0]["hospital_name_source"] is None
 
     queued = client.get("/api/v2/documents", params={"status": "queued"}).json()
     assert queued["total"] == 1

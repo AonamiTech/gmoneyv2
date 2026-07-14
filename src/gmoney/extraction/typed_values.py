@@ -1,11 +1,25 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
 CURRENCY = re.compile(r"(?:₹|inr|rs\.?|rupees?)", re.IGNORECASE)
 NUMERIC = re.compile(r"^[+-]?\d+(?:\.\d{1,4})?$")
 MAX_ABSOLUTE = Decimal("999999999999.9999")
+
+SERVICE_DATE_FORMATS = (
+    "%d/%m/%Y",
+    "%d-%m-%Y",
+    "%d.%m.%Y",
+    "%d/%m/%y",
+    "%d-%m-%y",
+    "%d.%m.%y",
+    "%d-%b-%Y",
+    "%d %b %Y",
+    "%d-%B-%Y",
+    "%d %B %Y",
+)
 
 
 def parse_decimal(value: object) -> Decimal | None:
@@ -35,3 +49,15 @@ def parse_decimal(value: object) -> Decimal | None:
     if abs(number) > MAX_ABSOLUTE:
         return None
     return number
+
+
+def parse_service_date(value: object) -> str | None:
+    text = re.sub(r"\s+", " ", str(value or "")).strip(" -:")
+    if not text:
+        return None
+    for date_format in SERVICE_DATE_FORMATS:
+        try:
+            return datetime.strptime(text, date_format).date().isoformat()
+        except ValueError:
+            continue
+    return None

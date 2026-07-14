@@ -1,14 +1,18 @@
 "use client";
 
 import {
-  ChangeEvent,
-  DragEvent,
-  PointerEvent,
   useCallback,
   useEffect,
   useMemo,
   useRef,
   useState,
+} from "react";
+import type {
+  CSSProperties,
+  ChangeEvent,
+  DragEvent,
+  KeyboardEvent,
+  PointerEvent,
 } from "react";
 
 type Job = {
@@ -18,6 +22,9 @@ type Job = {
   page: number;
   pages: number | null;
   row_count: number | null;
+  hospital_name: string | null;
+  hospital_confidence: number | null;
+  hospital_name_source: "machine" | "reviewer" | null;
   error: string | null;
 };
 type JobsResult = { total: number; documents: Job[] };
@@ -33,9 +40,20 @@ type ReviewMeta = {
   reason: string | null;
   machine_values: Record<string, unknown>;
 };
+type Hospital = {
+  name: string;
+  source: "machine" | "reviewer";
+  machine_name: string | null;
+  confidence: number | null;
+  page_number: number;
+  evidence: Evidence;
+  reason: string | null;
+};
 type Row = {
   id: string;
   description: string | null;
+  service_date_raw: string | null;
+  service_date_iso: string | null;
   section: string | null;
   quantity: string | null;
   unit_price: string | null;
@@ -58,6 +76,7 @@ type RowsResult = {
   document_id: string;
   pages: number;
   page_assets: PageAsset[];
+  hospital: Hospital | null;
   review_revision: number;
   total: number;
   offset: number;
@@ -81,11 +100,13 @@ type ReviewSummary = {
   rows_pending: number;
   issues_open: number;
   issues: ReviewIssue[];
+  hospital: Hospital | null;
   approval: { status: string; approved_at: string; review_revision: number } | null;
 };
 type Health = { active_jobs: number; worker_capacity: number; queue_capacity: number };
 type EditValues = {
   description: string;
+  service_date_iso: string;
   quantity: string;
   unit_price: string;
   discount: string;
@@ -97,6 +118,7 @@ type EditValues = {
 const PAGE_SIZE = 150;
 const emptyEdit: EditValues = {
   description: "",
+  service_date_iso: "",
   quantity: "",
   unit_price: "",
   discount: "",
@@ -113,6 +135,17 @@ const money = (value: string | null) =>
         currency: "INR",
         maximumFractionDigits: 2,
       }).format(Number(value));
+
+const serviceDate = (value: string | null) => {
+  if (!value) return "—";
+  const [year, month, day] = value.split("-").map(Number);
+  if (!year || !month || !day) return value;
+  return new Intl.DateTimeFormat("en-IN", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+  }).format(new Date(Date.UTC(year, month - 1, day)));
+};
 
 const detail = (payload: unknown) => {
   if (typeof payload === "string") return payload;
@@ -158,14 +191,25 @@ export default function Home() {
   const [addDescription, setAddDescription] = useState("");
   const [addAmount, setAddAmount] = useState("");
   const [issueReason, setIssueReason] = useState("");
-  const [drawMode, setDrawMode] = useState<"add" | "relink" | null>(null);
+  const [hospitalEditMode, setHospitalEditMode] = useState(false);
+  const [hospitalName, setHospitalName] = useState("");
+  const [hospitalReason, setHospitalReason] = useState("");
+  const [drawMode, setDrawMode] = useState<"add" | "relink" | "hospital" | null>(null);
   const [draftPolygon, setDraftPolygon] = useState<Point[] | null>(null);
+  const [splitPercent, setSplitPercent] = useState(55);
+  const [resizingSplit, setResizingSplit] = useState(false);
+  const [viewMode, setViewMode] = useState<"fit-width" | "fit-page" | "zoom">("fit-width");
+  const [zoom, setZoom] = useState(150);
   const drawStart = useRef<Point | null>(null);
   const pageFrame = useRef<HTMLDivElement | null>(null);
+  const pageCanvas = useRef<HTMLDivElement | null>(null);
+  const splitView = useRef<HTMLDivElement | null>(null);
+  const evidencePane = useRef<HTMLElement | null>(null);
 
   const selectedJob = jobs.find((job) => job.id === selectedJobId) ?? null;
   const selectedRow = rowsResult?.rows.find((row) => row.id === selectedRowId) ?? null;
   const pageAsset = rowsResult?.page_assets.find((asset) => asset.page_number === viewPage);
+  const hospital = rowsResult?.hospital ?? review?.hospital ?? null;
   const activeJobs = jobs.filter((job) => ["queued", "processing"].includes(job.status));
 
   const replaceJobs = useCallback((updater: (current: Job[]) => Job[]) => {
@@ -231,6 +275,9 @@ export default function Home() {
     setPageFilter("");
     setEditMode(false);
     setAddMode(false);
+    setHospitalEditMode(false);
+    setDrawMode(null);
+    setDraftPolygon(null);
   }, [selectedJobId]);
 
   useEffect(() => {
@@ -282,6 +329,7 @@ export default function Home() {
     if (!selectedRow) return;
     setEditValues({
       description: selectedRow.description ?? "",
+      service_date_iso: selectedRow.service_date_iso ?? "",
       quantity: selectedRow.quantity ?? "",
       unit_price: selectedRow.unit_price ?? "",
       discount: selectedRow.discount ?? "",
@@ -292,6 +340,7 @@ export default function Home() {
     setReason(selectedRow.review.reason ?? "");
     setEditMode(true);
     setAddMode(false);
+    setHospitalEditMode(false);
     setDraftPolygon(null);
     setDrawMode(null);
   };
@@ -376,6 +425,41 @@ export default function Home() {
     }
   };
 
+  const beginHospitalEdit = () => {
+    if (!rowsResult) return;
+    const source = rowsResult.hospital;
+    setHospitalName(source?.name ?? selectedJob?.original_name.replace(/\.pdf$/i, "") ?? "");
+    setHospitalReason(source?.reason ?? "");
+    setHospitalEditMode(true);
+    setEditMode(false);
+    setAddMode(false);
+    setViewPage(source?.page_number ?? 1);
+    setDraftPolygon(source?.evidence?.polygon.points ?? null);
+    setDrawMode(null);
+  };
+
+  const saveHospital = async () => {
+    if (!selectedJob || !draftPolygon || hospitalName.trim().length < 2 || hospitalReason.trim().length < 3) {
+      setError("Confirm the hospital name, header evidence, and a short review reason.");
+      return;
+    }
+    const saved = await mutate(`/api/v2/documents/${selectedJob.id}/metadata`, {
+      method: "PATCH",
+      body: JSON.stringify({
+        hospital_name: hospitalName,
+        page_number: viewPage,
+        polygon: { points: draftPolygon },
+        reason: hospitalReason,
+      }),
+    });
+    if (saved) {
+      setHospitalEditMode(false);
+      setDraftPolygon(null);
+      setDrawMode(null);
+      void refreshJobs();
+    }
+  };
+
   const updateIssue = async (issue: ReviewIssue) => {
     if (!selectedJob || issueReason.trim().length < 3) {
       setError("Add a review note before changing an issue.");
@@ -437,6 +521,55 @@ export default function Home() {
     setDrawMode(null);
   };
 
+  const resize = (event: PointerEvent<HTMLButtonElement>) => {
+    if (!resizingSplit || !splitView.current) return;
+    const bounds = splitView.current.getBoundingClientRect();
+    const percentage = ((event.clientX - bounds.left) / bounds.width) * 100;
+    setSplitPercent(Math.max(44, Math.min(68, percentage)));
+  };
+
+  const resizeWithKeyboard = (event: KeyboardEvent<HTMLButtonElement>) => {
+    if (!["ArrowLeft", "ArrowRight"].includes(event.key)) return;
+    event.preventDefault();
+    setSplitPercent((current) =>
+      Math.max(44, Math.min(68, current + (event.key === "ArrowLeft" ? -2 : 2))),
+    );
+  };
+
+  const focusEvidence = () => {
+    const source = hospitalEditMode
+      ? hospital?.evidence
+      : selectedRow?.field_evidence?.description?.[0] ?? selectedRow?.evidence?.[0];
+    const sourceAsset = rowsResult?.page_assets.find(
+      (asset) => asset.page_number === source?.page_number,
+    );
+    if (!source || !sourceAsset) return;
+    setViewPage(source.page_number);
+    setViewMode("zoom");
+    setZoom(175);
+    window.setTimeout(() => {
+      const frame = pageFrame.current;
+      const canvas = pageCanvas.current;
+      if (!frame || !canvas) return;
+      const polygon = source.polygon.points;
+      const centerX = polygon.reduce((sum, point) => sum + point.x, 0) / polygon.length;
+      const centerY = polygon.reduce((sum, point) => sum + point.y, 0) / polygon.length;
+      frame.scrollTo({
+        left: Math.max(0, canvas.offsetLeft + (centerX / sourceAsset.width) * canvas.clientWidth - frame.clientWidth / 2),
+        top: Math.max(0, canvas.offsetTop + (centerY / sourceAsset.height) * canvas.clientHeight - frame.clientHeight / 2),
+        behavior: "smooth",
+      });
+    }, 80);
+  };
+
+  const toggleFullscreen = async () => {
+    if (document.fullscreenElement) {
+      await document.exitFullscreen();
+      return;
+    }
+    await evidencePane.current?.requestFullscreen();
+  };
+
   const progress = (job: Job) => {
     if (job.status === "complete") return 100;
     if (!job.pages) return job.status === "queued" ? 8 : 14;
@@ -450,6 +583,8 @@ export default function Home() {
       amount: points(selectedRow.field_evidence?.amount?.[0]),
     };
   }, [selectedRow, viewPage]);
+  const hospitalEvidence =
+    hospitalEditMode && hospital?.page_number === viewPage ? points(hospital.evidence) : "";
 
   const arrival = !jobs.length;
 
@@ -515,7 +650,21 @@ export default function Home() {
                 <button key={job.id} className={`job-card ${selectedJobId === job.id ? "selected" : ""}`} onClick={() => setSelectedJobId(job.id)}>
                   <span className={`job-state ${job.status}`} />
                   <span className="job-index">{String(index + 1).padStart(2, "0")}</span>
-                  <span className="job-copy"><b>{job.original_name}</b><small>{job.status === "processing" ? `page ${job.page} of ${job.pages ?? "?"}` : job.status}{job.row_count !== null ? ` · ${job.row_count} rows` : ""}</small></span>
+                  <span className="job-copy">
+                    <b>
+                      {job.hospital_name ??
+                        (job.status === "complete"
+                          ? job.original_name.replace(/\.pdf$/i, "")
+                          : "Identifying hospital…")}
+                    </b>
+                    <small className="job-file">{job.original_name}</small>
+                    <small>
+                      {job.status === "processing"
+                        ? `page ${job.page} of ${job.pages ?? "?"}`
+                        : job.status}
+                      {job.row_count !== null ? ` · ${job.row_count} rows` : ""}
+                    </small>
+                  </span>
                   <span className="job-progress"><i style={{ width: `${progress(job)}%` }} /></span>
                 </button>
               ))}
@@ -541,7 +690,21 @@ export default function Home() {
             {selectedJob?.status === "complete" && rowsResult && review && (
               <section className="workspace">
                 <div className="workspace-head">
-                  <div><p className="folio">03 / Evidence ledger</p><h2>{review.rows_active.toLocaleString("en-IN")} active rows</h2></div>
+                  <div className="hospital-heading">
+                    <p className="folio">03 / Evidence ledger</p>
+                    <div className="hospital-title-line">
+                      <h2>{hospital?.name ?? selectedJob.original_name.replace(/\.pdf$/i, "")}</h2>
+                      <button onClick={beginHospitalEdit}>Correct label</button>
+                    </div>
+                    <p className="document-identity">
+                      {selectedJob.original_name} · {review.rows_active.toLocaleString("en-IN")} active rows
+                      {hospital && (
+                        <span className={`identity-source ${hospital.source}`}>
+                          {hospital.source === "reviewer" ? "reviewer verified" : "machine identified"}
+                        </span>
+                      )}
+                    </p>
+                  </div>
                   <div className="summary-strip">
                     <span><b>{review.rows_modified}</b> corrected</span>
                     <span className={review.issues_open ? "warn" : ""}><b>{review.issues_open}</b> open issues</span>
@@ -556,21 +719,34 @@ export default function Home() {
                     <option value="">All dispositions</option><option value="accepted">Accepted</option><option value="pending">Pending</option><option value="rejected">Rejected</option><option value="unreadable">Unreadable</option>
                   </select>
                   <input className="page-filter" aria-label="Filter page" type="number" min="1" max={rowsResult.pages} placeholder="Page" value={pageFilter} onChange={(event) => { setPageFilter(event.target.value); setOffset(0); }} />
-                  <button className="toolbar-action" onClick={() => { setAddMode(true); setEditMode(false); setReason(""); setDraftPolygon(null); setDrawMode("add"); }}>+ Add grounded row</button>
+                  <button className="toolbar-action" onClick={() => { setAddMode(true); setEditMode(false); setHospitalEditMode(false); setReason(""); setDraftPolygon(null); setDrawMode("add"); }}>+ Add grounded row</button>
                   <button className="toolbar-action subtle" onClick={() => void deleteJob(selectedJob)}>Delete document</button>
                 </div>
 
-                <div className="split-view">
+                <div
+                  className={`split-view ${resizingSplit ? "resizing" : ""}`}
+                  ref={splitView}
+                  style={{ "--ledger-share": `${splitPercent}%` } as CSSProperties}
+                >
                   <div className="ledger-pane">
                     <div className="ledger-caption"><span>{selectedJob.original_name}</span><span>{rowsResult.total.toLocaleString("en-IN")} matching · revision {review.revision}</span></div>
                     <div className="table-shell">
                       <table>
-                        <thead><tr><th>#</th><th>Charge description</th><th>Qty</th><th>Rate</th><th>Net amount</th></tr></thead>
+                        <colgroup>
+                          <col className="number-column" />
+                          <col className="description-column" />
+                          <col className="date-column" />
+                          <col className="quantity-column" />
+                          <col className="money-column" />
+                          <col className="money-column" />
+                        </colgroup>
+                        <thead><tr><th>#</th><th>Charge description</th><th>Date</th><th>Qty</th><th>Rate</th><th>Net amount</th></tr></thead>
                         <tbody>
                           {rowsResult.rows.map((row, index) => (
-                            <tr key={row.id} className={`${selectedRowId === row.id ? "selected" : ""} ${row.review_disposition} ${row.review.modified ? "modified" : ""}`} onClick={() => { setSelectedRowId(row.id); setEditMode(false); setAddMode(false); setDraftPolygon(null); }}>
+                            <tr key={row.id} className={`${selectedRowId === row.id ? "selected" : ""} ${row.review_disposition} ${row.review.modified ? "modified" : ""}`} onClick={() => { setSelectedRowId(row.id); setEditMode(false); setAddMode(false); setHospitalEditMode(false); setDraftPolygon(null); }}>
                               <td>{String(offset + index + 1).padStart(2, "0")}</td>
                               <td><b>{row.description || "Unlabelled row"}</b><small><i className={row.review_disposition} /> {row.review_disposition} · p.{row.page_number}{row.review.modified ? " · reviewer changed" : ""}</small></td>
+                              <td className="service-date">{serviceDate(row.service_date_iso)}</td>
                               <td>{row.quantity ?? "—"}</td><td>{money(row.unit_price)}</td><td>{money(row.net_amount)}</td>
                             </tr>
                           ))}
@@ -585,26 +761,70 @@ export default function Home() {
                     </div>
                   </div>
 
-                  <aside className="evidence-pane">
+                  <button
+                    type="button"
+                    className="split-resizer"
+                    aria-label="Resize ledger and evidence panels"
+                    aria-valuemin={44}
+                    aria-valuemax={68}
+                    aria-valuenow={Math.round(splitPercent)}
+                    role="separator"
+                    onPointerDown={(event) => {
+                      event.currentTarget.setPointerCapture(event.pointerId);
+                      setResizingSplit(true);
+                    }}
+                    onPointerMove={resize}
+                    onPointerUp={(event) => {
+                      setResizingSplit(false);
+                      event.currentTarget.releasePointerCapture(event.pointerId);
+                    }}
+                    onPointerCancel={() => setResizingSplit(false)}
+                    onKeyDown={resizeWithKeyboard}
+                  ><span /></button>
+
+                  <aside className="evidence-pane" ref={evidencePane}>
                     <div className="evidence-head">
                       <span>Source page {viewPage} / {rowsResult.pages}</span>
-                      <span className="page-switch"><button disabled={viewPage <= 1} onClick={() => setViewPage(viewPage - 1)}>←</button><button disabled={viewPage >= rowsResult.pages} onClick={() => setViewPage(viewPage + 1)}>→</button></span>
+                      <span className="evidence-controls">
+                        <span className="page-switch"><button aria-label="Previous page" disabled={viewPage <= 1} onClick={() => setViewPage(viewPage - 1)}>←</button><button aria-label="Next page" disabled={viewPage >= rowsResult.pages} onClick={() => setViewPage(viewPage + 1)}>→</button></span>
+                        <span className="view-switch">
+                          <button className={viewMode === "fit-page" ? "active" : ""} onClick={() => setViewMode("fit-page")}>Page</button>
+                          <button className={viewMode === "fit-width" ? "active" : ""} onClick={() => setViewMode("fit-width")}>Width</button>
+                          <button aria-label="Zoom out" onClick={() => { setViewMode("zoom"); setZoom((value) => Math.max(75, value - 25)); }}>−</button>
+                          <output>{viewMode === "zoom" ? `${zoom}%` : "Fit"}</output>
+                          <button aria-label="Zoom in" onClick={() => { setViewMode("zoom"); setZoom((value) => Math.min(300, value + 25)); }}>+</button>
+                          <button onClick={focusEvidence}>Focus</button>
+                          <button aria-label="Toggle fullscreen evidence" onClick={() => void toggleFullscreen()}>⛶</button>
+                        </span>
+                      </span>
                     </div>
-                    <div className={`page-frame ${drawMode ? "drawing" : ""}`} ref={pageFrame}>
-                      <div className="page-canvas" style={pageAsset ? { aspectRatio: `${pageAsset.width} / ${pageAsset.height}` } : undefined}>
+                    <div className={`page-frame ${viewMode} ${drawMode ? "drawing" : ""}`} ref={pageFrame}>
+                      <div
+                        className="page-canvas"
+                        ref={pageCanvas}
+                        style={pageAsset ? { aspectRatio: `${pageAsset.width} / ${pageAsset.height}`, "--page-zoom": `${zoom}%` } as CSSProperties : undefined}
+                      >
                         {/* eslint-disable-next-line @next/next/no-img-element -- immutable evidence is intentionally not optimized */}
                         <img src={`/api/v2/documents/${selectedJob.id}/pages/${viewPage}`} alt={`Rendered bill page ${viewPage}`} />
                         {pageAsset && (
                           <svg viewBox={`0 0 ${pageAsset.width} ${pageAsset.height}`} preserveAspectRatio="none" aria-label={drawMode ? "Draw row evidence" : "Linked row evidence"} onPointerDown={startDraw} onPointerMove={moveDraw} onPointerUp={endDraw}>
                             {evidence.description && <polygon className="description-evidence" points={evidence.description} />}
                             {evidence.amount && evidence.amount !== evidence.description && <polygon className="amount-evidence" points={evidence.amount} />}
+                            {hospitalEvidence && !draftPolygon && <polygon className="hospital-evidence" points={hospitalEvidence} />}
                             {draftPolygon && <polygon className="draft-evidence" points={draftPolygon.map((point) => `${point.x},${point.y}`).join(" ")} />}
                           </svg>
                         )}
                       </div>
                     </div>
                     {drawMode && <div className="draw-instruction">Drag across the visible source row to anchor the reviewer evidence.</div>}
-                    {selectedRow && !addMode && (
+                    {hospitalEditMode && hospital && (
+                      <div className="evidence-note hospital-note">
+                        <span>H</span>
+                        <div><strong>{hospital.name}</strong><p>Hospital header · grounded on page {hospital.page_number}</p></div>
+                        <button onClick={focusEvidence}>Focus header ↗</button>
+                      </div>
+                    )}
+                    {selectedRow && !addMode && !hospitalEditMode && (
                       <div className="evidence-note">
                         <span>{String((rowsResult.rows.findIndex((row) => row.id === selectedRow.id) + offset + 1)).padStart(2, "0")}</span>
                         <div><strong>{selectedRow.description}</strong><p>{money(selectedRow.net_amount)} · grounded on page {selectedRow.page_number}</p></div>
@@ -614,10 +834,15 @@ export default function Home() {
                   </aside>
                 </div>
 
-                {(editMode || addMode) && (
+                {(editMode || addMode || hospitalEditMode) && (
                   <div className="review-sheet">
-                    <div className="sheet-title"><p className="folio">04 / Human review</p><h3>{addMode ? "Add a missing grounded row" : "Correct without erasing the machine record"}</h3></div>
-                    {addMode ? (
+                    <div className="sheet-title"><p className="folio">04 / Human review</p><h3>{hospitalEditMode ? "Verify the hospital identity" : addMode ? "Add a missing grounded row" : "Correct without erasing the machine record"}</h3></div>
+                    {hospitalEditMode ? (
+                      <div className="edit-grid hospital-edit-grid">
+                        <label className="wide"><span>Hospital name</span><input value={hospitalName} onChange={(event) => setHospitalName(event.target.value)} /></label>
+                        <label className="wide"><span>Review reason</span><input value={hospitalReason} onChange={(event) => setHospitalReason(event.target.value)} placeholder="What did you verify in the bill header?" /></label>
+                      </div>
+                    ) : addMode ? (
                       <div className="edit-grid">
                         <label><span>Description</span><input value={addDescription} onChange={(event) => setAddDescription(event.target.value)} /></label>
                         <label><span>Net amount</span><input inputMode="decimal" value={addAmount} onChange={(event) => setAddAmount(event.target.value)} /></label>
@@ -626,6 +851,7 @@ export default function Home() {
                     ) : (
                       <div className="edit-grid">
                         <label className="wide"><span>Description</span><input value={editValues.description} onChange={(event) => setEditValues({ ...editValues, description: event.target.value })} /></label>
+                        <label><span>Service date</span><input type="date" value={editValues.service_date_iso} onChange={(event) => setEditValues({ ...editValues, service_date_iso: event.target.value })} /></label>
                         <label><span>Quantity</span><input value={editValues.quantity} onChange={(event) => setEditValues({ ...editValues, quantity: event.target.value })} /></label>
                         <label><span>Unit rate</span><input value={editValues.unit_price} onChange={(event) => setEditValues({ ...editValues, unit_price: event.target.value })} /></label>
                         <label><span>Discount</span><input value={editValues.discount} onChange={(event) => setEditValues({ ...editValues, discount: event.target.value })} /></label>
@@ -636,10 +862,10 @@ export default function Home() {
                       </div>
                     )}
                     <div className="sheet-actions">
-                      <button className="secondary" onClick={() => { setDrawMode(addMode ? "add" : "relink"); setDraftPolygon(null); }}>{draftPolygon ? "Redraw evidence" : addMode ? "Draw evidence above" : "Relink evidence"}</button>
-                      <button className="secondary" onClick={() => { setEditMode(false); setAddMode(false); setDrawMode(null); setDraftPolygon(null); }}>Cancel</button>
-                      {!addMode && <button className="danger" onClick={() => void rejectSelected()}>Reject row</button>}
-                      <button className="primary" onClick={() => void (addMode ? addRow() : saveEdit())}>{addMode ? "Add grounded row" : "Save correction"}</button>
+                      <button className="secondary" onClick={() => { setDrawMode(hospitalEditMode ? "hospital" : addMode ? "add" : "relink"); setDraftPolygon(null); }}>{draftPolygon ? "Redraw evidence" : hospitalEditMode ? "Draw header evidence" : addMode ? "Draw evidence above" : "Relink evidence"}</button>
+                      <button className="secondary" onClick={() => { setEditMode(false); setAddMode(false); setHospitalEditMode(false); setDrawMode(null); setDraftPolygon(null); }}>Cancel</button>
+                      {!addMode && !hospitalEditMode && <button className="danger" onClick={() => void rejectSelected()}>Reject row</button>}
+                      <button className="primary" onClick={() => void (hospitalEditMode ? saveHospital() : addMode ? addRow() : saveEdit())}>{hospitalEditMode ? "Save hospital identity" : addMode ? "Add grounded row" : "Save correction"}</button>
                     </div>
                   </div>
                 )}

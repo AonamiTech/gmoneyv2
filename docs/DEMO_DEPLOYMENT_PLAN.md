@@ -21,6 +21,9 @@ unseen-hospital Phase 3 checkpoint gate.
 - Provide a Next.js review desk with a shared server-backed document queue, two visible
   inference lanes, row filtering, original-versus-corrected values, evidence relinking,
   reviewer-added rows, structural issue resolution, approval, and CSV/JSON/evidence exports.
+  The detected hospital name is the primary document label and can be corrected with
+  revisioned header evidence. The ledger uses an independently scrolling table, a service-date
+  column, a resizable evidence split, page/width fit modes, zoom, evidence focus, and fullscreen.
 - Preserve immutable machine output and store reviewer changes in an atomic revisioned overlay.
   Authentication, PostgreSQL, and Temporal remain outside this demo.
 - Accept only PDF files up to 25 MiB, cap the queue at 20 jobs, expose the shared recent-document
@@ -46,8 +49,12 @@ unseen-hospital Phase 3 checkpoint gate.
 
 - Python tests/Ruff and frontend lint/type/build pass.
 - The committed annotated regression remains above its recorded Phase 3 gates.
-- Bills 10 and 11 process concurrently on D16 without OOM, swapping, corruption, or
-  duplicate rows and reproduce their retained 80-row and 36-row semantic outputs.
+- All eleven exposed Sample Bills process in two D16 lanes without OOM, swapping,
+  corruption, or ungrounded accepted rows. Bills 10 and 11 produce 80 and 35 charge
+  rows respectively; the latter intentionally excludes the contact-phone false positive.
+- Bill 10 exposes 75 structured service dates without retaining date ranges in descriptions;
+  Bill 10 and Bill 11 are labelled `Vijaya Group of Hospitals` and
+  `Dr.Kamakshi Memorial Hospitals Pvt. Ltd.` from page-one evidence.
 - Row correction, evidence relinking, reviewer addition/rejection, issue resolution,
   approval, and all three exports pass against the deployed API.
 - A public upload on port 3100 shows extracted rows and synchronized page evidence;

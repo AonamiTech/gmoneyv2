@@ -11,7 +11,7 @@ from gmoney.demo.store import JobStore
 _extractor: Any = None
 
 
-def _run_job(root_value: str, job_id: str, vl_url: str) -> int:
+def _run_job(root_value: str, job_id: str, vl_url: str) -> dict[str, Any]:
     global _extractor
     from gmoney.extraction.offline import OfflineExtractor
 
@@ -32,7 +32,12 @@ def _run_job(root_value: str, job_id: str, vl_url: str) -> int:
 
     temporary.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
     temporary.replace(result_path)
-    return len(result["rows"])
+    hospital = result.get("hospital") or {}
+    return {
+        "row_count": len(result["rows"]),
+        "hospital_name": hospital.get("name"),
+        "hospital_confidence": hospital.get("confidence"),
+    }
 
 
 def main() -> None:
@@ -42,7 +47,7 @@ def main() -> None:
     retention_hours = int(os.environ.get("GMONEY_RETENTION_HOURS", "6"))
     store = JobStore(root)
     store.recover()
-    futures: dict[Future[int], str] = {}
+    futures: dict[Future[dict[str, Any]], str] = {}
     last_cleanup = 0.0
     with ProcessPoolExecutor(max_workers=concurrency) as executor:
         while True:
@@ -50,8 +55,8 @@ def main() -> None:
                 if not future.done():
                     continue
                 try:
-                    row_count = future.result()
-                    store.update(job_id, status="complete", row_count=row_count, error=None)
+                    summary = future.result()
+                    store.update(job_id, status="complete", error=None, **summary)
                 except Exception as error:  # noqa: BLE001 - boundary records sanitized failure
                     store.update(job_id, status="failed", error=type(error).__name__)
                 del futures[future]

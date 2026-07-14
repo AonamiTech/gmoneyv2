@@ -21,6 +21,7 @@ from gmoney.demo.review import (
     export_payload,
     load_result,
     normalize_changes,
+    project_hospital,
     project_rows,
     public_page_assets,
     review_summary,
@@ -38,7 +39,7 @@ store = JobStore(DEMO_ROOT)
 
 app = FastAPI(
     title="GMoney V2 Evidence Demo",
-    version="0.3.0",
+    version="0.4.0",
     docs_url="/api/v2/docs",
     openapi_url="/api/v2/openapi.json",
 )
@@ -72,6 +73,13 @@ class IssuePatch(BaseModel):
     reason: str = Field(min_length=3, max_length=500)
 
 
+class HospitalPatch(BaseModel):
+    hospital_name: str = Field(min_length=2, max_length=200)
+    page_number: int = Field(ge=1)
+    polygon: ReviewPolygon
+    reason: str = Field(min_length=3, max_length=500)
+
+
 @app.middleware("http")
 async def private_demo_responses(request: Any, call_next: Any) -> Response:
     response = await call_next(request)
@@ -81,7 +89,7 @@ async def private_demo_responses(request: Any, call_next: Any) -> Response:
 
 
 def _public_state(state: dict[str, Any]) -> dict[str, Any]:
-    return {
+    public = {
         key: state.get(key)
         for key in (
             "id",
@@ -92,9 +100,23 @@ def _public_state(state: dict[str, Any]) -> dict[str, Any]:
             "page",
             "pages",
             "row_count",
+            "hospital_name",
+            "hospital_confidence",
             "error",
         )
     }
+    public["hospital_name_source"] = "machine" if state.get("hospital_name") else None
+    if state.get("status") == "complete":
+        try:
+            hospital_override = store.read_review(state["id"]).get(
+                "document_overrides", {}
+            ).get("hospital")
+        except KeyError:
+            hospital_override = None
+        if hospital_override:
+            public["hospital_name"] = hospital_override["name"]
+            public["hospital_name_source"] = "reviewer"
+    return public
 
 
 def _state_or_404(job_id: str) -> dict[str, Any]:
@@ -276,6 +298,8 @@ def get_rows(
             if needle in str(row.get("description") or "").casefold()
             or needle in str(row.get("service_code") or "").casefold()
             or needle in str(row.get("section") or "").casefold()
+            or needle in str(row.get("service_date_raw") or "").casefold()
+            or needle in str(row.get("service_date_iso") or "").casefold()
         ]
     if disposition:
         rows = [row for row in rows if row.get("review_disposition") == disposition]
@@ -286,6 +310,7 @@ def get_rows(
         "document_id": result["document_id"],
         "pages": result["pages"],
         "page_assets": public_page_assets(result),
+        "hospital": project_hospital(result, review),
         "review_revision": review["revision"],
         "total": total,
         "offset": offset,
@@ -298,6 +323,47 @@ def get_rows(
 def get_review(job_id: str) -> dict[str, Any]:
     result, review = _complete_result(job_id)
     return review_summary(result, review)
+
+
+@app.patch("/api/v2/documents/{job_id}/metadata")
+def update_document_metadata(
+    job_id: str,
+    payload: HospitalPatch,
+    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
+) -> dict[str, Any]:
+    result, _ = _complete_result(job_id)
+    expected = _expected_revision(if_match)
+    evidence = evidence_for_page(
+        result,
+        payload.page_number,
+        [point.model_dump() for point in payload.polygon.points],
+    )
+    hospital_name = re.sub(r"\s+", " ", payload.hospital_name).strip()
+
+    def mutation(review: dict[str, Any]) -> dict[str, Any]:
+        review.setdefault("document_overrides", {})["hospital"] = {
+            "name": hospital_name,
+            "reason": payload.reason.strip(),
+            "evidence": evidence,
+            "updated_at": utc_now(),
+        }
+        review["approval"] = None
+        review["events"].append(
+            _event(
+                expected + 1,
+                "hospital_updated",
+                job_id,
+                payload.reason,
+                {"hospital_name": hospital_name, "page_number": payload.page_number},
+            )
+        )
+        return review
+
+    review = _mutate(job_id, expected, mutation)
+    return {
+        "review_revision": review["revision"],
+        "hospital": project_hospital(result, review),
+    }
 
 
 @app.patch("/api/v2/documents/{job_id}/rows/{row_id}")

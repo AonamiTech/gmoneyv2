@@ -25,6 +25,7 @@ from gmoney.contracts.phase3 import (
 )
 from gmoney.evaluation.corpus import sha256_file
 from gmoney.extraction.canonicalize import canonicalize_rows
+from gmoney.extraction.hospital import detect_hospital
 from gmoney.extraction.ocr_rows import (
     TableSchemaState,
     fuse_provider_descriptions,
@@ -633,6 +634,7 @@ class OfflineExtractor:
         all_rows: list[CanonicalRow] = []
         diagnostics: list[dict[str, Any]] = []
         schema_states: list[TableSchemaState] = []
+        hospital = None
         gemini_calls = 0
         gemini_cost = Decimal("0")
         gemini_provider_disabled_reason: str | None = None
@@ -654,6 +656,12 @@ class OfflineExtractor:
                 page_asset.page_number,
                 page_asset.artifact_sha256,
             )
+            if page_asset.page_number == 1:
+                hospital = detect_hospital(
+                    tokens,
+                    page_width=page_asset.width,
+                    page_height=page_asset.height,
+                )
             layout_request = InferenceRequest(
                 request_id=str(uuid4()),
                 artifact_sha256=page_asset.artifact_sha256,
@@ -1304,6 +1312,7 @@ class OfflineExtractor:
             "output_version": "offline_accuracy_spine_v3",
             "document_id": document_id,
             "hospital_id": self.hospital_id,
+            "hospital": hospital,
             "source_sha256": sha256_file(source),
             "source_name": source.name,
             "pages": len(manifest.pages),

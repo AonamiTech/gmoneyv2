@@ -51,6 +51,8 @@ class JobStore:
             "page": 0,
             "pages": None,
             "row_count": None,
+            "hospital_name": None,
+            "hospital_confidence": None,
             "error": None,
         }
         self.write(job_id, state)
@@ -83,6 +85,7 @@ class JobStore:
             "row_overrides": {},
             "added_rows": {},
             "issue_overrides": {},
+            "document_overrides": {},
             "events": [],
             "approval": None,
         }
@@ -91,7 +94,10 @@ class JobStore:
         path = self.job_dir(job_id) / "review.json"
         if not path.is_file():
             return self.empty_review()
-        return json.loads(path.read_text())
+        review = json.loads(path.read_text())
+        for key, value in self.empty_review().items():
+            review.setdefault(key, value)
+        return review
 
     @contextmanager
     def _review_lock(self, job_id: str) -> Iterator[None]:

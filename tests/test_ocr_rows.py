@@ -227,6 +227,66 @@ def test_compact_itemname_header_keeps_ledger_with_repeated_bill_metadata() -> N
     assert result.rows[0].candidate.amount == Decimal("2395.00")
 
 
+def test_compact_unitprice_header_preserves_rate_quantity_and_amount_columns() -> None:
+    tokens = (
+        token(0, "Description", (100, 30, 300, 45)),
+        token(1, "UnitPrice", (520, 30, 620, 45)),
+        token(2, "Quantity", (650, 30, 750, 45)),
+        token(3, "Amount", (850, 30, 950, 45)),
+        token(4, "Room :408--A/C", (100, 70, 330, 85)),
+        token(5, "3000.00", (530, 70, 610, 85)),
+        token(6, "4.00", (680, 70, 730, 85)),
+        token(7, "12000.00", (850, 70, 940, 85)),
+        token(8, "Consultation", (100, 100, 300, 115)),
+        token(9, "350.00", (530, 100, 610, 115)),
+        token(10, "1.00", (680, 100, 730, 115)),
+        token(11, "350.00", (850, 100, 930, 115)),
+    )
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 20, 980, 140),
+    )
+    assert result.schema is not None
+    assert result.rows[0].candidate.rate == Decimal("3000.00")
+    assert result.rows[0].candidate.quantity == Decimal("4.00")
+    assert result.rows[0].candidate.amount == Decimal("12000.00")
+    assert result.rows[1].candidate.rate == Decimal("350.00")
+    assert result.rows[1].candidate.quantity == Decimal("1.00")
+
+
+def test_alphabetic_service_date_is_structured_and_removed_from_description() -> None:
+    tokens = (
+        token(0, "Description", (100, 30, 420, 45)),
+        token(1, "Rate", (600, 30, 680, 45)),
+        token(2, "Qty", (700, 30, 760, 45)),
+        token(3, "Amount", (850, 30, 950, 45)),
+        token(
+            4,
+            "12-Feb-2026 SER0944134 234A (SHARING A/C) - 12-Feb-2026 13:29 to 12",
+            (100, 70, 560, 85),
+        ),
+        token(5, "2062.50", (600, 70, 680, 85)),
+        token(6, "1.00", (710, 70, 750, 85)),
+        token(7, "2062.50", (850, 70, 930, 85)),
+        token(8, "13-Feb-2026 SER0945309 OXYGEN", (100, 100, 520, 115)),
+        token(9, "77.00", (600, 100, 670, 115)),
+        token(10, "24.00", (710, 100, 755, 115)),
+        token(11, "1848.00", (850, 100, 930, 115)),
+    )
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 20, 980, 140),
+    )
+    first = result.rows[0].candidate
+    assert first.service_date == "12-Feb-2026"
+    assert first.description == "SER0944134 234A (SHARING A/C)"
+    assert result.rows[0].field_token_ids["service_date"] == ("token-4",)
+
+
 def test_description_continuation_after_amount_extends_previous_row() -> None:
     tokens = (
         token(0, "Description", (100, 30, 250, 45)),
@@ -424,6 +484,28 @@ def test_footer_totals_short_fragments_and_standalone_expiry_are_not_rows() -> N
         for row in result.rows
         if row.candidate.role is RowRole.UNRESOLVED
     ] == ["ExpDate"]
+
+
+def test_contact_footer_phone_number_is_metadata_not_a_charge() -> None:
+    tokens = (
+        token(0, "Description", (100, 30, 400, 45)),
+        token(1, "Amount", (850, 30, 950, 45)),
+        token(2, "Consultation", (100, 70, 300, 85)),
+        token(3, "350.00", (850, 70, 930, 85)),
+        token(4, "Doctor Appointments Free Home Sample Co", (100, 100, 600, 115)),
+        token(5, "9962725555", (850, 100, 950, 115)),
+    )
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 20, 980, 140),
+    )
+    assert [row.candidate.description for row in result.rows] == [
+        "Consultation",
+        "Doctor Appointments Free Home Sample Co",
+    ]
+    assert result.rows[1].candidate.role is RowRole.UNRESOLVED
 
 
 def test_headerless_settlement_region_is_terminal_payment() -> None:
