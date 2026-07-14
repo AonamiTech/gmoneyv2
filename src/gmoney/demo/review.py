@@ -232,6 +232,36 @@ def structural_issues(result: dict[str, Any], review: dict[str, Any]) -> list[di
                 "updated_at": override.get("updated_at"),
             }
         )
+    field_flags = {
+        "missing_labeled_quantity",
+        "missing_labeled_unit_price",
+        "line_arithmetic_mismatch",
+    }
+    flagged_tables: dict[tuple[int, str], set[str]] = {}
+    for row in result.get("rows", []):
+        reasons = field_flags & set(row.get("validation_flags", []))
+        if reasons:
+            key = (int(row.get("page_number") or 1), str(row.get("table_id") or "unknown"))
+            flagged_tables.setdefault(key, set()).update(reasons)
+    for (page_number, table_id), reason_set in sorted(flagged_tables.items()):
+        reasons = sorted(reason_set)
+        issue_key = f"{page_number}:{table_id}:{','.join(reasons)}"
+        issue_id = hashlib.sha256(issue_key.encode()).hexdigest()[:20]
+        if any(issue["id"] == issue_id for issue in issues):
+            continue
+        override = overrides.get(issue_id, {})
+        issues.append(
+            {
+                "id": issue_id,
+                "page_number": page_number,
+                "table_id": table_id,
+                "table_type": "field_validation",
+                "reason_codes": reasons,
+                "status": override.get("status", "open"),
+                "resolution_reason": override.get("reason"),
+                "updated_at": override.get("updated_at"),
+            }
+        )
     return issues
 
 

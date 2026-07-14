@@ -1,7 +1,14 @@
 from decimal import Decimal
 
-from gmoney.contracts.extraction import CanonicalRow, ReviewDisposition, RowRole, TableType
-from gmoney.extraction.offline import _apply_document_role_policy
+from gmoney.contracts.evidence import Point, Polygon
+from gmoney.contracts.extraction import (
+    CanonicalRow,
+    EvidenceRef,
+    ReviewDisposition,
+    RowRole,
+    TableType,
+)
+from gmoney.extraction.offline import _apply_document_role_policy, _deduplicate
 
 
 def row(order: int, role: RowRole, section: str, amount: str) -> CanonicalRow:
@@ -51,3 +58,34 @@ def test_coincidental_cross_page_sum_does_not_delete_detail() -> None:
         row(2, RowRole.DETAIL, "service", "20"),
     ]
     assert len(_apply_document_role_policy(rows)) == 3
+
+
+def test_overlapping_table_proposals_keep_the_trustworthy_complete_row() -> None:
+    description_evidence = EvidenceRef(
+        page_number=1,
+        table_id="full",
+        polygon=Polygon(
+            points=(
+                Point(x=0, y=0),
+                Point(x=10, y=0),
+                Point(x=10, y=10),
+                Point(x=0, y=10),
+            )
+        ),
+        artifact_sha256="a" * 64,
+        token_ids=("shared-description-token",),
+    )
+    partial = row(0, RowRole.DETAIL, "implant", "1").model_copy(
+        update={
+            "description": "ULTIMASTER STENT 3.00MM x 18",
+            "field_evidence": {"description": (description_evidence,)},
+            "validation_flags": ("line_arithmetic_mismatch",),
+        }
+    )
+    complete = row(1, RowRole.DETAIL, "implant", "40879.66").model_copy(
+        update={
+            "description": "ULTIMASTER STENT 3.00MM x 18MM",
+            "field_evidence": {"description": (description_evidence,)},
+        }
+    )
+    assert _deduplicate([partial, complete]) == [complete]

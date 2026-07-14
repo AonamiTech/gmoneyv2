@@ -2,6 +2,11 @@
 
 Date: 2026-07-14
 
+> Historical release record: this documents the currently deployed six-hour build. The
+> verified 30-day history and corrected quantity/unit-price candidate supersedes it in the
+> repository, but deployment is intentionally waiting for the required managed data disk;
+> the VM root disk has only 3.8 GiB free and the two 440 GiB NVMe devices are ephemeral.
+
 ## Outcome
 
 The unauthenticated editable evidence demo is deployed at

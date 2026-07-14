@@ -49,6 +49,7 @@ class CandidateLedgerRow:
     table_type: TableType = TableType.UNKNOWN
     category: str | None = None
     source_route: str = "provider_otsl"
+    validation_flags: tuple[str, ...] = ()
 
 
 def _normalized(value: str) -> str:

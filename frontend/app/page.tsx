@@ -26,8 +26,18 @@ type Job = {
   hospital_confidence: number | null;
   hospital_name_source: "machine" | "reviewer" | null;
   error: string | null;
+  created_at: string;
+  updated_at: string;
+  last_activity_at: string;
+  expires_at: string | null;
 };
-type JobsResult = { total: number; documents: Job[] };
+type JobsResult = {
+  total: number;
+  offset: number;
+  limit: number;
+  has_more: boolean;
+  documents: Job[];
+};
 type Point = { x: number; y: number };
 type Evidence = {
   page_number: number;
@@ -64,6 +74,7 @@ type Row = {
   page_number: number;
   evidence: Evidence[];
   field_evidence: Record<string, Evidence[]>;
+  validation_flags: string[];
   review: ReviewMeta;
 };
 type PageAsset = {
@@ -103,7 +114,15 @@ type ReviewSummary = {
   hospital: Hospital | null;
   approval: { status: string; approved_at: string; review_revision: number } | null;
 };
-type Health = { active_jobs: number; worker_capacity: number; queue_capacity: number };
+type Health = {
+  active_jobs: number;
+  worker_capacity: number;
+  queue_capacity: number;
+  retention_hours: number;
+  storage_total_bytes: number;
+  storage_free_bytes: number;
+  storage_min_free_bytes: number;
+};
 type EditValues = {
   description: string;
   service_date_iso: string;
@@ -147,6 +166,21 @@ const serviceDate = (value: string | null) => {
   }).format(new Date(Date.UTC(year, month - 1, day)));
 };
 
+const dateTime = (value: string | null) =>
+  value
+    ? new Intl.DateTimeFormat("en-IN", {
+        day: "2-digit",
+        month: "short",
+        hour: "2-digit",
+        minute: "2-digit",
+      }).format(new Date(value))
+    : "—";
+
+const storageSize = (value: number | undefined) => {
+  if (value === undefined) return "—";
+  return `${(value / 1024 ** 3).toFixed(value >= 100 * 1024 ** 3 ? 0 : 1)} GB`;
+};
+
 const detail = (payload: unknown) => {
   if (typeof payload === "string") return payload;
   if (payload && typeof payload === "object" && "detail" in payload) {
@@ -170,7 +204,11 @@ const points = (evidence: Evidence | undefined) =>
   evidence?.polygon.points.map((point) => `${point.x},${point.y}`).join(" ") ?? "";
 
 export default function Home() {
-  const [jobs, setJobs] = useState<Job[]>([]);
+  const [activeJobs, setActiveJobs] = useState<Job[]>([]);
+  const [historyJobs, setHistoryJobs] = useState<Job[]>([]);
+  const [historyTotal, setHistoryTotal] = useState(0);
+  const [historyQuery, setHistoryQuery] = useState("");
+  const [railView, setRailView] = useState<"active" | "history">("history");
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
   const [rowsResult, setRowsResult] = useState<RowsResult | null>(null);
   const [review, setReview] = useState<ReviewSummary | null>(null);
@@ -205,42 +243,98 @@ export default function Home() {
   const pageCanvas = useRef<HTMLDivElement | null>(null);
   const splitView = useRef<HTMLDivElement | null>(null);
   const evidencePane = useRef<HTMLElement | null>(null);
+  const previousActiveIds = useRef<Set<string>>(new Set());
 
+  const jobs = useMemo(
+    () => [
+      ...activeJobs,
+      ...historyJobs.filter(
+        (historyJob) => !activeJobs.some((activeJob) => activeJob.id === historyJob.id),
+      ),
+    ],
+    [activeJobs, historyJobs],
+  );
+  const visibleJobs = railView === "active" ? activeJobs : historyJobs;
   const selectedJob = jobs.find((job) => job.id === selectedJobId) ?? null;
   const selectedRow = rowsResult?.rows.find((row) => row.id === selectedRowId) ?? null;
   const pageAsset = rowsResult?.page_assets.find((asset) => asset.page_number === viewPage);
   const hospital = rowsResult?.hospital ?? review?.hospital ?? null;
-  const activeJobs = jobs.filter((job) => ["queued", "processing"].includes(job.status));
-
-  const replaceJobs = useCallback((updater: (current: Job[]) => Job[]) => {
-    setJobs(updater);
-  }, []);
-
   const refreshHealth = useCallback(() => {
     request<Health>("/api/v2/health/ready").then(setHealth).catch(() => setHealth(null));
   }, []);
 
-  const refreshJobs = useCallback(async () => {
-    const result = await request<JobsResult>("/api/v2/documents?limit=100");
-    const live = result.documents;
-    setJobs(live);
-    setSelectedJobId((current) =>
-      current && live.some((job) => job.id === current) ? current : (live[0]?.id ?? null),
-    );
+  const refreshActiveJobs = useCallback(async () => {
+    const result = await request<JobsResult>("/api/v2/documents?scope=active&limit=200");
+    setActiveJobs(result.documents);
+    return result.documents;
   }, []);
 
+  const refreshHistoryJobs = useCallback(async (historyOffset = 0, append = false) => {
+    const params = new URLSearchParams({
+      scope: "history",
+      offset: String(historyOffset),
+      limit: "50",
+    });
+    if (historyQuery.trim()) params.set("query", historyQuery.trim());
+    const result = await request<JobsResult>(`/api/v2/documents?${params}`);
+    setHistoryTotal(result.total);
+    setHistoryJobs((current) => {
+      if (!append) return result.documents;
+      const known = new Set(current.map((job) => job.id));
+      return [...current, ...result.documents.filter((job) => !known.has(job.id))];
+    });
+    return result.documents;
+  }, [historyQuery]);
+
   useEffect(() => {
-    void refreshJobs().catch(() => setError("The shared bill list could not be loaded."));
+    void refreshActiveJobs().catch(() => setError("The active bill queue could not be loaded."));
     refreshHealth();
-  }, [refreshHealth, refreshJobs]);
+  }, [refreshActiveJobs, refreshHealth]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      void refreshHistoryJobs().catch(() => setError("Bill history could not be loaded."));
+    }, 220);
+    return () => window.clearTimeout(timer);
+  }, [refreshHistoryJobs]);
 
   useEffect(() => {
     const poll = window.setInterval(() => {
-      void refreshJobs().catch(() => undefined);
+      void refreshActiveJobs().catch(() => undefined);
       refreshHealth();
     }, 3000);
     return () => window.clearInterval(poll);
-  }, [refreshHealth, refreshJobs]);
+  }, [refreshActiveJobs, refreshHealth]);
+
+  useEffect(() => {
+    const poll = window.setInterval(() => {
+      void refreshHistoryJobs().catch(() => undefined);
+    }, 30000);
+    return () => window.clearInterval(poll);
+  }, [refreshHistoryJobs]);
+
+  useEffect(() => {
+    const currentIds = new Set(activeJobs.map((job) => job.id));
+    const jobLeftActiveQueue = [...previousActiveIds.current].some(
+      (jobId) => !currentIds.has(jobId),
+    );
+    previousActiveIds.current = currentIds;
+    if (jobLeftActiveQueue) {
+      void refreshHistoryJobs().catch(() => undefined);
+    }
+  }, [activeJobs, refreshHistoryJobs]);
+
+  useEffect(() => {
+    if (railView === "active" && !activeJobs.length && historyJobs.length) {
+      setRailView("history");
+      return;
+    }
+    setSelectedJobId((current) =>
+      current && visibleJobs.some((job) => job.id === current)
+        ? current
+        : (visibleJobs[0]?.id ?? null),
+    );
+  }, [activeJobs.length, historyJobs.length, railView, visibleJobs]);
 
   const loadWorkspace = useCallback(async () => {
     if (!selectedJob || selectedJob.status !== "complete") return;
@@ -302,9 +396,13 @@ export default function Home() {
             return request<Job>("/api/v2/documents", { method: "POST", body });
           }),
         );
-        replaceJobs((current) => [...uploaded, ...current.filter((job) => !uploaded.some((item) => item.id === job.id))]);
+        setActiveJobs((current) => [
+          ...uploaded,
+          ...current.filter((job) => !uploaded.some((item) => item.id === job.id)),
+        ]);
+        setRailView("active");
         setSelectedJobId(uploaded[0].id);
-        void refreshJobs();
+        void refreshActiveJobs();
         refreshHealth();
       } catch (cause) {
         setError(cause instanceof Error ? cause.message : "Upload failed");
@@ -312,7 +410,7 @@ export default function Home() {
         setUploading(false);
       }
     },
-    [refreshHealth, refreshJobs, replaceJobs],
+    [refreshActiveJobs, refreshHealth],
   );
 
   const acceptFiles = (event: ChangeEvent<HTMLInputElement>) => {
@@ -456,7 +554,7 @@ export default function Home() {
       setHospitalEditMode(false);
       setDraftPolygon(null);
       setDrawMode(null);
-      void refreshJobs();
+      void refreshHistoryJobs();
     }
   };
 
@@ -481,7 +579,9 @@ export default function Home() {
   const deleteJob = async (job: Job) => {
     try {
       await request(`/api/v2/documents/${job.id}`, { method: "DELETE" });
-      replaceJobs((current) => current.filter((item) => item.id !== job.id));
+      setActiveJobs((current) => current.filter((item) => item.id !== job.id));
+      setHistoryJobs((current) => current.filter((item) => item.id !== job.id));
+      setHistoryTotal((current) => Math.max(0, current - 1));
       if (selectedJobId === job.id) setSelectedJobId(null);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Document could not be deleted");
@@ -591,7 +691,7 @@ export default function Home() {
   return (
     <main>
       <div className="risk-ribbon">
-        Public HTTP demo · no login · shared bill list · uploads are unencrypted and removed after six hours
+        Public HTTP demo · no login · shared 30-day bill history · uploads are unencrypted
       </div>
       <header className="masthead">
         <div className="brand-mark">G</div>
@@ -600,7 +700,7 @@ export default function Home() {
           <h1>Read every charge.<br />Resolve every doubt.</h1>
         </div>
         <div className={`mast-status ${health ? "online" : "offline"}`}>
-          <span /> {health ? `${health.worker_capacity} inference lanes · ${health.active_jobs} active` : "Inference unavailable"}
+          <span /> {health ? `${health.worker_capacity} lanes · ${health.active_jobs} active · ${storageSize(health.storage_free_bytes)} free` : "Inference unavailable"}
         </div>
       </header>
 
@@ -615,7 +715,7 @@ export default function Home() {
             <div className="proof-strip">
               <div><b>300</b><span>DPI evidence</span></div>
               <div><b>2×</b><span>parallel lanes</span></div>
-              <div><b>6h</b><span>automatic cleanup</span></div>
+              <div><b>30d</b><span>searchable history</span></div>
             </div>
           </div>
           <label
@@ -635,7 +735,10 @@ export default function Home() {
         <section className="review-desk">
           <aside className="queue-rail">
             <div className="rail-head">
-              <div><p className="folio">01 / Queue</p><h2>{jobs.length} documents</h2></div>
+              <div>
+                <p className="folio">01 / Document index</p>
+                <h2>{railView === "active" ? activeJobs.length : historyTotal} documents</h2>
+              </div>
               <label className="compact-upload">
                 <input type="file" multiple accept="application/pdf,.pdf" onChange={acceptFiles} disabled={uploading} />
                 {uploading ? "…" : "+"}
@@ -645,8 +748,25 @@ export default function Home() {
               <span>{activeJobs.filter((job) => job.status === "processing").length} / {health?.worker_capacity ?? 2} lanes occupied</span>
               <i style={{ width: `${Math.min(100, (activeJobs.filter((job) => job.status === "processing").length / (health?.worker_capacity ?? 2)) * 100)}%` }} />
             </div>
+            <div className="rail-tabs" role="tablist" aria-label="Document index">
+              <button className={railView === "active" ? "active" : ""} onClick={() => setRailView("active")}>
+                Active <span>{activeJobs.length}</span>
+              </button>
+              <button className={railView === "history" ? "active" : ""} onClick={() => setRailView("history")}>
+                History <span>{historyTotal}</span>
+              </button>
+            </div>
+            {railView === "history" && (
+              <input
+                className="history-search"
+                aria-label="Search bill history"
+                placeholder="Hospital or filename"
+                value={historyQuery}
+                onChange={(event) => setHistoryQuery(event.target.value)}
+              />
+            )}
             <div className="job-list">
-              {jobs.map((job, index) => (
+              {visibleJobs.map((job, index) => (
                 <button key={job.id} className={`job-card ${selectedJobId === job.id ? "selected" : ""}`} onClick={() => setSelectedJobId(job.id)}>
                   <span className={`job-state ${job.status}`} />
                   <span className="job-index">{String(index + 1).padStart(2, "0")}</span>
@@ -664,12 +784,27 @@ export default function Home() {
                         : job.status}
                       {job.row_count !== null ? ` · ${job.row_count} rows` : ""}
                     </small>
+                    <small className="job-time">
+                      {job.status === "complete"
+                        ? `updated ${dateTime(job.last_activity_at)} · expires ${dateTime(job.expires_at)}`
+                        : `received ${dateTime(job.created_at)}`}
+                    </small>
                   </span>
                   <span className="job-progress"><i style={{ width: `${progress(job)}%` }} /></span>
                 </button>
               ))}
+              {!visibleJobs.length && (
+                <div className="rail-empty">
+                  {railView === "active" ? "No bills are running." : "No historical bills match."}
+                </div>
+              )}
+              {railView === "history" && historyJobs.length < historyTotal && (
+                <button className="load-history" onClick={() => void refreshHistoryJobs(historyJobs.length, true)}>
+                  Load older bills
+                </button>
+              )}
             </div>
-            <div className="rail-note">Shared demo queue · completed bills retained for six hours</div>
+            <div className="rail-note">Public shared index · full evidence retained for 30 days</div>
           </aside>
 
           <div className="desk-main">
@@ -745,7 +880,16 @@ export default function Home() {
                           {rowsResult.rows.map((row, index) => (
                             <tr key={row.id} className={`${selectedRowId === row.id ? "selected" : ""} ${row.review_disposition} ${row.review.modified ? "modified" : ""}`} onClick={() => { setSelectedRowId(row.id); setEditMode(false); setAddMode(false); setHospitalEditMode(false); setDraftPolygon(null); }}>
                               <td>{String(offset + index + 1).padStart(2, "0")}</td>
-                              <td><b>{row.description || "Unlabelled row"}</b><small><i className={row.review_disposition} /> {row.review_disposition} · p.{row.page_number}{row.review.modified ? " · reviewer changed" : ""}</small></td>
+                              <td>
+                                <b>{row.description || "Unlabelled row"}</b>
+                                <small>
+                                  <i className={row.review_disposition} /> {row.review_disposition} · p.{row.page_number}
+                                  {row.review.modified ? " · reviewer changed" : ""}
+                                  {row.validation_flags?.some((flag) => ["missing_labeled_quantity", "missing_labeled_unit_price", "line_arithmetic_mismatch"].includes(flag))
+                                    ? " · field warning"
+                                    : ""}
+                                </small>
+                              </td>
                               <td className="service-date">{serviceDate(row.service_date_iso)}</td>
                               <td>{row.quantity ?? "—"}</td><td>{money(row.unit_price)}</td><td>{money(row.net_amount)}</td>
                             </tr>

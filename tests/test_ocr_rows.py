@@ -256,6 +256,196 @@ def test_compact_unitprice_header_preserves_rate_quantity_and_amount_columns() -
     assert result.rows[1].candidate.quantity == Decimal("1.00")
 
 
+def test_repeated_shifted_headers_reassign_rate_and_quantity_lanes() -> None:
+    tokens = (
+        token(0, "Description", (100, 30, 300, 45)),
+        token(1, "UnitPrice", (520, 30, 620, 45)),
+        token(2, "Quantity", (650, 30, 750, 45)),
+        token(3, "Amount", (850, 30, 950, 45)),
+        token(4, "Room :408--A/C", (100, 70, 330, 85)),
+        token(5, "3000.00", (530, 70, 610, 85)),
+        token(6, "4.00", (680, 70, 730, 85)),
+        token(7, "12000.00", (850, 70, 940, 85)),
+        token(8, "Consultation : -Rs 700.00", (100, 105, 410, 120)),
+        token(9, "Description", (100, 140, 300, 155)),
+        token(10, "UnitPrice", (650, 140, 750, 155)),
+        token(11, "Quantity", (770, 140, 850, 155)),
+        token(12, "Amount", (880, 140, 970, 155)),
+        token(13, "Consultation one", (100, 180, 330, 195)),
+        token(14, "350.00", (660, 180, 740, 195)),
+        token(15, "1.00", (790, 180, 830, 195)),
+        token(16, "350.00", (890, 180, 960, 195)),
+        token(17, "Consultation two", (100, 210, 330, 225)),
+        token(18, "350.00", (660, 210, 740, 225)),
+        token(19, "1.00", (790, 210, 830, 225)),
+        token(20, "350.00", (890, 210, 960, 225)),
+    )
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 20, 990, 250),
+    )
+    assert result.diagnostics["header_segments"] == 2
+    assert [row.candidate.rate for row in result.rows] == [
+        Decimal("3000.00"),
+        Decimal("350.00"),
+        Decimal("350.00"),
+    ]
+    assert [row.candidate.quantity for row in result.rows] == [
+        Decimal("4.00"),
+        Decimal("1.00"),
+        Decimal("1.00"),
+    ]
+
+
+def test_category_total_with_header_words_does_not_reset_quantity_and_rate() -> None:
+    tokens = (
+        token(0, "Description", (100, 30, 300, 45)),
+        token(1, "Rate", (650, 30, 740, 45)),
+        token(2, "Qty", (770, 30, 830, 45)),
+        token(3, "Amount", (880, 30, 970, 45)),
+        token(4, "BLOOD GROUP & RH TYPE", (100, 70, 400, 85)),
+        token(5, "32.00", (660, 70, 730, 85)),
+        token(6, "1.00", (780, 70, 820, 85)),
+        token(7, "32.00", (890, 70, 960, 85)),
+        token(8, "TOTAL FOR BLOOD BANK INVESTIGATIONS", (100, 105, 520, 120)),
+        token(9, "32.00", (890, 105, 960, 120)),
+        token(10, "FIRST VISIT CARDIAC SURGEON", (100, 140, 480, 155)),
+        token(11, "350.00", (660, 140, 730, 155)),
+        token(12, "1.00", (780, 140, 820, 155)),
+        token(13, "350.00", (890, 140, 960, 155)),
+    )
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 20, 990, 180),
+    )
+    assert result.diagnostics["header_segments"] == 1
+    assert [row.candidate.description for row in result.rows] == [
+        "BLOOD GROUP & RH TYPE",
+        "FIRST VISIT CARDIAC SURGEON",
+    ]
+    assert [row.candidate.quantity for row in result.rows] == [
+        Decimal("1.00"),
+        Decimal("1.00"),
+    ]
+    assert [row.candidate.rate for row in result.rows] == [
+        Decimal("32.00"),
+        Decimal("350.00"),
+    ]
+
+
+def test_compound_quantity_unitprice_header_splits_both_semantic_lanes() -> None:
+    tokens = (
+        token(0, "No", (80, 30, 95, 45)),
+        token(1, "Description", (100, 30, 300, 45)),
+        token(2, "Expiry Date", (500, 30, 620, 45)),
+        token(3, "Quantity UnitPrice", (640, 30, 850, 45)),
+        token(4, "Amount", (880, 30, 970, 45)),
+        token(5, "5575450", (80, 70, 95, 85)),
+        token(6, "NS 100 ML FLEXIDRIP", (100, 70, 390, 85)),
+        token(7, "Aug/2028 1.00", (500, 70, 710, 85)),
+        token(8, "44.93", (780, 70, 840, 85)),
+        token(9, "44.93", (890, 70, 960, 85)),
+        token(10, "5576674", (80, 100, 95, 115)),
+        token(11, "KABICEFTAM 3GM", (100, 100, 360, 115)),
+        token(12, "Aug/2027 3.00", (500, 100, 710, 115)),
+        token(13, "1624.00", (760, 100, 845, 115)),
+        token(14, "4872.00", (880, 100, 960, 115)),
+    )
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 20, 990, 140),
+    )
+    assert [row.candidate.quantity for row in result.rows] == [
+        Decimal("1.00"),
+        Decimal("3.00"),
+    ]
+    assert [row.candidate.rate for row in result.rows] == [
+        Decimal("44.93"),
+        Decimal("1624.00"),
+    ]
+    assert [row.candidate.amount for row in result.rows] == [
+        Decimal("44.93"),
+        Decimal("4872.00"),
+    ]
+
+
+def test_compound_rate_quantity_data_token_splits_both_semantic_values() -> None:
+    tokens = (
+        token(0, "Description", (100, 30, 300, 45)),
+        token(1, "Rate Qty", (600, 30, 760, 45)),
+        token(2, "Amount", (850, 30, 950, 45)),
+        token(3, "SURGICAL BLADE", (100, 70, 350, 85)),
+        token(4, "33.00 1.00", (600, 70, 760, 85)),
+        token(5, "33.00", (870, 70, 940, 85)),
+        token(6, "BED DRY SHEET", (100, 100, 350, 115)),
+        token(7, "-275.00 3.00", (600, 100, 760, 115)),
+        token(8, "-825.00", (860, 100, 940, 115)),
+        token(9, "SODAC INJECTION", (100, 130, 350, 145)),
+        token(10, "35.7620.0", (600, 130, 760, 145)),
+        token(11, "715.20", (860, 130, 940, 145)),
+    )
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 20, 980, 170),
+    )
+    assert [row.candidate.rate for row in result.rows] == [
+        Decimal("33.00"),
+        Decimal("-275.00"),
+        Decimal("35.76"),
+    ]
+    assert [row.candidate.quantity for row in result.rows] == [
+        Decimal("1.00"),
+        Decimal("3.00"),
+        Decimal("20.0"),
+    ]
+    assert not any(row.candidate.validation_flags for row in result.rows)
+
+
+def test_repeated_procedure_header_is_not_published_as_a_charge() -> None:
+    tokens = (
+        token(0, "Item Name", (100, 30, 260, 45)),
+        token(1, "Service Code", (520, 30, 620, 45)),
+        token(2, "Date", (650, 30, 710, 45)),
+        token(3, "Net Amount", (870, 30, 970, 45)),
+        token(4, "MRI Head", (100, 70, 260, 85)),
+        token(5, "RI089", (530, 70, 600, 85)),
+        token(6, "18/01/2026", (650, 70, 750, 85)),
+        token(7, "2475.00", (880, 70, 960, 85)),
+        token(8, "Day Care Procedure", (100, 110, 310, 125)),
+        token(9, "Procedure Name", (100, 140, 280, 155)),
+        token(10, "Service Code", (520, 140, 620, 155)),
+        token(11, "Date", (650, 140, 710, 155)),
+        token(12, "HSN Code Quantity", (720, 140, 850, 155)),
+        token(13, "Net Amount", (870, 140, 970, 155)),
+        token(14, "Urinary Bladder Catheterisation", (100, 180, 400, 195)),
+        token(15, "GP009", (530, 180, 600, 195)),
+        token(16, "19/01/2026", (650, 180, 750, 195)),
+        token(17, "1", (800, 180, 815, 195)),
+        token(18, "630.00", (890, 180, 960, 195)),
+    )
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 20, 990, 220),
+    )
+    assert result.diagnostics["header_segments"] == 2
+    assert [row.candidate.description for row in result.rows] == [
+        "MRI Head RI089",
+        "Urinary Bladder Catheterisation GP009",
+    ]
+    assert result.rows[1].candidate.quantity == Decimal("1")
+    assert result.rows[1].candidate.amount == Decimal("630.00")
+
+
 def test_alphabetic_service_date_is_structured_and_removed_from_description() -> None:
     tokens = (
         token(0, "Description", (100, 30, 420, 45)),
@@ -484,6 +674,34 @@ def test_footer_totals_short_fragments_and_standalone_expiry_are_not_rows() -> N
         for row in result.rows
         if row.candidate.role is RowRole.UNRESOLVED
     ] == ["ExpDate"]
+
+
+def test_item_movement_totals_and_payer_footer_are_not_charges() -> None:
+    tokens = (
+        token(0, "Description", (100, 30, 400, 45)),
+        token(1, "Amount", (850, 30, 950, 45)),
+        token(2, "SURGICAL BLADE", (100, 70, 350, 85)),
+        token(3, "33.00", (870, 70, 940, 85)),
+        token(4, "Item Issues Total", (100, 100, 350, 115)),
+        token(5, "9885.83", (850, 100, 940, 115)),
+        token(6, "Credit From UNITED INDIA INSURANCE", (100, 130, 500, 145)),
+        token(7, "124615.00", (850, 130, 950, 145)),
+        token(8, "Rupees In One Lakh Only", (100, 160, 450, 175)),
+        token(9, "124615.00", (850, 160, 950, 175)),
+        token(10, "Patient Wise Total", (100, 190, 350, 205)),
+        token(11, "0.00", (850, 190, 940, 205)),
+    )
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 20, 980, 230),
+    )
+    assert [
+        row.candidate.description
+        for row in result.rows
+        if row.candidate.role in {RowRole.DETAIL, RowRole.REFUND}
+    ] == ["SURGICAL BLADE"]
 
 
 def test_contact_footer_phone_number_is_metadata_not_a_charge() -> None:

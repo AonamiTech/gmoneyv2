@@ -47,7 +47,8 @@ The demo Compose project exposes the Next.js evidence desk and FastAPI review AP
 port 3100 while keeping model and API diagnostics on loopback. It processes two bills
 concurrently, preserves immutable machine rows, and stores reviewer corrections in a
 revisioned filesystem overlay. Its shared queue lets a fresh browser discover active and
-recent bills without retaining browser-local job IDs. Completed documents are labelled by
+historical bills without retaining browser-local job IDs. Completed documents are
+searchable for 30 days and labelled by
 their evidence-grounded hospital identity; reviewers can correct that identity, service dates,
 rows, and evidence without changing the machine result. The evidence workspace provides an
 independently scrolling ledger plus resize, fit, zoom, focus, and fullscreen page controls.
@@ -57,6 +58,7 @@ GMONEY_IMAGE_TAG=$(git rev-parse --short=12 HEAD) \
   docker compose -f compose.demo.yaml up -d --build
 ```
 
-The demo has no authentication and serves plain HTTP. Uploaded PDFs and derived review
-artifacts are deleted six hours after completion; do not treat it as a production PHI
-system. See [docs/DEMO_DEPLOYMENT_PLAN.md](docs/DEMO_DEPLOYMENT_PLAN.md).
+The demo has no authentication and serves plain HTTP. Uploaded PDFs and full evidence/review
+artifacts are stored on a dedicated data volume and deleted 30 days after their latest
+extraction or review activity; do not treat it as a production PHI system. See
+[docs/DEMO_DEPLOYMENT_PLAN.md](docs/DEMO_DEPLOYMENT_PLAN.md).

@@ -21,6 +21,7 @@ HEADER_TERMS: dict[str, tuple[str, ...]] = {
         "service name",
         "item name",
         "itemname",
+        "procedure name",
         "test name",
         "investigation",
         "services",
@@ -35,7 +36,15 @@ HEADER_TERMS: dict[str, tuple[str, ...]] = {
     "quantity": ("quantity", "qty", "nos", "unit days", "units"),
     "rate": ("unit price", "unitprice", "unit rate", "unitrate", "rate"),
     "discount": ("discount", "disc amt", "disc"),
-    "amount": ("net amount", "total amount", "line total", "amount", "total"),
+    "amount": (
+        "net amount",
+        "total amount",
+        "line total",
+        "amount",
+        "amoun",
+        "amour",
+        "total",
+    ),
 }
 
 DATE_VALUE = (
@@ -278,28 +287,146 @@ def _normalize_orientation(
     return rotated, (0, 0, round(width), round(normalized_height)), orientation, slope
 
 
+def _virtual_horizontal_token(
+    token: OcrToken,
+    start: int,
+    end: int,
+    text_length: int,
+) -> OcrToken:
+    left, top, right, bottom = _bounds(token)
+    span_left = left + (right - left) * start / max(1, text_length)
+    span_right = left + (right - left) * end / max(1, text_length)
+    return token.model_copy(
+        update={
+            "polygon": Polygon(
+                points=(
+                    Point(x=span_left, y=top),
+                    Point(x=span_right, y=top),
+                    Point(x=span_right, y=bottom),
+                    Point(x=span_left, y=bottom),
+                )
+            )
+        }
+    )
+
+
 def _header_roles(line: OcrLine) -> dict[str, OcrToken]:
     roles: dict[str, OcrToken] = {}
     for token in line.tokens:
         normalized = _normalize(token.text)
-        best: tuple[int, str] | None = None
+        matches: dict[str, tuple[int, int, int]] = {}
         for role, terms in HEADER_TERMS.items():
             for term in terms:
                 normalized_term = _normalize(term)
-                if normalized_term and normalized_term in normalized:
-                    candidate = (len(normalized_term), role)
-                    if best is None or candidate > best:
-                        best = candidate
-        if best:
-            role = best[1]
+                if not normalized_term:
+                    continue
+                if len(normalized_term) <= 4 and " " not in normalized_term:
+                    match = re.search(
+                        rf"(?<![a-z0-9]){re.escape(normalized_term)}(?![a-z0-9])",
+                        normalized,
+                    )
+                    start = match.start() if match else -1
+                else:
+                    start = normalized.find(normalized_term)
+                if normalized_term and start >= 0:
+                    candidate = (len(normalized_term), start, start + len(normalized_term))
+                    if role not in matches or candidate > matches[role]:
+                        matches[role] = candidate
+        compound = len(matches) > 1
+        for role, (_, start, end) in matches.items():
+            role_token = (
+                _virtual_horizontal_token(token, start, end, len(normalized))
+                if compound
+                else token
+            )
             if role != "amount" or role not in roles or _center_x(token) > _center_x(roles[role]):
-                roles[role] = token
+                roles[role] = role_token
     return roles
 
 
 def _is_header_token(token: OcrToken) -> bool:
     normalized = _normalize(token.text)
-    return any(normalized == _normalize(term) for terms in HEADER_TERMS.values() for term in terms)
+    if any(
+        normalized == _normalize(term)
+        for terms in HEADER_TERMS.values()
+        for term in terms
+    ):
+        return True
+    if len(_header_roles(OcrLine((token,)))) > 1:
+        return True
+    if " " not in normalized:
+        return False
+    terms = sorted(
+        {
+            _normalize(term)
+            for role_terms in HEADER_TERMS.values()
+            for term in role_terms
+            if _normalize(term)
+        },
+        key=len,
+        reverse=True,
+    )
+    remainder = normalized
+    matched = False
+    for term in terms:
+        if term in remainder:
+            remainder = remainder.replace(term, " ")
+            matched = True
+    return matched and not re.sub(r"[^a-z0-9]+", "", remainder)
+
+
+def _valid_header(roles: dict[str, OcrToken]) -> bool:
+    return "description" in roles and bool({"amount", "rate", "quantity"} & roles.keys())
+
+
+def _valid_header_line(line: OcrLine, roles: dict[str, OcrToken]) -> bool:
+    """Reject ledger totals that happen to contain header vocabulary."""
+    normalized = _normalize(" ".join(token.text for token in line.tokens))
+    return _valid_header(roles) and not normalized.startswith(
+        ("total for", "sub total", "subtotal", "grand total")
+    )
+
+
+def _column_centers(
+    roles: dict[str, OcrToken],
+    *,
+    left: float,
+    width: float,
+) -> dict[str, float]:
+    return {role: (_center_x(token) - left) / width for role, token in roles.items()}
+
+
+def _description_lane(
+    centers: dict[str, float],
+    stable_centers: tuple[float, ...],
+    table_type: TableType,
+) -> tuple[float, float | None]:
+    description_center = centers.get("description")
+    financial_centers = tuple(
+        center
+        for center in stable_centers
+        if (center >= 0.55 if description_center is None else center > description_center + 0.04)
+    )
+    labeled_financial_centers = tuple(
+        centers[role]
+        for role in ("rate", "quantity", "discount", "amount")
+        if role in centers
+    )
+    first_numeric_center = (
+        min(labeled_financial_centers)
+        if labeled_financial_centers
+        else (min(financial_centers) if financial_centers else centers.get("amount"))
+    )
+    description_min = 0.0
+    description_max = first_numeric_center
+    if table_type is TableType.PHARMACY:
+        description_min = min(stable_centers, default=0.02) + 0.015
+        description_max = min(
+            centers.get("company", 1.0) - 0.03,
+            centers.get("batch", 1.0) - 0.05,
+            first_numeric_center or 1.0,
+        )
+    return description_min, description_max
 
 
 def _numeric_tokens(line: OcrLine) -> list[tuple[OcrToken, Decimal]]:
@@ -309,18 +436,54 @@ def _numeric_tokens(line: OcrLine) -> list[tuple[OcrToken, Decimal]]:
         if value is not None:
             output.append((token, value))
             continue
-        currency_parts = tuple(re.finditer(r"[+-]?\d[\d,]*\.\d{2}", token.text))
-        parts = (
-            currency_parts
-            if len(currency_parts) >= 2
-            else tuple(re.finditer(r"[+-]?\d[\d,]*(?:\.\d{1,4})?", token.text))
+        expiry_quantity = re.search(
+            r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)/\d{4}\s*"
+            r"(?P<quantity>[+-]?\d+(?:\.\d{1,4})?)\s*$",
+            token.text,
+            re.IGNORECASE,
         )
-        if len(parts) < 2:
+        if expiry_quantity is not None:
+            parsed = parse_decimal(expiry_quantity.group("quantity"))
+            if parsed is not None:
+                output.append(
+                    (
+                        _virtual_horizontal_token(
+                            token,
+                            expiry_quantity.start("quantity"),
+                            expiry_quantity.end("quantity"),
+                            len(token.text),
+                        ),
+                        parsed,
+                    )
+                )
+                continue
+        concatenated = re.fullmatch(
+            r"(?P<first>[+-]?\d[\d,]*\.\d{2})(?P<second>\d+(?:\.\d{1,4})?)",
+            token.text.strip(),
+        )
+        if concatenated is not None:
+            spans = tuple(
+                (
+                    concatenated.group(name),
+                    concatenated.start(name),
+                    concatenated.end(name),
+                )
+                for name in ("first", "second")
+            )
+        else:
+            currency_parts = tuple(re.finditer(r"[+-]?\d[\d,]*\.\d{2}", token.text))
+            parts = (
+                currency_parts
+                if len(currency_parts) >= 2
+                else tuple(re.finditer(r"[+-]?\d[\d,]*(?:\.\d{1,4})?", token.text))
+            )
+            spans = tuple((part.group(), part.start(), part.end()) for part in parts)
+        if len(spans) < 2:
             continue
         left, top, right, bottom = _bounds(token)
         text_length = max(1, len(token.text))
-        for part in parts:
-            parsed = parse_decimal(part.group())
+        for text, start, end in spans:
+            parsed = parse_decimal(text)
             if parsed is None:
                 continue
             # OCR occasionally merges adjacent numeric cells (for example,
@@ -328,8 +491,8 @@ def _numeric_tokens(line: OcrLine) -> list[tuple[OcrToken, Decimal]]:
             # span's horizontal geometry so the rightmost printed value keeps
             # its column identity. The original token ID is deliberately kept
             # and resolves back to the untouched source polygon for evidence.
-            span_left = left + (right - left) * part.start() / text_length
-            span_right = left + (right - left) * part.end() / text_length
+            span_left = left + (right - left) * start / text_length
+            span_right = left + (right - left) * end / text_length
             virtual = token.model_copy(
                 update={
                     "polygon": Polygon(
@@ -559,8 +722,10 @@ def _is_metadata_description(description: str) -> bool:
                 "e mail",
                 "phone no",
                 "mobile no",
+                "credit fro",
             )
         )
+        or normalized.startswith("rupees in")
         or normalized in {"cgst", "sgst", "net bill", "upi", "expdate", "exp date"}
         or normalized.endswith(" admission")
         or normalized.endswith(" discharge")
@@ -607,6 +772,12 @@ def _is_total_description(normalized: str) -> bool:
                 "patient balance",
                 "cgst amount",
                 "sgst amount",
+                "item issue total",
+                "item issues total",
+                "item return total",
+                "item returns total",
+                "patient wise total",
+                "company wise total",
             )
         )
     )
@@ -651,14 +822,23 @@ def _closest_numeric(
     target: float | None,
     left: float,
     width: float,
-    used: set[str],
+    used: set[tuple[str, float, Decimal]],
 ) -> tuple[OcrToken, Decimal] | None:
-    available = [(token, value) for token, value in numeric if token.token_id not in used]
+    available = [
+        (token, value)
+        for token, value in numeric
+        if _numeric_identity(token, value) not in used
+    ]
     if not available:
         return None
     if target is None:
         return max(available, key=lambda item: _center_x(item[0]))
     return min(available, key=lambda item: abs(((_center_x(item[0]) - left) / width) - target))
+
+
+def _numeric_identity(token: OcrToken, value: Decimal) -> tuple[str, float, Decimal]:
+    """Identify a numeric span while retaining its original OCR evidence ID."""
+    return token.token_id, round(_center_x(token), 6), value
 
 
 def reconstruct_ocr_rows(
@@ -681,18 +861,41 @@ def reconstruct_ocr_rows(
         return ReconstructionResult((), None, {"ocr_line_count": 0, "ocr_row_count": 0})
 
     header_candidates = [(index, _header_roles(line)) for index, line in enumerate(lines)]
-    header_index, header_roles = max(header_candidates, key=lambda item: (len(item[1]), -item[0]))
-    header_valid = "description" in header_roles and bool(
-        {"amount", "rate", "quantity"} & header_roles.keys()
-    )
+    header_roles_by_index = dict(header_candidates)
+    valid_header_candidates = [
+        item
+        for item in header_candidates
+        if _valid_header_line(lines[item[0]], item[1])
+    ]
+    if valid_header_candidates:
+        header_index, header_roles = min(valid_header_candidates, key=lambda item: item[0])
+    else:
+        header_index, header_roles = max(
+            header_candidates,
+            key=lambda item: (len(item[1]), -item[0]),
+        )
+    header_valid = _valid_header(header_roles)
     data_lines = lines[header_index + 1 :] if header_valid else lines
-    stable_centers = _stable_numeric_centers(data_lines, left, width)
+    repeated_header_indexes = tuple(
+        index
+        for index, roles in header_candidates
+        if header_valid
+        and index > header_index
+        and _valid_header_line(lines[index], roles)
+    )
+    first_segment_end = repeated_header_indexes[0] if repeated_header_indexes else len(lines)
+    first_segment_lines = (
+        lines[header_index + 1 : first_segment_end] if header_valid else data_lines
+    )
+    stable_centers = _stable_numeric_centers(first_segment_lines, left, width)
 
-    detected_centers = {
-        role: (_center_x(token) - left) / width
-        for role, token in header_roles.items()
-        if header_valid or role in {"company", "batch", "expiry"}
-    }
+    detected_centers = _column_centers(header_roles, left=left, width=width)
+    if not header_valid:
+        detected_centers = {
+            role: center
+            for role, center in detected_centers.items()
+            if role in {"company", "batch", "expiry"}
+        }
     column_centers: dict[str, float] = dict(detected_centers)
     inherited = False
     if not header_valid and prior_schemas:
@@ -736,6 +939,7 @@ def reconstruct_ocr_rows(
         has_ledger_header=header_valid,
         zero_tail_summary=zero_tail_summary,
     )
+    has_tax_columns = bool(re.search(r"\b(?:gst|tax)\b", _normalize(table_text)))
     header_ids = tuple(
         token.token_id for token in (lines[header_index].tokens if header_valid else ())
     )
@@ -752,35 +956,37 @@ def reconstruct_ocr_rows(
         )
 
     amount_center = column_centers.get("amount")
-    description_center = column_centers.get("description")
-    financial_centers = tuple(
-        center
-        for center in stable_centers
-        if (center >= 0.55 if description_center is None else center > description_center + 0.04)
+    description_min, description_max = _description_lane(
+        column_centers,
+        stable_centers,
+        table_type,
     )
-    labeled_financial_centers = tuple(
-        column_centers[role]
-        for role in ("rate", "quantity", "discount", "amount")
-        if role in column_centers
-    )
-    first_numeric_center = (
-        min(labeled_financial_centers)
-        if labeled_financial_centers
-        else (min(financial_centers) if financial_centers else amount_center)
-    )
-    description_min = 0.0
-    description_max = first_numeric_center
-    if table_type is TableType.PHARMACY:
-        description_min = min(stable_centers, default=0.02) + 0.015
-        description_max = min(
-            column_centers.get("company", 1.0) - 0.03,
-            column_centers.get("batch", 1.0) - 0.05,
-            first_numeric_center or 1.0,
-        )
     aligned: list[AlignedLedgerRow] = []
     pending_description_tokens: list[OcrToken] = []
     current_section: str | None = None
     for source_row, line in enumerate(data_lines, start=(header_index + 1 if header_valid else 0)):
+        repeated_roles = header_roles_by_index.get(source_row, {})
+        if _valid_header_line(line, repeated_roles):
+            next_header = next(
+                (index for index in repeated_header_indexes if index > source_row),
+                len(lines),
+            )
+            segment_stable_centers = _stable_numeric_centers(
+                lines[source_row + 1 : next_header],
+                left,
+                width,
+            )
+            column_centers = _column_centers(repeated_roles, left=left, width=width)
+            if segment_stable_centers:
+                column_centers["amount"] = segment_stable_centers[-1]
+            stable_centers = segment_stable_centers
+            amount_center = column_centers.get("amount")
+            description_min, description_max = _description_lane(
+                column_centers,
+                stable_centers,
+                table_type,
+            )
+            continue
         numeric = _numeric_tokens(line)
         amount_pair = _closest_numeric(numeric, amount_center, left, width, set())
         amount_token = amount_pair[0] if amount_pair else None
@@ -903,7 +1109,7 @@ def reconstruct_ocr_rows(
             continue
 
         assert amount_token is not None and amount is not None
-        used = {amount_token.token_id}
+        used = {_numeric_identity(amount_token, amount)}
         field_tokens: dict[str, tuple[str, ...]] = {
             "description": tuple(token.token_id for token in description_tokens),
             "amount": (amount_token.token_id,),
@@ -935,7 +1141,7 @@ def reconstruct_ocr_rows(
             token, value = pair
             if abs(((_center_x(token) - left) / width) - target) > 0.06:
                 continue
-            used.add(token.token_id)
+            used.add(_numeric_identity(token, value))
             field_tokens[role] = (token.token_id,)
             values[role] = value
 
@@ -970,6 +1176,17 @@ def reconstruct_ocr_rows(
             role = RowRole.DETAIL
         if amount < 0 and role is RowRole.DETAIL:
             role = RowRole.REFUND
+        validation_flags: list[str] = []
+        if "quantity" in column_centers and values["quantity"] is None:
+            validation_flags.append("missing_labeled_quantity")
+        if "rate" in column_centers and values["rate"] is None:
+            validation_flags.append("missing_labeled_unit_price")
+        if values["quantity"] is not None and values["rate"] is not None and not has_tax_columns:
+            expected_amount = values["quantity"] * values["rate"]
+            if values["discount"] is not None:
+                expected_amount -= values["discount"]
+            if abs(expected_amount - amount) > Decimal("0.01"):
+                validation_flags.append("line_arithmetic_mismatch")
         candidate = CandidateLedgerRow(
             source_row=source_row,
             role=role,
@@ -988,6 +1205,7 @@ def reconstruct_ocr_rows(
                 or row_category(current_section or "", table_type)
             ),
             source_route="ocr_spatial_graph",
+            validation_flags=tuple(validation_flags),
         )
         evidence_tokens = tuple(
             dict.fromkeys(token_id for ids in field_tokens.values() for token_id in ids)
@@ -1024,6 +1242,7 @@ def reconstruct_ocr_rows(
             "deskew_slope": deskew_slope,
             "table_type": table_type.value,
             "column_centers": column_centers,
+            "header_segments": 1 + len(repeated_header_indexes) if header_valid else 0,
         },
     )
 

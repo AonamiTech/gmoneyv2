@@ -11,12 +11,21 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
-ACTIVE_STATUSES = {"queued", "processing"}
+ACTIVE_STATUSES = {"uploading", "queued", "processing"}
 TERMINAL_STATUSES = {"complete", "failed"}
 
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
+def parse_utc(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+def utc_text(value: datetime) -> str:
+    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
 class ReviewRevisionConflict(RuntimeError):
@@ -152,6 +161,29 @@ class JobStore:
                 state.update(status="queued", error=None, page=0)
                 self.write(state["id"], state)
 
+    def last_activity(self, job_id: str, state: dict[str, Any] | None = None) -> datetime:
+        current = state or self.read(job_id)
+        updated = parse_utc(str(current["updated_at"]))
+        review_path = self.job_dir(job_id) / "review.json"
+        if review_path.is_file():
+            try:
+                review_updated = parse_utc(str(json.loads(review_path.read_text())["updated_at"]))
+                updated = max(updated, review_updated)
+            except (KeyError, OSError, json.JSONDecodeError, ValueError):
+                pass
+        return updated
+
+    def expires_at(
+        self,
+        job_id: str,
+        retention_hours: int,
+        state: dict[str, Any] | None = None,
+    ) -> str | None:
+        current = state or self.read(job_id)
+        if current.get("status") not in TERMINAL_STATUSES:
+            return None
+        return utc_text(self.last_activity(job_id, current) + timedelta(hours=retention_hours))
+
     def delete(self, job_id: str) -> None:
         state = self.read(job_id)
         if state.get("status") in ACTIVE_STATUSES:
@@ -159,21 +191,14 @@ class JobStore:
         shutil.rmtree(self.job_dir(job_id))
 
     def cleanup(self, retention_hours: int) -> int:
+        if retention_hours <= 0:
+            raise ValueError("retention_hours must be positive")
         cutoff = datetime.now(UTC) - timedelta(hours=retention_hours)
         removed = 0
         for state in self.states():
             if state.get("status") in ACTIVE_STATUSES:
                 continue
-            updated = datetime.fromisoformat(state["updated_at"].replace("Z", "+00:00"))
-            review_path = self.job_dir(state["id"]) / "review.json"
-            if review_path.is_file():
-                try:
-                    review_updated = datetime.fromisoformat(
-                        json.loads(review_path.read_text())["updated_at"].replace("Z", "+00:00")
-                    )
-                    updated = max(updated, review_updated)
-                except (KeyError, OSError, json.JSONDecodeError, ValueError):
-                    pass
+            updated = self.last_activity(state["id"], state)
             if updated < cutoff:
                 shutil.rmtree(self.job_dir(state["id"]), ignore_errors=True)
                 removed += 1

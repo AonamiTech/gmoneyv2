@@ -46,6 +46,7 @@ gmoney-layout-bakeoff = "gmoney.inference.layout_bakeoff:app"
 gmoney-ocr-fallback = "gmoney.inference.ocr_fallback_cli:app"
 gmoney-offline-extract = "gmoney.extraction.offline:app"
 gmoney-demo-worker = "gmoney.demo.worker:main"
+gmoney-demo-import = "gmoney.demo.import_history:app"
 gmoney-profiles = "gmoney.profiles.cli:app"
 gmoney-phase3-evaluate = "gmoney.evaluation.phase3_cli:app"
 

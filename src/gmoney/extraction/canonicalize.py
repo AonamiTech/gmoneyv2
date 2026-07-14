@@ -152,7 +152,7 @@ def canonicalize_rows(
                 field_evidence=field_evidence,
                 candidate_ids=(f"candidate-{identity}",),
                 source_routes=row.source_routes,
-                validation_flags=(),
+                validation_flags=candidate.validation_flags,
             )
         )
     return tuple(output)

@@ -247,21 +247,28 @@ def _deduplicate(rows: list[CanonicalRow]) -> list[CanonicalRow]:
     selected: dict[tuple[object, ...], CanonicalRow] = {}
     for row in rows:
         description = re.sub(r"[^a-z0-9]+", " ", (row.description or "").casefold()).strip()
-        amount_evidence_ids = tuple(
+        description_evidence_ids = tuple(
             sorted(
                 token_id
-                for evidence in row.field_evidence.get("amount", ())
+                for evidence in row.field_evidence.get("description", ())
                 for token_id in evidence.token_ids
             )
         )
-        key = (row.page_number, row.net_amount, amount_evidence_ids or description)
+        key = (
+            row.page_number,
+            ("description_evidence", description_evidence_ids)
+            if description_evidence_ids
+            else ("fallback", row.net_amount, description),
+        )
         current = selected.get(key)
         score = (
+            not row.validation_flags,
             "ocr_spatial_graph" in row.source_routes,
             len(row.field_evidence),
             len(description),
         )
         current_score = (
+            bool(current and not current.validation_flags),
             bool(current and "ocr_spatial_graph" in current.source_routes),
             len(current.field_evidence) if current else -1,
             len(current.description or "") if current else -1,

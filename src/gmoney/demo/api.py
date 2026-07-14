@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 from contextlib import suppress
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -28,12 +29,21 @@ from gmoney.demo.review import (
     reviewer_row,
     structural_issues,
 )
-from gmoney.demo.store import JobStore, ReviewRevisionConflict, utc_now
+from gmoney.demo.store import (
+    ACTIVE_STATUSES,
+    TERMINAL_STATUSES,
+    JobStore,
+    ReviewRevisionConflict,
+    utc_now,
+    utc_text,
+)
 
 MAX_UPLOAD_BYTES = int(os.environ.get("GMONEY_MAX_UPLOAD_BYTES", str(25 * 1024 * 1024)))
 MAX_ACTIVE_JOBS = int(os.environ.get("GMONEY_MAX_ACTIVE_JOBS", "20"))
 MAX_PDF_PAGES = int(os.environ.get("GMONEY_MAX_PDF_PAGES", "200"))
 WORKER_CAPACITY = int(os.environ.get("GMONEY_WORKER_CAPACITY", "2"))
+RETENTION_HOURS = int(os.environ.get("GMONEY_RETENTION_HOURS", "720"))
+MIN_FREE_BYTES = int(os.environ.get("GMONEY_MIN_FREE_BYTES", "0"))
 DEMO_ROOT = Path(os.environ.get("GMONEY_DEMO_ROOT", "/tmp/gmoney-v2-demo"))
 store = JobStore(DEMO_ROOT)
 
@@ -116,6 +126,8 @@ def _public_state(state: dict[str, Any]) -> dict[str, Any]:
         if hospital_override:
             public["hospital_name"] = hospital_override["name"]
             public["hospital_name_source"] = "reviewer"
+    public["last_activity_at"] = utc_text(store.last_activity(state["id"], state))
+    public["expires_at"] = store.expires_at(state["id"], RETENTION_HOURS, state)
     return public
 
 
@@ -200,11 +212,16 @@ def live() -> dict[str, str]:
 
 @app.get("/api/v2/health/ready", tags=["health"])
 def ready() -> dict[str, Any]:
+    storage = shutil.disk_usage(store.jobs_root)
     return {
         "status": "ready",
         "active_jobs": store.active_count(),
         "worker_capacity": WORKER_CAPACITY,
         "queue_capacity": MAX_ACTIVE_JOBS,
+        "retention_hours": RETENTION_HOURS,
+        "storage_total_bytes": storage.total,
+        "storage_free_bytes": storage.free,
+        "storage_min_free_bytes": MIN_FREE_BYTES,
     }
 
 
@@ -214,6 +231,11 @@ async def create_document(
 ) -> dict[str, Any]:
     if store.active_count() >= MAX_ACTIVE_JOBS:
         raise HTTPException(status_code=429, detail="Demo queue is full")
+    if MIN_FREE_BYTES and shutil.disk_usage(store.jobs_root).free < MIN_FREE_BYTES:
+        raise HTTPException(
+            status_code=507,
+            detail="Evidence storage is below its safe free-space threshold",
+        )
     if not (file.filename or "").casefold().endswith(".pdf"):
         raise HTTPException(status_code=415, detail="Only PDF files are accepted")
 
@@ -259,18 +281,46 @@ async def create_document(
 @app.get("/api/v2/documents")
 def list_documents(
     limit: Annotated[int, Query(ge=1, le=200)] = 100,
+    offset: Annotated[int, Query(ge=0)] = 0,
+    scope: Annotated[Literal["active", "history", "all"], Query()] = "all",
+    query: Annotated[str | None, Query(max_length=200)] = None,
     document_status: Annotated[
         Literal["uploading", "queued", "processing", "complete", "failed"] | None,
         Query(alias="status"),
     ] = None,
 ) -> dict[str, Any]:
     states = store.states()
+    if scope == "active":
+        states = [state for state in states if state.get("status") in ACTIVE_STATUSES]
+    elif scope == "history":
+        states = [state for state in states if state.get("status") in TERMINAL_STATUSES]
     if document_status is not None:
         states = [state for state in states if state.get("status") == document_status]
-    states.sort(key=lambda state: str(state.get("created_at") or ""), reverse=True)
+    documents = [_public_state(state) for state in states]
+    if query:
+        needle = query.casefold().strip()
+        documents = [
+            document
+            for document in documents
+            if needle in str(document.get("original_name") or "").casefold()
+            or needle in str(document.get("hospital_name") or "").casefold()
+        ]
+    documents.sort(
+        key=lambda document: str(
+            document.get("last_activity_at")
+            or document.get("updated_at")
+            or document.get("created_at")
+            or ""
+        ),
+        reverse=True,
+    )
+    total = len(documents)
     return {
-        "total": len(states),
-        "documents": [_public_state(state) for state in states[:limit]],
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "has_more": offset + limit < total,
+        "documents": documents[offset : offset + limit],
     }
 
 

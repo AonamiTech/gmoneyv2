@@ -44,7 +44,7 @@ def main() -> None:
     root = Path(os.environ.get("GMONEY_DEMO_ROOT", "/tmp/gmoney-v2-demo"))
     vl_url = os.environ.get("GMONEY_VL_URL", "http://paddleocr-vl:8111")
     concurrency = int(os.environ.get("GMONEY_WORKER_CONCURRENCY", "3"))
-    retention_hours = int(os.environ.get("GMONEY_RETENTION_HOURS", "6"))
+    retention_hours = int(os.environ.get("GMONEY_RETENTION_HOURS", "720"))
     store = JobStore(root)
     store.recover()
     futures: dict[Future[dict[str, Any]], str] = {}
