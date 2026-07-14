@@ -234,6 +234,24 @@ async def create_document(
         await file.close()
 
 
+@app.get("/api/v2/documents")
+def list_documents(
+    limit: Annotated[int, Query(ge=1, le=200)] = 100,
+    document_status: Annotated[
+        Literal["uploading", "queued", "processing", "complete", "failed"] | None,
+        Query(alias="status"),
+    ] = None,
+) -> dict[str, Any]:
+    states = store.states()
+    if document_status is not None:
+        states = [state for state in states if state.get("status") == document_status]
+    states.sort(key=lambda state: str(state.get("created_at") or ""), reverse=True)
+    return {
+        "total": len(states),
+        "documents": [_public_state(state) for state in states[:limit]],
+    }
+
+
 @app.get("/api/v2/documents/{job_id}")
 def get_document(job_id: str) -> dict[str, Any]:
     return _public_state(_state_or_404(job_id))

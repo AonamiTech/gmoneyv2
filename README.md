@@ -46,7 +46,8 @@ See [phase-3-plan.md](phase-3-plan.md) and
 The demo Compose project exposes the Next.js evidence desk and FastAPI review API on
 port 3100 while keeping model and API diagnostics on loopback. It processes two bills
 concurrently, preserves immutable machine rows, and stores reviewer corrections in a
-revisioned filesystem overlay.
+revisioned filesystem overlay. Its shared queue lets a fresh browser discover active and
+recent bills without retaining browser-local job IDs.
 
 ```bash
 GMONEY_IMAGE_TAG=$(git rev-parse --short=12 HEAD) \

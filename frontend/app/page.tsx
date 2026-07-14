@@ -20,6 +20,7 @@ type Job = {
   row_count: number | null;
   error: string | null;
 };
+type JobsResult = { total: number; documents: Job[] };
 type Point = { x: number; y: number };
 type Evidence = {
   page_number: number;
@@ -93,8 +94,6 @@ type EditValues = {
   review_disposition: string;
 };
 
-const JOBS_KEY = "gmoney-demo-jobs-v2";
-const LEGACY_JOB_KEY = "gmoney-demo-job";
 const PAGE_SIZE = 150;
 const emptyEdit: EditValues = {
   description: "",
@@ -169,70 +168,35 @@ export default function Home() {
   const pageAsset = rowsResult?.page_assets.find((asset) => asset.page_number === viewPage);
   const activeJobs = jobs.filter((job) => ["queued", "processing"].includes(job.status));
 
-  const remember = useCallback((next: Job[]) => {
-    const ids = next.map((job) => job.id).slice(0, 20);
-    localStorage.setItem(JOBS_KEY, JSON.stringify(ids));
+  const replaceJobs = useCallback((updater: (current: Job[]) => Job[]) => {
+    setJobs(updater);
   }, []);
-
-  const replaceJobs = useCallback(
-    (updater: (current: Job[]) => Job[]) => {
-      setJobs((current) => {
-        const next = updater(current);
-        remember(next);
-        return next;
-      });
-    },
-    [remember],
-  );
 
   const refreshHealth = useCallback(() => {
     request<Health>("/api/v2/health/ready").then(setHealth).catch(() => setHealth(null));
   }, []);
 
-  const refreshJobs = useCallback(async (ids?: string[]) => {
-    const targets = ids ?? jobs.map((job) => job.id);
-    if (!targets.length) return;
-    const states = await Promise.all(
-      targets.map((id) => request<Job>(`/api/v2/documents/${id}`).catch(() => null)),
-    );
-    const live = states.filter((state): state is Job => state !== null);
+  const refreshJobs = useCallback(async () => {
+    const result = await request<JobsResult>("/api/v2/documents?limit=100");
+    const live = result.documents;
     setJobs(live);
-    remember(live);
     setSelectedJobId((current) =>
       current && live.some((job) => job.id === current) ? current : (live[0]?.id ?? null),
     );
-  }, [jobs, remember]);
-
-  useEffect(() => {
-    let ids: string[] = [];
-    try {
-      ids = JSON.parse(localStorage.getItem(JOBS_KEY) ?? "[]") as string[];
-    } catch {
-      localStorage.removeItem(JOBS_KEY);
-    }
-    const legacy = localStorage.getItem(LEGACY_JOB_KEY);
-    if (legacy && !ids.includes(legacy)) ids.unshift(legacy);
-    localStorage.removeItem(LEGACY_JOB_KEY);
-    if (ids.length) void refreshJobs(ids);
-    refreshHealth();
-    // Initial hydration deliberately runs once using the persisted UUID set.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
-    if (!activeJobs.length) return;
+    void refreshJobs().catch(() => setError("The shared bill list could not be loaded."));
+    refreshHealth();
+  }, [refreshHealth, refreshJobs]);
+
+  useEffect(() => {
     const poll = window.setInterval(() => {
-      void Promise.all(
-        activeJobs.map((job) =>
-          request<Job>(`/api/v2/documents/${job.id}`).then((state) => {
-            replaceJobs((current) => current.map((item) => (item.id === state.id ? state : item)));
-          }),
-        ),
-      );
+      void refreshJobs().catch(() => undefined);
       refreshHealth();
-    }, 1500);
+    }, 3000);
     return () => window.clearInterval(poll);
-  }, [activeJobs, refreshHealth, replaceJobs]);
+  }, [refreshHealth, refreshJobs]);
 
   const loadWorkspace = useCallback(async () => {
     if (!selectedJob || selectedJob.status !== "complete") return;
@@ -293,6 +257,7 @@ export default function Home() {
         );
         replaceJobs((current) => [...uploaded, ...current.filter((job) => !uploaded.some((item) => item.id === job.id))]);
         setSelectedJobId(uploaded[0].id);
+        void refreshJobs();
         refreshHealth();
       } catch (cause) {
         setError(cause instanceof Error ? cause.message : "Upload failed");
@@ -300,7 +265,7 @@ export default function Home() {
         setUploading(false);
       }
     },
-    [refreshHealth, replaceJobs],
+    [refreshHealth, refreshJobs, replaceJobs],
   );
 
   const acceptFiles = (event: ChangeEvent<HTMLInputElement>) => {
@@ -491,7 +456,7 @@ export default function Home() {
   return (
     <main>
       <div className="risk-ribbon">
-        Public HTTP demo · no login · uploads are unencrypted and removed six hours after completion
+        Public HTTP demo · no login · shared bill list · uploads are unencrypted and removed after six hours
       </div>
       <header className="masthead">
         <div className="brand-mark">G</div>
@@ -515,7 +480,7 @@ export default function Home() {
             <div className="proof-strip">
               <div><b>300</b><span>DPI evidence</span></div>
               <div><b>2×</b><span>parallel lanes</span></div>
-              <div><b>6h</b><span>private cleanup</span></div>
+              <div><b>6h</b><span>automatic cleanup</span></div>
             </div>
           </div>
           <label
@@ -555,7 +520,7 @@ export default function Home() {
                 </button>
               ))}
             </div>
-            <div className="rail-note">UUID-scoped · no public document listing</div>
+            <div className="rail-note">Shared demo queue · completed bills retained for six hours</div>
           </aside>
 
           <div className="desk-main">

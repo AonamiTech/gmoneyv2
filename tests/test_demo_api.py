@@ -25,7 +25,7 @@ def pdf_bytes(pages: int = 1) -> bytes:
     return payload
 
 
-def test_pdf_upload_status_and_no_listing_endpoint(tmp_path: Path, monkeypatch) -> None:
+def test_pdf_upload_status_and_shared_listing_endpoint(tmp_path: Path, monkeypatch) -> None:
     client, store = client_for(tmp_path, monkeypatch)
     response = client.post(
         "/api/v2/documents",
@@ -36,7 +36,9 @@ def test_pdf_upload_status_and_no_listing_endpoint(tmp_path: Path, monkeypatch) 
     assert payload["status"] == "queued"
     assert (store.job_dir(payload["id"]) / "source.pdf").read_bytes().startswith(b"%PDF-")
     assert client.get(f"/api/v2/documents/{payload['id']}").status_code == 200
-    assert client.get("/api/v2/documents").status_code == 405
+    listing = client.get("/api/v2/documents")
+    assert listing.status_code == 200
+    assert listing.json()["documents"][0]["id"] == payload["id"]
 
 
 def test_upload_rejects_extension_signature_and_oversize(tmp_path: Path, monkeypatch) -> None:
@@ -295,6 +297,40 @@ def test_active_job_cannot_be_deleted(tmp_path: Path, monkeypatch) -> None:
     assert client.delete(f"/api/v2/documents/{state['id']}").status_code == 409
     store.update(state["id"], status="failed")
     assert client.delete(f"/api/v2/documents/{state['id']}").status_code == 204
+
+
+def test_documents_can_be_discovered_in_newest_first_shared_queue(
+    tmp_path: Path, monkeypatch
+) -> None:
+    client, store = client_for(tmp_path, monkeypatch)
+    first = store.create("first.pdf")
+    second = store.create("second.pdf")
+    store.update(first["id"], status="complete", row_count=3)
+    store.update(second["id"], status="queued")
+
+    response = client.get("/api/v2/documents", params={"limit": 1})
+    assert response.status_code == 200
+    assert response.json()["total"] == 2
+    assert response.json()["documents"] == [
+        {
+            key: store.read(second["id"]).get(key)
+            for key in (
+                "id",
+                "status",
+                "original_name",
+                "created_at",
+                "updated_at",
+                "page",
+                "pages",
+                "row_count",
+                "error",
+            )
+        }
+    ]
+
+    queued = client.get("/api/v2/documents", params={"status": "queued"}).json()
+    assert queued["total"] == 1
+    assert queued["documents"][0]["id"] == second["id"]
 
 
 def test_worker_restart_requeues_interrupted_job(tmp_path: Path) -> None:

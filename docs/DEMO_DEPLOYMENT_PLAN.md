@@ -18,14 +18,14 @@ unseen-hospital Phase 3 checkpoint gate.
   revisioned review, approval, export, and delete APIs.
 - Use an atomic filesystem queue and two reusable worker processes with content-addressed stage
   caches. Recover interrupted jobs after restart.
-- Provide a Next.js review desk with a browser-local document queue, two visible
+- Provide a Next.js review desk with a shared server-backed document queue, two visible
   inference lanes, row filtering, original-versus-corrected values, evidence relinking,
   reviewer-added rows, structural issue resolution, approval, and CSV/JSON/evidence exports.
 - Preserve immutable machine output and store reviewer changes in an atomic revisioned overlay.
-  Authentication, a global document list, PostgreSQL, and Temporal remain outside this demo.
-- Accept only PDF files up to 25 MiB, cap the queue at 20 jobs, never list documents, never expose
-  raw OCR/VLM diagnostics or paths, reject documents over 200 pages, and delete demo artifacts
-  after six hours.
+  Authentication, PostgreSQL, and Temporal remain outside this demo.
+- Accept only PDF files up to 25 MiB, cap the queue at 20 jobs, expose the shared recent-document
+  list required for the demo, never expose raw OCR/VLM diagnostics or paths, reject documents over
+  200 pages, and delete demo artifacts after six hours.
 
 ## Side-by-side deployment
 
