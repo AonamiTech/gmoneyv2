@@ -33,6 +33,15 @@ def is_implausibly_low_yield(reconstruction: ReconstructionResult) -> bool:
     return 0 < row_count <= 2 and line_count >= 12 and row_count / line_count < 0.2
 
 
+def is_terminal_non_ledger(reconstruction: ReconstructionResult) -> bool:
+    table_type = (
+        reconstruction.schema.table_type.value
+        if reconstruction.schema is not None
+        else reconstruction.diagnostics.get("table_type")
+    )
+    return table_type in {TableType.METADATA.value, TableType.PAYMENT.value}
+
+
 def decide_recovery(
     reconstruction: ReconstructionResult,
     *,
@@ -41,18 +50,19 @@ def decide_recovery(
     profile_match: ProfileMatch | None = None,
 ) -> RouteDecision:
     reasons: list[RecoveryReason] = []
-    if not reconstruction.rows:
-        reasons.append(RecoveryReason.ZERO_YIELD)
-    elif is_implausibly_low_yield(reconstruction):
-        reasons.append(RecoveryReason.LOW_YIELD)
-    if reconstruction.schema is None:
-        reasons.append(RecoveryReason.NO_SCHEMA)
-    if reconstruction.diagnostics.get("table_type") == TableType.UNKNOWN.value:
-        reasons.append(RecoveryReason.UNKNOWN_TABLE)
-    if vlm_truncated:
-        reasons.append(RecoveryReason.VLM_TRUNCATED)
-    if profile_match is not None and profile_match.profile_key and not profile_match.selected:
-        reasons.append(RecoveryReason.PROFILE_AMBIGUOUS)
+    if not is_terminal_non_ledger(reconstruction):
+        if not reconstruction.rows:
+            reasons.append(RecoveryReason.ZERO_YIELD)
+        elif is_implausibly_low_yield(reconstruction):
+            reasons.append(RecoveryReason.LOW_YIELD)
+        if reconstruction.schema is None:
+            reasons.append(RecoveryReason.NO_SCHEMA)
+        if reconstruction.diagnostics.get("table_type") == TableType.UNKNOWN.value:
+            reasons.append(RecoveryReason.UNKNOWN_TABLE)
+        if vlm_truncated:
+            reasons.append(RecoveryReason.VLM_TRUNCATED)
+        if profile_match is not None and profile_match.profile_key and not profile_match.selected:
+            reasons.append(RecoveryReason.PROFILE_AMBIGUOUS)
     stages: list[RecoveryStage] = []
     if reasons:
         stages.extend(

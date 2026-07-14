@@ -1,4 +1,5 @@
 from gmoney.contracts.evidence import OcrToken, Point, Polygon
+from gmoney.contracts.extraction import TableType
 from gmoney.contracts.phase3 import GeminiMode, RecoveryReason, RecoveryStage
 from gmoney.extraction.ocr_rows import ReconstructionResult
 from gmoney.extraction.recovery import (
@@ -69,3 +70,15 @@ def test_implausibly_low_yield_is_escalated() -> None:
     assert is_implausibly_low_yield(reconstruction)
     decision = decide_recovery(reconstruction, gemini_mode=GeminiMode.OFF)
     assert RecoveryReason.LOW_YIELD in decision.reasons
+
+
+def test_empty_metadata_region_is_terminal_without_recovery() -> None:
+    reconstruction = ReconstructionResult(
+        rows=(),
+        schema=None,
+        diagnostics={"table_type": TableType.METADATA.value},
+    )
+    decision = decide_recovery(reconstruction, gemini_mode=GeminiMode.OFF)
+    assert decision.reasons == ()
+    assert decision.planned_stages == ()
+    assert decision.route == "local_ocr"

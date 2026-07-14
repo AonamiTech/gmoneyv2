@@ -4,28 +4,28 @@
       "annotation_status": "required",
       "eligible_for_frozen_gate": false,
       "hospital_id": null,
-      "identity_status": "pending_review",
+      "identity_status": "not_applicable",
       "relative_path": "Sample Bills/Bill 1.pdf",
       "sha256": "7dc99f26cc46cecd5e892cb5442d0a511ddcc19da50802d6a5702aa6c0bf3a08",
-      "status": "candidate_unseen"
+      "status": "exposed_regression"
     },
     {
       "annotation_status": "required",
       "eligible_for_frozen_gate": false,
       "hospital_id": null,
-      "identity_status": "pending_review",
+      "identity_status": "not_applicable",
       "relative_path": "Sample Bills/Bill 10.pdf",
       "sha256": "a6c35948713c5bd28863388a146cb70a8b68311b801d5c967a606dabc6819be6",
-      "status": "candidate_unseen"
+      "status": "exposed_regression"
     },
     {
       "annotation_status": "required",
       "eligible_for_frozen_gate": false,
       "hospital_id": null,
-      "identity_status": "pending_review",
+      "identity_status": "not_applicable",
       "relative_path": "Sample Bills/Bill 11.pdf",
       "sha256": "7020bce20fcf9c2f12f74f838ac3fc675917238aedff069d1fe6735763afd46d",
-      "status": "candidate_unseen"
+      "status": "exposed_regression"
     },
     {
       "annotation_status": "not_required",
@@ -40,73 +40,73 @@
       "annotation_status": "required",
       "eligible_for_frozen_gate": false,
       "hospital_id": null,
-      "identity_status": "pending_review",
+      "identity_status": "not_applicable",
       "relative_path": "Sample Bills/Bill 13.pdf",
       "sha256": "362c6947014ab18226d7a63d731080d69825111632ee3f5e385142a287b252ee",
-      "status": "candidate_unseen"
+      "status": "exposed_regression"
     },
     {
       "annotation_status": "required",
       "eligible_for_frozen_gate": false,
       "hospital_id": null,
-      "identity_status": "pending_review",
+      "identity_status": "not_applicable",
       "relative_path": "Sample Bills/Bill 2.pdf",
       "sha256": "f84c7465ffa6d45aa4d593675a39bc628d5da0de0a2deda0617aed1bfd7917c2",
-      "status": "candidate_unseen"
+      "status": "exposed_regression"
     },
     {
       "annotation_status": "required",
       "eligible_for_frozen_gate": false,
       "hospital_id": null,
-      "identity_status": "pending_review",
+      "identity_status": "not_applicable",
       "relative_path": "Sample Bills/Bill 3.pdf",
       "sha256": "2f0217d5624e3650d2715503b6cdf99a01c55a1ac11e463605e3c0a34a0258eb",
-      "status": "candidate_unseen"
+      "status": "exposed_regression"
     },
     {
       "annotation_status": "required",
       "eligible_for_frozen_gate": false,
       "hospital_id": null,
-      "identity_status": "pending_review",
+      "identity_status": "not_applicable",
       "relative_path": "Sample Bills/Bill 6.pdf",
       "sha256": "4724326b37e1603c695fc7e931adbafeaeb375691f19d58ac24772cdd8599585",
-      "status": "candidate_unseen"
+      "status": "exposed_regression"
     },
     {
       "annotation_status": "required",
       "eligible_for_frozen_gate": false,
       "hospital_id": null,
-      "identity_status": "pending_review",
+      "identity_status": "not_applicable",
       "relative_path": "Sample Bills/Bill 7.pdf",
       "sha256": "ea4960bcc7754ec1d0c6c6940e8851533686d2aa19b0f4e894d925d3224f8fb2",
-      "status": "candidate_unseen"
+      "status": "exposed_regression"
     },
     {
       "annotation_status": "required",
       "eligible_for_frozen_gate": false,
       "hospital_id": null,
-      "identity_status": "pending_review",
+      "identity_status": "not_applicable",
       "relative_path": "Sample Bills/Bill 8.pdf",
       "sha256": "999bebfbd09d9fbd4a48c39d9e0151d67e17e8f6028bda3bd405f40d0ca5f801",
-      "status": "candidate_unseen"
+      "status": "exposed_regression"
     },
     {
       "annotation_status": "required",
       "eligible_for_frozen_gate": false,
       "hospital_id": null,
-      "identity_status": "pending_review",
+      "identity_status": "not_applicable",
       "relative_path": "Sample Bills/Bill 9.pdf",
       "sha256": "5e2cd2d3d20bf8660a7cc9751c3ab13367cd9fb8da30cf7aca11ef011a5905ef",
-      "status": "candidate_unseen"
+      "status": "exposed_regression"
     },
     {
       "annotation_status": "required",
       "eligible_for_frozen_gate": false,
       "hospital_id": null,
-      "identity_status": "pending_review",
+      "identity_status": "not_applicable",
       "relative_path": "Sample Bills/bill 4.pdf",
       "sha256": "6733966ba0ab21aeb48becabda1b887716f930a6a546fd7540478a023eaca100",
-      "status": "candidate_unseen"
+      "status": "exposed_regression"
     }
   ],
   "manifest_version": "phase3_sealed_candidates_v1",
@@ -114,10 +114,10 @@
   "source_catalog_version": "corpus_catalog_v1",
   "summary": {
     "blocking_reasons": [
-      "hospital_identity_review_required",
+      "replacement_unseen_hospitals_required",
       "frozen_gold_annotation_required"
     ],
-    "candidate_documents": 11,
+    "candidate_documents": 0,
     "confirmed_distinct_hospitals": 0,
     "frozen_gold_documents": 0,
     "gate_ready": false

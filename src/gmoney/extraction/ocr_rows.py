@@ -20,6 +20,7 @@ HEADER_TERMS: dict[str, tuple[str, ...]] = {
         "particulars",
         "service name",
         "item name",
+        "itemname",
         "test name",
         "investigation",
         "services",
@@ -140,17 +141,68 @@ def _lines(tokens: tuple[OcrToken, ...]) -> tuple[OcrLine, ...]:
 def _normalize_orientation(
     tokens: tuple[OcrToken, ...],
     box: tuple[int, int, int, int],
-) -> tuple[tuple[OcrToken, ...], tuple[int, int, int, int], str]:
+) -> tuple[tuple[OcrToken, ...], tuple[int, int, int, int], str, float]:
     """Rotate sideways OCR geometry into reading order without changing token IDs."""
     if not tokens:
-        return tokens, box, "upright"
+        return tokens, box, "upright", 0.0
+
+    def deskew(
+        candidate: tuple[OcrToken, ...],
+        *,
+        normalize_origin: bool,
+    ) -> tuple[tuple[OcrToken, ...], float]:
+        slopes: list[float] = []
+        for token in candidate:
+            points = token.polygon.points
+            edges = [(points[index], points[(index + 1) % 4]) for index in range(4)]
+            start, end = max(
+                edges,
+                key=lambda edge: (edge[1].x - edge[0].x) ** 2
+                + (edge[1].y - edge[0].y) ** 2,
+            )
+            if abs(end.x - start.x) <= 5:
+                continue
+            slope = (end.y - start.y) / (end.x - start.x)
+            if abs(slope) <= 0.25:
+                slopes.append(slope)
+        slope = median(slopes) if slopes else 0.0
+        anchor_x = min(point.x for token in candidate for point in token.polygon.points)
+        minimum_y = min(
+            point.y - slope * (point.x - anchor_x)
+            for token in candidate
+            for point in token.polygon.points
+        )
+        y_offset = -minimum_y if normalize_origin else max(0.0, -minimum_y)
+        transformed = tuple(
+            token.model_copy(
+                update={
+                    "polygon": Polygon(
+                        points=tuple(
+                            Point(
+                                x=point.x,
+                                y=(
+                                    point.y
+                                    - slope * (point.x - anchor_x)
+                                    + y_offset
+                                ),
+                            )
+                            for point in token.polygon.points
+                        )
+                    )
+                }
+            )
+            for token in candidate
+        )
+        return transformed, slope
+
     vertical_fraction = sum(
         (_bounds(token)[3] - _bounds(token)[1])
         > 1.3 * max(1.0, _bounds(token)[2] - _bounds(token)[0])
         for token in tokens
     ) / len(tokens)
     if vertical_fraction < 0.65:
-        return tokens, box, "upright"
+        deskewed, slope = deskew(tokens, normalize_origin=False)
+        return deskewed, box, "upright", slope
 
     points = [point for token in tokens for point in token.polygon.points]
     min_x = min(point.x for point in points)
@@ -177,38 +229,6 @@ def _normalize_orientation(
             for token in tokens
         )
 
-    def deskew(candidate: tuple[OcrToken, ...]) -> tuple[OcrToken, ...]:
-        slopes: list[float] = []
-        for token in candidate:
-            points = token.polygon.points
-            edges = [(points[index], points[(index + 1) % 4]) for index in range(4)]
-            start, end = max(
-                edges,
-                key=lambda edge: (edge[1].x - edge[0].x) ** 2 + (edge[1].y - edge[0].y) ** 2,
-            )
-            if abs(end.x - start.x) <= 5:
-                continue
-            slope = (end.y - start.y) / (end.x - start.x)
-            if abs(slope) <= 0.25:
-                slopes.append(slope)
-        slope = median(slopes) if slopes else 0.0
-        minimum_y = min(
-            point.y - slope * point.x for token in candidate for point in token.polygon.points
-        )
-        return tuple(
-            token.model_copy(
-                update={
-                    "polygon": Polygon(
-                        points=tuple(
-                            Point(x=point.x, y=point.y - slope * point.x - minimum_y)
-                            for point in token.polygon.points
-                        )
-                    )
-                }
-            )
-            for token in candidate
-        )
-
     width = max_y - min_y
 
     def reading_order_score(candidate: tuple[OcrToken, ...]) -> tuple[int, int]:
@@ -231,16 +251,20 @@ def _normalize_orientation(
         header_strength = max((len(_header_roles(line)) for line in lines), default=0)
         return (currency_lane, header_strength)
 
-    clockwise_tokens = deskew(rotate(True))
-    counterclockwise_tokens = deskew(rotate(False))
+    clockwise_tokens, clockwise_slope = deskew(rotate(True), normalize_origin=True)
+    counterclockwise_tokens, counterclockwise_slope = deskew(
+        rotate(False), normalize_origin=True
+    )
     if reading_order_score(clockwise_tokens) >= reading_order_score(counterclockwise_tokens):
         rotated = clockwise_tokens
         orientation = "clockwise_90"
+        slope = clockwise_slope
     else:
         rotated = counterclockwise_tokens
         orientation = "counterclockwise_90"
+        slope = counterclockwise_slope
     normalized_height = max(point.y for token in rotated for point in token.polygon.points)
-    return rotated, (0, 0, round(width), round(normalized_height)), orientation
+    return rotated, (0, 0, round(width), round(normalized_height)), orientation, slope
 
 
 def _header_roles(line: OcrLine) -> dict[str, OcrToken]:
@@ -335,6 +359,7 @@ def _classify_table(
     has_serial: bool,
     row_count: int,
     *,
+    has_ledger_header: bool = False,
     zero_tail_summary: bool = False,
 ) -> TableType:
     normalized = _normalize(text)
@@ -357,12 +382,25 @@ def _classify_table(
             "discharge",
         )
     )
-    if metadata_hits >= 2 and row_count <= 12 and not has_serial:
+    if (
+        metadata_hits >= 2
+        and row_count <= 24
+        and not has_serial
+        and not has_ledger_header
+    ):
         return TableType.METADATA
     if "break up of charges" in normalized or "package break up" in normalized:
         return TableType.PACKAGE_SUMMARY
     if (
-        zero_tail_summary
+        all(
+            term in normalized
+            for term in ("service name", "patient amount", "company amount", "total amount")
+        )
+        or all(
+            term in normalized
+            for term in ("service name", "patient", "company", "grand total")
+        )
+        or zero_tail_summary
         or any(
             term in normalized
             for term in ("bill summary", "summary of charges", "department amount")
@@ -381,6 +419,20 @@ def _classify_table(
         )
     ) or ("m r p" in normalized and "exp" in normalized):
         return TableType.PHARMACY
+    if (
+        row_count <= 24
+        and not has_ledger_header
+        and any(
+            term in normalized
+            for term in (
+                "payer received",
+                "payer receivable",
+                "patient received",
+                "patient balance",
+            )
+        )
+    ):
+        return TableType.PAYMENT
     if any(
         term in normalized
         for term in ("payment mode", "amount paid", "amount received", "receipt ref")
@@ -486,7 +538,7 @@ def _is_metadata_description(description: str) -> bool:
                 "receipt details",
             )
         )
-        or normalized in {"cgst", "sgst", "net bill", "upi"}
+        or normalized in {"cgst", "sgst", "net bill", "upi", "expdate", "exp date"}
         or normalized.endswith(" admission")
         or normalized.endswith(" discharge")
         or ("date time" in normalized and "page" in normalized)
@@ -497,21 +549,42 @@ def _is_metadata_description(description: str) -> bool:
 
 
 def _is_total_description(normalized: str) -> bool:
-    return normalized in {"total", "sub total", "subtotal"} or normalized.startswith(
-        (
-            "sub total",
-            "subtotal",
-            "total for",
-            "grand total",
-            "total bill amount",
-            "total discount amount",
-            "net amount",
-            "net tpa corporate amount",
-            "bill amount",
-            "amount paid",
-            "amount to be received",
-            "balance amount",
-            "balance due",
+    return (
+        normalized in {"total", "sub total", "subtotal"}
+        or any(
+            term in normalized
+            for term in (
+                "gross bill amount",
+                "bill round off",
+                "round off amount",
+                "net bill amount",
+                "company credit limit",
+            )
+        )
+        or normalized.startswith(
+            (
+                "sub total",
+                "subtotal",
+                "total for",
+                "grand total",
+                "total bill amount",
+                "total discount amount",
+                "net amount",
+                "net tpa corporate amount",
+                "bill amount",
+                "amount paid",
+                "amount to be received",
+                "balance amount",
+                "balance due",
+                "payer amount",
+                "payer received",
+                "payer receivable",
+                "patient amount",
+                "patient received",
+                "patient balance",
+                "cgst amount",
+                "sgst amount",
+            )
         )
     )
 
@@ -575,7 +648,9 @@ def reconstruct_ocr_rows(
 ) -> ReconstructionResult:
     original_scoped = tokens_in_box(tokens, box)
     original_by_id = {token.token_id: token for token in original_scoped}
-    scoped, geometry_box, orientation = _normalize_orientation(original_scoped, box)
+    scoped, geometry_box, orientation, deskew_slope = _normalize_orientation(
+        original_scoped, box
+    )
     left, _, right, _ = geometry_box
     width = max(1.0, right - left)
     lines = _lines(scoped)
@@ -635,6 +710,7 @@ def reconstruct_ocr_rows(
         table_text,
         header_valid and "serial" in header_roles,
         len(data_lines),
+        has_ledger_header=header_valid,
         zero_tail_summary=zero_tail_summary,
     )
     header_ids = tuple(
@@ -798,6 +874,8 @@ def reconstruct_ocr_rows(
         if not description:
             continue
         normalized_description = _normalize(description)
+        if len(re.sub(r"[^a-z0-9]", "", normalized_description)) < 3:
+            continue
         if _is_total_description(normalized_description):
             continue
 
@@ -920,6 +998,7 @@ def reconstruct_ocr_rows(
             "header_found": header_valid,
             "schema_inherited": inherited,
             "orientation": orientation,
+            "deskew_slope": deskew_slope,
             "table_type": table_type.value,
             "column_centers": column_centers,
         },

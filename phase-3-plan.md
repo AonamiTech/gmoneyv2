@@ -57,3 +57,11 @@ stack on port 3000.
 Commit the tested implementation and a Phase 3 review report. Create the annotated
 `checkpoint-phase-3` tag only after the unseen and active-profile datasets and all
 quality, grounding, privacy, routing, and resource gates pass.
+
+## Execution note
+
+On 2026-07-13 all eleven reserved Sample Bills were processed at the user's explicit
+request. They are therefore exposed regression documents, not a sealed unseen cohort.
+`corpus/phase3-sealed-candidates.json` records that state. A replacement hospital-
+disjoint cohort with confirmed identities and frozen gold is required before the
+unseen quality gate or the Phase 3 checkpoint can pass.

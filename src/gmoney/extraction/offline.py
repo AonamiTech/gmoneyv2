@@ -38,6 +38,7 @@ from gmoney.extraction.recovery import (
     decide_recovery,
     ground_adjudication,
     is_implausibly_low_yield,
+    is_terminal_non_ledger,
     map_crop_tokens_to_page,
 )
 from gmoney.extraction.rows import extract_candidate_rows
@@ -800,7 +801,9 @@ class OfflineExtractor:
                     )
                 )
                 recovery_attempts: list[RecoveryAttempt] = []
-                if not parsed_rows or is_implausibly_low_yield(reconstruction):
+                if not is_terminal_non_ledger(reconstruction) and (
+                    not parsed_rows or is_implausibly_low_yield(reconstruction)
+                ):
                     recovered, attempts = self._recover_crop_ocr(
                         source=source,
                         artifact_root=artifact_root,
@@ -844,14 +847,17 @@ class OfflineExtractor:
                 # table, avoiding context pressure on dense, already-readable
                 # ledgers.
                 advisor_eligible = bool(
-                    reconstruction.schema is None
-                    or reconstruction.schema.table_type
-                    not in {
-                        TableType.CATEGORY_SUMMARY,
-                        TableType.PACKAGE_SUMMARY,
-                        TableType.PAYMENT,
-                        TableType.METADATA,
-                    }
+                    not is_terminal_non_ledger(reconstruction)
+                    and (
+                        reconstruction.schema is None
+                        or reconstruction.schema.table_type
+                        not in {
+                            TableType.CATEGORY_SUMMARY,
+                            TableType.PACKAGE_SUMMARY,
+                            TableType.PAYMENT,
+                            TableType.METADATA,
+                        }
+                    )
                 )
                 use_vl = bool(
                     advisor_eligible
@@ -1038,7 +1044,8 @@ class OfflineExtractor:
                     profile_match=profile_match,
                 )
                 needs_gemini_recovery = bool(
-                    not parsed_rows or is_implausibly_low_yield(reconstruction)
+                    not is_terminal_non_ledger(reconstruction)
+                    and (not parsed_rows or is_implausibly_low_yield(reconstruction))
                 )
                 gemini_block_reason: str | None = None
                 if needs_gemini_recovery and self.gemini_mode is not GeminiMode.OFF:
@@ -1224,10 +1231,13 @@ class OfflineExtractor:
                         )
                     )
                 terminal_unresolved = bool(
-                    not parsed_rows
-                    or (
-                        RecoveryReason.LOW_YIELD in route_decision.reasons
-                        and len(parsed_rows) <= len(reconstruction.rows)
+                    not is_terminal_non_ledger(reconstruction)
+                    and (
+                        not parsed_rows
+                        or (
+                            RecoveryReason.LOW_YIELD in route_decision.reasons
+                            and len(parsed_rows) <= len(reconstruction.rows)
+                        )
                     )
                 )
                 if terminal_unresolved and route_decision.reasons:

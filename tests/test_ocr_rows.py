@@ -30,6 +30,27 @@ def token(index: int, text: str, box: tuple[float, float, float, float]) -> OcrT
     )
 
 
+def skewed_token(
+    index: int,
+    text: str,
+    box: tuple[float, float, float, float],
+    slope: float,
+) -> OcrToken:
+    left, top, right, bottom = box
+    return token(index, text, box).model_copy(
+        update={
+            "polygon": Polygon(
+                points=(
+                    Point(x=left, y=top + slope * left),
+                    Point(x=right, y=top + slope * right),
+                    Point(x=right, y=bottom + slope * right),
+                    Point(x=left, y=bottom + slope * left),
+                )
+            )
+        }
+    )
+
+
 def test_reconstructs_split_description_and_uses_rightmost_amount() -> None:
     tokens = (
         token(0, "Patient", (10, 5, 80, 15)),
@@ -53,6 +74,41 @@ def test_reconstructs_split_description_and_uses_rightmost_amount() -> None:
     assert result.rows[0].candidate.description == "Registration"
     assert result.rows[0].candidate.amount == Decimal("500.00")
     assert result.rows[0].field_token_ids["amount"] == ("token-8",)
+
+
+def test_upright_skew_is_deskewed_before_row_grouping() -> None:
+    slope = -0.025
+    tokens = (
+        skewed_token(0, "Service Name", (100, 100, 300, 125), slope),
+        skewed_token(1, "Patient Amount", (600, 100, 740, 125), slope),
+        skewed_token(2, "Company Amount", (750, 100, 900, 125), slope),
+        skewed_token(3, "Total Amount", (910, 100, 1000, 125), slope),
+        skewed_token(4, "BED CHARGES", (100, 150, 300, 175), slope),
+        skewed_token(5, "0.00", (600, 150, 680, 175), slope),
+        skewed_token(6, "16200.00", (750, 150, 850, 175), slope),
+        skewed_token(7, "16200.00", (910, 150, 1000, 175), slope),
+        skewed_token(8, "LABORATORY", (100, 200, 300, 225), slope),
+        skewed_token(9, "0.00", (600, 200, 680, 225), slope),
+        skewed_token(10, "6422.00", (750, 200, 850, 225), slope),
+        skewed_token(11, "6422.00", (910, 200, 1000, 225), slope),
+    )
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 50, 1020, 260),
+    )
+    assert [row.candidate.description for row in result.rows] == [
+        "BED CHARGES",
+        "LABORATORY",
+    ]
+    assert [row.candidate.amount for row in result.rows] == [
+        Decimal("16200.00"),
+        Decimal("6422.00"),
+    ]
+    assert result.schema is not None
+    assert result.schema.table_type is TableType.CATEGORY_SUMMARY
+    assert result.diagnostics["deskew_slope"] == slope
 
 
 def test_merged_discount_and_amount_token_uses_rightmost_value() -> None:
@@ -143,6 +199,32 @@ def test_schema_is_inherited_across_continuation_page() -> None:
     assert second.diagnostics["schema_inherited"] is True
     assert second.rows[0].candidate.description == "Syringe"
     assert second.rows[0].candidate.amount == Decimal("20.00")
+
+
+def test_compact_itemname_header_keeps_ledger_with_repeated_bill_metadata() -> None:
+    tokens = (
+        token(0, "Bill No. UHID Bill Date", (100, 20, 450, 35)),
+        token(1, "Patient Name Age/Sex Category", (100, 45, 500, 60)),
+        token(2, "Mobile Number Address", (100, 70, 400, 85)),
+        token(3, "ItemName", (100, 100, 300, 115)),
+        token(4, "Quantity", (500, 100, 580, 115)),
+        token(5, "Net Amount", (850, 100, 950, 115)),
+        token(6, "Diaper", (100, 130, 250, 145)),
+        token(7, "41", (510, 130, 540, 145)),
+        token(8, "2395.00", (850, 130, 930, 145)),
+    )
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 10, 980, 170),
+    )
+    assert result.diagnostics["header_found"] is True
+    assert result.schema is not None
+    assert result.schema.table_type is TableType.ITEM_LEDGER
+    assert len(result.rows) == 1
+    assert result.rows[0].candidate.description == "Diaper"
+    assert result.rows[0].candidate.amount == Decimal("2395.00")
 
 
 def test_description_continuation_after_amount_extends_previous_row() -> None:
@@ -307,3 +389,61 @@ def test_document_totals_and_advance_are_not_detail_rows() -> None:
         "Advance Received",
     ]
     assert result.rows[1].candidate.role is RowRole.PAYMENT
+
+
+def test_footer_totals_short_fragments_and_standalone_expiry_are_not_rows() -> None:
+    tokens = (
+        token(0, "Description", (100, 30, 300, 45)),
+        token(1, "Amount", (850, 30, 950, 45)),
+        token(2, "Medicine", (100, 70, 300, 85)),
+        token(3, "100.00", (850, 70, 940, 85)),
+        token(4, "P", (100, 100, 130, 115)),
+        token(5, "1493283.00", (850, 100, 940, 115)),
+        token(6, "CGST Amount @2.5%", (100, 130, 350, 145)),
+        token(7, "0.00", (850, 130, 940, 145)),
+        token(8, "Payer Receivable (INR)", (100, 160, 400, 175)),
+        token(9, "1493283.00", (850, 160, 940, 175)),
+        token(10, "Round Off Amount", (100, 190, 350, 205)),
+        token(11, "0.58", (850, 190, 940, 205)),
+        token(12, "ExpDate", (100, 220, 250, 235)),
+        token(13, "146.40", (850, 220, 940, 235)),
+    )
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 20, 980, 250),
+    )
+    assert [
+        (row.candidate.description, row.candidate.amount)
+        for row in result.rows
+        if row.candidate.role is RowRole.DETAIL
+    ] == [("Medicine", Decimal("100.00"))]
+    assert [
+        row.candidate.description
+        for row in result.rows
+        if row.candidate.role is RowRole.UNRESOLVED
+    ] == ["ExpDate"]
+
+
+def test_headerless_settlement_region_is_terminal_payment() -> None:
+    tokens = (
+        token(0, "Payer Received", (100, 30, 350, 45)),
+        token(1, "0.00", (850, 30, 940, 45)),
+        token(2, "Patient Balance", (100, 60, 350, 75)),
+        token(3, "0.04", (850, 60, 940, 75)),
+        token(4, "Payer Receivable (INR)", (100, 90, 400, 105)),
+        token(5, "1493283.00", (850, 90, 940, 105)),
+    )
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 20, 980, 120),
+    )
+    assert result.schema is not None
+    assert result.schema.table_type is TableType.PAYMENT
+    assert {row.candidate.role for row in result.rows} <= {
+        RowRole.PAYMENT,
+        RowRole.UNRESOLVED,
+    }
