@@ -1,29 +1,31 @@
-# Phase 2 Completion and D16 Demo Deployment Plan
+# Editable D16 Client Demo Deployment Plan
 
 ## Goal
 
-Finish the frozen Phase 2 accuracy gate, then deploy a live upload/results/evidence demo on
-`20.57.131.189` without changing the existing application on port 3000.
+Deploy the Phase 3 extraction engine as an explicitly non-production, unauthenticated
+client demo on `20.57.131.189` without changing the existing application on port 3000.
 
-## Accuracy gate
+## Quality boundary
 
-1. Resume the larger validation bill and make only general parser corrections.
-2. Regress the already-passing 9-row training and 7-row validation bills after any correction.
-3. Freeze the extraction commit before evaluating the sealed 409-row unseen-layout holdout.
-4. Require at least 85% precision and recall under both frozen evaluators.
-5. On pass, write the Phase 2 checkpoint report and tag `checkpoint-phase-2`. On failure, stop
-   public deployment and publish the required categorized failure report.
+The annotated exposed regression passes the accuracy targets recorded in the Phase 3
+review. Newly uploaded bills have no gold annotation, so the UI makes no per-document
+precision or recall claim. This deployment does not satisfy or weaken the blocked
+unseen-hospital Phase 3 checkpoint gate.
 
 ## Demo slice
 
-- Add PDF upload, job status/progress, canonical rows, rendered page, evidence, and delete APIs.
-- Use an atomic filesystem queue and three reusable worker processes with content-addressed stage
+- Provide PDF upload, job status/progress, canonical rows, rendered pages, evidence,
+  revisioned review, approval, export, and delete APIs.
+- Use an atomic filesystem queue and two reusable worker processes with content-addressed stage
   caches. Recover interrupted jobs after restart.
-- Add a Next.js client demo with upload, progress, extracted item table, page preview, and evidence
-  highlighting. Editing, export, authentication, Gemini recovery, profiles, and full Temporal
-  orchestration remain later phases.
+- Provide a Next.js review desk with a browser-local document queue, two visible
+  inference lanes, row filtering, original-versus-corrected values, evidence relinking,
+  reviewer-added rows, structural issue resolution, approval, and CSV/JSON/evidence exports.
+- Preserve immutable machine output and store reviewer changes in an atomic revisioned overlay.
+  Authentication, a global document list, PostgreSQL, and Temporal remain outside this demo.
 - Accept only PDF files up to 25 MiB, cap the queue at 20 jobs, never list documents, never expose
-  raw OCR/VLM diagnostics or paths, and delete demo artifacts after six hours.
+  raw OCR/VLM diagnostics or paths, reject documents over 200 pages, and delete demo artifacts
+  after six hours.
 
 ## Side-by-side deployment
 
@@ -31,17 +33,23 @@ Finish the frozen Phase 2 accuracy gate, then deploy a live upload/results/evide
 - Expose only nginx on public port 3100. Bind backend diagnostics to localhost:8100 and
   PaddleOCR-VL to localhost:8111.
 - Preserve the existing seven-container legacy project, its port 3000, images, volumes, and data.
-- Tag images with the Git SHA, record their digests, and keep runtime data under
+- Build images on the control host, tag them with the Git SHA, stream them to D16,
+  record their digests, and keep runtime data under
   `/home/azureuser/gmoneyv2-runtime`.
-- The user opens Azure NSG TCP 3100. Public unauthenticated access and its PHI risk were explicitly
-  accepted for this time-limited demo.
+- The user opens Azure NSG TCP 3100 if required. Public unauthenticated HTTP access,
+  unencrypted uploads, and the resulting PHI risk were explicitly accepted for this
+  time-limited demo.
+- Preserve `/home/azureuser/gmoneyv2-phase3-sample11-final`; it is not mounted into
+  the public demo and is not subject to demo cleanup.
 
 ## Acceptance
 
 - Python tests/Ruff and frontend lint/type/build pass.
-- Known regression bills remain at 100% precision and recall.
-- The sealed holdout passes the 85%/85% gate under both evaluators.
-- Three concurrent documents complete on the D16 without OOM, swapping, corruption, or duplicate
-  rows.
-- A public upload on port 3100 shows extracted rows and synchronized page evidence.
+- The committed annotated regression remains above its recorded Phase 3 gates.
+- Bills 10 and 11 process concurrently on D16 without OOM, swapping, corruption, or
+  duplicate rows and reproduce their retained 80-row and 36-row semantic outputs.
+- Row correction, evidence relinking, reviewer addition/rejection, issue resolution,
+  approval, and all three exports pass against the deployed API.
+- A public upload on port 3100 shows extracted rows and synchronized page evidence;
+  ports 8100 and 8111 remain loopback-only.
 - Port 3000 continues returning HTTP 200; ports 8100 and 8111 are not public.

@@ -40,3 +40,19 @@ passing frozen promotion decision.
 
 See [phase-3-plan.md](phase-3-plan.md) and
 [docs/reviews/phase-3.md](docs/reviews/phase-3.md) for the gates and current status.
+
+## Editable client demo
+
+The demo Compose project exposes the Next.js evidence desk and FastAPI review API on
+port 3100 while keeping model and API diagnostics on loopback. It processes two bills
+concurrently, preserves immutable machine rows, and stores reviewer corrections in a
+revisioned filesystem overlay.
+
+```bash
+GMONEY_IMAGE_TAG=$(git rev-parse --short=12 HEAD) \
+  docker compose -f compose.demo.yaml up -d --build
+```
+
+The demo has no authentication and serves plain HTTP. Uploaded PDFs and derived review
+artifacts are deleted six hours after completion; do not treat it as a production PHI
+system. See [docs/DEMO_DEPLOYMENT_PLAN.md](docs/DEMO_DEPLOYMENT_PLAN.md).

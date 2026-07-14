@@ -19,11 +19,13 @@ def _run_job(root_value: str, job_id: str, vl_url: str) -> int:
     if _extractor is None:
         _extractor = OfflineExtractor(vl_url)
     directory = store.job_dir(job_id)
+    state = store.read(job_id)
 
     def progress(page: int, pages: int) -> None:
         store.update(job_id, status="processing", page=page, pages=pages)
 
     result = _extractor.extract(directory / "source.pdf", directory / "artifacts", progress)
+    result["source_name"] = state["original_name"]
     result_path = directory / "result.json"
     temporary = directory / "result.tmp"
     import json

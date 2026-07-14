@@ -3,7 +3,10 @@ from __future__ import annotations
 import json
 import os
 import shutil
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
+from fcntl import LOCK_EX, LOCK_UN, flock
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -14,6 +17,12 @@ TERMINAL_STATUSES = {"complete", "failed"}
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
+class ReviewRevisionConflict(RuntimeError):
+    def __init__(self, current_revision: int) -> None:
+        super().__init__("review_revision_conflict")
+        self.current_revision = current_revision
 
 
 class JobStore:
@@ -66,6 +75,53 @@ class JobStore:
         self.write(job_id, state)
         return state
 
+    @staticmethod
+    def empty_review() -> dict[str, Any]:
+        return {
+            "revision": 0,
+            "updated_at": utc_now(),
+            "row_overrides": {},
+            "added_rows": {},
+            "issue_overrides": {},
+            "events": [],
+            "approval": None,
+        }
+
+    def read_review(self, job_id: str) -> dict[str, Any]:
+        path = self.job_dir(job_id) / "review.json"
+        if not path.is_file():
+            return self.empty_review()
+        return json.loads(path.read_text())
+
+    @contextmanager
+    def _review_lock(self, job_id: str) -> Iterator[None]:
+        lock_path = self.job_dir(job_id) / ".review.lock"
+        with lock_path.open("a+") as lock:
+            flock(lock.fileno(), LOCK_EX)
+            try:
+                yield
+            finally:
+                flock(lock.fileno(), LOCK_UN)
+
+    def mutate_review(
+        self,
+        job_id: str,
+        expected_revision: int,
+        mutation: Callable[[dict[str, Any]], dict[str, Any]],
+    ) -> dict[str, Any]:
+        with self._review_lock(job_id):
+            current = self.read_review(job_id)
+            if current["revision"] != expected_revision:
+                raise ReviewRevisionConflict(current["revision"])
+            updated = mutation(json.loads(json.dumps(current)))
+            updated["revision"] = current["revision"] + 1
+            updated["updated_at"] = utc_now()
+            path = self.job_dir(job_id) / "review.json"
+            temporary = path.with_name(f"review.{os.getpid()}.tmp")
+            temporary.write_text(json.dumps(updated, indent=2, sort_keys=True) + "\n")
+            temporary.replace(path)
+            return updated
+
     def states(self) -> list[dict[str, Any]]:
         states: list[dict[str, Any]] = []
         for state_path in self.jobs_root.glob("*/state.json"):
@@ -103,6 +159,15 @@ class JobStore:
             if state.get("status") in ACTIVE_STATUSES:
                 continue
             updated = datetime.fromisoformat(state["updated_at"].replace("Z", "+00:00"))
+            review_path = self.job_dir(state["id"]) / "review.json"
+            if review_path.is_file():
+                try:
+                    review_updated = datetime.fromisoformat(
+                        json.loads(review_path.read_text())["updated_at"].replace("Z", "+00:00")
+                    )
+                    updated = max(updated, review_updated)
+                except (KeyError, OSError, json.JSONDecodeError, ValueError):
+                    pass
             if updated < cutoff:
                 shutil.rmtree(self.job_dir(state["id"]), ignore_errors=True)
                 removed += 1

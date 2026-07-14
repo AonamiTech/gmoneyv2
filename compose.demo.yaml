@@ -15,7 +15,7 @@ services:
       - --ctx-size
       - "24576"
       - --parallel
-      - "3"
+      - "2"
       - --threads
       - "14"
       - --temp
@@ -45,6 +45,9 @@ services:
     user: "10001:10001"
     environment:
       GMONEY_DEMO_ROOT: /runtime
+      GMONEY_MAX_ACTIVE_JOBS: "20"
+      GMONEY_MAX_PDF_PAGES: "200"
+      GMONEY_WORKER_CAPACITY: "2"
     volumes:
       - /home/azureuser/gmoneyv2-runtime/jobs:/runtime/jobs
     ports:
@@ -75,7 +78,7 @@ services:
       FLAGS_paddle_num_threads: "4"
       GMONEY_DEMO_ROOT: /runtime
       GMONEY_VL_URL: http://paddleocr-vl:8111
-      GMONEY_WORKER_CONCURRENCY: "3"
+      GMONEY_WORKER_CONCURRENCY: "2"
       GMONEY_RETENTION_HOURS: "6"
     volumes:
       - /home/azureuser/gmoneyv2-runtime/jobs:/runtime/jobs
