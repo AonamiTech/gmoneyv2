@@ -58,9 +58,10 @@ manifest SHA-256
 An importer smoke test hard-linked that complete archive into a temporary demo store,
 published all 11 original filenames, returned the Kamakshi bill by hospital search,
 reported a 30-day expiry for every bill, and retained the same page-artifact inode.
-A second import skipped all 11 tombstoned documents. The public deployment remains on
-the historical six-hour release until the 1 TiB managed disk is attached; the VM still
-has no durable data disk, while its root filesystem has only 3.8 GiB free.
+A second import skipped all 11 tombstoned documents. The same store is now public on port
+3100 and retained all 11 entries across a service restart. The temporary root-disk fallback
+has 15 GiB free and rejects new uploads below 3 GiB; the 1 TiB managed disk is still required
+before scaling this retention model toward 5,000 bills.
 
 ## Quality boundary
 
