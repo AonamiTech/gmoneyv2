@@ -59,6 +59,10 @@ After Azure reports the attachment, prepare only `/dev/disk/azure/scsi1/lun0`:
 sudo scripts/prepare_demo_data_disk.sh /dev/disk/azure/scsi1/lun0
 ```
 
+For a temporary root-disk-only client demo, the operator may explicitly override
+`GMONEY_MIN_FREE_BYTES`; never set it below 3 GiB. This is not suitable for the projected
+5,000-bill corpus and does not replace the managed-disk requirement for durable scale.
+
 - Deploy an isolated `gmoney-v2-demo` Compose project under `/home/azureuser/gmoneyv2`.
 - Expose only nginx on public port 3100. Bind backend diagnostics to localhost:8100 and
   PaddleOCR-VL to localhost:8111.
