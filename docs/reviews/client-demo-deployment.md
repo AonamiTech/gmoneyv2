@@ -2,9 +2,13 @@
 
 Date: 2026-07-15
 
-> Current release record: commit `6588d6915f49` deploys the verified 30-day history and
-> corrected quantity/unit-price implementation. The explicitly authorized root-disk fallback
-> uses a 3 GiB upload floor; a managed disk remains required before scaling toward 5,000 bills.
+> Current release record: commit `6f7f96bab8da027066bcc8e73dc7044db2507776`
+> preserves the verified 30-day history, removes Nginx request throttling, and
+> adds bill-total reconciliation. The explicitly authorized root-disk fallback
+> uses a 3 GiB upload floor; a managed disk remains required before scaling
+> toward 5,000 bills. See
+> [`cpu-demo-upload-path-fix.md`](cpu-demo-upload-path-fix.md) for the cutover
+> evidence.
 
 ## Outcome
 
