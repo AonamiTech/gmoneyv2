@@ -8,6 +8,7 @@ cd "$repo_root"
 .venv/bin/pytest -W error
 docker compose config --quiet
 docker compose -f compose.inference.yaml config --quiet
+docker compose -f compose.demo.yaml -f compose.gpu.yaml config --quiet
 .venv/bin/python - <<'PY'
 import json
 from pathlib import Path
@@ -21,4 +22,3 @@ assert summary["heavy_parser"]["concurrent_outputs_identical"] is True
 assert summary["heavy_parser"]["observed_server_memory_gib_max"] < 8
 print("phase 1 summary gates passed")
 PY
-

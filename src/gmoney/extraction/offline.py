@@ -12,7 +12,7 @@ from uuid import uuid4
 import cv2
 import typer
 
-from gmoney.contracts.extraction import CanonicalRow, PageType, RowRole, TableType
+from gmoney.contracts.extraction import CanonicalRow, DocumentTotal, PageType, RowRole, TableType
 from gmoney.contracts.phase3 import (
     AdjudicationRequest,
     GeminiMode,
@@ -25,6 +25,12 @@ from gmoney.contracts.phase3 import (
 )
 from gmoney.evaluation.corpus import sha256_file
 from gmoney.extraction.canonicalize import canonicalize_rows
+from gmoney.extraction.document_total import (
+    DOCUMENT_TOTAL_VERSION,
+    DocumentTotalCandidate,
+    extract_document_total_candidates,
+    select_document_total,
+)
 from gmoney.extraction.hospital import detect_hospital
 from gmoney.extraction.ocr_rows import (
     TableSchemaState,
@@ -391,6 +397,8 @@ class OfflineExtractor:
         self,
         vl_url: str,
         *,
+        paddle_device: str = "cpu",
+        vl_device: str = "cpu",
         hospital_id: str | None = None,
         profile_registry: Path | None = None,
         gemini_mode: GeminiMode = GeminiMode.OFF,
@@ -411,9 +419,9 @@ class OfflineExtractor:
                 prompt_version=self.settings.gemini_prompt_version,
                 redaction_version=self.settings.gemini_redaction_version,
             )
-        self.ocr = PaddleOcrV6Adapter()
-        self.layout = PaddleDocLayoutV3Adapter()
-        self.vl = PaddleOcrVlAdapter(base_url=vl_url)
+        self.ocr = PaddleOcrV6Adapter(device=paddle_device)
+        self.layout = PaddleDocLayoutV3Adapter(device=paddle_device)
+        self.vl = PaddleOcrVlAdapter(base_url=vl_url, device=vl_device)
         self.profiles = (
             JsonProfileRepository(profile_registry).list_profiles()
             if profile_registry is not None and profile_registry.exists()
@@ -639,6 +647,7 @@ class OfflineExtractor:
             progress(0, len(manifest.pages))
         document_id = manifest.document_sha256
         all_rows: list[CanonicalRow] = []
+        document_total_candidates: list[DocumentTotalCandidate] = []
         diagnostics: list[dict[str, Any]] = []
         schema_states: list[TableSchemaState] = []
         hospital = None
@@ -663,6 +672,7 @@ class OfflineExtractor:
                 page_asset.page_number,
                 page_asset.artifact_sha256,
             )
+            document_total_candidates.extend(extract_document_total_candidates(tokens))
             if page_asset.page_number == 1:
                 hospital = detect_hospital(
                     tokens,
@@ -1315,8 +1325,13 @@ class OfflineExtractor:
                 progress(page_asset.page_number, len(manifest.pages))
 
         rows = _apply_document_role_policy(_deduplicate(all_rows))
+        document_total: DocumentTotal | None = select_document_total(document_total_candidates)
         return {
             "output_version": "offline_accuracy_spine_v3",
+            "document_total_version": DOCUMENT_TOTAL_VERSION,
+            "document_total": (
+                document_total.model_dump(mode="json") if document_total is not None else None
+            ),
             "document_id": document_id,
             "hospital_id": self.hospital_id,
             "hospital": hospital,
@@ -1355,12 +1370,16 @@ def run(
     artifact_root: Annotated[Path, typer.Option(file_okay=False)],
     output: Annotated[Path, typer.Option(dir_okay=False)],
     vl_url: str = "http://127.0.0.1:8111",
+    paddle_device: str = "cpu",
+    vl_device: str = "cpu",
     hospital_id: str | None = None,
     profile_registry: Annotated[Path | None, typer.Option(dir_okay=False)] = None,
     gemini_mode: GeminiMode = GeminiMode.OFF,
 ) -> None:
     result = OfflineExtractor(
         vl_url,
+        paddle_device=paddle_device,
+        vl_device=vl_device,
         hospital_id=hospital_id,
         profile_registry=profile_registry,
         gemini_mode=gemini_mode,

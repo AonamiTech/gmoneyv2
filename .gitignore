@@ -15,6 +15,7 @@ node_modules/
 data/
 artifacts/
 model-cache/
+Sample Bills/
 *.log
 *.tsbuildinfo
 .DS_Store

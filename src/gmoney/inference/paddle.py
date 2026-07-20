@@ -48,16 +48,17 @@ class PaddleOcrV6Adapter:
         device="cpu",
     )
 
-    def __init__(self) -> None:
+    def __init__(self, device: str = "cpu") -> None:
         from paddleocr import PaddleOCR
 
+        self.spec = type(self).spec.model_copy(update={"device": device})
         self._model = PaddleOCR(
             text_detection_model_name="PP-OCRv6_medium_det",
             text_recognition_model_name="PP-OCRv6_medium_rec",
             use_doc_orientation_classify=False,
             use_doc_unwarping=False,
             use_textline_orientation=False,
-            device="cpu",
+            device=device,
         )
 
     def predict(self, request: InferenceRequest) -> InferenceResponse:
@@ -87,10 +88,11 @@ class PaddleDocLayoutV3Adapter:
         device="cpu",
     )
 
-    def __init__(self) -> None:
+    def __init__(self, device: str = "cpu") -> None:
         from paddleocr import LayoutDetection
 
-        self._model = LayoutDetection(model_name="PP-DocLayoutV3", device="cpu")
+        self.spec = type(self).spec.model_copy(update={"device": device})
+        self._model = LayoutDetection(model_name="PP-DocLayoutV3", device=device)
 
     def predict(self, request: InferenceRequest) -> InferenceResponse:
         started = time.perf_counter()
@@ -119,12 +121,13 @@ class PaddleWirelessTableAdapter:
         device="cpu",
     )
 
-    def __init__(self) -> None:
+    def __init__(self, device: str = "cpu") -> None:
         from paddleocr import TableStructureRecognition
 
+        self.spec = type(self).spec.model_copy(update={"device": device})
         self._model = TableStructureRecognition(
             model_name="SLANeXt_wireless",
-            device="cpu",
+            device=device,
         )
 
     def predict(self, request: InferenceRequest) -> InferenceResponse:
@@ -158,7 +161,9 @@ class PaddleOcrVlAdapter:
         self,
         base_url: str = "http://127.0.0.1:8111",
         timeout_seconds: float = 900,
+        device: str = "cpu",
     ) -> None:
+        self.spec = type(self).spec.model_copy(update={"device": device})
         self._client = httpx.Client(base_url=base_url, timeout=timeout_seconds)
 
     def predict(self, request: InferenceRequest) -> InferenceResponse:

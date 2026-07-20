@@ -114,6 +114,21 @@ main::after { content: ""; position: fixed; width: 560px; height: 560px; right: 
 .summary-strip b { display: block; margin-bottom: 3px; font: 19px/1 var(--serif); }
 .summary-strip .warn b { color: var(--signal); }
 .summary-strip .approved { color: #2f7652; background: rgba(61,154,104,.08); }
+.totals-band { position: relative; display: grid; grid-template-columns: 1fr 1fr 1.05fr; margin-bottom: 14px; border: 1px solid var(--ink); background: rgba(255,255,255,.2); box-shadow: 7px 7px 0 rgba(20,35,31,.08); overflow: hidden; }
+.totals-band::before { content: "RECONCILIATION"; position: absolute; right: 9px; top: 7px; color: rgba(20,35,31,.28); font-size: 6px; font-weight: 700; letter-spacing: .17em; pointer-events: none; }
+.totals-band article { min-width: 0; min-height: 104px; padding: 19px 20px 16px; border-right: 1px solid var(--ink); }
+.totals-band article:last-child { border-right: 0; }
+.totals-band p { margin: 0 0 8px; color: var(--muted); font-size: 8px; font-weight: 700; letter-spacing: .13em; text-transform: uppercase; }
+.totals-band strong { display: block; font: 36px/.92 var(--serif); letter-spacing: -.025em; }
+.totals-band small, .totals-band button { display: block; margin-top: 9px; color: var(--muted); font-size: 8px; letter-spacing: .055em; }
+.totals-band button { padding: 0 0 2px; border: 0; border-bottom: 1px solid currentColor; color: #2f6fad; background: transparent; cursor: pointer; text-align: left; }
+.totals-band button:hover { color: var(--signal); }
+.totals-band .printed-total { background: rgba(47,111,173,.055); }
+.totals-band.match .difference-total { color: #285f44; background: rgba(61,154,104,.11); }
+.totals-band.mismatch .difference-total { color: var(--paper); background: var(--ink); }
+.totals-band.mismatch .difference-total p, .totals-band.mismatch .difference-total small { color: #bac3bd; }
+.totals-band.mismatch .difference-total strong { color: #ff7954; }
+.totals-band.items_partial .difference-total, .totals-band.bill_total_missing .difference-total { background: repeating-linear-gradient(135deg, transparent, transparent 8px, rgba(20,35,31,.035) 8px, rgba(20,35,31,.035) 9px); }
 .review-toolbar { min-height: 45px; display: flex; align-items: stretch; border: 1px solid var(--ink); border-bottom: 0; background: var(--paper-deep); }
 .review-toolbar input, .review-toolbar select { min-width: 0; padding: 0 12px; border: 0; border-right: 1px solid var(--line); color: inherit; background: transparent; font-size: 10px; outline: 0; }
 .review-toolbar > input:first-child { flex: 1; }
@@ -182,6 +197,7 @@ tbody tr.rejected td { opacity: .48; text-decoration: line-through; }
 .page-frame polygon { stroke-width: 4; vector-effect: non-scaling-stroke; }
 .description-evidence { fill: rgba(237,91,50,.18); stroke: var(--signal); animation: evidence-pulse 1.8s ease-in-out infinite; }
 .amount-evidence { fill: rgba(61,154,104,.18); stroke: #2f7652; }
+.total-evidence { fill: rgba(47,111,173,.2); stroke: #2f6fad; stroke-dasharray: 10 5; animation: evidence-pulse-blue 1.8s ease-in-out infinite; }
 .hospital-evidence { fill: rgba(47,111,173,.17); stroke: #2f6fad; animation: evidence-pulse-blue 1.8s ease-in-out infinite; }
 .draft-evidence { fill: rgba(231,172,45,.22); stroke: #bc7b13; stroke-dasharray: 9 5; }
 .draw-instruction { margin: -6px 14px 5px; padding: 9px; color: #684713; background: #f0d99b; font-size: 8px; letter-spacing: .07em; text-align: center; text-transform: uppercase; }
@@ -192,6 +208,7 @@ tbody tr.rejected td { opacity: .48; text-decoration: line-through; }
 .evidence-note p { margin: 4px 0 0; color: var(--muted); font-size: 11px; }
 .evidence-note button { align-self: center; border: 0; border-bottom: 1px solid currentColor; background: transparent; font-size: 9px; cursor: pointer; }
 .hospital-note > span { color: #2f6fad; }
+.total-note > span { color: #2f6fad; }
 
 .review-sheet { position: relative; margin-top: 18px; padding: 22px; display: grid; grid-template-columns: minmax(250px,.7fr) minmax(500px,1.3fr); gap: 28px; border: 1px solid var(--ink); background: var(--paper-deep); box-shadow: 10px 10px 0 rgba(20,35,31,.08); animation: rise .35s both; }
 .sheet-title h3, .approval-zone h3 { margin: 0; font: 30px/1 var(--serif); }
@@ -263,6 +280,9 @@ footer { display: flex; justify-content: space-between; border-top: 1px solid va
   .workspace-head h2 { font-size: 39px; }
   .hospital-title-line { align-items: flex-start; flex-direction: column; }
   .summary-strip { margin-top: 16px; overflow: auto; }
+  .totals-band { grid-template-columns: 1fr; box-shadow: 5px 5px 0 rgba(20,35,31,.08); }
+  .totals-band article { min-height: 92px; border-right: 0; border-bottom: 1px solid var(--ink); }
+  .totals-band article:last-child { border-bottom: 0; }
   .review-toolbar input, .review-toolbar select, .toolbar-action { min-height: 42px; border: 0; border-bottom: 1px solid var(--line); }
   .split-view { height: auto; grid-template-columns: 1fr; }
   .ledger-pane { border-right: 0; border-bottom: 1px solid var(--ink); max-height: 520px; }

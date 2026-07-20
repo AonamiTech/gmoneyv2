@@ -9,6 +9,7 @@ from gmoney.contracts.evidence import (
 )
 from gmoney.contracts.extraction import (
     CanonicalRow,
+    DocumentTotal,
     EvidenceRef,
     PageType,
     ProviderCandidate,
@@ -48,6 +49,7 @@ __all__ = [
     "AdjudicationRow",
     "DriftDecision",
     "DriftObservation",
+    "DocumentTotal",
     "EvidenceRef",
     "GoldAnnotation",
     "GoldRow",

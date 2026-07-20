@@ -89,6 +89,18 @@ type RowsResult = {
   page_assets: PageAsset[];
   hospital: Hospital | null;
   review_revision: number;
+  totals: {
+    items_total: string;
+    bill_total: {
+      amount: string;
+      label: string;
+      page_number: number;
+      evidence: Evidence;
+    } | null;
+    difference: string | null;
+    comparison: "match" | "mismatch" | "items_partial" | "bill_total_missing";
+    missing_item_amounts: number;
+  };
   total: number;
   offset: number;
   limit: number;
@@ -155,6 +167,13 @@ const money = (value: string | null) =>
         maximumFractionDigits: 2,
       }).format(Number(value));
 
+const differenceCopy = (value: string | null) => {
+  if (value === null) return "Comparison unavailable";
+  const difference = Number(value);
+  if (Math.abs(difference) <= 0.01) return "Items and bill agree";
+  return `Items are ${money(String(Math.abs(difference)))} ${difference > 0 ? "above" : "below"} bill`;
+};
+
 const serviceDate = (value: string | null) => {
   if (!value) return "—";
   const [year, month, day] = value.split("-").map(Number);
@@ -181,7 +200,7 @@ const storageSize = (value: number | undefined) => {
   return `${(value / 1024 ** 3).toFixed(value >= 100 * 1024 ** 3 ? 0 : 1)} GB`;
 };
 
-const detail = (payload: unknown) => {
+const detail = (payload: unknown, status: number, statusText: string) => {
   if (typeof payload === "string") return payload;
   if (payload && typeof payload === "object" && "detail" in payload) {
     const value = (payload as { detail: unknown }).detail;
@@ -190,13 +209,29 @@ const detail = (payload: unknown) => {
       return String((value as { code: unknown }).code).replaceAll("_", " ");
     }
   }
-  return "The request could not be completed.";
+  if (status === 413) return "The PDF is larger than the allowed upload size.";
+  if (status === 429) return "Too many requests are in progress. Please try again shortly.";
+  if ([502, 503, 504].includes(status)) {
+    return "The service is temporarily unavailable. Please try again shortly.";
+  }
+  const suffix = statusText ? ` ${statusText}` : "";
+  return `The request failed (HTTP ${status}${suffix}).`;
 };
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, init);
-  const payload = response.status === 204 ? null : await response.json().catch(() => null);
-  if (!response.ok) throw new Error(detail(payload));
+  let payload: unknown = null;
+  if (response.status !== 204) {
+    const body = await response.text();
+    if (body) {
+      try {
+        payload = JSON.parse(body);
+      } catch {
+        payload = null;
+      }
+    }
+  }
+  if (!response.ok) throw new Error(detail(payload, response.status, response.statusText));
   return payload as T;
 }
 
@@ -230,6 +265,7 @@ export default function Home() {
   const [addAmount, setAddAmount] = useState("");
   const [issueReason, setIssueReason] = useState("");
   const [hospitalEditMode, setHospitalEditMode] = useState(false);
+  const [totalEvidenceActive, setTotalEvidenceActive] = useState(false);
   const [hospitalName, setHospitalName] = useState("");
   const [hospitalReason, setHospitalReason] = useState("");
   const [drawMode, setDrawMode] = useState<"add" | "relink" | "hospital" | null>(null);
@@ -370,6 +406,7 @@ export default function Home() {
     setEditMode(false);
     setAddMode(false);
     setHospitalEditMode(false);
+    setTotalEvidenceActive(false);
     setDrawMode(null);
     setDraftPolygon(null);
   }, [selectedJobId]);
@@ -425,6 +462,7 @@ export default function Home() {
 
   const beginEdit = () => {
     if (!selectedRow) return;
+    setTotalEvidenceActive(false);
     setEditValues({
       description: selectedRow.description ?? "",
       service_date_iso: selectedRow.service_date_iso ?? "",
@@ -525,6 +563,7 @@ export default function Home() {
 
   const beginHospitalEdit = () => {
     if (!rowsResult) return;
+    setTotalEvidenceActive(false);
     const source = rowsResult.hospital;
     setHospitalName(source?.name ?? selectedJob?.original_name.replace(/\.pdf$/i, "") ?? "");
     setHospitalReason(source?.reason ?? "");
@@ -636,10 +675,7 @@ export default function Home() {
     );
   };
 
-  const focusEvidence = () => {
-    const source = hospitalEditMode
-      ? hospital?.evidence
-      : selectedRow?.field_evidence?.description?.[0] ?? selectedRow?.evidence?.[0];
+  const focusEvidenceSource = (source: Evidence | undefined) => {
     const sourceAsset = rowsResult?.page_assets.find(
       (asset) => asset.page_number === source?.page_number,
     );
@@ -662,6 +698,25 @@ export default function Home() {
     }, 80);
   };
 
+  const focusEvidence = () => {
+    const source = totalEvidenceActive
+      ? rowsResult?.totals.bill_total?.evidence
+      : hospitalEditMode
+        ? hospital?.evidence
+        : selectedRow?.field_evidence?.description?.[0] ?? selectedRow?.evidence?.[0];
+    focusEvidenceSource(source);
+  };
+
+  const focusBillTotal = () => {
+    const source = rowsResult?.totals.bill_total?.evidence;
+    if (!source) return;
+    setTotalEvidenceActive(true);
+    setHospitalEditMode(false);
+    setEditMode(false);
+    setAddMode(false);
+    focusEvidenceSource(source);
+  };
+
   const toggleFullscreen = async () => {
     if (document.fullscreenElement) {
       await document.exitFullscreen();
@@ -677,16 +732,28 @@ export default function Home() {
   };
 
   const evidence = useMemo(() => {
-    if (!selectedRow || selectedRow.page_number !== viewPage) return { description: "", amount: "" };
+    const total = rowsResult?.totals.bill_total;
+    if (totalEvidenceActive) {
+      return {
+        description: "",
+        amount: "",
+        total: total?.page_number === viewPage ? points(total.evidence) : "",
+      };
+    }
+    if (!selectedRow || selectedRow.page_number !== viewPage) {
+      return { description: "", amount: "", total: "" };
+    }
     return {
       description: points(selectedRow.field_evidence?.description?.[0] ?? selectedRow.evidence?.[0]),
       amount: points(selectedRow.field_evidence?.amount?.[0]),
+      total: "",
     };
-  }, [selectedRow, viewPage]);
+  }, [rowsResult?.totals.bill_total, selectedRow, totalEvidenceActive, viewPage]);
   const hospitalEvidence =
     hospitalEditMode && hospital?.page_number === viewPage ? points(hospital.evidence) : "";
 
   const arrival = !jobs.length;
+  const workerCapacity = health?.worker_capacity ?? 1;
 
   return (
     <main>
@@ -710,11 +777,11 @@ export default function Home() {
             <p className="folio">01 / Intake</p>
             <h2>A bill enters.<br /><em>An auditable ledger emerges.</em></h2>
             <p className="lede">
-              Upload one or more hospital bill PDFs. Two documents run in parallel; every accepted value remains linked to the exact source page.
+              Upload one or more hospital bill PDFs. Up to {workerCapacity} {workerCapacity === 1 ? "document runs" : "documents run"} at once; every accepted value remains linked to the exact source page.
             </p>
             <div className="proof-strip">
               <div><b>300</b><span>DPI evidence</span></div>
-              <div><b>2×</b><span>parallel lanes</span></div>
+              <div><b>{workerCapacity}×</b><span>inference {workerCapacity === 1 ? "lane" : "lanes"}</span></div>
               <div><b>30d</b><span>searchable history</span></div>
             </div>
           </div>
@@ -848,6 +915,38 @@ export default function Home() {
                   </div>
                 </div>
 
+                <section className={`totals-band ${rowsResult.totals.comparison}`} aria-label="Bill totals comparison" aria-live="polite">
+                  <article>
+                    <p>Active items total</p>
+                    <strong>{money(rowsResult.totals.items_total)}</strong>
+                    <small>
+                      {rowsResult.totals.missing_item_amounts
+                        ? `Partial · ${rowsResult.totals.missing_item_amounts} missing ${rowsResult.totals.missing_item_amounts === 1 ? "amount" : "amounts"}`
+                        : "All non-rejected ledger rows"}
+                    </small>
+                  </article>
+                  <article className="printed-total">
+                    <p>Printed bill total</p>
+                    <strong>{money(rowsResult.totals.bill_total?.amount ?? null)}</strong>
+                    {rowsResult.totals.bill_total ? (
+                      <button type="button" onClick={focusBillTotal}>
+                        {rowsResult.totals.bill_total.label} · source p.{rowsResult.totals.bill_total.page_number} ↗
+                      </button>
+                    ) : (
+                      <small>Not extracted from an explicit final-total label</small>
+                    )}
+                  </article>
+                  <article className="difference-total">
+                    <p>Difference</p>
+                    <strong>
+                      {rowsResult.totals.difference === null
+                        ? "—"
+                        : money(String(Math.abs(Number(rowsResult.totals.difference))))}
+                    </strong>
+                    <small>{differenceCopy(rowsResult.totals.difference)}</small>
+                  </article>
+                </section>
+
                 <div className="review-toolbar">
                   <input aria-label="Search rows" placeholder="Search charge, section, code…" value={query} onChange={(event) => { setQuery(event.target.value); setOffset(0); }} />
                   <select aria-label="Filter disposition" value={disposition} onChange={(event) => { setDisposition(event.target.value); setOffset(0); }}>
@@ -878,7 +977,7 @@ export default function Home() {
                         <thead><tr><th>#</th><th>Charge description</th><th>Date</th><th>Qty</th><th>Rate</th><th>Net amount</th></tr></thead>
                         <tbody>
                           {rowsResult.rows.map((row, index) => (
-                            <tr key={row.id} className={`${selectedRowId === row.id ? "selected" : ""} ${row.review_disposition} ${row.review.modified ? "modified" : ""}`} onClick={() => { setSelectedRowId(row.id); setEditMode(false); setAddMode(false); setHospitalEditMode(false); setDraftPolygon(null); }}>
+                            <tr key={row.id} className={`${selectedRowId === row.id ? "selected" : ""} ${row.review_disposition} ${row.review.modified ? "modified" : ""}`} onClick={() => { setSelectedRowId(row.id); setEditMode(false); setAddMode(false); setHospitalEditMode(false); setTotalEvidenceActive(false); setDraftPolygon(null); }}>
                               <td>{String(offset + index + 1).padStart(2, "0")}</td>
                               <td>
                                 <b>{row.description || "Unlabelled row"}</b>
@@ -954,6 +1053,7 @@ export default function Home() {
                           <svg viewBox={`0 0 ${pageAsset.width} ${pageAsset.height}`} preserveAspectRatio="none" aria-label={drawMode ? "Draw row evidence" : "Linked row evidence"} onPointerDown={startDraw} onPointerMove={moveDraw} onPointerUp={endDraw}>
                             {evidence.description && <polygon className="description-evidence" points={evidence.description} />}
                             {evidence.amount && evidence.amount !== evidence.description && <polygon className="amount-evidence" points={evidence.amount} />}
+                            {evidence.total && <polygon className="total-evidence" points={evidence.total} />}
                             {hospitalEvidence && !draftPolygon && <polygon className="hospital-evidence" points={hospitalEvidence} />}
                             {draftPolygon && <polygon className="draft-evidence" points={draftPolygon.map((point) => `${point.x},${point.y}`).join(" ")} />}
                           </svg>
@@ -968,7 +1068,14 @@ export default function Home() {
                         <button onClick={focusEvidence}>Focus header ↗</button>
                       </div>
                     )}
-                    {selectedRow && !addMode && !hospitalEditMode && (
+                    {totalEvidenceActive && rowsResult.totals.bill_total && (
+                      <div className="evidence-note total-note">
+                        <span>Σ</span>
+                        <div><strong>{rowsResult.totals.bill_total.label}</strong><p>{money(rowsResult.totals.bill_total.amount)} · printed on page {rowsResult.totals.bill_total.page_number}</p></div>
+                        <button onClick={focusEvidence}>Focus total ↗</button>
+                      </div>
+                    )}
+                    {selectedRow && !addMode && !hospitalEditMode && !totalEvidenceActive && (
                       <div className="evidence-note">
                         <span>{String((rowsResult.rows.findIndex((row) => row.id === selectedRow.id) + offset + 1)).padStart(2, "0")}</span>
                         <div><strong>{selectedRow.description}</strong><p>{money(selectedRow.net_amount)} · grounded on page {selectedRow.page_number}</p></div>

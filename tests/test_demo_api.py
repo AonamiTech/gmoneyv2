@@ -58,13 +58,12 @@ def test_upload_rejects_extension_signature_and_oversize(tmp_path: Path, monkeyp
         == 415
     )
     monkeypatch.setattr(api, "MAX_UPLOAD_BYTES", 5)
-    assert (
-        client.post(
-            "/api/v2/documents",
-            files={"file": ("bill.pdf", pdf_bytes(), "application/pdf")},
-        ).status_code
-        == 413
+    oversized = client.post(
+        "/api/v2/documents",
+        files={"file": ("bill.pdf", pdf_bytes(), "application/pdf")},
     )
+    assert oversized.status_code == 413
+    assert oversized.json()["detail"] == "PDF exceeds the 5 bytes limit"
 
 
 def test_completed_rows_and_page_are_scoped_to_uuid(tmp_path: Path, monkeypatch) -> None:
@@ -163,6 +162,17 @@ def completed_job(
     }
     result: dict[str, object] = {
         "output_version": "offline_accuracy_spine_v3",
+        "document_total_version": "document_total_v1",
+        "document_total": {
+            "total_version": "document_total_v1",
+            "amount_raw": "120.00",
+            "amount": "120.00",
+            "label": "Net Bill Amount",
+            "page_number": 1,
+            "evidence": evidence,
+            "confidence": 0.98,
+            "source_route": "page_ocr_final_total",
+        },
         "document_id": "d" * 64,
         "source_sha256": "e" * 64,
         "source_name": "client-bill.pdf",
@@ -219,6 +229,19 @@ def test_review_updates_are_revisioned_and_machine_output_is_immutable(
     assert response.json()["row"]["net_amount"] == "125.50"
     assert response.json()["row"]["review"]["machine_values"]["description"] == "Consultation"
     assert json.loads((store.job_dir(job_id) / "result.json").read_text()) == machine
+    totals = client.get(f"/api/v2/documents/{job_id}/rows").json()["totals"]
+    assert totals == {
+        "items_total": "125.50",
+        "bill_total": {
+            "amount": "120.00",
+            "label": "Net Bill Amount",
+            "page_number": 1,
+            "evidence": machine["document_total"]["evidence"],
+        },
+        "difference": "5.50",
+        "comparison": "mismatch",
+        "missing_item_amounts": 0,
+    }
 
     stale = client.patch(
         f"/api/v2/documents/{job_id}/rows/machine-row",
@@ -251,6 +274,11 @@ def test_reviewer_can_add_and_soft_reject_a_grounded_row(tmp_path: Path, monkeyp
     )
     assert response.status_code == 201
     row_id = response.json()["row"]["id"]
+    added_totals = client.get(
+        f"/api/v2/documents/{job_id}/rows", params={"query": "Added medicine"}
+    ).json()["totals"]
+    assert added_totals["items_total"] == "142.00"
+    assert added_totals["difference"] == "22.00"
     rejected = client.delete(
         f"/api/v2/documents/{job_id}/rows/{row_id}",
         headers={"If-Match": "1"},
@@ -260,6 +288,8 @@ def test_reviewer_can_add_and_soft_reject_a_grounded_row(tmp_path: Path, monkeyp
     rows = client.get(f"/api/v2/documents/{job_id}/rows", params={"disposition": "rejected"})
     assert rows.json()["total"] == 1
     assert rows.json()["rows"][0]["review"]["source"] == "reviewer"
+    assert rows.json()["totals"]["items_total"] == "100.00"
+    assert rows.json()["totals"]["difference"] == "-20.00"
 
 
 def test_hospital_name_correction_is_revisioned_grounded_and_exported(

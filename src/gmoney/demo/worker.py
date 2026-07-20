@@ -17,7 +17,11 @@ def _run_job(root_value: str, job_id: str, vl_url: str) -> dict[str, Any]:
 
     store = JobStore(Path(root_value))
     if _extractor is None:
-        _extractor = OfflineExtractor(vl_url)
+        _extractor = OfflineExtractor(
+            vl_url,
+            paddle_device=os.environ.get("GMONEY_PADDLE_DEVICE", "cpu"),
+            vl_device=os.environ.get("GMONEY_VL_DEVICE", "cpu"),
+        )
     directory = store.job_dir(job_id)
     state = store.read(job_id)
 

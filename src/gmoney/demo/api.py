@@ -28,6 +28,7 @@ from gmoney.demo.review import (
     review_summary,
     reviewer_row,
     structural_issues,
+    totals_summary,
 )
 from gmoney.demo.store import (
     ACTIVE_STATUSES,
@@ -53,6 +54,16 @@ app = FastAPI(
     docs_url="/api/v2/docs",
     openapi_url="/api/v2/openapi.json",
 )
+
+
+def _byte_limit_label(size: int) -> str:
+    mebibyte = 1024 * 1024
+    kibibyte = 1024
+    if size >= mebibyte and size % mebibyte == 0:
+        return f"{size // mebibyte} MiB"
+    if size >= kibibyte and size % kibibyte == 0:
+        return f"{size // kibibyte} KiB"
+    return f"{size} bytes"
 
 
 class ReviewPoint(BaseModel):
@@ -250,7 +261,10 @@ async def create_document(
                     signature = chunk[:5]
                 size += len(chunk)
                 if size > MAX_UPLOAD_BYTES:
-                    raise HTTPException(status_code=413, detail="PDF exceeds the 25 MiB limit")
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"PDF exceeds the {_byte_limit_label(MAX_UPLOAD_BYTES)} limit",
+                    )
                 output.write(chunk)
         if signature != b"%PDF-":
             raise HTTPException(status_code=415, detail="File does not have a valid PDF signature")
@@ -340,6 +354,7 @@ def get_rows(
 ) -> dict[str, Any]:
     result, review = _complete_result(job_id)
     rows = project_rows(result, review)
+    totals = totals_summary(result, review, rows)
     if query:
         needle = query.casefold().strip()
         rows = [
@@ -362,6 +377,7 @@ def get_rows(
         "page_assets": public_page_assets(result),
         "hospital": project_hospital(result, review),
         "review_revision": review["revision"],
+        "totals": totals,
         "total": total,
         "offset": offset,
         "limit": limit,

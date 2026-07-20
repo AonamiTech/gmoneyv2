@@ -63,6 +63,17 @@ class EvidenceRef(ContractModel):
     token_ids: tuple[str, ...] = ()
 
 
+class DocumentTotal(ContractModel):
+    total_version: str = "document_total_v1"
+    amount_raw: str
+    amount: Decimal
+    label: str
+    page_number: int = Field(ge=1)
+    evidence: EvidenceRef
+    confidence: float = Field(ge=0, le=1)
+    source_route: str = "page_ocr_final_total"
+
+
 class ProviderCandidate(VersionedContract):
     provider: str
     model: str

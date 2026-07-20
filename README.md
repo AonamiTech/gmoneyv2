@@ -41,6 +41,14 @@ passing frozen promotion decision.
 See [phase-3-plan.md](phase-3-plan.md) and
 [docs/reviews/phase-3.md](docs/reviews/phase-3.md) for the gates and current status.
 
+## GPU demo
+
+Use `compose.demo.yaml` with `compose.gpu.yaml` to run Paddle OCR/layout and the
+PaddleOCR-VL llama.cpp service on one NVIDIA GPU while preserving the existing
+API and evidence-review behavior. See
+[docs/GPU_DEMO_DEPLOYMENT.md](docs/GPU_DEMO_DEPLOYMENT.md) for host preparation,
+storage constraints, release commands, and acceptance gates.
+
 ## Editable client demo
 
 The demo Compose project exposes the Next.js evidence desk and FastAPI review API on
@@ -52,10 +60,22 @@ searchable for 30 days and labelled by
 their evidence-grounded hospital identity; reviewers can correct that identity, service dates,
 rows, and evidence without changing the machine result. The evidence workspace provides an
 independently scrolling ledger plus resize, fit, zoom, focus, and fullscreen page controls.
+It also reconciles the active reviewed item sum with an evidence-grounded final total printed
+on the bill; intermediate subtotals, payments, advances, and balance figures are excluded.
 
 ```bash
 GMONEY_IMAGE_TAG=$(git rev-parse --short=12 HEAD) \
   docker compose -f compose.demo.yaml up -d --build
+```
+
+Completed jobs created before document-total extraction can be upgraded from their retained
+page OCR caches without rerunning inference. Review the dry-run summary before applying it:
+
+```bash
+docker compose -f compose.demo.yaml run --rm --no-deps api \
+  gmoney-demo-backfill-totals --root /runtime
+docker compose -f compose.demo.yaml run --rm --no-deps api \
+  gmoney-demo-backfill-totals --root /runtime --apply
 ```
 
 The demo has no authentication and serves plain HTTP. Uploaded PDFs and full evidence/review

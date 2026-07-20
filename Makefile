@@ -15,4 +15,5 @@ corpus:
 
 compose-config:
 	docker compose config --quiet
-
+	docker compose -f compose.demo.yaml config --quiet
+	docker compose -f compose.demo.yaml -f compose.gpu.yaml config --quiet

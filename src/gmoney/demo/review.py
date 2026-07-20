@@ -32,6 +32,7 @@ EDITABLE_DECIMAL_FIELDS = {
 }
 EDITABLE_ENUM_FIELDS = {"role", "review_disposition"}
 EDITABLE_FIELDS = EDITABLE_TEXT_FIELDS | EDITABLE_DECIMAL_FIELDS | EDITABLE_ENUM_FIELDS
+ITEM_TOTAL_ROLES = {"detail", "refund", "category_rollup"}
 RAW_FIELD = {
     "quantity": "quantity_raw",
     "unit_price": "unit_price_raw",
@@ -198,6 +199,63 @@ def project_hospital(result: dict[str, Any], review: dict[str, Any]) -> dict[str
         "source": "machine",
         "machine_name": machine.get("name"),
         "reason": None,
+    }
+
+
+def totals_summary(
+    result: dict[str, Any],
+    review: dict[str, Any],
+    rows: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    projected = rows if rows is not None else project_rows(result, review)
+    included = [
+        row
+        for row in projected
+        if row.get("review_disposition") != "rejected"
+        and row.get("role") in ITEM_TOTAL_ROLES
+    ]
+    item_total = Decimal("0")
+    missing_amounts = 0
+    for row in included:
+        value = row.get("net_amount")
+        try:
+            parsed = Decimal(str(value)) if value is not None else None
+        except InvalidOperation:
+            parsed = None
+        if parsed is None or not parsed.is_finite():
+            missing_amounts += 1
+        else:
+            item_total += parsed
+
+    machine_total = result.get("document_total")
+    bill_total = None
+    bill_amount: Decimal | None = None
+    if isinstance(machine_total, dict):
+        try:
+            parsed = Decimal(str(machine_total.get("amount")))
+        except InvalidOperation:
+            parsed = Decimal("NaN")
+        if parsed.is_finite():
+            bill_amount = parsed
+            bill_total = {
+                key: machine_total.get(key)
+                for key in ("amount", "label", "page_number", "evidence")
+            }
+
+    difference: Decimal | None = None
+    if missing_amounts:
+        comparison = "items_partial"
+    elif bill_amount is None:
+        comparison = "bill_total_missing"
+    else:
+        difference = item_total - bill_amount
+        comparison = "match" if abs(difference) <= Decimal("0.01") else "mismatch"
+    return {
+        "items_total": format(item_total, "f"),
+        "bill_total": bill_total,
+        "difference": format(difference, "f") if difference is not None else None,
+        "comparison": comparison,
+        "missing_item_amounts": missing_amounts,
     }
 
 

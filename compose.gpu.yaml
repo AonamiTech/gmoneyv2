@@ -1,0 +1,71 @@
+name: gmoney-v2-demo
+
+services:
+  nginx:
+    ports:
+      - "${GMONEY_PUBLIC_HTTP_PORT:-3100}:8080"
+
+  paddleocr-vl:
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda@sha256:b57dce073940d6f347d59230d4d28fc947db8948f2eb162326008380b07bab77
+    command:
+      - --model
+      - /models/PaddleOCR-VL-1.6-GGUF.gguf
+      - --mmproj
+      - /models/PaddleOCR-VL-1.6-GGUF-mmproj.gguf
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8111"
+      - --ctx-size
+      - "24576"
+      - --parallel
+      - "1"
+      - --threads
+      - "4"
+      - --n-gpu-layers
+      - "99"
+      - --fit
+      - "on"
+      - --fit-target
+      - "8192"
+      - --temp
+      - "0"
+    volumes:
+      - ${GMONEY_MODEL_ROOT:-/home/ubuntu/gmoneyv2-runtime/model-cache}/paddleocr-vl-1.6:/models:ro
+    deploy:
+      resources:
+        limits:
+          memory: 16G
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  api:
+    environment:
+      GMONEY_WORKER_CAPACITY: "${GMONEY_GPU_WORKER_CONCURRENCY:-1}"
+
+  worker:
+    image: gmoney-v2-worker-gpu:${GMONEY_IMAGE_TAG:-local}
+    build:
+      context: .
+      dockerfile: infra/docker/inference-gpu.Dockerfile
+    environment:
+      GMONEY_PADDLE_DEVICE: gpu:0
+      GMONEY_VL_DEVICE: cuda:0
+      GMONEY_WORKER_CONCURRENCY: "${GMONEY_GPU_WORKER_CONCURRENCY:-1}"
+      OMP_NUM_THREADS: "4"
+      MKL_NUM_THREADS: "4"
+      FLAGS_paddle_num_threads: "4"
+    volumes:
+      - ${GMONEY_MODEL_ROOT:-/home/ubuntu/gmoneyv2-runtime/model-cache}:/home/modelworker/.paddlex
+    deploy:
+      resources:
+        limits:
+          memory: 24G
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

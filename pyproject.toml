@@ -36,6 +36,12 @@ inference-cpu = [
   "paddlex[ocr]==3.7.2",
   "psutil>=7,<8",
 ]
+inference-gpu = [
+  "huggingface-hub>=1,<2",
+  "paddleocr==3.7.0",
+  "paddlex[ocr]==3.7.2",
+  "psutil>=7,<8",
+]
 
 [project.scripts]
 gmoney-corpus = "gmoney.evaluation.corpus:app"
@@ -47,6 +53,7 @@ gmoney-ocr-fallback = "gmoney.inference.ocr_fallback_cli:app"
 gmoney-offline-extract = "gmoney.extraction.offline:app"
 gmoney-demo-worker = "gmoney.demo.worker:main"
 gmoney-demo-import = "gmoney.demo.import_history:app"
+gmoney-demo-backfill-totals = "gmoney.demo.backfill_totals:app"
 gmoney-profiles = "gmoney.profiles.cli:app"
 gmoney-phase3-evaluate = "gmoney.evaluation.phase3_cli:app"
 

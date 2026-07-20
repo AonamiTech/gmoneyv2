@@ -27,10 +27,16 @@ ADAPTERS = {
     "pp-ocrv6-medium": PaddleOcrV6Adapter,
     "pp-doclayoutv3": PaddleDocLayoutV3Adapter,
     "slanext-wireless": PaddleWirelessTableAdapter,
-    "paddleocr-vl-1.6": lambda: PaddleOcrVlAdapter(
-        base_url=os.getenv("PADDLEOCR_VL_URL", "http://127.0.0.1:8111")
-    ),
 }
+
+
+def _adapter(model: str, device: str):
+    if model == "paddleocr-vl-1.6":
+        return PaddleOcrVlAdapter(
+            base_url=os.getenv("PADDLEOCR_VL_URL", "http://127.0.0.1:8111"),
+            device=device,
+        )
+    return ADAPTERS[model](device=device)
 
 
 @app.command("run")
@@ -39,10 +45,12 @@ def run(
     images: Annotated[list[Path], typer.Option(exists=True, dir_okay=False)],
     output: Annotated[Path, typer.Option(dir_okay=False)],
     concurrency: Annotated[int, typer.Option(min=1, max=3)] = 1,
+    device: str = "cpu",
 ) -> None:
-    if model not in ADAPTERS:
-        raise typer.BadParameter(f"unknown model {model}; choose from {sorted(ADAPTERS)}")
-    adapter = ADAPTERS[model]()
+    models = (*ADAPTERS, "paddleocr-vl-1.6")
+    if model not in models:
+        raise typer.BadParameter(f"unknown model {model}; choose from {sorted(models)}")
+    adapter = _adapter(model, device)
 
     def predict(item: tuple[int, Path]) -> dict[str, object]:
         page_number, image = item

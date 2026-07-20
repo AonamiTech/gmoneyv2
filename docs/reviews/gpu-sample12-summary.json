@@ -1,0 +1,297 @@
+{
+  "run_version": "gpu_sample12_exposed_regression_v1",
+  "batch_id": "gpu-sample12-20260715T041552Z",
+  "created_at": "2026-07-15T04:42:49Z",
+  "target": {
+    "public_url": "http://34.180.11.221/",
+    "release": "409a538740f5-gpu-028401830bf2",
+    "gpu": "Tesla T4",
+    "gpu_memory_mib": 15360,
+    "nvidia_driver": "610.43.02"
+  },
+  "configuration": {
+    "bill_workers": 2,
+    "vlm_slots": 1,
+    "paddle_device": "gpu:0",
+    "vlm_device": "cuda:0",
+    "page_dpi": 300,
+    "recovery_crop_dpi": 400,
+    "vlm_context_tokens": 24576,
+    "max_full_crop_output_tokens": 16384,
+    "max_upload_bytes": 52428800,
+    "storage_floor_bytes": 10737418240,
+    "retention_hours": 720
+  },
+  "source": {
+    "documents": 12,
+    "pages": 166,
+    "bytes": 173106476,
+    "documents_manifest": [
+      {
+        "name": "Bill 1.pdf",
+        "pages": 30,
+        "bytes": 36974480,
+        "sha256": "7dc99f26cc46cecd5e892cb5442d0a511ddcc19da50802d6a5702aa6c0bf3a08"
+      },
+      {
+        "name": "Bill 2.pdf",
+        "pages": 31,
+        "bytes": 37115133,
+        "sha256": "f84c7465ffa6d45aa4d593675a39bc628d5da0de0a2deda0617aed1bfd7917c2"
+      },
+      {
+        "name": "Bill 3.pdf",
+        "pages": 8,
+        "bytes": 4890428,
+        "sha256": "2f0217d5624e3650d2715503b6cdf99a01c55a1ac11e463605e3c0a34a0258eb"
+      },
+      {
+        "name": "bill 4.pdf",
+        "pages": 43,
+        "bytes": 43553332,
+        "sha256": "6733966ba0ab21aeb48becabda1b887716f930a6a546fd7540478a023eaca100"
+      },
+      {
+        "name": "Bill 6.pdf",
+        "pages": 4,
+        "bytes": 2729410,
+        "sha256": "4724326b37e1603c695fc7e931adbafeaeb375691f19d58ac24772cdd8599585"
+      },
+      {
+        "name": "Bill 7.pdf",
+        "pages": 13,
+        "bytes": 10149223,
+        "sha256": "ea4960bcc7754ec1d0c6c6940e8851533686d2aa19b0f4e894d925d3224f8fb2"
+      },
+      {
+        "name": "Bill 8.pdf",
+        "pages": 9,
+        "bytes": 7347215,
+        "sha256": "999bebfbd09d9fbd4a48c39d9e0151d67e17e8f6028bda3bd405f40d0ca5f801"
+      },
+      {
+        "name": "Bill 9.pdf",
+        "pages": 9,
+        "bytes": 12969609,
+        "sha256": "5e2cd2d3d20bf8660a7cc9751c3ab13367cd9fb8da30cf7aca11ef011a5905ef"
+      },
+      {
+        "name": "Bill 10.pdf",
+        "pages": 4,
+        "bytes": 2276231,
+        "sha256": "a6c35948713c5bd28863388a146cb70a8b68311b801d5c967a606dabc6819be6"
+      },
+      {
+        "name": "Bill 11.pdf",
+        "pages": 2,
+        "bytes": 3119284,
+        "sha256": "7020bce20fcf9c2f12f74f838ac3fc675917238aedff069d1fe6735763afd46d"
+      },
+      {
+        "name": "Bill 12.pdf",
+        "pages": 3,
+        "bytes": 2178624,
+        "sha256": "5d73bbe431954ae6183cb6d34b52c3dd491aae90776956b07c0d5cfab6486c35"
+      },
+      {
+        "name": "Bill 13.pdf",
+        "pages": 10,
+        "bytes": 9803507,
+        "sha256": "362c6947014ab18226d7a63d731080d69825111632ee3f5e385142a287b252ee"
+      }
+    ]
+  },
+  "timing": {
+    "first_job_created_at": "2026-07-15T04:19:17.902Z",
+    "last_job_completed_at": "2026-07-15T04:36:17.896Z",
+    "wall_seconds": 1020,
+    "telemetry_started_at": "2026-07-15T04:19:08Z",
+    "telemetry_stopped_at": "2026-07-15T04:37:31Z"
+  },
+  "telemetry": {
+    "samples": 542,
+    "sample_interval_seconds": 2,
+    "canary_peak_gpu_memory_mib": 9969,
+    "batch_peak_gpu_memory_mib": 13223,
+    "max_gpu_utilization_percent": 100,
+    "max_gpu_temperature_c": 75,
+    "safety_gate_mib": 14000,
+    "safety_gate_passed": true
+  },
+  "results": {
+    "status_counts": {
+      "complete": 12
+    },
+    "documents": 12,
+    "pages": 166,
+    "rows": 5551,
+    "sample11_rows": 5460,
+    "bill12_rows": 91,
+    "local_vlm_calls": 17,
+    "gemini_calls": 0,
+    "documents_manifest": [
+      {
+        "name": "Bill 1.pdf",
+        "job_id": "af29a3d6-b765-433a-8255-e4536be85bc7",
+        "pages": 30,
+        "rows": 1332,
+        "created_at": "2026-07-15T04:21:41.952378Z",
+        "completed_at": "2026-07-15T04:36:17.896971Z",
+        "end_to_end_seconds": 875.944,
+        "status": "complete"
+      },
+      {
+        "name": "Bill 2.pdf",
+        "job_id": "83d4a78f-d95a-4f72-a1d9-f37bd463643c",
+        "pages": 31,
+        "rows": 1568,
+        "created_at": "2026-07-15T04:21:41.760352Z",
+        "completed_at": "2026-07-15T04:31:52.180265Z",
+        "end_to_end_seconds": 610.42,
+        "status": "complete"
+      },
+      {
+        "name": "Bill 3.pdf",
+        "job_id": "3da23209-dc89-4001-b3f3-7c10a3781a4f",
+        "pages": 8,
+        "rows": 145,
+        "created_at": "2026-07-15T04:20:27.330236Z",
+        "completed_at": "2026-07-15T04:26:20.220749Z",
+        "end_to_end_seconds": 352.89,
+        "status": "complete"
+      },
+      {
+        "name": "bill 4.pdf",
+        "job_id": "cae638b0-d40a-4586-baf5-cb81f027c791",
+        "pages": 43,
+        "rows": 1434,
+        "created_at": "2026-07-15T04:21:41.538224Z",
+        "completed_at": "2026-07-15T04:33:19.426582Z",
+        "end_to_end_seconds": 697.888,
+        "status": "complete"
+      },
+      {
+        "name": "Bill 6.pdf",
+        "job_id": "c08872fe-2d5b-440a-9c83-3c5284f214ba",
+        "pages": 4,
+        "rows": 12,
+        "created_at": "2026-07-15T04:20:27.363301Z",
+        "completed_at": "2026-07-15T04:25:54.144058Z",
+        "end_to_end_seconds": 326.781,
+        "status": "complete"
+      },
+      {
+        "name": "Bill 7.pdf",
+        "job_id": "e0373f82-22c0-461f-827a-3384af575e41",
+        "pages": 13,
+        "rows": 198,
+        "created_at": "2026-07-15T04:20:27.087980Z",
+        "completed_at": "2026-07-15T04:22:12.059473Z",
+        "end_to_end_seconds": 104.972,
+        "status": "complete"
+      },
+      {
+        "name": "Bill 8.pdf",
+        "job_id": "03de3eac-c0a1-4630-9fcc-f04187b4c323",
+        "pages": 9,
+        "rows": 135,
+        "created_at": "2026-07-15T04:20:27.203797Z",
+        "completed_at": "2026-07-15T04:23:17.226487Z",
+        "end_to_end_seconds": 170.023,
+        "status": "complete"
+      },
+      {
+        "name": "Bill 9.pdf",
+        "job_id": "cdc67dfb-03f6-45e8-9d93-4ba874beef56",
+        "pages": 9,
+        "rows": 217,
+        "created_at": "2026-07-15T04:20:27.276550Z",
+        "completed_at": "2026-07-15T04:23:44.800162Z",
+        "end_to_end_seconds": 197.524,
+        "status": "complete"
+      },
+      {
+        "name": "Bill 10.pdf",
+        "job_id": "e25e00ab-976e-4d1e-b799-e12dab771ebf",
+        "pages": 4,
+        "rows": 76,
+        "created_at": "2026-07-15T04:20:27.392150Z",
+        "completed_at": "2026-07-15T04:26:30.747714Z",
+        "end_to_end_seconds": 363.355,
+        "status": "complete"
+      },
+      {
+        "name": "Bill 11.pdf",
+        "job_id": "0164d200-b4ec-47fa-80f4-6b18d6479f1f",
+        "pages": 2,
+        "rows": 35,
+        "created_at": "2026-07-15T04:19:17.902316Z",
+        "completed_at": "2026-07-15T04:19:48.211706Z",
+        "end_to_end_seconds": 30.309,
+        "status": "complete"
+      },
+      {
+        "name": "Bill 12.pdf",
+        "job_id": "53793609-8d13-4bcd-926d-74f6ea4b1277",
+        "pages": 3,
+        "rows": 91,
+        "created_at": "2026-07-15T04:19:17.930202Z",
+        "completed_at": "2026-07-15T04:19:55.220151Z",
+        "end_to_end_seconds": 37.29,
+        "status": "complete"
+      },
+      {
+        "name": "Bill 13.pdf",
+        "job_id": "ad5a2249-db3b-4522-8849-74fd08bcba23",
+        "pages": 10,
+        "rows": 308,
+        "created_at": "2026-07-15T04:20:27.151022Z",
+        "completed_at": "2026-07-15T04:22:05.040808Z",
+        "end_to_end_seconds": 97.889,
+        "status": "complete"
+      }
+    ]
+  },
+  "integrity": {
+    "verified_jobs": 12,
+    "verified_pages": 166,
+    "verified_rows": 5551,
+    "artifact_files": 803,
+    "artifact_bytes": 1257091088,
+    "missing_evidence_rows": 0,
+    "missing_description_or_amount_evidence_rows": 0,
+    "invalid_evidence_references": 0,
+    "page_hash_mismatches": 0,
+    "source_hash_mismatches": 0,
+    "devices": [
+      "cuda:0",
+      "gpu:0"
+    ],
+    "errors": []
+  },
+  "acceptance": {
+    "two_bill_canary_passed": true,
+    "all_documents_complete": true,
+    "persisted_after_full_stack_restart": true,
+    "container_restart_counts_zero": true,
+    "oom_killed_false": true,
+    "fatal_oom_cuda_error_markers": 0,
+    "public_health_http_200": true,
+    "diagnostic_ports_external": false,
+    "post_cleanup_free_bytes": 23420116992
+  },
+  "comparison": {
+    "retained_sample11_row_baseline": 5460,
+    "current_sample11_rows": 5460,
+    "sample11_row_delta": 0,
+    "prior_bill12_canary_rows": 90,
+    "current_bill12_rows": 91,
+    "bill12_row_delta": 1,
+    "accuracy_claim": false,
+    "note": "The Sample Bills are exposed regression inputs without frozen gold; completion, routing, grounding, and artifact integrity are validated, not precision or recall."
+  },
+  "operational_events": [
+    "The 25 MiB default upload guard rejected Bills 1, 2, and 4 before processing.",
+    "The failed placeholders were deleted; the configured GPU upload limit was raised to 50 MiB and all three original PDFs were accepted unchanged."
+  ]
+}

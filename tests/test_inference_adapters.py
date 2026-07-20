@@ -1,10 +1,11 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
 
 from gmoney.inference.contracts import InferenceRequest
-from gmoney.inference.paddle import PaddleOcrVlAdapter, _require_output
+from gmoney.inference.paddle import PaddleOcrV6Adapter, PaddleOcrVlAdapter, _require_output
 
 
 def test_empty_model_output_is_never_a_success() -> None:
@@ -30,3 +31,21 @@ def test_vl_adapter_rejects_empty_provider_output(tmp_path: Path) -> None:
                 page_number=1,
             )
         )
+
+
+def test_adapter_device_is_forwarded_and_recorded(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakePaddleOcr:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "paddleocr",
+        SimpleNamespace(PaddleOCR=FakePaddleOcr),
+    )
+    adapter = PaddleOcrV6Adapter(device="gpu:0")
+    assert captured["device"] == "gpu:0"
+    assert adapter.spec.device == "gpu:0"
+    assert PaddleOcrVlAdapter(device="cuda:0").spec.device == "cuda:0"
