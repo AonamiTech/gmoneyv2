@@ -67,6 +67,7 @@ type Row = {
   section: string | null;
   quantity: string | null;
   unit_price: string | null;
+  gross_amount: string | null;
   discount: string | null;
   net_amount: string | null;
   role: string;
@@ -76,6 +77,15 @@ type Row = {
   field_evidence: Record<string, Evidence[]>;
   validation_flags: string[];
   review: ReviewMeta;
+};
+type PrintedTotal = {
+  amount: string;
+  label: string;
+  kind: string | null;
+  scope: string | null;
+  page_number: number;
+  evidence: Evidence;
+  is_primary?: boolean;
 };
 type PageAsset = {
   page_number: number;
@@ -91,14 +101,10 @@ type RowsResult = {
   review_revision: number;
   totals: {
     items_total: string;
-    bill_total: {
-      amount: string;
-      label: string;
-      page_number: number;
-      evidence: Evidence;
-    } | null;
+    bill_total: PrintedTotal | null;
+    printed_totals: PrintedTotal[];
     difference: string | null;
-    comparison: "match" | "mismatch" | "items_partial" | "bill_total_missing";
+    comparison: "match" | "mismatch" | "items_partial" | "bill_total_missing" | "multiple_printed_totals";
     missing_item_amounts: number;
   };
   total: number;
@@ -140,6 +146,7 @@ type EditValues = {
   service_date_iso: string;
   quantity: string;
   unit_price: string;
+  gross_amount: string;
   discount: string;
   net_amount: string;
   role: string;
@@ -152,6 +159,7 @@ const emptyEdit: EditValues = {
   service_date_iso: "",
   quantity: "",
   unit_price: "",
+  gross_amount: "",
   discount: "",
   net_amount: "",
   role: "detail",
@@ -167,15 +175,16 @@ const money = (value: string | null) =>
         maximumFractionDigits: 2,
       }).format(Number(value));
 
-const differenceCopy = (value: string | null) => {
+const differenceCopy = (value: string | null, comparison: RowsResult["totals"]["comparison"]) => {
+  if (comparison === "multiple_printed_totals") return "Multiple document totals found · review printed totals";
   if (value === null) return "Comparison unavailable";
   const difference = Number(value);
   if (Math.abs(difference) <= 0.01) return "Items and bill agree";
   return `Items are ${money(String(Math.abs(difference)))} ${difference > 0 ? "above" : "below"} bill`;
 };
 
-const serviceDate = (value: string | null) => {
-  if (!value) return "—";
+const serviceDate = (value: string | null, raw: string | null) => {
+  if (!value) return raw || "—";
   const [year, month, day] = value.split("-").map(Number);
   if (!year || !month || !day) return value;
   return new Intl.DateTimeFormat("en-IN", {
@@ -265,7 +274,8 @@ export default function Home() {
   const [addAmount, setAddAmount] = useState("");
   const [issueReason, setIssueReason] = useState("");
   const [hospitalEditMode, setHospitalEditMode] = useState(false);
-  const [totalEvidenceActive, setTotalEvidenceActive] = useState(false);
+  const [focusedPrintedTotal, setFocusedPrintedTotal] = useState<PrintedTotal | null>(null);
+  const totalEvidenceActive = focusedPrintedTotal !== null;
   const [hospitalName, setHospitalName] = useState("");
   const [hospitalReason, setHospitalReason] = useState("");
   const [drawMode, setDrawMode] = useState<"add" | "relink" | "hospital" | null>(null);
@@ -406,7 +416,7 @@ export default function Home() {
     setEditMode(false);
     setAddMode(false);
     setHospitalEditMode(false);
-    setTotalEvidenceActive(false);
+    setFocusedPrintedTotal(null);
     setDrawMode(null);
     setDraftPolygon(null);
   }, [selectedJobId]);
@@ -462,12 +472,13 @@ export default function Home() {
 
   const beginEdit = () => {
     if (!selectedRow) return;
-    setTotalEvidenceActive(false);
+    setFocusedPrintedTotal(null);
     setEditValues({
       description: selectedRow.description ?? "",
       service_date_iso: selectedRow.service_date_iso ?? "",
       quantity: selectedRow.quantity ?? "",
       unit_price: selectedRow.unit_price ?? "",
+      gross_amount: selectedRow.gross_amount ?? "",
       discount: selectedRow.discount ?? "",
       net_amount: selectedRow.net_amount ?? "",
       role: selectedRow.role,
@@ -563,7 +574,7 @@ export default function Home() {
 
   const beginHospitalEdit = () => {
     if (!rowsResult) return;
-    setTotalEvidenceActive(false);
+    setFocusedPrintedTotal(null);
     const source = rowsResult.hospital;
     setHospitalName(source?.name ?? selectedJob?.original_name.replace(/\.pdf$/i, "") ?? "");
     setHospitalReason(source?.reason ?? "");
@@ -700,17 +711,17 @@ export default function Home() {
 
   const focusEvidence = () => {
     const source = totalEvidenceActive
-      ? rowsResult?.totals.bill_total?.evidence
+      ? focusedPrintedTotal?.evidence
       : hospitalEditMode
         ? hospital?.evidence
         : selectedRow?.field_evidence?.description?.[0] ?? selectedRow?.evidence?.[0];
     focusEvidenceSource(source);
   };
 
-  const focusBillTotal = () => {
-    const source = rowsResult?.totals.bill_total?.evidence;
+  const focusBillTotal = (total: PrintedTotal | null = rowsResult?.totals.bill_total ?? null) => {
+    const source = total?.evidence;
     if (!source) return;
-    setTotalEvidenceActive(true);
+    setFocusedPrintedTotal(total);
     setHospitalEditMode(false);
     setEditMode(false);
     setAddMode(false);
@@ -732,7 +743,7 @@ export default function Home() {
   };
 
   const evidence = useMemo(() => {
-    const total = rowsResult?.totals.bill_total;
+    const total = focusedPrintedTotal;
     if (totalEvidenceActive) {
       return {
         description: "",
@@ -748,7 +759,7 @@ export default function Home() {
       amount: points(selectedRow.field_evidence?.amount?.[0]),
       total: "",
     };
-  }, [rowsResult?.totals.bill_total, selectedRow, totalEvidenceActive, viewPage]);
+  }, [focusedPrintedTotal, selectedRow, totalEvidenceActive, viewPage]);
   const hospitalEvidence =
     hospitalEditMode && hospital?.page_number === viewPage ? points(hospital.evidence) : "";
 
@@ -917,23 +928,37 @@ export default function Home() {
 
                 <section className={`totals-band ${rowsResult.totals.comparison}`} aria-label="Bill totals comparison" aria-live="polite">
                   <article>
-                    <p>Active items total</p>
+                    <p>Billable items total</p>
                     <strong>{money(rowsResult.totals.items_total)}</strong>
                     <small>
                       {rowsResult.totals.missing_item_amounts
                         ? `Partial · ${rowsResult.totals.missing_item_amounts} missing ${rowsResult.totals.missing_item_amounts === 1 ? "amount" : "amounts"}`
-                        : "All non-rejected ledger rows"}
+                        : "Informational rows excluded"}
                     </small>
                   </article>
                   <article className="printed-total">
                     <p>Printed bill total</p>
                     <strong>{money(rowsResult.totals.bill_total?.amount ?? null)}</strong>
                     {rowsResult.totals.bill_total ? (
-                      <button type="button" onClick={focusBillTotal}>
+                      <button type="button" onClick={() => focusBillTotal()}>
                         {rowsResult.totals.bill_total.label} · source p.{rowsResult.totals.bill_total.page_number} ↗
                       </button>
                     ) : (
                       <small>Not extracted from an explicit final-total label</small>
+                    )}
+                    {rowsResult.totals.printed_totals.length > 1 && (
+                      <details className="printed-totals-list">
+                        <summary>{rowsResult.totals.printed_totals.length} explicit totals found</summary>
+                        {rowsResult.totals.printed_totals.map((total, index) => (
+                          <button
+                            type="button"
+                            key={`${total.page_number}-${total.label}-${total.amount}-${index}`}
+                            onClick={() => focusBillTotal(total)}
+                          >
+                            {total.is_primary ? "Primary · " : ""}{total.label} · {money(total.amount)} · p.{total.page_number}
+                          </button>
+                        ))}
+                      </details>
                     )}
                   </article>
                   <article className="difference-total">
@@ -943,7 +968,7 @@ export default function Home() {
                         ? "—"
                         : money(String(Math.abs(Number(rowsResult.totals.difference))))}
                     </strong>
-                    <small>{differenceCopy(rowsResult.totals.difference)}</small>
+                    <small>{differenceCopy(rowsResult.totals.difference, rowsResult.totals.comparison)}</small>
                   </article>
                 </section>
 
@@ -973,24 +998,25 @@ export default function Home() {
                           <col className="quantity-column" />
                           <col className="money-column" />
                           <col className="money-column" />
+                          <col className="money-column" />
                         </colgroup>
-                        <thead><tr><th>#</th><th>Charge description</th><th>Date</th><th>Qty</th><th>Rate</th><th>Net amount</th></tr></thead>
+                        <thead><tr><th>#</th><th>Service / charge</th><th>Date</th><th>Qty</th><th>Rate</th><th>Gross</th><th>Net amount</th></tr></thead>
                         <tbody>
                           {rowsResult.rows.map((row, index) => (
-                            <tr key={row.id} className={`${selectedRowId === row.id ? "selected" : ""} ${row.review_disposition} ${row.review.modified ? "modified" : ""}`} onClick={() => { setSelectedRowId(row.id); setEditMode(false); setAddMode(false); setHospitalEditMode(false); setTotalEvidenceActive(false); setDraftPolygon(null); }}>
+                            <tr key={row.id} className={`${selectedRowId === row.id ? "selected" : ""} ${row.role} ${row.review_disposition} ${row.review.modified ? "modified" : ""}`} onClick={() => { setSelectedRowId(row.id); setEditMode(false); setAddMode(false); setHospitalEditMode(false); setFocusedPrintedTotal(null); setDraftPolygon(null); }}>
                               <td>{String(offset + index + 1).padStart(2, "0")}</td>
                               <td>
                                 <b>{row.description || "Unlabelled row"}</b>
                                 <small>
-                                  <i className={row.review_disposition} /> {row.review_disposition} · p.{row.page_number}
+                                  <i className={row.review_disposition} /> {row.role === "informational" ? "included in package · informational" : row.review_disposition} · p.{row.page_number}
                                   {row.review.modified ? " · reviewer changed" : ""}
                                   {row.validation_flags?.some((flag) => ["missing_labeled_quantity", "missing_labeled_unit_price", "line_arithmetic_mismatch"].includes(flag))
                                     ? " · field warning"
                                     : ""}
                                 </small>
                               </td>
-                              <td className="service-date">{serviceDate(row.service_date_iso)}</td>
-                              <td>{row.quantity ?? "—"}</td><td>{money(row.unit_price)}</td><td>{money(row.net_amount)}</td>
+                              <td className="service-date" title={row.service_date_raw ?? undefined}>{serviceDate(row.service_date_iso, row.service_date_raw)}</td>
+                              <td>{row.quantity ?? "—"}</td><td>{money(row.unit_price)}</td><td>{money(row.gross_amount)}</td><td>{money(row.net_amount)}</td>
                             </tr>
                           ))}
                         </tbody>
@@ -1068,17 +1094,17 @@ export default function Home() {
                         <button onClick={focusEvidence}>Focus header ↗</button>
                       </div>
                     )}
-                    {totalEvidenceActive && rowsResult.totals.bill_total && (
+                    {totalEvidenceActive && focusedPrintedTotal && (
                       <div className="evidence-note total-note">
                         <span>Σ</span>
-                        <div><strong>{rowsResult.totals.bill_total.label}</strong><p>{money(rowsResult.totals.bill_total.amount)} · printed on page {rowsResult.totals.bill_total.page_number}</p></div>
+                        <div><strong>{focusedPrintedTotal.label}</strong><p>{money(focusedPrintedTotal.amount)} · printed on page {focusedPrintedTotal.page_number}</p></div>
                         <button onClick={focusEvidence}>Focus total ↗</button>
                       </div>
                     )}
                     {selectedRow && !addMode && !hospitalEditMode && !totalEvidenceActive && (
                       <div className="evidence-note">
                         <span>{String((rowsResult.rows.findIndex((row) => row.id === selectedRow.id) + offset + 1)).padStart(2, "0")}</span>
-                        <div><strong>{selectedRow.description}</strong><p>{money(selectedRow.net_amount)} · grounded on page {selectedRow.page_number}</p></div>
+                        <div><strong>{selectedRow.description}</strong><p>{selectedRow.role === "informational" ? "Included package component · no separate printed amount" : money(selectedRow.net_amount)} · grounded on page {selectedRow.page_number}</p></div>
                         <button onClick={beginEdit}>Review row ↗</button>
                       </div>
                     )}
@@ -1105,9 +1131,10 @@ export default function Home() {
                         <label><span>Service date</span><input type="date" value={editValues.service_date_iso} onChange={(event) => setEditValues({ ...editValues, service_date_iso: event.target.value })} /></label>
                         <label><span>Quantity</span><input value={editValues.quantity} onChange={(event) => setEditValues({ ...editValues, quantity: event.target.value })} /></label>
                         <label><span>Unit rate</span><input value={editValues.unit_price} onChange={(event) => setEditValues({ ...editValues, unit_price: event.target.value })} /></label>
+                        <label><span>Gross amount</span><input value={editValues.gross_amount} onChange={(event) => setEditValues({ ...editValues, gross_amount: event.target.value })} /></label>
                         <label><span>Discount</span><input value={editValues.discount} onChange={(event) => setEditValues({ ...editValues, discount: event.target.value })} /></label>
                         <label><span>Net amount</span><input value={editValues.net_amount} onChange={(event) => setEditValues({ ...editValues, net_amount: event.target.value })} /></label>
-                        <label><span>Role</span><select value={editValues.role} onChange={(event) => setEditValues({ ...editValues, role: event.target.value })}><option value="detail">Detail</option><option value="category_rollup">Category rollup</option><option value="refund">Refund</option></select></label>
+                        <label><span>Role</span><select value={editValues.role} onChange={(event) => setEditValues({ ...editValues, role: event.target.value })}><option value="detail">Detail</option><option value="informational">Informational</option><option value="category_rollup">Category rollup</option><option value="refund">Refund</option></select></label>
                         <label><span>Disposition</span><select value={editValues.review_disposition} onChange={(event) => setEditValues({ ...editValues, review_disposition: event.target.value })}><option value="accepted">Accepted</option><option value="pending">Pending</option><option value="unreadable">Unreadable</option></select></label>
                         <label className="wide"><span>Review reason</span><input value={reason} onChange={(event) => setReason(event.target.value)} placeholder="What did you verify or change?" /></label>
                       </div>

@@ -107,3 +107,26 @@ def test_descriptionless_numeric_candidate_stays_out_of_canonical_ledger() -> No
         grounding_ratio=1,
     )
     assert canonicalize_rows("document", 1, "table", "a" * 64, (aligned,)) == ()
+
+
+def test_grounded_informational_row_is_published_without_an_amount() -> None:
+    candidate = CandidateLedgerRow(
+        source_row=2,
+        role=RowRole.INFORMATIONAL,
+        cells=("Complete Haemogram", "20/01/2026"),
+        description="Complete Haemogram",
+        service_date="20/01/2026",
+    )
+    aligned = AlignedLedgerRow(
+        candidate=candidate,
+        field_token_ids={"description": ("t1",), "service_date": ("t2",)},
+        evidence_token_ids=("t1", "t2"),
+        evidence_box=(10, 20, 200, 40),
+        grounding_ratio=1,
+    )
+    row = canonicalize_rows("document", 1, "table", "a" * 64, (aligned,))[0]
+    assert row.role is RowRole.INFORMATIONAL
+    assert row.service_date_raw == "20/01/2026"
+    assert row.service_date_iso == "2026-01-20"
+    assert row.net_amount is None
+    assert "amount" not in row.field_evidence

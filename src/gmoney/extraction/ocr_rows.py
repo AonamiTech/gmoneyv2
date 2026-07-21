@@ -21,20 +21,31 @@ HEADER_TERMS: dict[str, tuple[str, ...]] = {
         "service name",
         "item name",
         "itemname",
+        "product name",
+        "productname",
         "procedure name",
         "test name",
         "investigation",
         "services",
         "department",
     ),
-    "service_date": ("service date", "date time", "date"),
-    "request_no": ("request no", "requisition", "ref no"),
+    "service_date": (
+        "service date",
+        "bill date",
+        "billdate",
+        "date time",
+        "date/time",
+        "date",
+    ),
+    "request_no": ("request no", "requisition", "ref no", "bill number"),
     "service_code": ("service code", "code"),
+    "hsn_code": ("hsn code", "hsn", "sac code", "sac"),
     "company": ("company", "comp"),
     "batch": ("batch no", "bath no", "batch"),
     "expiry": ("expiry", "exp"),
     "quantity": ("quantity", "qty", "nos", "unit days", "units"),
     "rate": ("unit price", "unitprice", "unit rate", "unitrate", "rate"),
+    "gross_amount": ("gross amount", "service amount", "service amt"),
     "discount": ("discount", "disc amt", "disc"),
     "amount": (
         "net amount",
@@ -54,7 +65,11 @@ DATE_VALUE = (
     r"[-\s]\d{2,4})"
 )
 DATE_PREFIX = re.compile(
-    rf"^\s*(?P<date>{DATE_VALUE})(?:\s+\d{{1,2}}:\d{{2}}(?::\d{{2}})?)?\s*[-:]?\s*",
+    rf"^\s*(?P<date>{DATE_VALUE})(?:\s*\d{{1,2}}:\d{{2}}(?::\d{{2}})?)?\s*[-:]?\s*",
+    re.IGNORECASE,
+)
+DATE_SPAN = re.compile(
+    rf"{DATE_VALUE}(?:\s*\d{{1,2}}:\d{{2}}(?::\d{{2}})?)?",
     re.IGNORECASE,
 )
 DATE_RANGE_SUFFIX = re.compile(
@@ -139,6 +154,13 @@ class ReconstructionResult:
     rows: tuple[AlignedLedgerRow, ...]
     schema: TableSchemaState | None
     diagnostics: dict[str, object]
+
+
+@dataclass(frozen=True)
+class HeaderBlock:
+    start: int
+    end: int
+    roles: dict[str, OcrToken]
 
 
 def _lines(tokens: tuple[OcrToken, ...]) -> tuple[OcrLine, ...]:
@@ -334,6 +356,8 @@ def _header_roles(line: OcrLine) -> dict[str, OcrToken]:
                         matches[role] = candidate
         compound = len(matches) > 1
         for role, (_, start, end) in matches.items():
+            if role == "service_code" and "hsn_code" in matches:
+                continue
             role_token = (
                 _virtual_horizontal_token(token, start, end, len(normalized))
                 if compound
@@ -376,7 +400,9 @@ def _is_header_token(token: OcrToken) -> bool:
 
 
 def _valid_header(roles: dict[str, OcrToken]) -> bool:
-    return "description" in roles and bool({"amount", "rate", "quantity"} & roles.keys())
+    return "description" in roles and bool(
+        {"amount", "rate", "gross_amount", "quantity"} & roles.keys()
+    )
 
 
 def _valid_header_line(line: OcrLine, roles: dict[str, OcrToken]) -> bool:
@@ -385,6 +411,76 @@ def _valid_header_line(line: OcrLine, roles: dict[str, OcrToken]) -> bool:
     return _valid_header(roles) and not normalized.startswith(
         ("total for", "sub total", "subtotal", "grand total")
     )
+
+
+def _merge_header_roles(
+    current: dict[str, OcrToken], incoming: dict[str, OcrToken]
+) -> dict[str, OcrToken]:
+    merged = dict(current)
+    for role, token in incoming.items():
+        existing = merged.get(role)
+        if existing is None or (role == "amount" and _center_x(token) > _center_x(existing)):
+            merged[role] = token
+    return merged
+
+
+def _header_blocks(lines: tuple[OcrLine, ...]) -> tuple[HeaderBlock, ...]:
+    """Recognize headers split by OCR over as many as three adjacent lines."""
+    fragment_words = {
+        "amount",
+        "bill",
+        "code",
+        "date",
+        "description",
+        "disc",
+        "discount",
+        "gross",
+        "hsn",
+        "item",
+        "name",
+        "net",
+        "no",
+        "particulars",
+        "price",
+        "product",
+        "procedure",
+        "qty",
+        "quantity",
+        "rate",
+        "ref",
+        "request",
+        "sac",
+        "serial",
+        "service",
+        "sr",
+        "test",
+        "time",
+        "total",
+        "unit",
+    }
+    candidates: list[HeaderBlock] = []
+    for start in range(len(lines)):
+        roles: dict[str, OcrToken] = {}
+        start_words = set(re.findall(r"[a-z]+", _normalize(lines[start].text)))
+        if not _header_roles(lines[start]) and not (
+            start_words and start_words <= fragment_words
+        ):
+            continue
+        for end in range(start, min(len(lines), start + 3)):
+            roles = _merge_header_roles(roles, _header_roles(lines[end]))
+            if not _valid_header(roles):
+                continue
+            normalized = _normalize(" ".join(line.text for line in lines[start : end + 1]))
+            if normalized.startswith(("total for", "sub total", "subtotal", "grand total")):
+                continue
+            candidates.append(HeaderBlock(start=start, end=end, roles=dict(roles)))
+            break
+    selected: list[HeaderBlock] = []
+    for candidate in candidates:
+        if selected and candidate.start <= selected[-1].end:
+            continue
+        selected.append(candidate)
+    return tuple(selected)
 
 
 def _column_centers(
@@ -407,14 +503,25 @@ def _description_lane(
         for center in stable_centers
         if (center >= 0.55 if description_center is None else center > description_center + 0.04)
     )
-    labeled_financial_centers = tuple(
+    labeled_field_centers = tuple(
         centers[role]
-        for role in ("rate", "quantity", "discount", "amount")
+        for role in (
+            "request_no",
+            "service_code",
+            "hsn_code",
+            "service_date",
+            "rate",
+            "quantity",
+            "gross_amount",
+            "discount",
+            "amount",
+        )
         if role in centers
+        and (description_center is None or centers[role] > description_center + 0.04)
     )
     first_numeric_center = (
-        min(labeled_financial_centers)
-        if labeled_financial_centers
+        min(labeled_field_centers)
+        if labeled_field_centers
         else (min(financial_centers) if financial_centers else centers.get("amount"))
     )
     description_min = 0.0
@@ -457,6 +564,15 @@ def _numeric_tokens(line: OcrLine) -> list[tuple[OcrToken, Decimal]]:
                     )
                 )
                 continue
+        non_currency_text = re.sub(
+            r"\b(?:inr|rs|rupees?)\.?\b",
+            "",
+            token.text,
+            flags=re.IGNORECASE,
+        )
+        if re.search(r"[A-Za-z]", non_currency_text):
+            continue
+        date_spans = tuple((match.start(), match.end()) for match in DATE_SPAN.finditer(token.text))
         concatenated = re.fullmatch(
             r"(?P<first>[+-]?\d[\d,]*\.\d{2})(?P<second>\d+(?:\.\d{1,4})?)",
             token.text.strip(),
@@ -478,6 +594,12 @@ def _numeric_tokens(line: OcrLine) -> list[tuple[OcrToken, Decimal]]:
                 else tuple(re.finditer(r"[+-]?\d[\d,]*(?:\.\d{1,4})?", token.text))
             )
             spans = tuple((part.group(), part.start(), part.end()) for part in parts)
+        if date_spans:
+            spans = tuple(
+                span
+                for span in spans
+                if not any(span[1] < end and span[2] > start for start, end in date_spans)
+            )
         if len(spans) < 2:
             continue
         left, top, right, bottom = _bounds(token)
@@ -549,6 +671,13 @@ def _classify_table(
             "sponsor",
             "billing category",
             "mobile no",
+            "uid",
+            "aadhaar",
+            "aadhar",
+            "policy no",
+            "policy number",
+            "pin code",
+            "pincode",
             "bill no",
             "bill date time",
             "relation",
@@ -565,6 +694,20 @@ def _classify_table(
         return TableType.METADATA
     if "break up of charges" in normalized or "package break up" in normalized:
         return TableType.PACKAGE_SUMMARY
+    if (
+        row_count <= 24
+        and all(
+            term in normalized
+            for term in (
+                "service name",
+                "bill amount",
+                "discount amount",
+                "total amount",
+                "total bill amount",
+            )
+        )
+    ):
+        return TableType.CATEGORY_SUMMARY
     if (
         all(
             term in normalized
@@ -623,6 +766,8 @@ def _classify_table(
 
 def row_category(description: str, table_type: TableType) -> str | None:
     normalized = _normalize(description)
+    if "package" in normalized:
+        return "package"
     if table_type is TableType.PHARMACY or any(
         term in normalized for term in ("pharmacy", "medicine", "consumable")
     ):
@@ -722,11 +867,32 @@ def _is_metadata_description(description: str) -> bool:
                 "e mail",
                 "phone no",
                 "mobile no",
+                "uid",
+                "aadhaar",
+                "aadhar",
+                "policy no",
+                "policy number",
+                "pin code",
+                "pincode",
                 "credit fro",
             )
         )
         or normalized.startswith("rupees in")
-        or normalized in {"cgst", "sgst", "net bill", "upi", "expdate", "exp date"}
+        or normalized
+        in {
+            "cgst",
+            "sgst",
+            "net bill",
+            "upi",
+            "expdate",
+            "exp date",
+            "uid aadhaar",
+            "uid aadhar",
+            "policy no",
+            "policy number",
+            "pin code",
+            "pincode",
+        }
         or normalized.endswith(" admission")
         or normalized.endswith(" discharge")
         or ("date time" in normalized and "page" in normalized)
@@ -738,7 +904,7 @@ def _is_metadata_description(description: str) -> bool:
 
 def _is_total_description(normalized: str) -> bool:
     return (
-        normalized in {"total", "sub total", "subtotal"}
+        normalized in {"total", "totals", "tota", "sub total", "subtotal"}
         or any(
             term in normalized
             for term in (
@@ -746,6 +912,14 @@ def _is_total_description(normalized: str) -> bool:
                 "bill round off",
                 "round off amount",
                 "net bill amount",
+                "total gross bill value",
+                "total payable amount",
+                "net patient payable amt",
+                "net patient payable amount",
+                "net payable",
+                "gross amount",
+                "amount to be recelved",
+                "amount to be receive",
                 "company credit limit",
             )
         )
@@ -783,6 +957,18 @@ def _is_total_description(normalized: str) -> bool:
     )
 
 
+def _is_structural_total_line(line: OcrLine) -> bool:
+    normalized = _normalize(line.text)
+    if _is_total_description(normalized):
+        return True
+    if not line.tokens:
+        return False
+    leading = _normalize(line.tokens[0].text)
+    if leading not in {"total", "sub total", "subtotal"}:
+        return False
+    return not any(re.search(r"[a-z]", _normalize(token.text)) for token in line.tokens[1:])
+
+
 def _is_description_continuation(text: str, previous: str) -> bool:
     stripped = text.strip()
     return bool(
@@ -815,6 +1001,68 @@ def _clip_token_to_lane(
     end = min(text_length, round(text_length * end_fraction))
     clipped = token.text[start:end].strip(" -:[]")
     return token.model_copy(update={"text": clipped}) if clipped else None
+
+
+def _closest_field_token(
+    line: OcrLine,
+    target: float | None,
+    left: float,
+    width: float,
+    *,
+    role: str,
+) -> OcrToken | None:
+    if target is None:
+        return None
+
+    def valid(token: OcrToken) -> bool:
+        text = token.text.strip()
+        if not text or _is_header_token(token):
+            return False
+        if role == "service_date":
+            return DATE_SPAN.search(text) is not None
+        if role == "service_code":
+            return bool(re.fullmatch(r"(?=.*[A-Za-z])(?=.*\d)[A-Za-z0-9./-]{3,30}", text))
+        if role == "hsn_code":
+            return DATE_SPAN.search(text) is None and bool(
+                re.fullmatch(r"[A-Za-z0-9./-]{3,30}", text)
+            )
+        if role == "request_no":
+            return bool(re.fullmatch(r"[A-Za-z0-9./-]{3,60}", text))
+        return False
+
+    candidates = [token for token in line.tokens if valid(token)]
+    if not candidates:
+        return None
+    selected = min(candidates, key=lambda token: abs(((_center_x(token) - left) / width) - target))
+    return (
+        selected
+        if abs(((_center_x(selected) - left) / width) - target) <= 0.08
+        else None
+    )
+
+
+def _structured_text_fields(
+    line: OcrLine,
+    column_centers: dict[str, float],
+    left: float,
+    width: float,
+) -> tuple[dict[str, str], dict[str, tuple[str, ...]]]:
+    values: dict[str, str] = {}
+    evidence: dict[str, tuple[str, ...]] = {}
+    for role in ("service_date", "request_no", "service_code", "hsn_code"):
+        token = _closest_field_token(
+            line,
+            column_centers.get(role),
+            left,
+            width,
+            role=role,
+        )
+        if token is None:
+            continue
+        raw = re.sub(r"\s+", " ", token.text).strip()
+        values[role] = raw
+        evidence[role] = (token.token_id,)
+    return values, evidence
 
 
 def _closest_numeric(
@@ -861,28 +1109,35 @@ def reconstruct_ocr_rows(
         return ReconstructionResult((), None, {"ocr_line_count": 0, "ocr_row_count": 0})
 
     header_candidates = [(index, _header_roles(line)) for index, line in enumerate(lines)]
-    header_roles_by_index = dict(header_candidates)
-    valid_header_candidates = [
-        item
-        for item in header_candidates
-        if _valid_header_line(lines[item[0]], item[1])
-    ]
-    if valid_header_candidates:
-        header_index, header_roles = min(valid_header_candidates, key=lambda item: item[0])
+    merged_headers = _header_blocks(lines)
+    if merged_headers:
+        primary_header = merged_headers[0]
+        header_start = primary_header.start
+        header_index = primary_header.end
+        header_roles = primary_header.roles
     else:
+        header_start = 0
         header_index, header_roles = max(
             header_candidates,
             key=lambda item: (len(item[1]), -item[0]),
         )
     header_valid = _valid_header(header_roles)
     data_lines = lines[header_index + 1 :] if header_valid else lines
-    repeated_header_indexes = tuple(
-        index
-        for index, roles in header_candidates
-        if header_valid
-        and index > header_index
-        and _valid_header_line(lines[index], roles)
+    repeated_header_blocks = tuple(
+        block for block in merged_headers if header_valid and block.start > header_index
     )
+    if header_valid and not merged_headers:
+        repeated_header_blocks = tuple(
+            HeaderBlock(start=index, end=index, roles=roles)
+            for index, roles in header_candidates
+            if index > header_index and _valid_header_line(lines[index], roles)
+        )
+    repeated_header_indexes = tuple(block.start for block in repeated_header_blocks)
+    repeated_header_by_line = {
+        index: block
+        for block in repeated_header_blocks
+        for index in range(block.start, block.end + 1)
+    }
     first_segment_end = repeated_header_indexes[0] if repeated_header_indexes else len(lines)
     first_segment_lines = (
         lines[header_index + 1 : first_segment_end] if header_valid else data_lines
@@ -918,10 +1173,13 @@ def reconstruct_ocr_rows(
             inherited = True
 
     if stable_centers:
-        # The rightmost stable numeric lane is the printed extended amount.
-        # Do not invent optional column meanings from unlabeled lanes: a shifted
-        # quantity/rate is more dangerous than leaving that optional field blank.
-        column_centers["amount"] = stable_centers[-1]
+        labeled_amount = column_centers.get("amount")
+        if labeled_amount is None:
+            column_centers["amount"] = stable_centers[-1]
+        else:
+            nearby = min(stable_centers, key=lambda center: abs(center - labeled_amount))
+            if abs(nearby - labeled_amount) <= 0.06:
+                column_centers["amount"] = nearby
 
     summary_lines = [values for line in data_lines if len(values := _numeric_tokens(line)) >= 3]
     zero_tail_summary = bool(
@@ -941,7 +1199,9 @@ def reconstruct_ocr_rows(
     )
     has_tax_columns = bool(re.search(r"\b(?:gst|tax)\b", _normalize(table_text)))
     header_ids = tuple(
-        token.token_id for token in (lines[header_index].tokens if header_valid else ())
+        token.token_id
+        for line in (lines[header_start : header_index + 1] if header_valid else ())
+        for token in line.tokens
     )
     schema = None
     if "amount" in column_centers:
@@ -963,10 +1223,82 @@ def reconstruct_ocr_rows(
     )
     aligned: list[AlignedLedgerRow] = []
     pending_description_tokens: list[OcrToken] = []
+    pending_service_date: str | None = None
+    pending_service_date_ids: tuple[str, ...] = ()
     current_section: str | None = None
+
+    def extend_previous_description(
+        continuation_tokens: list[OcrToken], continuation_text: str
+    ) -> None:
+        previous = aligned[-1]
+        continuation_ids = tuple(token.token_id for token in continuation_tokens)
+        description_ids = tuple(
+            dict.fromkeys(
+                (*previous.field_token_ids.get("description", ()), *continuation_ids)
+            )
+        )
+        continuation_boxes = [
+            _bounds(original_by_id[token_id]) for token_id in continuation_ids
+        ]
+        previous_box = previous.evidence_box
+        assert previous_box is not None
+        combined_box = (
+            min(previous_box[0], *(item[0] for item in continuation_boxes)),
+            min(previous_box[1], *(item[1] for item in continuation_boxes)),
+            max(previous_box[2], *(item[2] for item in continuation_boxes)),
+            max(previous_box[3], *(item[3] for item in continuation_boxes)),
+        )
+        aligned[-1] = replace(
+            previous,
+            candidate=replace(
+                previous.candidate,
+                description=(
+                    f"{previous.candidate.description or ''} {continuation_text}"
+                ).strip(),
+            ),
+            field_token_ids={
+                **previous.field_token_ids,
+                "description": description_ids,
+            },
+            evidence_token_ids=tuple(
+                dict.fromkeys((*previous.evidence_token_ids, *continuation_ids))
+            ),
+            evidence_box=combined_box,
+        )
+
+    def append_aligned(
+        *,
+        candidate: CandidateLedgerRow,
+        field_tokens: dict[str, tuple[str, ...]],
+    ) -> None:
+        evidence_tokens = tuple(
+            dict.fromkeys(token_id for ids in field_tokens.values() for token_id in ids)
+        )
+        selected_tokens = [original_by_id[token_id] for token_id in evidence_tokens]
+        boxes = [_bounds(token) for token in selected_tokens]
+        evidence_box = (
+            min(item[0] for item in boxes),
+            min(item[1] for item in boxes),
+            max(item[2] for item in boxes),
+            max(item[3] for item in boxes),
+        )
+        aligned.append(
+            AlignedLedgerRow(
+                candidate=candidate,
+                field_token_ids=field_tokens,
+                evidence_token_ids=evidence_tokens,
+                evidence_box=evidence_box,
+                grounding_ratio=1.0,
+                source_routes=("ocr_spatial_graph",),
+            )
+        )
+
     for source_row, line in enumerate(data_lines, start=(header_index + 1 if header_valid else 0)):
-        repeated_roles = header_roles_by_index.get(source_row, {})
-        if _valid_header_line(line, repeated_roles):
+        repeated_block = repeated_header_by_line.get(source_row)
+        if repeated_block is not None:
+            if source_row != repeated_block.end:
+                continue
+            repeated_roles = repeated_block.roles
             next_header = next(
                 (index for index in repeated_header_indexes if index > source_row),
                 len(lines),
@@ -978,7 +1310,16 @@ def reconstruct_ocr_rows(
             )
             column_centers = _column_centers(repeated_roles, left=left, width=width)
             if segment_stable_centers:
-                column_centers["amount"] = segment_stable_centers[-1]
+                labeled_amount = column_centers.get("amount")
+                if labeled_amount is None:
+                    column_centers["amount"] = segment_stable_centers[-1]
+                else:
+                    nearby = min(
+                        segment_stable_centers,
+                        key=lambda center: abs(center - labeled_amount),
+                    )
+                    if abs(nearby - labeled_amount) <= 0.06:
+                        column_centers["amount"] = nearby
             stable_centers = segment_stable_centers
             amount_center = column_centers.get("amount")
             description_min, description_max = _description_lane(
@@ -998,10 +1339,45 @@ def reconstruct_ocr_rows(
                 or abs(((_center_x(amount_token) - left) / width) - amount_center) <= 0.06
             )
         )
+        structured_values, structured_evidence = _structured_text_fields(
+            line,
+            column_centers,
+            left,
+            width,
+        )
+        if pending_service_date:
+            current_date = structured_values.get("service_date")
+            same_date = bool(
+                current_date
+                and re.sub(r"\s+", "", current_date)
+                == re.sub(r"\s+", "", pending_service_date)
+            )
+            structured_values["service_date"] = (
+                pending_service_date
+                if not current_date or same_date
+                else f"{pending_service_date} {current_date}"
+            )
+            structured_evidence["service_date"] = tuple(
+                dict.fromkeys(
+                    (
+                        *pending_service_date_ids,
+                        *structured_evidence.get("service_date", ()),
+                    )
+                )
+            )
+            pending_service_date = None
+            pending_service_date_ids = ()
+        reserved_ids = {
+            token_id
+            for token_ids in structured_evidence.values()
+            for token_id in token_ids
+        }
+        if amount_token is not None:
+            reserved_ids.add(amount_token.token_id)
 
         line_description_tokens: list[OcrToken] = []
         for token in line.tokens:
-            if amount_token is not None and token.token_id == amount_token.token_id:
+            if token.token_id in reserved_ids:
                 continue
             if _is_header_token(token):
                 continue
@@ -1022,7 +1398,86 @@ def reconstruct_ocr_rows(
             ):
                 line_description_tokens.append(description_token)
 
+        if _is_structural_total_line(line):
+            if pending_description_tokens and aligned:
+                continuation_text, _, _ = _clean_description(
+                    " ".join(token.text for token in pending_description_tokens)
+                )
+                if continuation_text:
+                    extend_previous_description(
+                        pending_description_tokens,
+                        continuation_text,
+                    )
+            pending_description_tokens = []
+            continue
+
         if not amount_in_lane:
+            if (
+                (line_description_tokens or pending_description_tokens)
+                and structured_values
+                and table_type not in {TableType.METADATA, TableType.PAYMENT}
+            ):
+                if line_description_tokens and pending_description_tokens:
+                    pending_text, _, _ = _clean_description(
+                        " ".join(token.text for token in pending_description_tokens)
+                    )
+                    current_section = pending_text or current_section
+                    pending_description_tokens = []
+                elif pending_description_tokens:
+                    line_description_tokens = pending_description_tokens
+                    pending_description_tokens = []
+                description_text = " ".join(
+                    token.text for token in line_description_tokens
+                )
+                description, embedded_date, embedded_request = _clean_description(
+                    description_text
+                )
+                if description and len(re.sub(r"[^a-z0-9]", "", _normalize(description))) >= 3:
+                    field_tokens = {
+                        "description": tuple(
+                            token.token_id for token in line_description_tokens
+                        ),
+                        **structured_evidence,
+                    }
+                    service_date = structured_values.get("service_date") or embedded_date
+                    request_no = structured_values.get("request_no") or embedded_request
+                    if description.startswith("/") and request_no:
+                        description = " ".join(
+                            part
+                            for part in (
+                                current_section,
+                                f"{request_no}{description}",
+                            )
+                            if part
+                        )
+                    candidate = CandidateLedgerRow(
+                        source_row=source_row,
+                        role=RowRole.INFORMATIONAL,
+                        cells=tuple(token.text for token in line.tokens),
+                        section=current_section,
+                        description=description,
+                        service_date=service_date,
+                        request_no=request_no,
+                        service_code=structured_values.get("service_code"),
+                        hsn_code=structured_values.get("hsn_code"),
+                        amount=None,
+                        table_type=table_type,
+                        category=(
+                            row_category(description, table_type)
+                            or row_category(current_section or "", table_type)
+                        ),
+                        source_route="ocr_spatial_graph",
+                    )
+                    append_aligned(candidate=candidate, field_tokens=field_tokens)
+                continue
+            if (
+                not line_description_tokens
+                and structured_values.get("service_date")
+                and set(structured_values) == {"service_date"}
+            ):
+                pending_service_date = structured_values["service_date"]
+                pending_service_date_ids = structured_evidence["service_date"]
+                continue
             # Defer deciding whether a text-only line is a section label or a
             # description split from its numeric row until the following line.
             if line_description_tokens:
@@ -1037,52 +1492,10 @@ def reconstruct_ocr_rows(
                         aligned[-1].candidate.description or "",
                     )
                 ):
-                    previous = aligned[-1]
-                    continuation_ids = tuple(token.token_id for token in line_description_tokens)
-                    description_ids = tuple(
-                        dict.fromkeys(
-                            (
-                                *previous.field_token_ids.get("description", ()),
-                                *continuation_ids,
-                            )
-                        )
-                    )
-                    continuation_boxes = [
-                        _bounds(original_by_id[token_id]) for token_id in continuation_ids
-                    ]
-                    previous_box = previous.evidence_box
-                    assert previous_box is not None
-                    combined_box = (
-                        min(previous_box[0], *(box[0] for box in continuation_boxes)),
-                        min(previous_box[1], *(box[1] for box in continuation_boxes)),
-                        max(previous_box[2], *(box[2] for box in continuation_boxes)),
-                        max(previous_box[3], *(box[3] for box in continuation_boxes)),
-                    )
-                    aligned[-1] = replace(
-                        previous,
-                        candidate=replace(
-                            previous.candidate,
-                            description=(
-                                f"{previous.candidate.description or ''} {continuation_text}"
-                            ).strip(),
-                        ),
-                        field_token_ids={
-                            **previous.field_token_ids,
-                            "description": description_ids,
-                        },
-                        evidence_token_ids=tuple(
-                            dict.fromkeys((*previous.evidence_token_ids, *continuation_ids))
-                        ),
-                        evidence_box=combined_box,
-                    )
+                    extend_previous_description(line_description_tokens, continuation_text)
                     pending_description_tokens = []
                 else:
                     pending_description_tokens = line_description_tokens
-            continue
-
-        normalized_line = _normalize(line.text)
-        if _is_total_description(normalized_line):
-            pending_description_tokens = []
             continue
 
         description_tokens = line_description_tokens
@@ -1099,7 +1512,9 @@ def reconstruct_ocr_rows(
             pending_description_tokens = []
 
         description_text = " ".join(token.text for token in description_tokens)
-        description, service_date, request_no = _clean_description(description_text)
+        description, embedded_date, embedded_request = _clean_description(description_text)
+        service_date = structured_values.get("service_date") or embedded_date
+        request_no = structured_values.get("request_no") or embedded_request
         if not description:
             continue
         normalized_description = _normalize(description)
@@ -1113,8 +1528,9 @@ def reconstruct_ocr_rows(
         field_tokens: dict[str, tuple[str, ...]] = {
             "description": tuple(token.token_id for token in description_tokens),
             "amount": (amount_token.token_id,),
+            **structured_evidence,
         }
-        if service_date:
+        if service_date and "service_date" not in field_tokens:
             date_tokens = tuple(
                 token.token_id
                 for token in description_tokens
@@ -1122,7 +1538,7 @@ def reconstruct_ocr_rows(
             )
             if date_tokens:
                 field_tokens["service_date"] = date_tokens
-        if request_no:
+        if request_no and "request_no" not in field_tokens:
             request_tokens = tuple(
                 token.token_id
                 for token in description_tokens
@@ -1130,8 +1546,13 @@ def reconstruct_ocr_rows(
             )
             if request_tokens:
                 field_tokens["request_no"] = request_tokens
-        values: dict[str, Decimal | None] = {"quantity": None, "rate": None, "discount": None}
-        for role in ("rate", "quantity", "discount"):
+        values: dict[str, Decimal | None] = {
+            "quantity": None,
+            "rate": None,
+            "gross_amount": None,
+            "discount": None,
+        }
+        for role in ("rate", "quantity", "gross_amount", "discount"):
             target = column_centers.get(role)
             if target is None:
                 continue
@@ -1187,6 +1608,12 @@ def reconstruct_ocr_rows(
                 expected_amount -= values["discount"]
             if abs(expected_amount - amount) > Decimal("0.01"):
                 validation_flags.append("line_arithmetic_mismatch")
+        elif values["gross_amount"] is not None and not has_tax_columns:
+            expected_amount = values["gross_amount"]
+            if values["discount"] is not None:
+                expected_amount -= values["discount"]
+            if abs(expected_amount - amount) > Decimal("0.01"):
+                validation_flags.append("line_arithmetic_mismatch")
         candidate = CandidateLedgerRow(
             source_row=source_row,
             role=role,
@@ -1195,8 +1622,11 @@ def reconstruct_ocr_rows(
             description=description,
             service_date=service_date,
             request_no=request_no,
+            service_code=structured_values.get("service_code"),
+            hsn_code=structured_values.get("hsn_code"),
             quantity=values["quantity"],
             rate=values["rate"],
+            gross_amount=values["gross_amount"],
             discount=values["discount"],
             amount=amount,
             table_type=table_type,
@@ -1207,27 +1637,7 @@ def reconstruct_ocr_rows(
             source_route="ocr_spatial_graph",
             validation_flags=tuple(validation_flags),
         )
-        evidence_tokens = tuple(
-            dict.fromkeys(token_id for ids in field_tokens.values() for token_id in ids)
-        )
-        selected_tokens = [original_by_id[token_id] for token_id in evidence_tokens]
-        boxes = [_bounds(token) for token in selected_tokens]
-        evidence_box = (
-            min(item[0] for item in boxes),
-            min(item[1] for item in boxes),
-            max(item[2] for item in boxes),
-            max(item[3] for item in boxes),
-        )
-        aligned.append(
-            AlignedLedgerRow(
-                candidate=candidate,
-                field_token_ids=field_tokens,
-                evidence_token_ids=evidence_tokens,
-                evidence_box=evidence_box,
-                grounding_ratio=1.0,
-                source_routes=("ocr_spatial_graph",),
-            )
-        )
+        append_aligned(candidate=candidate, field_tokens=field_tokens)
 
     return ReconstructionResult(
         rows=tuple(aligned),

@@ -175,6 +175,7 @@ def align_candidate_rows(
             for field, value in (
                 ("rate", aligned_candidate.rate),
                 ("quantity", aligned_candidate.quantity),
+                ("gross_amount", aligned_candidate.gross_amount),
                 ("discount", aligned_candidate.discount),
             ):
                 token_index = _numeric_token(
@@ -237,6 +238,7 @@ def align_candidate_rows(
             for value in (
                 aligned_candidate.quantity,
                 aligned_candidate.rate,
+                aligned_candidate.gross_amount,
                 aligned_candidate.discount,
                 aligned_candidate.amount,
             )

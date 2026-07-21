@@ -182,7 +182,7 @@ def ground_adjudication(
     evidence_by_id = {token.token_id: token for token in evidence_tokens}
     output: list[AlignedLedgerRow] = []
     rejected: list[str] = list(response.rejected_reasons)
-    numeric_fields = {"amount", "quantity", "rate", "discount"}
+    numeric_fields = {"amount", "quantity", "rate", "gross_amount", "discount"}
     optional_text_fields = {
         "service_date",
         "request_no",
@@ -275,6 +275,7 @@ def ground_adjudication(
             hsn_code=fields.get("hsn_code"),
             quantity=parse_decimal(fields.get("quantity")),
             rate=parse_decimal(fields.get("rate")),
+            gross_amount=parse_decimal(fields.get("gross_amount")),
             discount=parse_decimal(fields.get("discount")),
             amount=amount,
             table_type=table_type,

@@ -69,8 +69,10 @@ def test_backfill_is_dry_by_default_atomic_and_idempotent(tmp_path: Path) -> Non
     applied = backfill_totals(root=tmp_path, apply=True)
     assert applied["updated"] == 1
     result = json.loads(result_path.read_text())
-    assert result["document_total_version"] == "document_total_v1"
+    assert result["document_total_version"] == "document_total_v2"
+    assert result["document_totals_version"] == "document_totals_v1"
     assert result["document_total"]["amount"] == "1234.50"
+    assert result["document_totals"][0]["amount"] == "1234.50"
 
     repeated = backfill_totals(root=tmp_path, apply=True)
     assert repeated["already_current"] == 1

@@ -10,9 +10,11 @@ import typer
 from gmoney.demo.store import JobStore
 from gmoney.extraction.document_total import (
     DOCUMENT_TOTAL_VERSION,
+    DOCUMENT_TOTALS_VERSION,
     DocumentTotalCandidate,
     extract_document_total_candidates,
     select_document_total,
+    select_document_totals,
 )
 from gmoney.extraction.ocr_tokens import paddle_ocr_tokens
 
@@ -62,10 +64,15 @@ def backfill_totals(*, root: Path, apply: bool = False) -> dict[str, Any]:
         result_path = store.job_dir(job_id) / "result.json"
         try:
             result = json.loads(result_path.read_text())
-            if result.get("document_total_version") == DOCUMENT_TOTAL_VERSION:
+            if (
+                result.get("document_total_version") == DOCUMENT_TOTAL_VERSION
+                and result.get("document_totals_version") == DOCUMENT_TOTALS_VERSION
+            ):
                 summary["already_current"] += 1
                 continue
-            total = select_document_total(_cached_tokens(store.job_dir(job_id), result))
+            candidates = _cached_tokens(store.job_dir(job_id), result)
+            total = select_document_total(candidates)
+            totals = select_document_totals(candidates)
             if total is None:
                 summary["not_found"] += 1
             if not apply:
@@ -74,7 +81,9 @@ def backfill_totals(*, root: Path, apply: bool = False) -> dict[str, Any]:
             updated = {
                 **result,
                 "document_total_version": DOCUMENT_TOTAL_VERSION,
+                "document_totals_version": DOCUMENT_TOTALS_VERSION,
                 "document_total": total.model_dump(mode="json") if total is not None else None,
+                "document_totals": [item.model_dump(mode="json") for item in totals],
             }
             _atomic_json(result_path, updated)
             summary["updated"] += 1

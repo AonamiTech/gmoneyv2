@@ -148,6 +148,9 @@ def test_service_date_parser_supports_numeric_and_alphabetic_indian_dates() -> N
     assert parse_service_date("12/02/2026") == "2026-02-12"
     assert parse_service_date("12 February 2026") == "2026-02-12"
     assert parse_service_date("2026-02-12") is None
+    assert parse_service_date("20/01/2026 10:24:02") == "2026-01-20"
+    assert parse_service_date("20/01/202610:24:02") == "2026-01-20"
+    assert parse_service_date("20/01/2026 - 21/01/2026") is None
 
 
 def test_inference_cache_is_bound_to_artifact_options_and_model(tmp_path: Path) -> None:

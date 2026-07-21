@@ -54,6 +54,7 @@ gmoney-offline-extract = "gmoney.extraction.offline:app"
 gmoney-demo-worker = "gmoney.demo.worker:main"
 gmoney-demo-import = "gmoney.demo.import_history:app"
 gmoney-demo-backfill-totals = "gmoney.demo.backfill_totals:app"
+gmoney-demo-reprocess = "gmoney.demo.reprocess:app"
 gmoney-profiles = "gmoney.profiles.cli:app"
 gmoney-phase3-evaluate = "gmoney.evaluation.phase3_cli:app"
 

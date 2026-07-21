@@ -439,8 +439,13 @@ def test_repeated_procedure_header_is_not_published_as_a_charge() -> None:
     )
     assert result.diagnostics["header_segments"] == 2
     assert [row.candidate.description for row in result.rows] == [
-        "MRI Head RI089",
-        "Urinary Bladder Catheterisation GP009",
+        "MRI Head",
+        "Urinary Bladder Catheterisation",
+    ]
+    assert [row.candidate.service_code for row in result.rows] == ["RI089", "GP009"]
+    assert [row.candidate.service_date for row in result.rows] == [
+        "18/01/2026",
+        "19/01/2026",
     ]
     assert result.rows[1].candidate.quantity == Decimal("1")
     assert result.rows[1].candidate.amount == Decimal("630.00")
@@ -747,3 +752,202 @@ def test_headerless_settlement_region_is_terminal_payment() -> None:
         RowRole.PAYMENT,
         RowRole.UNRESOLVED,
     }
+
+
+def test_wrapped_header_keeps_date_code_and_amount_in_distinct_lanes() -> None:
+    tokens = (
+        token(0, "Service", (100, 20, 180, 32)),
+        token(1, "Net", (890, 20, 930, 32)),
+        token(2, "Service Name", (100, 42, 280, 54)),
+        token(3, "Date", (650, 42, 710, 54)),
+        token(4, "Code", (520, 64, 580, 76)),
+        token(5, "Amount", (870, 64, 960, 76)),
+        token(6, "Package Name : Coronary Angiography", (100, 100, 430, 114)),
+        token(7, "20/01/2026 - 21/01/2026", (650, 100, 790, 114)),
+        token(8, "11457.00", (870, 100, 960, 114)),
+        token(9, "Complete Haemogram", (100, 135, 360, 149)),
+        token(10, "LB012", (520, 135, 580, 149)),
+        token(11, "20/01/2026 10:24:02", (650, 135, 800, 149)),
+    )
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 10, 980, 170),
+    )
+    assert result.diagnostics["header_found"] is True
+    assert result.diagnostics["column_centers"]["amount"] > result.diagnostics[
+        "column_centers"
+    ]["service_date"]
+    assert len(result.rows) == 2
+    charge, component = (row.candidate for row in result.rows)
+    assert charge.amount == Decimal("11457.00")
+    assert charge.service_date == "20/01/2026 - 21/01/2026"
+    assert component.role is RowRole.INFORMATIONAL
+    assert component.amount is None
+    assert component.service_code == "LB012"
+    assert component.service_date == "20/01/2026 10:24:02"
+    assert result.rows[1].field_token_ids["service_date"] == ("token-11",)
+
+
+def test_wrapped_repeated_header_updates_columns_without_becoming_a_row() -> None:
+    tokens = (
+        token(0, "Service", (100, 20, 180, 32)),
+        token(1, "Net", (890, 20, 930, 32)),
+        token(2, "Service Name", (100, 42, 240, 54)),
+        token(3, "Date", (650, 42, 710, 54)),
+        token(4, "Code", (520, 64, 580, 76)),
+        token(5, "Amount", (870, 64, 960, 76)),
+        token(6, "First service", (100, 100, 280, 114)),
+        token(7, "LB001", (520, 100, 580, 114)),
+        token(8, "20/01/2026", (650, 100, 750, 114)),
+        token(9, "100.00", (870, 100, 950, 114)),
+        token(10, "Service", (100, 140, 180, 152)),
+        token(11, "Net", (890, 140, 930, 152)),
+        token(12, "Service Name", (100, 162, 240, 174)),
+        token(13, "Date", (650, 162, 710, 174)),
+        token(14, "Code", (520, 184, 580, 196)),
+        token(15, "Amount", (870, 184, 960, 196)),
+        token(16, "Second service", (100, 220, 280, 234)),
+        token(17, "LB002", (520, 220, 580, 234)),
+        token(18, "21/01/2026", (650, 220, 750, 234)),
+        token(19, "200.00", (870, 220, 950, 234)),
+    )
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 10, 980, 250),
+    )
+
+    assert [row.candidate.description for row in result.rows] == [
+        "First service",
+        "Second service",
+    ]
+    assert [row.candidate.amount for row in result.rows] == [
+        Decimal("100.00"),
+        Decimal("200.00"),
+    ]
+    assert [row.candidate.service_date for row in result.rows] == [
+        "20/01/2026",
+        "21/01/2026",
+    ]
+    assert result.diagnostics["header_segments"] == 2
+
+
+def test_description_before_subtotal_extends_previous_serial_row() -> None:
+    tokens = (
+        token(0, "Sr. No.", (80, 30, 140, 45)),
+        token(1, "Service Name", (200, 30, 430, 45)),
+        token(2, "Bill Amount", (650, 30, 760, 45)),
+        token(3, "Discount Amount", (770, 30, 860, 45)),
+        token(4, "Total Amount", (870, 30, 970, 45)),
+        token(5, "1", (90, 70, 105, 85)),
+        token(6, "Package(IPD) - Coronary", (200, 70, 500, 85)),
+        token(7, "11457.00", (880, 70, 960, 85)),
+        token(8, "Angiography (CAG)", (200, 100, 430, 115)),
+        token(9, "Total", (200, 130, 280, 145)),
+        token(10, "11457.00", (880, 130, 960, 145)),
+        token(11, "Total Bill Amount", (650, 160, 830, 175)),
+        token(12, "11457.00", (880, 160, 960, 175)),
+    )
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(70, 20, 980, 190),
+    )
+    assert len(result.rows) == 1
+    assert result.rows[0].candidate.description == (
+        "Package(IPD) - Coronary Angiography (CAG)"
+    )
+    assert result.rows[0].candidate.amount == Decimal("11457.00")
+    assert result.rows[0].candidate.role is RowRole.CATEGORY_ROLLUP
+
+
+def test_headerless_continuation_inherits_date_without_inventing_amount() -> None:
+    header = (
+        token(0, "Service Name", (100, 30, 300, 45)),
+        token(1, "Date", (650, 30, 710, 45)),
+        token(2, "Net Amount", (870, 30, 970, 45)),
+        token(3, "Package", (100, 70, 280, 85)),
+        token(4, "20/01/2026", (650, 70, 750, 85)),
+        token(5, "100.00", (880, 70, 960, 85)),
+    )
+    first = reconstruct_ocr_rows(
+        header,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 20, 980, 100),
+    )
+    continuation = tuple(
+        value.model_copy(update={"page_number": 2, "token_id": f"p2-{value.token_id}"})
+        for value in (
+            token(6, "Included medicine", (100, 30, 330, 45)),
+            token(7, "21/01/2026 11:47:02", (650, 30, 800, 45)),
+        )
+    )
+    second = reconstruct_ocr_rows(
+        continuation,
+        page_number=2,
+        table_id="p2-t1",
+        box=(80, 20, 980, 70),
+        prior_schemas=(first.schema,) if first.schema else (),
+    )
+    assert second.diagnostics["schema_inherited"] is True
+    assert len(second.rows) == 1
+    assert second.rows[0].candidate.role is RowRole.INFORMATIONAL
+    assert second.rows[0].candidate.service_date == "21/01/2026 11:47:02"
+    assert second.rows[0].candidate.amount is None
+
+
+def test_client_pharmacy_aliases_keep_date_product_gross_and_net_in_their_lanes() -> None:
+    tokens = (
+        token(0, "BillDate", (80, 25, 150, 40)),
+        token(1, "Bill Number", (170, 25, 260, 40)),
+        token(2, "ProductName", (290, 25, 430, 40)),
+        token(3, "Qty", (610, 25, 650, 40)),
+        token(4, "Rate", (700, 25, 750, 40)),
+        token(5, "Service Amt", (790, 25, 870, 40)),
+        token(6, "Total", (910, 25, 960, 40)),
+        token(7, "20/07/2026", (80, 70, 150, 85)),
+        token(8, "B-441", (170, 70, 250, 85)),
+        token(9, "Ceftriaxone 1g Inj", (290, 70, 500, 85)),
+        token(10, "2", (620, 70, 635, 85)),
+        token(11, "125.00", (700, 70, 755, 85)),
+        token(12, "250.00", (800, 70, 860, 85)),
+        token(13, "225.00", (910, 70, 965, 85)),
+    )
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(60, 15, 980, 100),
+    )
+    assert len(result.rows) == 1
+    candidate = result.rows[0].candidate
+    assert candidate.description == "Ceftriaxone 1g Inj"
+    assert candidate.service_date == "20/07/2026"
+    assert candidate.request_no == "B-441"
+    assert candidate.quantity == Decimal("2")
+    assert candidate.rate == Decimal("125.00")
+    assert candidate.gross_amount == Decimal("250.00")
+    assert candidate.amount == Decimal("225.00")
+
+
+def test_aadhaar_policy_and_pin_identifiers_are_not_published_as_money_rows() -> None:
+    tokens = (
+        token(0, "Aadhaar No", (100, 25, 220, 40)),
+        token(1, "857821813514", (500, 25, 650, 40)),
+        token(2, "Policy Number", (100, 60, 250, 75)),
+        token(3, "70000931", (500, 60, 620, 75)),
+        token(4, "Pin Code", (100, 95, 210, 110)),
+        token(5, "100066", (500, 95, 590, 110)),
+    )
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 15, 680, 125),
+    )
+    assert all(row.candidate.role is RowRole.UNRESOLVED for row in result.rows)

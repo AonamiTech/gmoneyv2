@@ -235,9 +235,22 @@ def test_review_updates_are_revisioned_and_machine_output_is_immutable(
         "bill_total": {
             "amount": "120.00",
             "label": "Net Bill Amount",
+            "kind": None,
+            "scope": None,
             "page_number": 1,
             "evidence": machine["document_total"]["evidence"],
         },
+        "printed_totals": [
+            {
+                "amount": "120.00",
+                "label": "Net Bill Amount",
+                "kind": "bill_total",
+                "scope": "document",
+                "page_number": 1,
+                "evidence": machine["document_total"]["evidence"],
+                "is_primary": True,
+            }
+        ],
         "difference": "5.50",
         "comparison": "mismatch",
         "missing_item_amounts": 0,
@@ -250,6 +263,85 @@ def test_review_updates_are_revisioned_and_machine_output_is_immutable(
     )
     assert stale.status_code == 409
     assert stale.json()["detail"]["current_revision"] == 1
+
+
+def test_conflicting_explicit_document_totals_are_exposed_without_false_difference(
+    tmp_path: Path, monkeypatch
+) -> None:
+    client, store = client_for(tmp_path, monkeypatch)
+    job_id, machine = completed_job(store)
+    primary = {
+        **machine["document_total"],
+        "kind": "bill_total",
+        "scope": "document",
+    }
+    alternate = {
+        **primary,
+        "amount_raw": "36,956.00",
+        "amount": "36956.00",
+        "label": "Net Amount",
+    }
+    machine["document_total"] = primary
+    machine["document_totals"] = [primary, alternate]
+    (store.job_dir(job_id) / "result.json").write_text(json.dumps(machine))
+
+    totals = client.get(f"/api/v2/documents/{job_id}/rows").json()["totals"]
+    assert totals["comparison"] == "multiple_printed_totals"
+    assert totals["difference"] is None
+    assert len(totals["printed_totals"]) == 2
+    assert totals["printed_totals"][0]["is_primary"] is True
+
+
+def test_informational_rows_are_visible_but_excluded_from_totals_and_approval(
+    tmp_path: Path, monkeypatch
+) -> None:
+    client, store = client_for(tmp_path, monkeypatch)
+    job_id, result = completed_job(store)
+    detail_row = result["rows"][0]
+    date_evidence = {
+        **detail_row["evidence"][0],
+        "token_ids": ["date-token"],
+    }
+    informational = {
+        **detail_row,
+        "id": "information-row",
+        "row_order": 1,
+        "role": "informational",
+        "description": "Included package pathology",
+        "service_date_raw": "20/01/2026",
+        "service_date_iso": "2026-01-20",
+        "quantity_raw": None,
+        "quantity": None,
+        "unit_price_raw": None,
+        "unit_price": None,
+        "gross_amount_raw": None,
+        "gross_amount": None,
+        "discount_raw": None,
+        "discount": None,
+        "net_amount_raw": None,
+        "net_amount": None,
+        "field_evidence": {
+            "description": detail_row["field_evidence"]["description"],
+            "service_date": [date_evidence],
+        },
+    }
+    result["rows"].append(informational)
+    (store.job_dir(job_id) / "result.json").write_text(json.dumps(result))
+    store.update(job_id, row_count=2)
+
+    rows = client.get(f"/api/v2/documents/{job_id}/rows").json()
+    assert rows["total"] == 2
+    assert rows["rows"][1]["role"] == "informational"
+    assert rows["rows"][1]["net_amount"] is None
+    assert rows["totals"]["items_total"] == "100.00"
+    assert rows["totals"]["difference"] == "-20.00"
+    assert rows["totals"]["missing_item_amounts"] == 0
+
+    approved = client.post(
+        f"/api/v2/documents/{job_id}/approval",
+        headers={"If-Match": "0"},
+    )
+    assert approved.status_code == 200
 
 
 def test_reviewer_can_add_and_soft_reject_a_grounded_row(tmp_path: Path, monkeypatch) -> None:

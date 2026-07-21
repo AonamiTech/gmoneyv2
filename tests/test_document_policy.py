@@ -60,6 +60,31 @@ def test_coincidental_cross_page_sum_does_not_delete_detail() -> None:
     assert len(_apply_document_role_policy(rows)) == 3
 
 
+def test_repeated_semantic_rollups_keep_the_richest_grounded_row() -> None:
+    compact = row(0, RowRole.CATEGORY_ROLLUP, "package", "11457").model_copy(
+        update={"description": "Package (IPD) - Coronary"}
+    )
+    continuation = row(1, RowRole.CATEGORY_ROLLUP, "package", "11457").model_copy(
+        update={
+            "page_number": 2,
+            "description": "Package Name: Coronary Angiography (CAG)",
+        }
+    )
+    abbreviated = row(2, RowRole.CATEGORY_ROLLUP, "package", "11457").model_copy(
+        update={"description": "Angiography (CAG)"}
+    )
+    unrelated = row(3, RowRole.CATEGORY_ROLLUP, "laboratory", "11457").model_copy(
+        update={"description": "Laboratory services"}
+    )
+
+    selected = _apply_document_role_policy([compact, continuation, abbreviated, unrelated])
+
+    assert [item.description for item in selected] == [
+        "Package Name: Coronary Angiography (CAG)",
+        "Laboratory services",
+    ]
+
+
 def test_overlapping_table_proposals_keep_the_trustworthy_complete_row() -> None:
     description_evidence = EvidenceRef(
         page_number=1,

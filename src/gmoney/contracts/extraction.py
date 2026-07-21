@@ -10,6 +10,7 @@ from gmoney.contracts.evidence import Polygon
 
 class RowRole(StrEnum):
     DETAIL = "detail"
+    INFORMATIONAL = "informational"
     CONTINUATION = "continuation"
     SECTION_HEADER = "section_header"
     CATEGORY_ROLLUP = "category_rollup"
@@ -55,6 +56,20 @@ class ReviewDisposition(StrEnum):
     UNREADABLE = "unreadable"
 
 
+class DocumentTotalKind(StrEnum):
+    BILL_TOTAL = "bill_total"
+    GROSS_TOTAL = "gross_total"
+    PAYABLE_TOTAL = "payable_total"
+    SETTLEMENT_TOTAL = "settlement_total"
+
+
+class DocumentTotalScope(StrEnum):
+    DOCUMENT = "document"
+    SECTION = "section"
+    SETTLEMENT = "settlement"
+    PAYMENT = "payment"
+
+
 class EvidenceRef(ContractModel):
     page_number: int = Field(ge=1)
     table_id: str | None = None
@@ -64,10 +79,12 @@ class EvidenceRef(ContractModel):
 
 
 class DocumentTotal(ContractModel):
-    total_version: str = "document_total_v1"
+    total_version: str = "document_total_v2"
     amount_raw: str
     amount: Decimal
     label: str
+    kind: DocumentTotalKind = DocumentTotalKind.BILL_TOTAL
+    scope: DocumentTotalScope = DocumentTotalScope.DOCUMENT
     page_number: int = Field(ge=1)
     evidence: EvidenceRef
     confidence: float = Field(ge=0, le=1)

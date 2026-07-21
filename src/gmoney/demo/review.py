@@ -40,7 +40,7 @@ RAW_FIELD = {
     "discount": "discount_raw",
     "net_amount": "net_amount_raw",
 }
-ALLOWED_ROLES = {"detail", "category_rollup", "refund"}
+ALLOWED_ROLES = {"detail", "informational", "category_rollup", "refund"}
 ALLOWED_DISPOSITIONS = {"accepted", "pending", "rejected", "unreadable"}
 EXPORT_FIELDS = (
     "hospital_name",
@@ -228,6 +228,9 @@ def totals_summary(
             item_total += parsed
 
     machine_total = result.get("document_total")
+    machine_totals = result.get("document_totals")
+    if not isinstance(machine_totals, list):
+        machine_totals = [machine_total] if isinstance(machine_total, dict) else []
     bill_total = None
     bill_amount: Decimal | None = None
     if isinstance(machine_total, dict):
@@ -239,20 +242,62 @@ def totals_summary(
             bill_amount = parsed
             bill_total = {
                 key: machine_total.get(key)
-                for key in ("amount", "label", "page_number", "evidence")
+                for key in (
+                    "amount",
+                    "label",
+                    "kind",
+                    "scope",
+                    "page_number",
+                    "evidence",
+                )
             }
+
+    printed_totals: list[dict[str, Any]] = []
+    comparable_amounts: set[Decimal] = set()
+    for machine_item in machine_totals:
+        if not isinstance(machine_item, dict):
+            continue
+        try:
+            amount = Decimal(str(machine_item.get("amount")))
+        except (InvalidOperation, TypeError):
+            continue
+        if not amount.is_finite():
+            continue
+        kind = str(machine_item.get("kind") or "bill_total")
+        scope = str(machine_item.get("scope") or "document")
+        printed_totals.append(
+            {
+                **{
+                    key: machine_item.get(key)
+                    for key in ("amount", "label", "kind", "scope", "page_number", "evidence")
+                },
+                "kind": kind,
+                "scope": scope,
+                "is_primary": bool(
+                    isinstance(machine_total, dict)
+                    and machine_item.get("evidence") == machine_total.get("evidence")
+                    and machine_item.get("amount") == machine_total.get("amount")
+                    and machine_item.get("label") == machine_total.get("label")
+                ),
+            }
+        )
+        if scope == "document" and kind == "bill_total":
+            comparable_amounts.add(amount)
 
     difference: Decimal | None = None
     if missing_amounts:
         comparison = "items_partial"
     elif bill_amount is None:
         comparison = "bill_total_missing"
+    elif len(comparable_amounts) > 1:
+        comparison = "multiple_printed_totals"
     else:
         difference = item_total - bill_amount
         comparison = "match" if abs(difference) <= Decimal("0.01") else "mismatch"
     return {
         "items_total": format(item_total, "f"),
         "bill_total": bill_total,
+        "printed_totals": printed_totals,
         "difference": format(difference, "f") if difference is not None else None,
         "comparison": comparison,
         "missing_item_amounts": missing_amounts,
@@ -436,16 +481,31 @@ def approval_blockers(
     blockers: list[str] = []
     rows = project_rows(result, review)
     active = [row for row in rows if row.get("review_disposition") != "rejected"]
-    if not active:
+    billable = [row for row in active if row.get("role") in ITEM_TOTAL_ROLES]
+    informational = [row for row in active if row.get("role") == "informational"]
+    if not billable:
         blockers.append("no_active_rows")
     if any(row.get("review_disposition") != "accepted" for row in active):
         blockers.append("pending_rows")
-    if any(not row.get("description") or row.get("net_amount") is None for row in active):
+    if any(not row.get("description") or row.get("net_amount") is None for row in billable):
         blockers.append("missing_required_values")
     if any(
-        not {"description", "amount"}.issubset(row.get("field_evidence", {})) for row in active
+        not {"description", "amount"}.issubset(row.get("field_evidence", {}))
+        for row in billable
     ):
         blockers.append("missing_field_evidence")
+    if any(
+        not row.get("description")
+        or "description" not in row.get("field_evidence", {})
+        or not {
+            "service_date",
+            "request_no",
+            "service_code",
+            "hsn_code",
+        }.intersection(row.get("field_evidence", {}))
+        for row in informational
+    ):
+        blockers.append("missing_informational_evidence")
     if any(issue["status"] == "open" for issue in structural_issues(result, review)):
         blockers.append("open_structural_issues")
     assets = result.get("page_assets", [])

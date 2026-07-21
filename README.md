@@ -60,8 +60,10 @@ searchable for 30 days and labelled by
 their evidence-grounded hospital identity; reviewers can correct that identity, service dates,
 rows, and evidence without changing the machine result. The evidence workspace provides an
 independently scrolling ledger plus resize, fit, zoom, focus, and fullscreen page controls.
-It also reconciles the active reviewed item sum with an evidence-grounded final total printed
-on the bill; intermediate subtotals, payments, advances, and balance figures are excluded.
+It also reconciles the active reviewed item sum with an evidence-grounded primary total printed
+on the bill and exposes every other explicit printed total with its page evidence. Conflicting
+document totals are shown for review instead of producing a misleading difference;
+section totals, payments, advances, and balance figures are excluded from the comparison.
 
 ```bash
 GMONEY_IMAGE_TAG=$(git rev-parse --short=12 HEAD) \
@@ -76,6 +78,37 @@ docker compose -f compose.demo.yaml run --rm --no-deps api \
   gmoney-demo-backfill-totals --root /runtime
 docker compose -f compose.demo.yaml run --rm --no-deps api \
   gmoney-demo-backfill-totals --root /runtime --apply
+```
+
+Completed jobs can also be re-extracted from their retained source and inference caches while
+preserving job IDs and reviewer history. Stage and inspect the entire batch while the service is
+live, then stop the API and worker for the short cutover. Cutover rechecks every review digest,
+invalidates old approvals, and keeps a durable rollback batch under
+`/runtime/jobs/.reprocess-backups`.
+
+```bash
+# Selection-only dry run (repeat --job-id for each intended document).
+docker compose -f compose.demo.yaml -f compose.gpu.yaml run --rm --no-deps \
+  --entrypoint gmoney-demo-reprocess worker \
+  --root /runtime --job-id <job-id>
+
+# Cached GPU re-extraction into a validated staging batch (repeat --job-id as needed).
+docker compose -f compose.demo.yaml -f compose.gpu.yaml run --rm --no-deps \
+  --entrypoint gmoney-demo-reprocess worker \
+  --root /runtime --job-id <job-id> --stage-only \
+  --vl-url http://paddleocr-vl:8111 --paddle-device gpu:0 --vl-device cuda:0
+
+# After inspection and during the maintenance window, apply the emitted staging path.
+docker compose -f compose.demo.yaml -f compose.gpu.yaml run --rm --no-deps \
+  --entrypoint gmoney-demo-reprocess worker \
+  --root /runtime --apply-staged \
+  /runtime/jobs/.reprocess-staging/<batch-timestamp>
+
+# Roll back every document in one emitted backup batch.
+docker compose -f compose.demo.yaml -f compose.gpu.yaml run --rm --no-deps \
+  --entrypoint gmoney-demo-reprocess worker \
+  --root /runtime --rollback-from \
+  /runtime/jobs/.reprocess-backups/<batch-timestamp>
 ```
 
 The demo has no authentication and serves plain HTTP. Uploaded PDFs and full evidence/review

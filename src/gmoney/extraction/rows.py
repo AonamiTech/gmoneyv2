@@ -14,6 +14,8 @@ ROLE_TERMS: dict[str, tuple[str, ...]] = {
         "particular",
         "service name",
         "item name",
+        "product name",
+        "productname",
         "item",
         "services",
         "test name",
@@ -21,10 +23,11 @@ ROLE_TERMS: dict[str, tuple[str, ...]] = {
     ),
     "quantity": ("quantity", "qty", "nos", "units", "unit/days"),
     "rate": ("rate", "unit price", "unit rate"),
+    "gross_amount": ("gross amount", "service amount", "service amt"),
     "discount": ("discount", "disco", "disc amt"),
     "amount": ("total amount", "net amount", "payable", "bill amount", "amount", "total"),
-    "service_date": ("service date", "date/time", "date"),
-    "request_no": ("request no", "requisition", "ref no"),
+    "service_date": ("service date", "bill date", "billdate", "date/time", "date"),
+    "request_no": ("request no", "requisition", "ref no", "bill number"),
     "service_code": ("service code", "code"),
     "hsn_code": ("hsn", "sac"),
 }
@@ -43,6 +46,7 @@ class CandidateLedgerRow:
     hsn_code: str | None = None
     quantity: Decimal | None = None
     rate: Decimal | None = None
+    gross_amount: Decimal | None = None
     discount: Decimal | None = None
     amount: Decimal | None = None
     amount_derived: bool = False
@@ -104,7 +108,9 @@ def _compound_header_columns(header: tuple[OtslCell, ...]) -> dict[str, int]:
             columns[role] = column
         index += 1
         column += 1
-    if "description" in columns and ({"rate", "amount", "quantity"} & columns.keys()):
+    if "description" in columns and (
+        {"rate", "gross_amount", "amount", "quantity"} & columns.keys()
+    ):
         return columns
     return {}
 
@@ -179,7 +185,7 @@ def _merge_continuation_rows(
     numeric_roles = sorted(
         (
             (column, role)
-            for role in ("quantity", "rate", "discount", "amount")
+            for role in ("quantity", "rate", "gross_amount", "discount", "amount")
             if (column := columns.get(role)) is not None
         ),
         key=lambda item: item[0],
@@ -244,6 +250,7 @@ def extract_candidate_rows(table: OtslTable) -> tuple[CandidateLedgerRow, ...]:
         description = _value(cells, columns, "description")
         quantity = parse_decimal(_value(cells, columns, "quantity"))
         rate = parse_decimal(_value(cells, columns, "rate"))
+        gross_amount = parse_decimal(_value(cells, columns, "gross_amount"))
         discount = parse_decimal(_value(cells, columns, "discount"))
         amount_text = _value(cells, columns, "amount")
         amount = parse_decimal(amount_text)
@@ -273,6 +280,7 @@ def extract_candidate_rows(table: OtslTable) -> tuple[CandidateLedgerRow, ...]:
                 hsn_code=_value(cells, columns, "hsn_code"),
                 quantity=quantity,
                 rate=rate,
+                gross_amount=gross_amount,
                 discount=discount,
                 amount=amount,
                 amount_derived=amount_derived,

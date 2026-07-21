@@ -7,6 +7,12 @@ from decimal import Decimal, InvalidOperation
 CURRENCY = re.compile(r"(?:₹|inr|rs\.?|rupees?)", re.IGNORECASE)
 NUMERIC = re.compile(r"^[+-]?\d+(?:\.\d{1,4})?$")
 MAX_ABSOLUTE = Decimal("999999999999.9999")
+DATE_FRAGMENT = re.compile(
+    r"\d{1,2}(?:[/.-]\d{1,2}[/.-]\d{2,4}|[-\s](?:Jan(?:uary)?|Feb(?:ruary)?|"
+    r"Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|"
+    r"Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)[-\s]\d{2,4})",
+    re.IGNORECASE,
+)
 
 SERVICE_DATE_FORMATS = (
     "%d/%m/%Y",
@@ -55,6 +61,13 @@ def parse_service_date(value: object) -> str | None:
     text = re.sub(r"\s+", " ", str(value or "")).strip(" -:")
     if not text:
         return None
+    matches = tuple(DATE_FRAGMENT.finditer(text))
+    if len(matches) != 1 or matches[0].start() != 0:
+        return None
+    remainder = text[matches[0].end() :].strip()
+    if remainder and not re.fullmatch(r"\d{1,2}:\d{2}(?::\d{2})?", remainder):
+        return None
+    text = matches[0].group()
     for date_format in SERVICE_DATE_FORMATS:
         try:
             return datetime.strptime(text, date_format).date().isoformat()

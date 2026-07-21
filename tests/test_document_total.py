@@ -4,6 +4,7 @@ from gmoney.contracts.evidence import OcrToken, Point, Polygon
 from gmoney.extraction.document_total import (
     extract_document_total_candidates,
     select_document_total,
+    select_document_totals,
 )
 
 
@@ -95,3 +96,36 @@ def test_later_same_priority_total_wins_and_intermediate_labels_are_rejected() -
     assert total is not None
     assert total.amount == Decimal("950.00")
     assert total.page_number == 2
+
+
+def test_retains_all_explicit_totals_with_scope_and_selects_primary() -> None:
+    candidates = extract_document_total_candidates(
+        (
+            token(0, "Gross Amount 1,200.00", (100, 80, 930, 100)),
+            token(1, "Net Amount 1,000.00", (100, 110, 930, 130)),
+            token(2, "Amount To Be Received 400.00", (100, 140, 930, 160)),
+            token(3, "Total Bill Amount 1,000.00", (100, 170, 930, 190)),
+        )
+    )
+    totals = select_document_totals(candidates)
+    assert [(item.label, item.amount, item.scope.value) for item in totals] == [
+        ("Gross Amount", Decimal("1200.00"), "document"),
+        ("Net Amount", Decimal("1000.00"), "document"),
+        ("Amount To Be Received", Decimal("400.00"), "payment"),
+        ("Total Bill Amount", Decimal("1000.00"), "document"),
+    ]
+    primary = select_document_total(candidates)
+    assert primary is not None
+    assert primary.label == "Total Bill Amount"
+
+
+def test_pharmacy_grand_total_is_section_scoped() -> None:
+    candidates = extract_document_total_candidates(
+        (
+            token(0, "Pharmacy Detailed Bill", (100, 30, 350, 50)),
+            token(1, "Grand Total", (100, 100, 300, 120)),
+            token(2, "28,555.00", (800, 100, 930, 120)),
+        )
+    )
+    assert len(candidates) == 1
+    assert candidates[0].total.scope.value == "section"
