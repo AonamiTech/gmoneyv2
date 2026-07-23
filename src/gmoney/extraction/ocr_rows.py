@@ -826,6 +826,13 @@ def _source_columns(
     return tuple(columns), tuple(centers)
 
 
+def _is_printed_table_footer(line: OcrLine) -> bool:
+    normalized = _normalize(line.text)
+    if re.search(r"\bpage \d+(?: of)? \d+\b", normalized):
+        return True
+    return "this bill was created using" in normalized
+
+
 def _source_rows(
     lines: tuple[OcrLine, ...],
     *,
@@ -878,6 +885,8 @@ def _source_rows(
     )
     pending_prefix: list[SourceCell] | None = None
     for line_index, line in enumerate(lines[start:end], start=start):
+        if _is_printed_table_footer(line):
+            break
         buckets: list[list[OcrToken]] = [[] for _ in columns]
         for token in line.tokens:
             if not outer_left <= _center_x(token) <= outer_right:
@@ -2346,6 +2355,11 @@ def reconstruct_ocr_rows(
         aligned_description_raw.append(raw_description)
 
     for source_row, line in enumerate(data_lines, start=(header_index + 1 if header_valid else 0)):
+        if _is_printed_table_footer(line):
+            pending_description_tokens = []
+            pending_service_date = None
+            pending_service_date_ids = ()
+            break
         repeated_block = repeated_header_by_line.get(source_row)
         if repeated_block is not None:
             if source_row != repeated_block.end:

@@ -2386,6 +2386,68 @@ def test_payment_details_before_total_does_not_extend_previous_charge() -> None:
 
 
 @pytest.mark.parametrize(
+    "footer_parts",
+    (
+        ("Page 1 of 2",),
+        ("Page", "1", "of", "2"),
+        ("Page 1", "of 2"),
+        ("Page", "1/2"),
+        ("This bill was created using PRESCO IPD",),
+    ),
+)
+def test_printed_table_stops_at_explicit_bill_page_footer(
+    footer_parts: tuple[str, ...],
+) -> None:
+    tokens = (
+        token(0, "Particular", (100, 30, 420, 45)),
+        token(1, "Amount", (600, 30, 700, 45)),
+        token(2, "Unit/Days", (760, 30, 840, 45)),
+        token(3, "Registration", (100, 70, 360, 85)),
+        token(4, "300.00", (620, 70, 690, 85)),
+        token(5, "1", (780, 70, 800, 85)),
+        token(6, "10/07/26,", (20, 110, 95, 125)),
+        *tuple(
+            token(
+                7 + index,
+                part,
+                (500 + index * 70, 110, 560 + index * 70, 125),
+            )
+            for index, part in enumerate(footer_parts)
+        ),
+        token(20, "13", (620, 150, 650, 165)),
+        token(21, "Background dashboard", (100, 180, 360, 195)),
+        token(22, "4177", (620, 180, 680, 195)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(0, 20, 900, 220),
+    )
+
+    assert len(result.source_tables) == 1
+    table = result.source_tables[0]
+    assert len(table.rows) == 1
+    values = {
+        column.label: next(
+            cell.raw_value
+            for cell in table.rows[0].cells
+            if cell.column_id == column.id
+        )
+        for column in table.columns
+    }
+    assert values == {
+        "Particular": "Registration",
+        "Amount": "300.00",
+        "Unit/Days": "1",
+    }
+    assert [
+        (row.candidate.description, row.candidate.amount) for row in result.rows
+    ] == [("Registration", Decimal("300.00"))]
+
+
+@pytest.mark.parametrize(
     "payment_heading",
     (
         (token(12, "Payment Details", (600, 130, 760, 145)),),
