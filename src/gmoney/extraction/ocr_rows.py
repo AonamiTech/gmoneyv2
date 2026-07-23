@@ -1885,28 +1885,40 @@ def _payment_footer_heading_tokens(line: OcrLine) -> tuple[OcrToken, ...]:
             and simplified[2].isdigit()
         )
 
-    def has_exact_heading_suffix(words: list[str]) -> bool:
-        if exact_heading(words):
-            return True
-        return any(
-            approved_prefix(words[:start]) and exact_heading(words[start:])
-            for start in range(1, len(words))
-        )
+    def exact_heading_start(words: list[str]) -> int | None:
+        for start in range(len(words)):
+            if start and not approved_prefix(words[:start]):
+                continue
+            for end in range(start + 1, len(words) + 1):
+                suffix = words[end:]
+                if exact_heading(words[start:end]) and (
+                    not suffix or all(word.isdigit() for word in suffix)
+                ):
+                    return start
+        return None
 
-    tokens = tuple(sorted(
-        (token for token in line.tokens if token.text.strip()),
-        key=lambda token: _bounds(token)[0],
-    ))
+    tokens = tuple(
+        sorted(
+            (token for token in line.tokens if token.text.strip()),
+            key=lambda token: _bounds(token)[0],
+        )
+    )
     for start in range(len(tokens)):
         for length in range(1, min(3, len(tokens) - start) + 1):
             candidate = tokens[start : start + length]
-            words = [
-                word
-                for token in candidate
-                for word in _normalize(token.text).split()
-            ]
-            if has_exact_heading_suffix(words):
-                return candidate
+            words_by_token = tuple(
+                _normalize(token.text).split() for token in candidate
+            )
+            words = [word for token_words in words_by_token for word in token_words]
+            heading_start = exact_heading_start(words)
+            if heading_start is None:
+                continue
+
+            word_offset = 0
+            for token_index, token_words in enumerate(words_by_token):
+                word_offset += len(token_words)
+                if word_offset > heading_start:
+                    return candidate[token_index:]
     return ()
 
 

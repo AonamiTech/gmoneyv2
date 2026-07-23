@@ -2395,16 +2395,23 @@ def test_payment_details_before_total_does_not_extend_previous_charge() -> None:
         ),
         (token(12, "ID 410 Payment Details", (600, 130, 760, 145)),),
         (token(12, "410 Payment Details", (600, 130, 760, 145)),),
+        (token(12, "Payment Details 410.00", (600, 130, 800, 145)),),
+        (token(12, "Payment Details: 410", (600, 130, 800, 145)),),
     ),
 )
 @pytest.mark.parametrize(
     "margin_text",
     ("410", "ID 410", "#410", "23-Jul-2026"),
 )
+@pytest.mark.parametrize(
+    "margin_box",
+    ((465, 130, 555, 145), (50, 130, 140, 145)),
+)
 @pytest.mark.parametrize("payment_amount", (None, "410.00"))
 def test_payment_heading_ends_pending_charge_before_polluted_summary(
     payment_heading: tuple[OcrToken, ...],
     margin_text: str,
+    margin_box: tuple[int, int, int, int],
     payment_amount: str | None,
 ) -> None:
     tokens = (
@@ -2419,7 +2426,7 @@ def test_payment_heading_ends_pending_charge_before_polluted_summary(
         token(8, "300", (890, 70, 950, 85)),
         token(9, "13.", (50, 100, 75, 115)),
         token(10, "Others-ENEMA PROCEDURE", (100, 100, 430, 115)),
-        token(11, margin_text, (465, 130, 555, 145)),
+        token(11, margin_text, margin_box),
         *payment_heading,
         *(
             (token(19, payment_amount, (890, 130, 960, 145)),)
