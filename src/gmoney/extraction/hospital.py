@@ -21,6 +21,10 @@ ORGANIZATION_MARKERS = (
     "clinic",
 )
 REJECT_MARKERS = (
+    "details of insured person",
+    "hospitalized",
+    "hospitalization",
+    "claim form",
     "patient name",
     "invoice no",
     "invoice date",
@@ -91,6 +95,10 @@ def _normalize(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", value.casefold()).strip()
 
 
+def _contains_normalized_phrase(value: str, phrase: str) -> bool:
+    return f" {phrase} " in f" {value} "
+
+
 @dataclass(frozen=True)
 class HeaderLine:
     tokens: tuple[OcrToken, ...]
@@ -138,7 +146,10 @@ def _clean_name(value: str) -> str:
         brand_normalized = _normalize(brand)
         value = (
             brand
-            if any(marker in brand_normalized for marker in ORGANIZATION_MARKERS)
+            if any(
+                _contains_normalized_phrase(brand_normalized, marker)
+                for marker in ORGANIZATION_MARKERS
+            )
             else operator
         )
     value = UNIT_PREFIX.sub("", value)
@@ -175,7 +186,12 @@ def _clean_name(value: str) -> str:
 
 def _candidate_score(text: str, tokens: tuple[OcrToken, ...], page_height: int) -> float:
     normalized = _normalize(text)
-    if not normalized or not any(marker in normalized for marker in ORGANIZATION_MARKERS):
+    organization_markers = tuple(
+        marker
+        for marker in ORGANIZATION_MARKERS
+        if _contains_normalized_phrase(normalized, marker)
+    )
+    if not normalized or not organization_markers:
         return -1.0
     if any(marker in normalized for marker in REJECT_MARKERS):
         return -1.0
@@ -186,9 +202,7 @@ def _candidate_score(text: str, tokens: tuple[OcrToken, ...], page_height: int) 
         return -1.0
     top = min(_bounds(token)[1] for token in tokens)
     confidence = mean(token.confidence for token in tokens)
-    marker_strength = max(
-        len(marker) for marker in ORGANIZATION_MARKERS if marker in normalized
-    ) / 20
+    marker_strength = max(len(marker) for marker in organization_markers) / 20
     tagline_penalty = 1.25 if any(marker in normalized for marker in TAGLINE_MARKERS) else 0.0
     length_penalty = max(0, len(text) - 30) * 0.005
     return (

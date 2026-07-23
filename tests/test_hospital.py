@@ -1,3 +1,5 @@
+import pytest
+
 from gmoney.contracts.evidence import OcrToken, Point, Polygon
 from gmoney.extraction.hospital import _clean_name, detect_hospital
 
@@ -67,6 +69,53 @@ def test_does_not_promote_patient_or_invoice_text_as_hospital() -> None:
         )
         is None
     )
+
+
+def test_rejects_insured_person_hospitalized_heading() -> None:
+    assert (
+        detect_hospital(
+            (
+                token(
+                    0,
+                    "Details of Insured Person Hospitalized:",
+                    (100, 80, 650, 120),
+                ),
+            ),
+            page_width=1200,
+            page_height=2000,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("text", ["Hospitalized", "Hospitalization"])
+def test_requires_complete_hospital_organization_marker(text: str) -> None:
+    assert (
+        detect_hospital(
+            (token(0, text, (100, 80, 400, 120)),),
+            page_width=1200,
+            page_height=2000,
+        )
+        is None
+    )
+
+
+def test_prefers_genuine_letterhead_over_nearby_administrative_heading() -> None:
+    identity = detect_hospital(
+        (
+            token(
+                0,
+                "Details of Insured Person Hospitalized:",
+                (100, 80, 650, 120),
+            ),
+            token(1, "Vithai Hospital", (100, 150, 450, 195)),
+        ),
+        page_width=1200,
+        page_height=2000,
+    )
+    assert identity is not None
+    assert identity["name"] == "Vithai Hospital"
+    assert identity["evidence"]["token_ids"] == ["header-1"]
 
 
 def test_cleans_joined_brand_unit_tagline_and_duplicate_logo_text() -> None:
