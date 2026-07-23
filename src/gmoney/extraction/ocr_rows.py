@@ -1575,26 +1575,34 @@ def _closest_field_token(
         return None
 
     def valid(token: OcrToken) -> bool:
-        text = token.text.strip()
-        if not text or _is_header_token(token):
-            return False
-        if role == "service_date":
-            return DATE_SPAN.search(text) is not None
-        if role == "service_code":
-            return bool(re.fullmatch(r"(?=.*[A-Za-z])(?=.*\d)[A-Za-z0-9./-]{3,30}", text))
-        if role == "hsn_code":
-            return DATE_SPAN.search(text) is None and bool(
-                re.fullmatch(r"[A-Za-z0-9./-]{3,30}", text)
-            )
-        if role == "request_no":
-            return bool(re.fullmatch(r"[A-Za-z0-9./-]{3,60}", text))
-        return False
+        return not _is_header_token(token) and _structured_field_value_is_valid(
+            role, token.text
+        )
 
     candidates = [token for token in line.tokens if valid(token)]
     if not candidates:
         return None
     selected = min(candidates, key=lambda token: abs(((_center_x(token) - left) / width) - target))
     return selected if abs(((_center_x(selected) - left) / width) - target) <= 0.08 else None
+
+
+def _structured_field_value_is_valid(role: str, value: str) -> bool:
+    text = value.strip()
+    if not text:
+        return False
+    if role == "service_date":
+        return DATE_SPAN.search(text) is not None
+    if role == "service_code":
+        return bool(
+            re.fullmatch(r"(?=.*[A-Za-z])(?=.*\d)[A-Za-z0-9./-]{3,30}", text)
+        )
+    if role == "hsn_code":
+        return DATE_SPAN.search(text) is None and bool(
+            re.fullmatch(r"[A-Za-z0-9./-]{3,30}", text)
+        )
+    if role == "request_no":
+        return bool(re.fullmatch(r"[A-Za-z0-9./-]{3,60}", text))
+    return False
 
 
 def _structured_text_fields(

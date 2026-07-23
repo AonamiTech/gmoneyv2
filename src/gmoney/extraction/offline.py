@@ -44,6 +44,7 @@ from gmoney.extraction.hospital import detect_hospital
 from gmoney.extraction.ocr_rows import (
     ReconstructionResult,
     TableSchemaState,
+    _structured_field_value_is_valid,
     fuse_provider_descriptions,
     reconstruct_ocr_rows,
     row_category,
@@ -367,14 +368,42 @@ def _link_source_tables(
             scored.sort(key=lambda item: item[0], reverse=True)
             canonical_row_id = None
             flags = source_row.validation_flags
+            linked_cells = source_row.cells
             if scored and (len(scored) == 1 or scored[0][0] != scored[1][0]):
-                canonical_row_id = str(scored[0][1].id)
+                matched = scored[0][1]
+                canonical_row_id = str(matched.id)
+                if matched.service_code is None:
+                    linked_cells = tuple(
+                        cell.model_copy(
+                            update={
+                                "raw_value": None,
+                                "evidence": (),
+                                "validation_flags": tuple(
+                                    dict.fromkeys(
+                                        (*cell.validation_flags, "excluded_invalid_overlay")
+                                    )
+                                ),
+                            }
+                        )
+                        if (
+                            column.canonical_field == "service_code"
+                            and cell.raw_value
+                            and not _structured_field_value_is_valid(
+                                "service_code", cell.raw_value
+                            )
+                        )
+                        else cell
+                        for column, cell in zip(
+                            table.columns, source_row.cells, strict=True
+                        )
+                    )
             elif scored:
                 flags = tuple(dict.fromkeys((*flags, "canonical_link_ambiguous")))
             linked_rows.append(
                 source_row.model_copy(
                     update={
                         "canonical_row_id": canonical_row_id,
+                        "cells": linked_cells,
                         "validation_flags": flags,
                     }
                 )
