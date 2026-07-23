@@ -1263,18 +1263,70 @@ def test_reprocess_validation_does_not_misclassify_billable_description_as_foote
 
 
 @pytest.mark.parametrize(
-    ("printed_label", "accepted"),
-    (("Discount (Rs.):", True), ("Discount Service", False)),
+    ("printed_label", "printed_description", "variant", "accepted"),
+    (
+        ("Discount (Rs.):", None, "live", True),
+        ("Discount Service", None, "live", False),
+        ("Discount", "MRI Service", "live", False),
+        ("Discount", None, "extra_financial", False),
+        ("Discount", None, "decoy_mapping", False),
+        ("Discount", None, "duplicate_description", False),
+    ),
 )
-def test_reprocess_validation_only_accepts_exact_discount_settlement_rows(
+def test_reprocess_validation_only_accepts_unambiguously_labeled_discount_rows(
     tmp_path: Path,
     printed_label: str,
+    printed_description: str | None,
+    variant: str,
     accepted: bool,
 ) -> None:
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
     new_rows = [row("new-row", page_sha)]
     printed = source_tables(new_rows, page_sha)
+    for column in printed[0]["columns"]:
+        column["order"] += 1
+    printed[0]["columns"].insert(
+        0,
+        {
+            "id": "metadata",
+            "label": "10/07/26,",
+            "order": 0,
+            "canonical_field": None,
+            "evidence": [evidence(page_sha, "metadata-header")],
+            "validation_flags": [],
+        },
+    )
+    printed[0]["columns"][2]["order"] = 3
+    printed[0]["columns"].insert(
+        2,
+        {
+            "id": "settlement-label",
+            "label": "Unit/Days",
+            "order": 2,
+            "canonical_field": "quantity",
+            "evidence": [evidence(page_sha, "settlement-header")],
+            "validation_flags": [],
+        },
+    )
+    printed[0]["rows"][0]["cells"].insert(
+        0,
+        {
+            "column_id": "metadata",
+            "raw_value": None,
+            "evidence": [],
+            "validation_flags": ["empty_cell"],
+        },
+    )
+    printed[0]["rows"][0]["cells"].insert(
+        2,
+        {
+            "column_id": "settlement-label",
+            "raw_value": None,
+            "evidence": [],
+            "validation_flags": ["empty_cell"],
+        },
+    )
     printed[0]["rows"].append(
         {
             "id": "p1-t1-s1-r2",
@@ -1282,7 +1334,25 @@ def test_reprocess_validation_only_accepts_exact_discount_settlement_rows(
             "canonical_row_id": None,
             "cells": [
                 {
+                    "column_id": "metadata",
+                    "raw_value": "10/07/26, 442",
+                    "evidence": [evidence(page_sha, "metadata-value")],
+                    "validation_flags": [],
+                },
+                {
                     "column_id": "description",
+                    "raw_value": printed_description,
+                    "evidence": (
+                        [evidence(page_sha, "billable-description")]
+                        if printed_description
+                        else []
+                    ),
+                    "validation_flags": (
+                        [] if printed_description else ["empty_cell"]
+                    ),
+                },
+                {
+                    "column_id": "settlement-label",
                     "raw_value": printed_label,
                     "evidence": [evidence(page_sha, "discount-description")],
                     "validation_flags": [],
@@ -1297,6 +1367,88 @@ def test_reprocess_validation_only_accepts_exact_discount_settlement_rows(
             "validation_flags": [],
         }
     )
+
+    def insert_footer_column(
+        index: int,
+        *,
+        column_id: str,
+        canonical_field: str,
+        raw_value: str,
+    ) -> None:
+        for column in printed[0]["columns"][index:]:
+            column["order"] += 1
+        printed[0]["columns"].insert(
+            index,
+            {
+                "id": column_id,
+                "label": column_id.replace("-", " ").title(),
+                "order": index,
+                "canonical_field": canonical_field,
+                "evidence": [evidence(page_sha, f"{column_id}-header")],
+                "validation_flags": [],
+            },
+        )
+        printed[0]["rows"][0]["cells"].insert(
+            index,
+            {
+                "column_id": column_id,
+                "raw_value": (
+                    "100.00"
+                    if canonical_field == "net_amount"
+                    else (
+                        "Package charge"
+                        if canonical_field == "description"
+                        else None
+                    )
+                ),
+                "evidence": (
+                    [evidence(page_sha, "amount-token")]
+                    if canonical_field == "net_amount"
+                    else (
+                        [evidence(page_sha, "description-token")]
+                        if canonical_field == "description"
+                        else []
+                    )
+                ),
+                "validation_flags": (
+                    []
+                    if canonical_field in {"net_amount", "description"}
+                    else ["empty_cell"]
+                ),
+            },
+        )
+        printed[0]["rows"][1]["cells"].insert(
+            index,
+            {
+                "column_id": column_id,
+                "raw_value": raw_value,
+                "evidence": [evidence(page_sha, f"{column_id}-value")],
+                "validation_flags": [],
+            },
+        )
+
+    if variant == "extra_financial":
+        insert_footer_column(
+            2,
+            column_id="gross",
+            canonical_field="gross_amount",
+            raw_value="100.00",
+        )
+    elif variant == "decoy_mapping":
+        insert_footer_column(
+            3,
+            column_id="decoy-net",
+            canonical_field="net_amount",
+            raw_value="not recorded",
+        )
+    elif variant == "duplicate_description":
+        insert_footer_column(
+            4,
+            column_id="second-description",
+            canonical_field="description",
+            raw_value="MRI Service",
+        )
+
     new_result = {
         **old_result,
         "rows": new_rows,

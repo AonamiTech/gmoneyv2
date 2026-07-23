@@ -233,15 +233,49 @@ def _unlinked_financial_row_is_explained(
     result: dict[str, Any],
 ) -> bool:
     """Accept grounded raw aggregates that intentionally are not ledger rows."""
-    label_text = " ".join(
+    label_values = tuple(
         cell.raw_value.strip()
         for cell in source_row.cells
         if cell.raw_value and cell.raw_value.strip()
         and parse_decimal(cell.raw_value) is None
     )
-    normalized_label = _normalized(label_text)
-    if normalized_label in {"discount", "discount rs"}:
+    normalized_label = _normalized(" ".join(label_values))
+    discount_labels = {"discount", "discount rs"}
+    description_values = tuple(
+        cells[column.id].raw_value
+        for column in table.columns
+        if column.canonical_field == "description"
+        and cells[column.id].raw_value
+    )
+    financial_columns = tuple(
+        column
+        for column in table.columns
+        if column.canonical_field in {"net_amount", "gross_amount"}
+        and (raw_value := cells[column.id].raw_value)
+        and raw_value.strip()
+        and parse_decimal(raw_value) is not None
+    )
+    if (
+        len(description_values) == 1
+        and _normalized(description_values[0]) in discount_labels
+        and len(financial_columns) == 1
+    ):
         return True
+    mapped_descriptions = tuple(
+        column
+        for column in table.columns
+        if column.canonical_field == "description"
+    )
+    if (
+        mapped_descriptions
+        and not description_values
+        and len(financial_columns) == 1
+    ):
+        financial_index = table.columns.index(financial_columns[0])
+        if financial_index > 0:
+            adjacent = cells[table.columns[financial_index - 1].id].raw_value
+            if adjacent and _normalized(adjacent) in discount_labels:
+                return True
     settlement_prefixes = (
         "advance received",
         "amount received",
