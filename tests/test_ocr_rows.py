@@ -2386,6 +2386,180 @@ def test_payment_details_before_total_does_not_extend_previous_charge() -> None:
 
 
 @pytest.mark.parametrize(
+    "payment_heading",
+    (
+        (token(12, "Payment Details", (600, 130, 760, 145)),),
+        (
+            token(12, "Payment", (600, 130, 680, 145)),
+            token(18, "Details", (690, 130, 760, 145)),
+        ),
+        (token(12, "ID 410 Payment Details", (600, 130, 760, 145)),),
+        (token(12, "410 Payment Details", (600, 130, 760, 145)),),
+    ),
+)
+@pytest.mark.parametrize(
+    "margin_text",
+    ("410", "ID 410", "#410", "23-Jul-2026"),
+)
+@pytest.mark.parametrize("payment_amount", (None, "410.00"))
+def test_payment_heading_ends_pending_charge_before_polluted_summary(
+    payment_heading: tuple[OcrToken, ...],
+    margin_text: str,
+    payment_amount: str | None,
+) -> None:
+    tokens = (
+        token(0, "Sr.N", (50, 30, 90, 45)),
+        token(1, "Particular", (100, 30, 420, 45)),
+        token(2, "Amount Rs. Unit/Days", (610, 30, 820, 45)),
+        token(3, "Total", (880, 30, 970, 45)),
+        token(4, "1.", (50, 70, 70, 85)),
+        token(5, "Registration", (100, 70, 360, 85)),
+        token(6, "300.00", (620, 70, 700, 85)),
+        token(7, "1", (760, 70, 780, 85)),
+        token(8, "300", (890, 70, 950, 85)),
+        token(9, "13.", (50, 100, 75, 115)),
+        token(10, "Others-ENEMA PROCEDURE", (100, 100, 430, 115)),
+        token(11, margin_text, (465, 130, 555, 145)),
+        *payment_heading,
+        *(
+            (token(19, payment_amount, (890, 130, 960, 145)),)
+            if payment_amount is not None
+            else ()
+        ),
+        token(13, "70855", (0, 160, 50, 175)),
+        token(14, "Total Bill Amount", (650, 160, 830, 175)),
+        token(15, "1,03,276.00", (880, 160, 970, 175)),
+        token(16, "Discount (Rs.):", (760, 190, 870, 205)),
+        token(17, "0.00", (900, 190, 960, 205)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(40, 20, 1000, 220),
+    )
+
+    assert [row.candidate.description for row in result.rows] == ["Registration"]
+    canonical = canonicalize_rows(
+        "d" * 64,
+        1,
+        "p1-t1",
+        "a" * 64,
+        result.rows,
+    )
+    linked = _link_source_tables(result.source_tables, canonical)
+    description_column = next(
+        column
+        for column in linked[0].columns
+        if column.canonical_field == "description"
+    )
+    unpriced_row = next(
+        row
+        for row in linked[0].rows
+        if any(
+            cell.column_id == description_column.id
+            and cell.raw_value == "Others-ENEMA PROCEDURE"
+            for cell in row.cells
+        )
+    )
+    assert unpriced_row.canonical_row_id is None
+
+
+def test_headerless_inherited_schema_uses_description_lane_for_payment_footer() -> None:
+    first = reconstruct_ocr_rows(
+        (
+            token(0, "Particular", (100, 30, 420, 45)),
+            token(1, "Rate", (610, 30, 700, 45)),
+            token(2, "Qty", (750, 30, 800, 45)),
+            token(3, "Amount", (880, 30, 970, 45)),
+            token(4, "Registration", (100, 70, 360, 85)),
+            token(5, "300.00", (620, 70, 700, 85)),
+            token(6, "1", (760, 70, 780, 85)),
+            token(7, "300", (890, 70, 950, 85)),
+        ),
+        page_number=1,
+        table_id="p1-t1",
+        box=(40, 20, 1000, 100),
+    )
+    continuation = tuple(
+        value.model_copy(
+            update={"page_number": 2, "token_id": f"p2-{value.token_id}"}
+        )
+        for value in (
+            token(8, "Registration", (100, 30, 360, 45)),
+            token(9, "300.00", (620, 30, 700, 45)),
+            token(10, "1", (760, 30, 780, 45)),
+            token(11, "300", (890, 30, 950, 45)),
+            token(12, "Others-ENEMA PROCEDURE", (100, 60, 430, 75)),
+            token(13, "Payment", (700, 90, 770, 105)),
+            token(14, "Details", (780, 90, 850, 105)),
+            token(15, "Total Bill Amount", (650, 120, 830, 135)),
+            token(16, "300", (890, 120, 950, 135)),
+        )
+    )
+
+    second = reconstruct_ocr_rows(
+        continuation,
+        page_number=2,
+        table_id="p2-t1",
+        box=(40, 20, 1000, 150),
+        prior_schemas=(first.schema,) if first.schema else (),
+    )
+
+    assert second.diagnostics["schema_inherited"] is True
+    assert [row.candidate.description for row in second.rows] == ["Registration"]
+
+
+def test_wrapped_payment_details_charge_in_description_lane_is_retained() -> None:
+    tokens = (
+        token(0, "Description", (100, 30, 430, 45)),
+        token(1, "Amount", (870, 30, 970, 45)),
+        token(2, "Payment", (100, 70, 180, 85)),
+        token(3, "Details", (190, 70, 260, 85)),
+        token(4, "Charge", (306, 70, 380, 85)),
+        token(5, "100.00", (880, 100, 960, 115)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 20, 980, 130),
+    )
+
+    assert len(result.rows) == 1
+    assert result.rows[0].candidate.description == "Payment Details Charge"
+    assert result.rows[0].candidate.amount == Decimal("100.00")
+
+
+@pytest.mark.parametrize(
+    "description",
+    ("Payment Details", "Payment Details Charge"),
+)
+def test_priced_payment_description_is_not_treated_as_footer_heading(
+    description: str,
+) -> None:
+    tokens = (
+        token(0, "Description", (100, 30, 430, 45)),
+        token(1, "Amount", (870, 30, 970, 45)),
+        token(2, description, (100, 70, 350, 85)),
+        token(3, "100.00", (880, 70, 960, 85)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 20, 980, 100),
+    )
+
+    assert len(result.rows) == 1
+    assert result.rows[0].candidate.description == description
+    assert result.rows[0].candidate.amount == Decimal("100.00")
+
+
+@pytest.mark.parametrize(
     "footer_text",
     (
         "Payment Details",

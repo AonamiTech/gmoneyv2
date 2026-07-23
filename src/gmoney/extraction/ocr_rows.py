@@ -1227,10 +1227,11 @@ def _description_cell_boundaries(
     printed_header_centers: tuple[float, ...],
 ) -> tuple[float | None, float | None]:
     description_center = centers.get("description")
+    boundary_centers = printed_header_centers or tuple(centers.values())
     previous_printed_center = max(
         (
             center
-            for center in printed_header_centers
+            for center in boundary_centers
             if description_center is not None and center < description_center - 0.04
         ),
         default=None,
@@ -1238,7 +1239,7 @@ def _description_cell_boundaries(
     next_printed_center = min(
         (
             center
-            for center in printed_header_centers
+            for center in boundary_centers
             if description_center is not None and center > description_center + 0.04
         ),
         default=None,
@@ -1820,6 +1821,95 @@ def _is_payment_footer_description(text: str) -> bool:
     ) or {"break", "up"} <= qualifiers
 
 
+def _payment_footer_heading_tokens(line: OcrLine) -> tuple[OcrToken, ...]:
+    def exact_heading(words: list[str]) -> bool:
+        if not words:
+            return False
+        if words[0] == "amount":
+            return len(words) == 2 and words[1] in {"paid", "received"}
+        subject = words[0].removesuffix("s")
+        if subject not in {"payment", "receipt", "settlement"}:
+            return False
+        if len(words) == 2:
+            return words[1] in {
+                "breakup",
+                "detail",
+                "details",
+                "history",
+                "information",
+                "mode",
+                "status",
+                "summary",
+            }
+        return subject == "payment" and words[1:] == ["break", "up"]
+
+    def approved_prefix(words: list[str]) -> bool:
+        simplified = [word.removeprefix("#") for word in words]
+        if simplified and all(word.isdigit() for word in simplified):
+            return True
+        if (
+            len(simplified) >= 2
+            and simplified[0] in {"id", "no", "row"}
+            and all(word.isdigit() for word in simplified[1:])
+        ):
+            return True
+        months = {
+            "jan",
+            "january",
+            "feb",
+            "february",
+            "mar",
+            "march",
+            "apr",
+            "april",
+            "may",
+            "jun",
+            "june",
+            "jul",
+            "july",
+            "aug",
+            "august",
+            "sep",
+            "september",
+            "oct",
+            "october",
+            "nov",
+            "november",
+            "dec",
+            "december",
+        }
+        return (
+            len(simplified) == 3
+            and simplified[0].isdigit()
+            and simplified[1] in months
+            and simplified[2].isdigit()
+        )
+
+    def has_exact_heading_suffix(words: list[str]) -> bool:
+        if exact_heading(words):
+            return True
+        return any(
+            approved_prefix(words[:start]) and exact_heading(words[start:])
+            for start in range(1, len(words))
+        )
+
+    tokens = tuple(sorted(
+        (token for token in line.tokens if token.text.strip()),
+        key=lambda token: _bounds(token)[0],
+    ))
+    for start in range(len(tokens)):
+        for length in range(1, min(3, len(tokens) - start) + 1):
+            candidate = tokens[start : start + length]
+            words = [
+                word
+                for token in candidate
+                for word in _normalize(token.text).split()
+            ]
+            if has_exact_heading_suffix(words):
+                return candidate
+    return ()
+
+
 def _clip_token_to_lane(
     token: OcrToken,
     minimum: float,
@@ -2361,6 +2451,26 @@ def reconstruct_ocr_rows(
             ):
                 line_description_tokens.append(description_token)
         line_description_tokens = list(_cell_reading_order(line_description_tokens))
+
+        if footer_tokens := _payment_footer_heading_tokens(line):
+            footer_left = min(_bounds(token)[0] for token in footer_tokens)
+            footer_right = max(_bounds(token)[2] for token in footer_tokens)
+            footer_center = ((footer_left + footer_right) / 2 - left) / width
+            footer_is_in_description_cell = (
+                (
+                    description_cell_min is None
+                    or footer_center >= description_cell_min
+                )
+                and (
+                    description_cell_max is None
+                    or footer_center < description_cell_max
+                )
+            )
+            if not footer_is_in_description_cell:
+                pending_description_tokens = []
+                pending_service_date = None
+                pending_service_date_ids = ()
+                continue
 
         if _is_structural_total_line(line):
             if pending_description_tokens and aligned:
