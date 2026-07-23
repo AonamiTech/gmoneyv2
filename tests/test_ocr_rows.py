@@ -1391,6 +1391,47 @@ def test_linked_source_row_splits_grounded_date_from_cross_column_ocr_token() ->
     assert "split_from_merged_ocr_token" in description_cell.validation_flags
 
 
+def test_wide_date_cell_extracts_grounded_date_and_request_prefix() -> None:
+    tokens = (
+        token(0, "Date", (100, 30, 170, 45)),
+        token(1, "Particulars", (300, 30, 500, 45)),
+        token(2, "Rate", (650, 30, 710, 45)),
+        token(3, "Qty", (760, 30, 800, 45)),
+        token(4, "Amount", (880, 30, 970, 45)),
+        token(5, "15/07/2026 14:51:00 - MNEIPI/265604", (100, 70, 340, 85)),
+        token(6, "FOLEY CATHETER 2 WAY 14 FR", (300, 70, 600, 85)),
+        token(7, "210.00", (650, 70, 710, 85)),
+        token(8, "1.00", (760, 70, 800, 85)),
+        token(9, "210.00", (880, 70, 970, 85)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 20, 980, 110),
+    )
+
+    assert len(result.rows) == 1
+    candidate = result.rows[0].candidate
+    assert candidate.service_date == "15/07/2026"
+    assert candidate.request_no == "MNEIPI/265604"
+    assert result.rows[0].field_token_ids["service_date"] == ("token-5",)
+    assert result.rows[0].field_token_ids["request_no"] == ("token-5",)
+    date_column = next(
+        column
+        for column in result.source_tables[0].columns
+        if column.canonical_field == "service_date_raw"
+    )
+    date_cell = next(
+        cell
+        for cell in result.source_tables[0].rows[0].cells
+        if cell.column_id == date_column.id
+    )
+    assert date_cell.raw_value == "15/07/2026 14:51:00 - MNEIPI/265604"
+    assert date_cell.evidence
+
+
 def test_printed_table_synthesizes_repeated_unlabeled_numeric_column() -> None:
     tokens = (
         token(0, "Date", (100, 30, 170, 45)),
@@ -1438,6 +1479,50 @@ def test_printed_table_synthesizes_repeated_unlabeled_numeric_column() -> None:
         assert cells[table.columns[3].id].raw_value == "1.00"
         assert cells[table.columns[4].id].raw_value == "0.00"
         assert cells[table.columns[5].id].raw_value == "570.00"
+
+
+@pytest.mark.parametrize("gross_center", (760, 770))
+def test_shifted_mapped_numeric_lane_does_not_create_a_synthetic_column(
+    gross_center: int,
+) -> None:
+    tokens = (
+        token(0, "Description", (180, 30, 420, 45)),
+        token(1, "Gross Amount", (650, 30, 770, 45)),
+        token(2, "Net Amount", (860, 30, 960, 45)),
+        *tuple(
+            value
+            for row, top in enumerate((70, 100, 130), start=1)
+            for value in (
+                token(row * 10, f"Item {row}", (180, top, 420, top + 15)),
+                token(
+                    row * 10 + 1,
+                    f"{row * 100}.00",
+                    (gross_center - 25, top, gross_center + 25, top + 15),
+                ),
+                token(
+                    row * 10 + 2,
+                    f"{row * 90}.00",
+                    (885, top, 935, top + 15),
+                ),
+            )
+        ),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(60, 20, 980, 170),
+    )
+
+    table = result.source_tables[0]
+    assert all(column.validation_flags != ("synthetic_header",) for column in table.columns)
+    gross_column = next(
+        column for column in table.columns if column.canonical_field == "gross_amount"
+    )
+    for row, expected in zip(table.rows, ("100.00", "200.00", "300.00"), strict=True):
+        cells = {cell.column_id: cell for cell in row.cells}
+        assert cells[gross_column.id].raw_value == expected
 
 
 @pytest.mark.parametrize(

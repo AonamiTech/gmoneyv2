@@ -67,6 +67,14 @@ def parse_service_date(value: object) -> str | None:
     remainder = text[matches[0].end() :].strip()
     if remainder and not re.fullmatch(r"\d{1,2}:\d{2}(?::\d{2})?", remainder):
         return None
+    if remainder:
+        try:
+            datetime.strptime(
+                remainder,
+                "%H:%M:%S" if remainder.count(":") == 2 else "%H:%M",
+            )
+        except ValueError:
+            return None
     text = matches[0].group()
     for date_format in SERVICE_DATE_FORMATS:
         try:

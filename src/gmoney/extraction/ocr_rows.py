@@ -691,8 +691,9 @@ def _missing_numeric_column_centers(
         )
         if (
             neighbors is None
-            or center - neighbors[0] <= width * 0.04
-            or neighbors[1] - center <= width * 0.04
+            or center - neighbors[0] <= width * 0.06
+            or neighbors[1] - center <= width * 0.06
+            or abs(center - (neighbors[0] + neighbors[1]) / 2) > width * 0.03
         ):
             continue
         missing.append(center)
@@ -1684,7 +1685,12 @@ def _closest_field_token(
     if not candidates:
         return None
     selected = min(candidates, key=lambda token: abs(((_center_x(token) - left) / width) - target))
-    return selected if abs(((_center_x(selected) - left) / width) - target) <= 0.08 else None
+    tolerance = 0.12 if role == "service_date" else 0.08
+    return (
+        selected
+        if abs(((_center_x(selected) - left) / width) - target) <= tolerance
+        else None
+    )
 
 
 def _structured_field_value_is_valid(role: str, value: str) -> bool:
@@ -1725,6 +1731,12 @@ def _structured_text_fields(
         if token is None:
             continue
         raw = re.sub(r"\s+", " ", token.text).strip()
+        if role == "service_date" and (date_match := DATE_PREFIX.match(raw)):
+            remainder = raw[date_match.end() :].strip()
+            if request_match := REQUEST_PREFIX.match(remainder):
+                values["request_no"] = request_match.group(0).strip()
+                evidence["request_no"] = (token.token_id,)
+                raw = date_match.group("date").strip()
         values[role] = raw
         evidence[role] = (token.token_id,)
     return values, evidence
