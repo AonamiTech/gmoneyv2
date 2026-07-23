@@ -4,6 +4,7 @@ import hashlib
 import json
 import shutil
 import threading
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +18,16 @@ from gmoney.demo.reprocess import (
     rollback_jobs,
     stage_reprocess_jobs,
 )
-from gmoney.demo.store import JobStore, ReviewRevisionConflict
+from gmoney.demo.store import JobStore, JobTransactionError, ReviewRevisionConflict
+
+VISUAL_AUDIT_CHECKS = {
+    "hospital_identity",
+    "printed_columns",
+    "row_order_and_count",
+    "cell_values",
+    "explicit_totals",
+    "non_ledger_exclusion",
+}
 
 
 def digest(value: bytes) -> str:
@@ -167,12 +177,16 @@ def source_tables(
     ]
 
 
-def setup_job(tmp_path: Path) -> tuple[JobStore, str, dict[str, Any]]:
+def setup_job(
+    tmp_path: Path,
+    *,
+    source_name: str = "Bill 12.pdf",
+    source: bytes = b"%PDF-fixture",
+) -> tuple[JobStore, str, dict[str, Any]]:
     store = JobStore(tmp_path)
-    state = store.create("Bill 12.pdf")
+    state = store.create(source_name)
     job_id = state["id"]
     job_dir = store.job_dir(job_id)
-    source = b"%PDF-fixture"
     page = b"PNG fixture"
     (job_dir / "source.pdf").write_bytes(source)
     page_path = job_dir / "artifacts" / "pages" / "page-1.png"
@@ -184,7 +198,7 @@ def setup_job(tmp_path: Path) -> tuple[JobStore, str, dict[str, Any]]:
         "document_id": "d" * 64,
         "document_total": None,
         "source_sha256": digest(source),
-        "source_name": "Bill 12.pdf",
+        "source_name": source_name,
         "hospital": None,
         "pages": 1,
         "page_assets": [
@@ -219,11 +233,53 @@ def setup_job(tmp_path: Path) -> tuple[JobStore, str, dict[str, Any]]:
 class FakeExtractor:
     def __init__(self, result: dict[str, Any]) -> None:
         self.result = result
+        self.calls: list[Path] = []
 
     def extract(self, source: Path, artifact_root: Path) -> dict[str, Any]:
         assert source.is_file()
         assert (artifact_root / "pages" / "page-1.png").is_file()
+        self.calls.append(source)
         return json.loads(json.dumps(self.result))
+
+
+def write_passing_visual_audit(staging_root: Path) -> dict[str, Any]:
+    manifest = json.loads((staging_root / "manifest.json").read_text())
+    audit = {
+        "version": "reprocess_visual_audit_v1",
+        "sources": [
+            {
+                "source_sha256": source["source_sha256"],
+                "reviewer": "visual-auditor@example.com",
+                "reviewed_at": manifest["sealed_at"],
+                "pages": [
+                    {"page_number": page_number, "status": "pass", "notes": ""}
+                    for page_number in range(1, source["page_count"] + 1)
+                ],
+                "checks": {
+                    check: "pass" for check in sorted(VISUAL_AUDIT_CHECKS)
+                },
+            }
+            for source in manifest["sources"]
+        ],
+    }
+    (staging_root / "visual-audit.json").write_text(json.dumps(audit))
+    return audit
+
+
+def stage_and_apply(
+    *,
+    root: Path,
+    job_ids: list[str],
+    extractor: Any,
+) -> dict[str, Any]:
+    staged = stage_reprocess_jobs(
+        root=root,
+        job_ids=job_ids,
+        extractor=extractor,
+    )
+    staging_root = Path(staged["staging_root"])
+    write_passing_visual_audit(staging_root)
+    return apply_staged_jobs(root=root, stage_batch=staging_root)
 
 
 def test_reprocess_validation_requires_printed_tables_for_canonical_rows(
@@ -236,6 +292,28 @@ def test_reprocess_validation_requires_printed_tables_for_canonical_rows(
             store.job_dir(job_id) / "source.pdf",
             old_result,
             old_result,
+            store.job_dir(job_id) / "artifacts",
+        )
+
+
+def test_reprocess_validation_requires_exact_page_asset_numbers(
+    tmp_path: Path,
+) -> None:
+    store, job_id, old_result = setup_job(tmp_path)
+    page_sha = old_result["page_assets"][0]["artifact_sha256"]
+    new_rows = [row("new-row", page_sha)]
+    new_result = {
+        **old_result,
+        "page_assets": [{**old_result["page_assets"][0], "page_number": 2}],
+        "rows": new_rows,
+        "source_tables": source_tables(new_rows, page_sha),
+    }
+
+    with pytest.raises(ValueError, match="page inventory"):
+        _validate_result(
+            store.job_dir(job_id) / "source.pdf",
+            old_result,
+            new_result,
             store.job_dir(job_id) / "artifacts",
         )
 
@@ -308,6 +386,102 @@ def test_reprocess_validation_rejects_printed_value_missing_from_canonical_row(
         )
 
 
+@pytest.mark.parametrize("canonical_field", ["net_amount", "gross_amount"])
+def test_reprocess_validation_rejects_unlinked_printed_financial_total(
+    tmp_path: Path,
+    canonical_field: str,
+) -> None:
+    store, job_id, old_result = setup_job(tmp_path)
+    page_sha = old_result["page_assets"][0]["artifact_sha256"]
+    new_rows = [row("new-row", page_sha)]
+    if canonical_field == "gross_amount":
+        new_rows[0]["gross_amount_raw"] = "100.00"
+        new_rows[0]["gross_amount"] = "100.00"
+        new_rows[0]["field_evidence"]["gross_amount"] = [
+            evidence(page_sha, "amount-token")
+        ]
+    printed = source_tables(new_rows, page_sha)
+    printed[0]["columns"][1]["canonical_field"] = canonical_field
+    printed[0]["rows"].append(
+        {
+            "id": "p1-t1-s1-r2",
+            "order": 1,
+            "canonical_row_id": None,
+            "cells": [
+                {
+                    "column_id": "description",
+                    "raw_value": "Grand Total",
+                    "evidence": [evidence(page_sha, "footer-description")],
+                    "validation_flags": [],
+                },
+                {
+                    "column_id": "amount",
+                    "raw_value": "100.00",
+                    "evidence": [evidence(page_sha, "footer-amount")],
+                    "validation_flags": [],
+                },
+            ],
+            "validation_flags": ["unlinked_canonical_row"],
+        }
+    )
+    new_result = {
+        **old_result,
+        "rows": new_rows,
+        "source_tables": printed,
+    }
+
+    with pytest.raises(ValueError, match="unlinked source row.*financial"):
+        _validate_result(
+            store.job_dir(job_id) / "source.pdf",
+            old_result,
+            new_result,
+            store.job_dir(job_id) / "artifacts",
+        )
+
+
+def test_reprocess_validation_allows_unlinked_non_ledger_text_without_amount(
+    tmp_path: Path,
+) -> None:
+    store, job_id, old_result = setup_job(tmp_path)
+    page_sha = old_result["page_assets"][0]["artifact_sha256"]
+    new_rows = [row("new-row", page_sha)]
+    printed = source_tables(new_rows, page_sha)
+    printed[0]["rows"].append(
+        {
+            "id": "p1-t1-s1-r2",
+            "order": 1,
+            "canonical_row_id": None,
+            "cells": [
+                {
+                    "column_id": "description",
+                    "raw_value": "Payment due within seven days",
+                    "evidence": [evidence(page_sha, "footer-description")],
+                    "validation_flags": [],
+                },
+                {
+                    "column_id": "amount",
+                    "raw_value": None,
+                    "evidence": [],
+                    "validation_flags": ["empty_cell"],
+                },
+            ],
+            "validation_flags": ["unlinked_canonical_row"],
+        }
+    )
+    new_result = {
+        **old_result,
+        "rows": new_rows,
+        "source_tables": printed,
+    }
+
+    _validate_result(
+        store.job_dir(job_id) / "source.pdf",
+        old_result,
+        new_result,
+        store.job_dir(job_id) / "artifacts",
+    )
+
+
 def test_reprocess_preserves_job_and_review_with_backup(tmp_path: Path) -> None:
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
@@ -324,10 +498,9 @@ def test_reprocess_preserves_job_and_review_with_backup(tmp_path: Path) -> None:
     assert dry_run["would_reprocess"] == 1
     assert json.loads((store.job_dir(job_id) / "result.json").read_text()) == old_result
 
-    summary = reprocess_jobs(
+    summary = stage_and_apply(
         root=tmp_path,
         job_ids=[job_id],
-        apply=True,
         extractor=FakeExtractor(new_result),
     )
     assert summary["reprocessed"] == 1
@@ -362,10 +535,9 @@ def test_manual_rollback_rejects_review_created_after_deployment(tmp_path: Path)
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
     new_rows = [row("new-row", page_sha)]
-    applied = reprocess_jobs(
+    applied = stage_and_apply(
         root=tmp_path,
         job_ids=[job_id],
-        apply=True,
         extractor=FakeExtractor(
             {
                 **old_result,
@@ -398,10 +570,9 @@ def test_manual_rollback_final_review_compare_and_swap(
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
     new_rows = [row("new-row", page_sha)]
-    applied = reprocess_jobs(
+    applied = stage_and_apply(
         root=tmp_path,
         job_ids=[job_id],
-        apply=True,
         extractor=FakeExtractor(
             {
                 **old_result,
@@ -444,10 +615,9 @@ def test_manual_rollback_batch_failure_restores_live_and_backup_batches(
     _, second_id, second_old = setup_job(tmp_path)
     page_sha = first_old["page_assets"][0]["artifact_sha256"]
     new_rows = [row("new-row", page_sha)]
-    applied = reprocess_jobs(
+    applied = stage_and_apply(
         root=tmp_path,
         job_ids=[first_id, second_id],
-        apply=True,
         extractor=FakeExtractor(
             {
                 **first_old,
@@ -493,10 +663,9 @@ def test_store_recovery_restores_interrupted_manual_rollback(tmp_path: Path) -> 
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
     new_rows = [row("new-row", page_sha)]
-    applied = reprocess_jobs(
+    applied = stage_and_apply(
         root=tmp_path,
         job_ids=[job_id],
-        apply=True,
         extractor=FakeExtractor(
             {
                 **old_result,
@@ -569,13 +738,37 @@ def test_reprocess_stops_if_review_changes_during_staging(tmp_path: Path) -> Non
             return super().extract(source, artifact_root)
 
     with pytest.raises(ValueError, match="review changed"):
+        stage_reprocess_jobs(
+            root=tmp_path,
+            job_ids=[job_id],
+            extractor=MutatingExtractor(extracted_result),
+        )
+    assert json.loads((store.job_dir(job_id) / "result.json").read_text()) == old_result
+
+
+def test_direct_apply_requires_the_two_phase_visual_audit_workflow(
+    tmp_path: Path,
+) -> None:
+    _, job_id, old_result = setup_job(tmp_path)
+    page_sha = old_result["page_assets"][0]["artifact_sha256"]
+    new_rows = [row("new-row", page_sha)]
+    extractor = FakeExtractor(
+        {
+            **old_result,
+            "rows": new_rows,
+            "source_tables": source_tables(new_rows, page_sha),
+        }
+    )
+
+    with pytest.raises(ValueError, match="two-phase.*visual audit"):
         reprocess_jobs(
             root=tmp_path,
             job_ids=[job_id],
             apply=True,
-            extractor=MutatingExtractor(extracted_result),
+            extractor=extractor,
         )
-    assert json.loads((store.job_dir(job_id) / "result.json").read_text()) == old_result
+
+    assert extractor.calls == []
 
 
 def test_stage_and_apply_are_separate_review_checked_phases(tmp_path: Path) -> None:
@@ -595,6 +788,7 @@ def test_stage_and_apply_are_separate_review_checked_phases(tmp_path: Path) -> N
     )
     assert staged["staged"] == 1
     assert json.loads((store.job_dir(job_id) / "result.json").read_text()) == old_result
+    write_passing_visual_audit(Path(staged["staging_root"]))
 
     applied = apply_staged_jobs(
         root=tmp_path,
@@ -606,6 +800,733 @@ def test_stage_and_apply_are_separate_review_checked_phases(tmp_path: Path) -> N
     ] == "new-row"
 
 
+def test_stage_extracts_identical_sources_once_and_preserves_per_job_reviews(
+    tmp_path: Path,
+) -> None:
+    store, first_id, first_old = setup_job(
+        tmp_path,
+        source_name="First copy.pdf",
+    )
+    _, second_id, second_old = setup_job(
+        tmp_path,
+        source_name="Second copy.pdf",
+    )
+    second_review = store.read_review(second_id)
+    second_review["revision"] = 7
+    second_review["row_overrides"]["old-row"]["changes"]["description"] = (
+        "Second reviewer correction"
+    )
+    (store.job_dir(second_id) / "review.json").write_text(json.dumps(second_review))
+    page_sha = first_old["page_assets"][0]["artifact_sha256"]
+    new_rows = [row("new-row", page_sha)]
+    extractor = FakeExtractor(
+        {
+            **first_old,
+            "source_name": "extractor representative name",
+            "rows": new_rows,
+            "source_tables": source_tables(new_rows, page_sha),
+        }
+    )
+
+    staged = stage_reprocess_jobs(
+        root=tmp_path,
+        job_ids=[second_id, first_id],
+        extractor=extractor,
+    )
+
+    staging_root = Path(staged["staging_root"])
+    ordered_ids = sorted((first_id, second_id))
+    representative_id = ordered_ids[0]
+    assert extractor.calls == [store.job_dir(representative_id) / "source.pdf"]
+    manifest = json.loads((staging_root / "manifest.json").read_text())
+    assert manifest["version"] == "reprocess_stage_v2"
+    assert manifest["sealed_at"] == manifest["created_at"]
+    assert len(manifest["sources"]) == 1
+    source_group = manifest["sources"][0]
+    assert source_group["source_sha256"] == first_old["source_sha256"]
+    assert source_group["representative_job_id"] == representative_id
+    assert source_group["job_ids"] == ordered_ids
+    assert source_group["page_count"] == 1
+    assert source_group["source_names"] == ["First copy.pdf", "Second copy.pdf"]
+    assert len(source_group["extraction_sha256"]) == 64
+    assert all(
+        len(document["staged_payload_sha256"]) == 64
+        for document in manifest["documents"]
+    )
+    for job_id, old_result in (
+        (first_id, first_old),
+        (second_id, second_old),
+    ):
+        staged_result = json.loads((staging_root / job_id / "result.json").read_text())
+        assert staged_result["source_name"] == old_result["source_name"]
+        assert (staging_root / job_id / "artifacts" / "pages" / "page-1.png").is_file()
+
+    first_review = json.loads((staging_root / first_id / "review.json").read_text())
+    second_staged_review = json.loads(
+        (staging_root / second_id / "review.json").read_text()
+    )
+    assert first_review["revision"] == 2
+    assert second_staged_review["revision"] == 8
+    assert first_review["row_overrides"]["new-row"]["changes"]["description"] == (
+        "Reviewer package charge"
+    )
+    assert second_staged_review["row_overrides"]["new-row"]["changes"][
+        "description"
+    ] == "Second reviewer correction"
+    assert first_review["events"][-1]["target_id"] == first_id
+    assert second_staged_review["events"][-1]["target_id"] == second_id
+
+
+def test_duplicate_review_change_during_staging_aborts_the_group(
+    tmp_path: Path,
+) -> None:
+    store, first_id, first_old = setup_job(tmp_path, source_name="First copy.pdf")
+    _, second_id, second_old = setup_job(tmp_path, source_name="Second copy.pdf")
+    page_sha = first_old["page_assets"][0]["artifact_sha256"]
+    extracted_result = {
+        **first_old,
+        "rows": [row("new-row", page_sha)],
+    }
+    extracted_result["source_tables"] = source_tables(
+        extracted_result["rows"],
+        page_sha,
+    )
+    changed_id = sorted((first_id, second_id))[1]
+
+    class MutatingExtractor(FakeExtractor):
+        def extract(self, source: Path, artifact_root: Path) -> dict[str, Any]:
+            review_path = store.job_dir(changed_id) / "review.json"
+            review = json.loads(review_path.read_text())
+            review["revision"] += 1
+            review["events"].append({"action": "concurrent-review"})
+            review_path.write_text(json.dumps(review))
+            return super().extract(source, artifact_root)
+
+    with pytest.raises(ValueError, match="review changed while staging"):
+        stage_reprocess_jobs(
+            root=tmp_path,
+            job_ids=[first_id, second_id],
+            extractor=MutatingExtractor(extracted_result),
+        )
+
+    assert json.loads((store.job_dir(first_id) / "result.json").read_text()) == first_old
+    assert json.loads((store.job_dir(second_id) / "result.json").read_text()) == (
+        second_old
+    )
+
+
+def test_duplicate_review_change_before_apply_aborts_without_any_cutover(
+    tmp_path: Path,
+) -> None:
+    store, first_id, first_old = setup_job(tmp_path, source_name="First copy.pdf")
+    _, second_id, second_old = setup_job(tmp_path, source_name="Second copy.pdf")
+    page_sha = first_old["page_assets"][0]["artifact_sha256"]
+    new_rows = [row("new-row", page_sha)]
+    staged = stage_reprocess_jobs(
+        root=tmp_path,
+        job_ids=[first_id, second_id],
+        extractor=FakeExtractor(
+            {
+                **first_old,
+                "rows": new_rows,
+                "source_tables": source_tables(new_rows, page_sha),
+            }
+        ),
+    )
+    staging_root = Path(staged["staging_root"])
+    write_passing_visual_audit(staging_root)
+    changed_id = sorted((first_id, second_id))[1]
+    store.mutate_review(
+        changed_id,
+        1,
+        lambda review: {
+            **review,
+            "events": [*review["events"], {"action": "concurrent-review"}],
+        },
+    )
+    backup_root = tmp_path / "audit-approved-backups"
+
+    with pytest.raises(ValueError, match="review changed after staging"):
+        apply_staged_jobs(
+            root=tmp_path,
+            stage_batch=staging_root,
+            backup_root=backup_root,
+        )
+
+    assert not backup_root.exists()
+    assert (staging_root / first_id / "result.json").is_file()
+    assert (staging_root / second_id / "result.json").is_file()
+    assert not list(staging_root.glob(".apply-*"))
+    assert json.loads((store.job_dir(first_id) / "result.json").read_text()) == first_old
+    assert json.loads((store.job_dir(second_id) / "result.json").read_text()) == (
+        second_old
+    )
+
+
+def test_apply_rejects_swapped_duplicate_reviews(
+    tmp_path: Path,
+) -> None:
+    store, first_id, first_old = setup_job(tmp_path, source_name="First copy.pdf")
+    _, second_id, second_old = setup_job(tmp_path, source_name="Second copy.pdf")
+    second_review = store.read_review(second_id)
+    second_review["revision"] = 4
+    second_review["row_overrides"]["old-row"]["changes"]["description"] = (
+        "Second correction"
+    )
+    (store.job_dir(second_id) / "review.json").write_text(json.dumps(second_review))
+    page_sha = first_old["page_assets"][0]["artifact_sha256"]
+    new_rows = [row("new-row", page_sha)]
+    staged = stage_reprocess_jobs(
+        root=tmp_path,
+        job_ids=[first_id, second_id],
+        extractor=FakeExtractor(
+            {
+                **first_old,
+                "rows": new_rows,
+                "source_tables": source_tables(new_rows, page_sha),
+            }
+        ),
+    )
+    staging_root = Path(staged["staging_root"])
+    first_staged_review = (staging_root / first_id / "review.json").read_text()
+    second_staged_review = (staging_root / second_id / "review.json").read_text()
+    (staging_root / first_id / "review.json").write_text(second_staged_review)
+    (staging_root / second_id / "review.json").write_text(first_staged_review)
+    manifest_path = staging_root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    for document in manifest["documents"]:
+        document["staged_payload_sha256"] = reprocess_module._tree_digest(
+            staging_root / document["job_id"]
+        )
+    manifest_path.write_text(json.dumps(manifest))
+    write_passing_visual_audit(staging_root)
+    backup_root = tmp_path / "swapped-review-backups"
+
+    with pytest.raises(ValueError, match="staged review migration"):
+        apply_staged_jobs(
+            root=tmp_path,
+            stage_batch=staging_root,
+            backup_root=backup_root,
+        )
+
+    assert not backup_root.exists()
+    assert (staging_root / first_id / "result.json").is_file()
+    assert (staging_root / second_id / "result.json").is_file()
+    assert not list(staging_root.glob(".apply-*"))
+    assert json.loads((store.job_dir(first_id) / "result.json").read_text()) == first_old
+    assert json.loads((store.job_dir(second_id) / "result.json").read_text()) == (
+        second_old
+    )
+
+
+def test_apply_rejects_staged_result_changed_after_visual_audit(
+    tmp_path: Path,
+) -> None:
+    store, job_id, old_result = setup_job(tmp_path)
+    page_sha = old_result["page_assets"][0]["artifact_sha256"]
+    new_rows = [row("new-row", page_sha)]
+
+    staged = stage_reprocess_jobs(
+        root=tmp_path,
+        job_ids=[job_id],
+        extractor=FakeExtractor(
+            {
+                **old_result,
+                "rows": new_rows,
+                "source_tables": source_tables(new_rows, page_sha),
+            }
+        ),
+    )
+    staging_root = Path(staged["staging_root"])
+    write_passing_visual_audit(staging_root)
+    result_path = staging_root / job_id / "result.json"
+    changed_result = json.loads(result_path.read_text())
+    changed_result["diagnostics"] = [{"tampered_after_audit": True}]
+    result_path.write_text(json.dumps(changed_result))
+    backup_root = tmp_path / "changed-stage-backups"
+
+    with pytest.raises(ValueError, match="staged payload digest"):
+        apply_staged_jobs(
+            root=tmp_path,
+            stage_batch=staging_root,
+            backup_root=backup_root,
+        )
+
+    assert not backup_root.exists()
+    assert json.loads((store.job_dir(job_id) / "result.json").read_text()) == old_result
+
+
+def test_apply_revalidates_staged_payload_after_acquiring_locks(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    store, job_id, old_result = setup_job(tmp_path)
+    page_sha = old_result["page_assets"][0]["artifact_sha256"]
+    new_rows = [row("new-row", page_sha)]
+    staged = stage_reprocess_jobs(
+        root=tmp_path,
+        job_ids=[job_id],
+        extractor=FakeExtractor(
+            {
+                **old_result,
+                "rows": new_rows,
+                "source_tables": source_tables(new_rows, page_sha),
+            }
+        ),
+    )
+    staging_root = Path(staged["staging_root"])
+    write_passing_visual_audit(staging_root)
+    result_path = staging_root / job_id / "result.json"
+    original_job_lock = JobStore.job_lock
+    injected = False
+
+    def racing_job_lock(
+        self: JobStore, locked_job_id: str, *, exclusive: bool
+    ) -> Any:
+        nonlocal injected
+        if exclusive and not injected:
+            injected = True
+            changed_result = json.loads(result_path.read_text())
+            changed_result["diagnostics"] = [{"changed_before_lock": True}]
+            result_path.write_text(json.dumps(changed_result))
+        return original_job_lock(self, locked_job_id, exclusive=exclusive)
+
+    monkeypatch.setattr(JobStore, "job_lock", racing_job_lock)
+    backup_root = tmp_path / "racing-stage-backups"
+
+    with pytest.raises(ValueError, match="staged payload digest"):
+        apply_staged_jobs(
+            root=tmp_path,
+            stage_batch=staging_root,
+            backup_root=backup_root,
+        )
+
+    assert not backup_root.exists()
+    assert json.loads((store.job_dir(job_id) / "result.json").read_text()) == old_result
+
+
+def test_apply_atomically_claims_the_staged_payload_before_cutover(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    store, job_id, old_result = setup_job(tmp_path)
+    page_sha = old_result["page_assets"][0]["artifact_sha256"]
+    new_rows = [row("new-row", page_sha)]
+    staged = stage_reprocess_jobs(
+        root=tmp_path,
+        job_ids=[job_id],
+        extractor=FakeExtractor(
+            {
+                **old_result,
+                "rows": new_rows,
+                "source_tables": source_tables(new_rows, page_sha),
+            }
+        ),
+    )
+    staging_root = Path(staged["staging_root"])
+    write_passing_visual_audit(staging_root)
+    known_result_path = staging_root / job_id / "result.json"
+    original_cutover = reprocess_module._cutover_job
+    injected = False
+
+    def racing_cutover(**kwargs: Any) -> Path:
+        nonlocal injected
+        if known_result_path.is_file():
+            injected = True
+            changed_result = json.loads(known_result_path.read_text())
+            changed_result["diagnostics"] = [{"changed_after_final_check": True}]
+            known_result_path.write_text(json.dumps(changed_result))
+        return original_cutover(**kwargs)
+
+    monkeypatch.setattr(reprocess_module, "_cutover_job", racing_cutover)
+
+    apply_staged_jobs(root=tmp_path, stage_batch=staging_root)
+
+    assert injected is False
+    live_result = json.loads((store.job_dir(job_id) / "result.json").read_text())
+    assert live_result.get("diagnostics") == old_result["diagnostics"]
+
+
+def test_apply_rejects_a_symlinked_staged_payload_root(tmp_path: Path) -> None:
+    store, job_id, old_result = setup_job(tmp_path)
+    page_sha = old_result["page_assets"][0]["artifact_sha256"]
+    new_rows = [row("new-row", page_sha)]
+    staged = stage_reprocess_jobs(
+        root=tmp_path,
+        job_ids=[job_id],
+        extractor=FakeExtractor(
+            {
+                **old_result,
+                "rows": new_rows,
+                "source_tables": source_tables(new_rows, page_sha),
+            }
+        ),
+    )
+    staging_root = Path(staged["staging_root"])
+    write_passing_visual_audit(staging_root)
+    stage_dir = staging_root / job_id
+    redirected = tmp_path / "redirected-staged-payload"
+    stage_dir.replace(redirected)
+    stage_dir.symlink_to(redirected, target_is_directory=True)
+    backup_root = tmp_path / "symlink-stage-backups"
+
+    with pytest.raises(ValueError, match="symbolic link|outside staging"):
+        apply_staged_jobs(
+            root=tmp_path,
+            stage_batch=staging_root,
+            backup_root=backup_root,
+        )
+
+    assert not backup_root.exists()
+    assert json.loads((store.job_dir(job_id) / "result.json").read_text()) == old_result
+
+
+def test_apply_cleanup_never_follows_a_symlinked_claim_root(
+    tmp_path: Path,
+) -> None:
+    store, job_id, old_result = setup_job(tmp_path)
+    page_sha = old_result["page_assets"][0]["artifact_sha256"]
+    new_rows = [row("new-row", page_sha)]
+    staged = stage_reprocess_jobs(
+        root=tmp_path,
+        job_ids=[job_id],
+        extractor=FakeExtractor(
+            {
+                **old_result,
+                "rows": new_rows,
+                "source_tables": source_tables(new_rows, page_sha),
+            }
+        ),
+    )
+    staging_root = Path(staged["staging_root"])
+    manifest_bytes = (staging_root / "manifest.json").read_bytes()
+    claimed_root = staging_root / f".apply-{hashlib.sha256(manifest_bytes).hexdigest()}"
+    orphaned_stage = tmp_path / "orphaned-staged-payload"
+    (staging_root / job_id).replace(orphaned_stage)
+    claimed_root.symlink_to(store.jobs_root, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="apply-owned staging namespace is unsafe"):
+        apply_staged_jobs(root=tmp_path, stage_batch=staging_root)
+
+    assert store.job_dir(job_id).is_dir()
+    assert json.loads((store.job_dir(job_id) / "result.json").read_text()) == old_result
+    assert claimed_root.is_symlink()
+    assert not (staging_root / job_id).exists()
+
+
+def test_apply_rejects_an_existing_cutover_journal_without_overwriting_it(
+    tmp_path: Path,
+) -> None:
+    store, job_id, old_result = setup_job(tmp_path)
+    page_sha = old_result["page_assets"][0]["artifact_sha256"]
+    new_rows = [row("new-row", page_sha)]
+    staged = stage_reprocess_jobs(
+        root=tmp_path,
+        job_ids=[job_id],
+        extractor=FakeExtractor(
+            {
+                **old_result,
+                "rows": new_rows,
+                "source_tables": source_tables(new_rows, page_sha),
+            }
+        ),
+    )
+    staging_root = Path(staged["staging_root"])
+    write_passing_visual_audit(staging_root)
+    journal_path = store.job_dir(job_id) / ".cutover.json"
+    prior_journal = {
+        "version": "job_cutover_v1",
+        "job_id": job_id,
+        "stage_dir": str(staging_root / job_id),
+        "backup_dir": str(tmp_path / "prior-backup" / job_id),
+        "commit_marker": str(tmp_path / "prior-backup" / ".committed.json"),
+    }
+    journal_path.write_text(json.dumps(prior_journal))
+
+    with pytest.raises(
+        JobTransactionError,
+        match="job_cutover_recovery_required",
+    ):
+        apply_staged_jobs(root=tmp_path, stage_batch=staging_root)
+
+    assert json.loads(journal_path.read_text()) == prior_journal
+    assert (staging_root / job_id / "result.json").is_file()
+    assert not list(staging_root.glob(".apply-*"))
+    assert json.loads((store.job_dir(job_id) / "result.json").read_text()) == old_result
+
+
+def test_apply_preserves_claimed_payload_when_cutover_requires_recovery(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    store, job_id, old_result = setup_job(tmp_path)
+    page_sha = old_result["page_assets"][0]["artifact_sha256"]
+    new_rows = [row("new-row", page_sha)]
+    staged = stage_reprocess_jobs(
+        root=tmp_path,
+        job_ids=[job_id],
+        extractor=FakeExtractor(
+            {
+                **old_result,
+                "rows": new_rows,
+                "source_tables": source_tables(new_rows, page_sha),
+            }
+        ),
+    )
+    staging_root = Path(staged["staging_root"])
+    write_passing_visual_audit(staging_root)
+
+    def recovery_required_cutover(**kwargs: Any) -> Path:
+        prepared = kwargs["prepared"]
+        journal_path = store.job_dir(job_id) / ".cutover.json"
+        journal_path.write_text(
+            json.dumps(
+                {
+                    "version": "job_cutover_v1",
+                    "job_id": job_id,
+                    "stage_dir": str(prepared.stage_dir),
+                    "backup_dir": str(kwargs["backup_root"] / job_id),
+                    "commit_marker": str(kwargs["commit_marker"]),
+                }
+            )
+        )
+        raise RuntimeError("cutover recovery required")
+
+    monkeypatch.setattr(
+        reprocess_module,
+        "_cutover_job",
+        recovery_required_cutover,
+    )
+
+    with pytest.raises(RuntimeError, match="cutover recovery required"):
+        apply_staged_jobs(root=tmp_path, stage_batch=staging_root)
+
+    journal = json.loads((store.job_dir(job_id) / ".cutover.json").read_text())
+    claimed_stage = Path(journal["stage_dir"])
+    assert claimed_stage.is_dir()
+    assert claimed_stage.parent.name.startswith(".apply-")
+    assert not (staging_root / job_id).exists()
+
+
+def test_apply_restores_mixed_preexisting_claims_when_validation_aborts(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    store, first_id, first_old = setup_job(tmp_path)
+    _, second_id, second_old = setup_job(tmp_path)
+    page_sha = first_old["page_assets"][0]["artifact_sha256"]
+    new_rows = [row("new-row", page_sha)]
+    staged = stage_reprocess_jobs(
+        root=tmp_path,
+        job_ids=[first_id, second_id],
+        extractor=FakeExtractor(
+            {
+                **first_old,
+                "rows": new_rows,
+                "source_tables": source_tables(new_rows, page_sha),
+            }
+        ),
+    )
+    staging_root = Path(staged["staging_root"])
+    write_passing_visual_audit(staging_root)
+    manifest_bytes = (staging_root / "manifest.json").read_bytes()
+    claimed_root = staging_root / f".apply-{hashlib.sha256(manifest_bytes).hexdigest()}"
+    claimed_root.mkdir()
+    ordered_ids = sorted((first_id, second_id))
+    (staging_root / ordered_ids[0]).replace(claimed_root / ordered_ids[0])
+    changed_result_path = staging_root / ordered_ids[1] / "result.json"
+    changed_result = json.loads(changed_result_path.read_text())
+    changed_result["diagnostics"] = [{"invalid_resumed_stage": True}]
+    changed_result_path.write_text(json.dumps(changed_result))
+    original_job_lock = JobStore.job_lock
+    exclusive_locks: list[str] = []
+
+    def tracking_job_lock(
+        self: JobStore, locked_job_id: str, *, exclusive: bool
+    ) -> Any:
+        if exclusive:
+            exclusive_locks.append(locked_job_id)
+        return original_job_lock(self, locked_job_id, exclusive=exclusive)
+
+    monkeypatch.setattr(JobStore, "job_lock", tracking_job_lock)
+
+    with pytest.raises(ValueError, match="staged payload digest"):
+        apply_staged_jobs(root=tmp_path, stage_batch=staging_root)
+
+    assert exclusive_locks == ordered_ids
+    assert (staging_root / first_id).is_dir()
+    assert (staging_root / second_id).is_dir()
+    assert not claimed_root.exists()
+    assert json.loads((store.job_dir(first_id) / "result.json").read_text()) == first_old
+    assert json.loads((store.job_dir(second_id) / "result.json").read_text()) == (
+        second_old
+    )
+
+
+def test_apply_rejects_visual_audit_replayed_for_a_new_extraction(
+    tmp_path: Path,
+) -> None:
+    _, job_id, old_result = setup_job(tmp_path)
+    page_sha = old_result["page_assets"][0]["artifact_sha256"]
+    first_rows = [row("first-new-row", page_sha)]
+    first_stage = stage_reprocess_jobs(
+        root=tmp_path,
+        job_ids=[job_id],
+        stage_root=tmp_path / "first-staging",
+        extractor=FakeExtractor(
+            {
+                **old_result,
+                "rows": first_rows,
+                "source_tables": source_tables(first_rows, page_sha),
+            }
+        ),
+    )
+    first_staging_root = Path(first_stage["staging_root"])
+    write_passing_visual_audit(first_staging_root)
+    old_audit = (first_staging_root / "visual-audit.json").read_text()
+
+    second_rows = [row("second-new-row", page_sha)]
+    second_stage = stage_reprocess_jobs(
+        root=tmp_path,
+        job_ids=[job_id],
+        stage_root=tmp_path / "second-staging",
+        extractor=FakeExtractor(
+            {
+                **old_result,
+                "rows": second_rows,
+                "source_tables": source_tables(second_rows, page_sha),
+            }
+        ),
+    )
+    second_staging_root = Path(second_stage["staging_root"])
+    (second_staging_root / "visual-audit.json").write_text(old_audit)
+    backup_root = tmp_path / "replayed-audit-backups"
+
+    with pytest.raises(ValueError, match="predates the sealed stage"):
+        apply_staged_jobs(
+            root=tmp_path,
+            stage_batch=second_staging_root,
+            backup_root=backup_root,
+        )
+
+    assert not backup_root.exists()
+
+
+@pytest.mark.parametrize(
+    ("audit_case", "message"),
+    [
+        ("missing", "visual audit is missing"),
+        ("incomplete_pages", "page inventory"),
+        ("failed_page", "page 1 did not pass"),
+        ("mismatched_sha", "source inventory"),
+        ("invalid_sha_type", "source inventory"),
+        ("duplicate_source", "source inventory"),
+        ("missing_source", "source inventory"),
+        ("manifest_page_count_mismatch", "staged page count"),
+        ("boolean_page_number", "page inventory"),
+        ("blank_reviewer", "reviewer"),
+        ("blank_reviewed_at", "reviewed_at"),
+        ("non_utc_reviewed_at", "reviewed_at"),
+    ],
+)
+def test_apply_rejects_invalid_visual_audit_before_creating_backups(
+    tmp_path: Path,
+    audit_case: str,
+    message: str,
+) -> None:
+    store, job_id, old_result = setup_job(tmp_path)
+    page_sha = old_result["page_assets"][0]["artifact_sha256"]
+    new_rows = [row("new-row", page_sha)]
+    staged = stage_reprocess_jobs(
+        root=tmp_path,
+        job_ids=[job_id],
+        extractor=FakeExtractor(
+            {
+                **old_result,
+                "rows": new_rows,
+                "source_tables": source_tables(new_rows, page_sha),
+            }
+        ),
+    )
+    staging_root = Path(staged["staging_root"])
+    if audit_case != "missing":
+        if audit_case == "manifest_page_count_mismatch":
+            manifest_path = staging_root / "manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["sources"][0]["page_count"] = 2
+            manifest_path.write_text(json.dumps(manifest))
+        audit = write_passing_visual_audit(staging_root)
+        if audit_case == "incomplete_pages":
+            audit["sources"][0]["pages"] = []
+        elif audit_case == "failed_page":
+            audit["sources"][0]["pages"][0]["status"] = "fail"
+        elif audit_case == "mismatched_sha":
+            audit["sources"][0]["source_sha256"] = "0" * 64
+        elif audit_case == "invalid_sha_type":
+            audit["sources"][0]["source_sha256"] = []
+        elif audit_case == "duplicate_source":
+            audit["sources"].append(deepcopy(audit["sources"][0]))
+        elif audit_case == "missing_source":
+            audit["sources"] = []
+        elif audit_case == "boolean_page_number":
+            audit["sources"][0]["pages"][0]["page_number"] = True
+        elif audit_case == "blank_reviewer":
+            audit["sources"][0]["reviewer"] = " "
+        elif audit_case == "blank_reviewed_at":
+            audit["sources"][0]["reviewed_at"] = ""
+        elif audit_case == "non_utc_reviewed_at":
+            audit["sources"][0]["reviewed_at"] = "2026-07-23T10:00:00+10:00"
+        (staging_root / "visual-audit.json").write_text(json.dumps(audit))
+    backup_root = tmp_path / "rejected-backups"
+
+    with pytest.raises(ValueError, match=message):
+        apply_staged_jobs(
+            root=tmp_path,
+            stage_batch=staging_root,
+            backup_root=backup_root,
+        )
+
+    assert not backup_root.exists()
+    assert json.loads((store.job_dir(job_id) / "result.json").read_text()) == old_result
+    assert store.read_review(job_id)["revision"] == 1
+
+
+@pytest.mark.parametrize("failed_check", sorted(VISUAL_AUDIT_CHECKS))
+def test_apply_rejects_each_failed_source_level_visual_check(
+    tmp_path: Path,
+    failed_check: str,
+) -> None:
+    store, job_id, old_result = setup_job(tmp_path)
+    page_sha = old_result["page_assets"][0]["artifact_sha256"]
+    new_rows = [row("new-row", page_sha)]
+    staged = stage_reprocess_jobs(
+        root=tmp_path,
+        job_ids=[job_id],
+        extractor=FakeExtractor(
+            {
+                **old_result,
+                "rows": new_rows,
+                "source_tables": source_tables(new_rows, page_sha),
+            }
+        ),
+    )
+    staging_root = Path(staged["staging_root"])
+    audit = write_passing_visual_audit(staging_root)
+    audit["sources"][0]["checks"][failed_check] = "fail"
+    (staging_root / "visual-audit.json").write_text(json.dumps(audit))
+    backup_root = tmp_path / "rejected-check-backups"
+
+    with pytest.raises(ValueError, match=f"{failed_check}.*did not pass"):
+        apply_staged_jobs(
+            root=tmp_path,
+            stage_batch=staging_root,
+            backup_root=backup_root,
+        )
+
+    assert not backup_root.exists()
+    assert json.loads((store.job_dir(job_id) / "result.json").read_text()) == old_result
+
+
 def test_unmappable_reviewed_row_is_preserved_as_reviewer_row(tmp_path: Path) -> None:
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
@@ -614,10 +1535,9 @@ def test_unmappable_reviewed_row_is_preserved_as_reviewer_row(tmp_path: Path) ->
     replacement["field_evidence"]["description"][0]["token_ids"] = ["different-description"]
     replacement["field_evidence"]["amount"][0]["token_ids"] = ["different-amount"]
 
-    summary = reprocess_jobs(
+    summary = stage_and_apply(
         root=tmp_path,
         job_ids=[job_id],
-        apply=True,
         extractor=FakeExtractor(
             {
                 **old_result,
@@ -653,6 +1573,7 @@ def test_review_started_during_cutover_is_not_overwritten(
             }
         ),
     )
+    write_passing_visual_audit(Path(staged["staging_root"]))
     marker_calls = 0
     mutation_started = threading.Event()
     mutation_outcome: list[str] = []
@@ -709,10 +1630,17 @@ def test_cutover_failure_restores_the_complete_old_workspace(
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
     new_rows = [row("new-row", page_sha)]
+
+    class NewArtifactExtractor(FakeExtractor):
+        def extract(self, source: Path, artifact_root: Path) -> dict[str, Any]:
+            result = super().extract(source, artifact_root)
+            (artifact_root / "new-only.txt").write_text("new")
+            return result
+
     staged = stage_reprocess_jobs(
         root=tmp_path,
         job_ids=[job_id],
-        extractor=FakeExtractor(
+        extractor=NewArtifactExtractor(
             {
                 **old_result,
                 "rows": new_rows,
@@ -720,8 +1648,7 @@ def test_cutover_failure_restores_the_complete_old_workspace(
             }
         ),
     )
-    stage_dir = Path(staged["staging_root"]) / job_id
-    (stage_dir / "artifacts" / "new-only.txt").write_text("new")
+    write_passing_visual_audit(Path(staged["staging_root"]))
     job_dir = store.job_dir(job_id)
     original_replace = Path.replace
     injected = False
@@ -730,7 +1657,8 @@ def test_cutover_failure_restores_the_complete_old_workspace(
         nonlocal injected
         if (
             not injected
-            and path == stage_dir / "result.json"
+            and path.name == "result.json"
+            and path.parent.name == job_id
             and target == job_dir / "result.json"
         ):
             injected = True
@@ -812,16 +1740,26 @@ def test_batch_failure_rolls_back_jobs_already_cut_over(
         job_ids=[first_id, second_id],
         extractor=FakeExtractor(new_result),
     )
+    staging_root = Path(staged["staging_root"])
+    manifest = json.loads((staging_root / "manifest.json").read_text())
+    assert [source["job_ids"] for source in manifest["sources"]] == [
+        sorted((first_id, second_id))
+    ]
+    write_passing_visual_audit(staging_root)
     ordered_ids = sorted((first_id, second_id))
     failed_id = ordered_ids[1]
-    failed_stage = Path(staged["staging_root"]) / failed_id / "result.json"
     failed_live = first_store.job_dir(failed_id) / "result.json"
     original_replace = Path.replace
     injected = False
 
     def failing_replace(path: Path, target: Path) -> Path:
         nonlocal injected
-        if not injected and path == failed_stage and target == failed_live:
+        if (
+            not injected
+            and path.name == "result.json"
+            and path.parent.name == failed_id
+            and target == failed_live
+        ):
             injected = True
             raise OSError("second job failed")
         return original_replace(path, target)

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import shutil
 from contextlib import ExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Annotated, Any
@@ -34,6 +36,18 @@ class PreparedJob:
 
 
 @dataclass(frozen=True)
+class JobSnapshot:
+    job_id: str
+    source: Path
+    artifact_root: Path
+    source_sha256: str
+    source_name: str
+    old_result: dict[str, Any]
+    review: dict[str, Any]
+    review_marker: tuple[bool, str | None]
+
+
+@dataclass(frozen=True)
 class RollbackJob:
     job_id: str
     backup_dir: Path
@@ -58,6 +72,43 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
 
 def _file_digest(path: Path) -> str:
     return sha256_file(path)
+
+
+def _tree_digest(root: Path) -> str:
+    if root.is_symlink():
+        raise ValueError(f"staged payload root is a symbolic link: {root}")
+    if not root.is_dir():
+        raise ValueError(f"staged directory is missing: {root}")
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
+        relative_path = path.relative_to(root).as_posix()
+        if path.is_symlink():
+            raise ValueError(f"staged payload contains a symbolic link: {relative_path}")
+        if path.is_dir():
+            digest.update(b"directory\0")
+            digest.update(relative_path.encode())
+            digest.update(b"\0")
+            continue
+        if not path.is_file():
+            raise ValueError(f"staged payload contains an unsupported path: {relative_path}")
+        digest.update(b"file\0")
+        digest.update(relative_path.encode())
+        digest.update(b"\0")
+        digest.update(bytes.fromhex(_file_digest(path)))
+    return digest.hexdigest()
+
+
+def _extraction_digest(stage_dir: Path) -> str:
+    digest = hashlib.sha256()
+    result_path = stage_dir / "result.json"
+    artifact_root = stage_dir / "artifacts"
+    if not result_path.is_file():
+        raise ValueError(f"staged result is missing: {result_path}")
+    digest.update(b"result.json\0")
+    digest.update(bytes.fromhex(_file_digest(result_path)))
+    digest.update(b"artifacts\0")
+    digest.update(bytes.fromhex(_tree_digest(artifact_root)))
+    return digest.hexdigest()
 
 
 def _review_marker(job_dir: Path) -> tuple[bool, str | None]:
@@ -252,6 +303,15 @@ def _validate_result(
     assets = new_result.get("page_assets", [])
     if len(assets) != int(new_result.get("pages") or 0):
         raise ValueError("page inventory is incomplete")
+    page_numbers = [
+        asset.get("page_number") if isinstance(asset, dict) else None
+        for asset in assets
+    ]
+    if (
+        any(type(page_number) is not int for page_number in page_numbers)
+        or page_numbers != list(range(1, int(new_result.get("pages") or 0) + 1))
+    ):
+        raise ValueError("page inventory has invalid page numbers")
     for asset in assets:
         path = (artifact_root / str(asset["relative_path"])).resolve()
         if artifact_root.resolve() not in path.parents or not path.is_file():
@@ -308,7 +368,21 @@ def _validate_result(
     }
     for table in source_tables:
         for source_row in table.rows:
+            cells = {cell.column_id: cell for cell in source_row.cells}
             if source_row.canonical_row_id is None:
+                for column in table.columns:
+                    if column.canonical_field not in {"net_amount", "gross_amount"}:
+                        continue
+                    raw_value = cells[column.id].raw_value
+                    if (
+                        raw_value
+                        and raw_value.strip()
+                        and parse_decimal(raw_value) is not None
+                    ):
+                        raise ValueError(
+                            "unlinked source row contains a mapped financial value: "
+                            f"{source_row.id}"
+                        )
                 continue
             canonical = canonical_rows.get(source_row.canonical_row_id)
             if canonical is None:
@@ -320,7 +394,6 @@ def _validate_result(
                     f"canonical row has multiple source links: {source_row.canonical_row_id}"
                 )
             linked_ids.add(source_row.canonical_row_id)
-            cells = {cell.column_id: cell for cell in source_row.cells}
             for column in table.columns:
                 field = column.canonical_field
                 if field is None:
@@ -389,21 +462,15 @@ def _validate_result(
             raise ValueError(f"canonical OCR row lacks a source-table link: {row_id}")
 
 
-def _prepare_job(
+def _snapshot_job(
     *,
     store: JobStore,
     job_id: str,
-    stage_root: Path,
-    extractor: Any,
-) -> PreparedJob:
+) -> JobSnapshot:
     job_dir = store.job_dir(job_id)
     source = job_dir / "source.pdf"
     result_path = job_dir / "result.json"
     artifact_root = job_dir / "artifacts"
-    stage_dir = stage_root / job_id
-    if stage_dir.exists():
-        raise ValueError(f"staging directory already exists: {stage_dir}")
-    stage_dir.mkdir(parents=True, mode=0o700)
     with store.job_lock(job_id, exclusive=False):
         store._require_stable_workspace(job_id)
         state = store.read(job_id)
@@ -414,20 +481,101 @@ def _prepare_job(
         old_result = json.loads(result_path.read_text())
         review = store._read_review_unlocked(job_id)
         marker = _review_marker(job_dir)
-        shutil.copytree(artifact_root, stage_dir / "artifacts")
-    new_result = extractor.extract(source, stage_dir / "artifacts")
-    _validate_result(source, old_result, new_result, stage_dir / "artifacts")
-    migrated_review = _migrate_review(job_id, old_result, new_result, review)
-    _atomic_json(stage_dir / "result.json", new_result)
-    _atomic_json(stage_dir / "review.json", migrated_review)
-    return PreparedJob(
+        source_sha256 = _file_digest(source)
+    return JobSnapshot(
         job_id=job_id,
-        stage_dir=stage_dir,
+        source=source,
+        artifact_root=artifact_root,
+        source_sha256=source_sha256,
+        source_name=str(
+            old_result.get("source_name")
+            or state.get("original_name")
+            or source.name
+        ),
         old_result=old_result,
-        new_result=new_result,
-        migrated_review=migrated_review,
+        review=review,
         review_marker=marker,
     )
+
+
+def _hardlink_or_copy2(source: str, target: str) -> str:
+    try:
+        os.link(source, target)
+    except OSError:
+        shutil.copy2(source, target)
+    return target
+
+
+def _prepare_source_group(
+    *,
+    store: JobStore,
+    snapshots: list[JobSnapshot],
+    stage_root: Path,
+    extractor: Any,
+) -> list[PreparedJob]:
+    ordered = sorted(snapshots, key=lambda item: item.job_id)
+    representative = ordered[0]
+    representative_stage = stage_root / representative.job_id
+    if representative_stage.exists():
+        raise ValueError(
+            f"staging directory already exists: {representative_stage}"
+        )
+    representative_stage.mkdir(parents=True, mode=0o700)
+    with store.job_lock(representative.job_id, exclusive=False):
+        store._require_stable_workspace(representative.job_id)
+        if (
+            _review_marker(store.job_dir(representative.job_id))
+            != representative.review_marker
+        ):
+            raise ValueError("a review changed while staging; no results were applied")
+        shutil.copytree(
+            representative.artifact_root,
+            representative_stage / "artifacts",
+        )
+    extracted_result = extractor.extract(
+        representative.source,
+        representative_stage / "artifacts",
+    )
+
+    prepared: list[PreparedJob] = []
+    for snapshot in ordered:
+        stage_dir = stage_root / snapshot.job_id
+        if snapshot.job_id != representative.job_id:
+            if stage_dir.exists():
+                raise ValueError(f"staging directory already exists: {stage_dir}")
+            stage_dir.mkdir(parents=True, mode=0o700)
+            shutil.copytree(
+                representative_stage / "artifacts",
+                stage_dir / "artifacts",
+                copy_function=_hardlink_or_copy2,
+            )
+        new_result = json.loads(json.dumps(extracted_result))
+        new_result["source_name"] = snapshot.source_name
+        _validate_result(
+            snapshot.source,
+            snapshot.old_result,
+            new_result,
+            stage_dir / "artifacts",
+        )
+        migrated_review = _migrate_review(
+            snapshot.job_id,
+            snapshot.old_result,
+            new_result,
+            snapshot.review,
+        )
+        _atomic_json(stage_dir / "result.json", new_result)
+        _atomic_json(stage_dir / "review.json", migrated_review)
+        prepared.append(
+            PreparedJob(
+                job_id=snapshot.job_id,
+                stage_dir=stage_dir,
+                old_result=snapshot.old_result,
+                new_result=new_result,
+                migrated_review=migrated_review,
+                review_marker=snapshot.review_marker,
+            )
+        )
+    return prepared
 
 
 def _cutover_job(
@@ -593,22 +741,11 @@ def reprocess_jobs(
     if not apply:
         summary["would_reprocess"] = len(selected)
         return summary
-
-    staged = stage_reprocess_jobs(
-        root=root,
-        job_ids=selected,
-        stage_root=stage_root,
-        vl_url=vl_url,
-        paddle_device=paddle_device,
-        vl_device=vl_device,
-        extractor=extractor,
+    raise ValueError(
+        "direct apply is disabled; use the two-phase visual audit workflow: "
+        "stage_reprocess_jobs(), record visual-audit.json, then "
+        "apply_staged_jobs()"
     )
-    applied = apply_staged_jobs(
-        root=root,
-        stage_batch=Path(staged["staging_root"]),
-        backup_root=backup_root,
-    )
-    return {**summary, **applied, "mode": "apply", "would_reprocess": len(selected)}
 
 
 def stage_reprocess_jobs(
@@ -641,15 +778,26 @@ def stage_reprocess_jobs(
         paddle_device=paddle_device,
         vl_device=vl_device,
     )
-    prepared = [
-        _prepare_job(
+    snapshots = [
+        _snapshot_job(
             store=store,
             job_id=job_id,
-            stage_root=staging,
-            extractor=active_extractor,
         )
         for job_id in selected
     ]
+    snapshots_by_source: dict[str, list[JobSnapshot]] = {}
+    for snapshot in snapshots:
+        snapshots_by_source.setdefault(snapshot.source_sha256, []).append(snapshot)
+    prepared_by_id: dict[str, PreparedJob] = {}
+    for source_sha256 in sorted(snapshots_by_source):
+        for item in _prepare_source_group(
+            store=store,
+            snapshots=snapshots_by_source[source_sha256],
+            stage_root=staging,
+            extractor=active_extractor,
+        ):
+            prepared_by_id[item.job_id] = item
+    prepared = [prepared_by_id[job_id] for job_id in selected]
     if any(
         _review_marker(store.job_dir(item.job_id)) != item.review_marker
         for item in prepared
@@ -662,15 +810,39 @@ def stage_reprocess_jobs(
             "rows_before": len(item.old_result.get("rows", [])),
             "rows_after": len(item.new_result.get("rows", [])),
             "review_marker": _marker_payload(item.review_marker),
+            "source_sha256": item.new_result.get("source_sha256"),
+            "staged_payload_sha256": _tree_digest(item.stage_dir),
         }
         for item in prepared
     ]
+    sources = []
+    for source_sha256 in sorted(snapshots_by_source):
+        group = sorted(
+            snapshots_by_source[source_sha256],
+            key=lambda item: item.job_id,
+        )
+        representative = prepared_by_id[group[0].job_id]
+        sources.append(
+            {
+                "source_sha256": source_sha256,
+                "representative_job_id": group[0].job_id,
+                "job_ids": [item.job_id for item in group],
+                "page_count": int(representative.new_result.get("pages") or 0),
+                "source_names": sorted({item.source_name for item in group}),
+                "extraction_sha256": _extraction_digest(
+                    representative.stage_dir
+                ),
+            }
+        )
+    sealed_at = utc_now()
     _atomic_json(
         staging / "manifest.json",
         {
-            "version": "reprocess_stage_v1",
-            "created_at": utc_now(),
+            "version": "reprocess_stage_v2",
+            "created_at": sealed_at,
+            "sealed_at": sealed_at,
             "documents": documents,
+            "sources": sources,
         },
     )
     return {
@@ -682,6 +854,384 @@ def stage_reprocess_jobs(
     }
 
 
+VISUAL_AUDIT_CHECKS = {
+    "hospital_identity",
+    "printed_columns",
+    "row_order_and_count",
+    "cell_values",
+    "explicit_totals",
+    "non_ledger_exclusion",
+}
+
+
+def _explicit_utc_timestamp(value: object) -> datetime:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("timestamp is missing")
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
+        raise ValueError("timestamp is not UTC")
+    return parsed
+
+
+def _stage_source_inventory(
+    manifest: dict[str, Any],
+) -> tuple[dict[str, dict[str, Any]], dict[str, str], datetime]:
+    if manifest.get("version") != "reprocess_stage_v2":
+        raise ValueError("unsupported or incomplete reprocess stage")
+    documents = manifest.get("documents")
+    sources = manifest.get("sources")
+    if not isinstance(documents, list) or not isinstance(sources, list):
+        raise ValueError("unsupported or incomplete reprocess stage")
+    try:
+        sealed_at = _explicit_utc_timestamp(manifest.get("sealed_at"))
+    except ValueError as error:
+        raise ValueError("unsupported or incomplete reprocess stage") from error
+
+    document_ids = [
+        str(document.get("job_id"))
+        for document in documents
+        if isinstance(document, dict) and document.get("job_id") is not None
+    ]
+    if len(document_ids) != len(documents) or len(set(document_ids)) != len(
+        document_ids
+    ):
+        raise ValueError("unsupported or incomplete reprocess stage")
+    for document in documents:
+        if (
+            not isinstance(document.get("source_sha256"), str)
+            or re.fullmatch(r"[a-f0-9]{64}", document["source_sha256"]) is None
+            or not isinstance(document.get("staged_payload_sha256"), str)
+            or re.fullmatch(
+                r"[a-f0-9]{64}", document["staged_payload_sha256"]
+            )
+            is None
+        ):
+            raise ValueError("unsupported or incomplete reprocess stage")
+
+    source_groups: dict[str, dict[str, Any]] = {}
+    job_sources: dict[str, str] = {}
+    for source in sources:
+        if not isinstance(source, dict):
+            raise ValueError("unsupported or incomplete reprocess stage")
+        source_sha256 = source.get("source_sha256")
+        job_ids = source.get("job_ids")
+        representative_job_id = source.get("representative_job_id")
+        page_count = source.get("page_count")
+        source_names = source.get("source_names")
+        extraction_sha256 = source.get("extraction_sha256")
+        if (
+            not isinstance(source_sha256, str)
+            or re.fullmatch(r"[a-f0-9]{64}", source_sha256) is None
+            or source_sha256 in source_groups
+            or not isinstance(job_ids, list)
+            or not job_ids
+            or any(not isinstance(job_id, str) or not job_id for job_id in job_ids)
+            or len(set(job_ids)) != len(job_ids)
+            or representative_job_id != sorted(job_ids)[0]
+            or not isinstance(page_count, int)
+            or isinstance(page_count, bool)
+            or page_count < 1
+            or not isinstance(source_names, list)
+            or not source_names
+            or any(not isinstance(name, str) or not name.strip() for name in source_names)
+            or not isinstance(extraction_sha256, str)
+            or re.fullmatch(r"[a-f0-9]{64}", extraction_sha256) is None
+        ):
+            raise ValueError("unsupported or incomplete reprocess stage")
+        source_groups[source_sha256] = source
+        for job_id in job_ids:
+            if job_id in job_sources:
+                raise ValueError("unsupported or incomplete reprocess stage")
+            job_sources[job_id] = source_sha256
+    if sorted(document_ids) != sorted(job_sources):
+        raise ValueError("unsupported or incomplete reprocess stage")
+    if any(
+        document["source_sha256"] != job_sources[str(document["job_id"])]
+        for document in documents
+    ):
+        raise ValueError("unsupported or incomplete reprocess stage")
+    return source_groups, job_sources, sealed_at
+
+
+def _validate_visual_audit(
+    *,
+    stage_batch: Path,
+    source_groups: dict[str, dict[str, Any]],
+    sealed_at: datetime,
+) -> str:
+    audit_path = stage_batch / "visual-audit.json"
+    if not audit_path.is_file():
+        raise ValueError("visual audit is missing")
+    try:
+        audit_bytes = audit_path.read_bytes()
+        audit = json.loads(audit_bytes)
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("visual audit is unreadable") from error
+    if (
+        not isinstance(audit, dict)
+        or audit.get("version") != "reprocess_visual_audit_v1"
+        or not isinstance(audit.get("sources"), list)
+    ):
+        raise ValueError("unsupported or incomplete visual audit")
+
+    audited_sources = audit["sources"]
+    audited_sha256s: list[str] = []
+    for source in audited_sources:
+        if (
+            not isinstance(source, dict)
+            or not isinstance(source.get("source_sha256"), str)
+            or re.fullmatch(r"[a-f0-9]{64}", source["source_sha256"]) is None
+        ):
+            raise ValueError("visual audit source inventory does not match stage")
+        audited_sha256s.append(source["source_sha256"])
+    if (
+        len(audited_sha256s) != len(source_groups)
+        or len(set(audited_sha256s)) != len(audited_sha256s)
+        or set(audited_sha256s) != set(source_groups)
+    ):
+        raise ValueError("visual audit source inventory does not match stage")
+
+    for source in audited_sources:
+        source_sha256 = str(source["source_sha256"])
+        reviewer = source.get("reviewer")
+        if not isinstance(reviewer, str) or not reviewer.strip():
+            raise ValueError(f"visual audit reviewer is missing for {source_sha256}")
+        reviewed_at = source.get("reviewed_at")
+        if not isinstance(reviewed_at, str) or not reviewed_at.strip():
+            raise ValueError(f"visual audit reviewed_at is missing for {source_sha256}")
+        try:
+            reviewed_timestamp = _explicit_utc_timestamp(reviewed_at)
+        except ValueError as error:
+            raise ValueError(
+                f"visual audit reviewed_at is invalid for {source_sha256}"
+            ) from error
+        if reviewed_timestamp < sealed_at:
+            raise ValueError(
+                f"visual audit reviewed_at predates the sealed stage for {source_sha256}"
+            )
+
+        pages = source.get("pages")
+        page_count = int(source_groups[source_sha256]["page_count"])
+        page_numbers = (
+            [
+                page.get("page_number") if isinstance(page, dict) else None
+                for page in pages
+            ]
+            if isinstance(pages, list)
+            else []
+        )
+        if (
+            not isinstance(pages, list)
+            or any(type(page_number) is not int for page_number in page_numbers)
+            or page_numbers != list(range(1, page_count + 1))
+        ):
+            raise ValueError(
+                f"visual audit page inventory is incomplete for {source_sha256}"
+            )
+        for page in pages:
+            page_number = int(page["page_number"])
+            if page.get("status") != "pass":
+                raise ValueError(
+                    f"visual audit page {page_number} did not pass for {source_sha256}"
+                )
+            if not isinstance(page.get("notes"), str):
+                raise ValueError(
+                    f"visual audit page {page_number} notes are invalid "
+                    f"for {source_sha256}"
+                )
+
+        checks = source.get("checks")
+        if not isinstance(checks, dict) or set(checks) != VISUAL_AUDIT_CHECKS:
+            raise ValueError(
+                f"visual audit check inventory is incomplete for {source_sha256}"
+            )
+        for check in sorted(VISUAL_AUDIT_CHECKS):
+            if checks[check] != "pass":
+                raise ValueError(
+                    f"visual audit check {check} did not pass for {source_sha256}"
+                )
+    return hashlib.sha256(audit_bytes).hexdigest()
+
+
+def _validate_staged_review_migration(
+    *,
+    prepared: PreparedJob,
+    current_review: dict[str, Any],
+) -> PreparedJob:
+    expected = _migrate_review(
+        prepared.job_id,
+        prepared.old_result,
+        prepared.new_result,
+        current_review,
+    )
+    staged = prepared.migrated_review
+    try:
+        staged_updated_at = staged["updated_at"]
+        staged_event_created_at = staged["events"][-1]["created_at"]
+        _explicit_utc_timestamp(staged_updated_at)
+        _explicit_utc_timestamp(staged_event_created_at)
+        expected["updated_at"] = staged_updated_at
+        expected["events"][-1]["created_at"] = staged_event_created_at
+    except (KeyError, IndexError, TypeError, ValueError) as error:
+        raise ValueError(
+            f"staged review migration is invalid for {prepared.job_id}"
+        ) from error
+    if expected != staged:
+        raise ValueError(
+            f"staged review migration does not match live review for {prepared.job_id}"
+        )
+    return replace(prepared, migrated_review=expected)
+
+
+def _require_digest(path: Path, expected: str, label: str) -> None:
+    if not path.is_file() or _file_digest(path) != expected:
+        raise ValueError(f"{label} changed after visual audit")
+
+
+def _require_staged_payload(stage_dir: Path, expected: str) -> None:
+    if _tree_digest(stage_dir) != expected:
+        raise ValueError(f"staged payload digest changed for {stage_dir.name}")
+
+
+def _require_direct_child(path: Path, parent: Path) -> None:
+    if path.is_symlink():
+        raise ValueError(f"staged payload root is a symbolic link: {path}")
+    if not path.is_dir() or path.resolve().parent != parent.resolve():
+        raise ValueError(f"staged payload is outside staging: {path}")
+
+
+def _locate_staged_payload(
+    *,
+    stage_batch: Path,
+    claimed_root: Path,
+    job_id: str,
+) -> Path:
+    original = stage_batch / job_id
+    claimed = claimed_root / job_id
+    original_present = original.exists() or original.is_symlink()
+    claimed_present = claimed.exists() or claimed.is_symlink()
+    if original_present == claimed_present:
+        raise ValueError(f"staged payload inventory is ambiguous for {job_id}")
+    path = original if original_present else claimed
+    parent = stage_batch if original_present else claimed_root
+    _require_direct_child(path, parent)
+    return path
+
+
+def _claim_staged_payloads(
+    *,
+    prepared: list[PreparedJob],
+    stage_batch: Path,
+    claimed_root: Path,
+) -> list[PreparedJob]:
+    if claimed_root.is_symlink():
+        raise ValueError("apply-owned staging root is a symbolic link")
+    claimed_root.mkdir(mode=0o700, exist_ok=True)
+    _require_direct_child(claimed_root, stage_batch)
+    claimed_items: list[PreparedJob] = []
+    moved: list[tuple[Path, Path]] = []
+    try:
+        for item in prepared:
+            target = claimed_root / item.job_id
+            if item.stage_dir.parent == claimed_root:
+                _require_direct_child(item.stage_dir, claimed_root)
+                claimed_items.append(item)
+                continue
+            _require_direct_child(item.stage_dir, stage_batch)
+            if target.exists() or target.is_symlink():
+                raise ValueError(
+                    f"apply-owned staged payload already exists for {item.job_id}"
+                )
+            item.stage_dir.replace(target)
+            moved.append((target, item.stage_dir))
+            claimed_items.append(replace(item, stage_dir=target))
+    except BaseException:
+        for claimed, original in reversed(moved):
+            if claimed.exists() and not original.exists():
+                claimed.replace(original)
+        if claimed_root.is_dir() and not any(claimed_root.iterdir()):
+            claimed_root.rmdir()
+        raise
+    return claimed_items
+
+
+def _release_claimed_payload_paths(
+    *,
+    job_ids: list[str],
+    stage_batch: Path,
+    claimed_root: Path,
+) -> None:
+    if not _claim_namespace_is_safe(
+        job_ids=job_ids,
+        stage_batch=stage_batch,
+        claimed_root=claimed_root,
+    ):
+        raise ValueError("apply-owned staging namespace is unsafe")
+    for job_id in job_ids:
+        claimed = claimed_root / job_id
+        if not claimed.exists():
+            continue
+        original = stage_batch / job_id
+        if original.exists() or original.is_symlink():
+            raise RuntimeError(
+                f"cannot release apply-owned staged payload for {job_id}"
+            )
+        claimed.replace(original)
+    if claimed_root.is_dir() and not any(claimed_root.iterdir()):
+        claimed_root.rmdir()
+
+
+def _claim_namespace_is_safe(
+    *,
+    job_ids: list[str],
+    stage_batch: Path,
+    claimed_root: Path,
+) -> bool:
+    if claimed_root.is_symlink():
+        return False
+    if not claimed_root.exists():
+        return True
+    if (
+        not claimed_root.is_dir()
+        or claimed_root.resolve().parent != stage_batch.resolve()
+    ):
+        return False
+    for job_id in job_ids:
+        claimed = claimed_root / job_id
+        if not claimed.exists() and not claimed.is_symlink():
+            continue
+        if (
+            claimed.is_symlink()
+            or not claimed.is_dir()
+            or claimed.resolve().parent != claimed_root.resolve()
+        ):
+            return False
+    return True
+
+
+def _release_claims_if_jobs_are_stable(
+    *,
+    store: JobStore,
+    job_ids: list[str],
+    stage_batch: Path,
+    claimed_root: Path,
+) -> bool:
+    if not _claim_namespace_is_safe(
+        job_ids=job_ids,
+        stage_batch=stage_batch,
+        claimed_root=claimed_root,
+    ):
+        return False
+    if any((store.job_dir(job_id) / ".cutover.json").is_file() for job_id in job_ids):
+        return False
+    _release_claimed_payload_paths(
+        job_ids=job_ids,
+        stage_batch=stage_batch,
+        claimed_root=claimed_root,
+    )
+    return True
+
+
 def apply_staged_jobs(
     *,
     root: Path,
@@ -690,51 +1240,144 @@ def apply_staged_jobs(
 ) -> dict[str, Any]:
     """Atomically cut over a validated batch after rechecking review markers."""
     store = JobStore(root)
+    if stage_batch.is_symlink() or not stage_batch.is_dir():
+        raise ValueError("staging batch is missing or is a symbolic link")
     manifest_path = stage_batch / "manifest.json"
-    manifest = json.loads(manifest_path.read_text())
-    if manifest.get("version") != "reprocess_stage_v1":
-        raise ValueError("unsupported or incomplete reprocess stage")
-    prepared: list[PreparedJob] = []
-    for document in manifest.get("documents", []):
-        job_id = str(document["job_id"])
-        job_dir = store.job_dir(job_id)
-        stage_dir = stage_batch / job_id
-        marker = _marker_from_payload(document["review_marker"])
-        if _review_marker(job_dir) != marker:
-            raise ValueError("review changed after staging; no results were applied")
-        old_result = json.loads((job_dir / "result.json").read_text())
-        new_result = json.loads((stage_dir / "result.json").read_text())
-        migrated_review = json.loads((stage_dir / "review.json").read_text())
-        _validate_result(
-            job_dir / "source.pdf",
-            old_result,
-            new_result,
-            stage_dir / "artifacts",
-        )
-        prepared.append(
-            PreparedJob(
-                job_id=job_id,
-                stage_dir=stage_dir,
-                old_result=old_result,
-                new_result=new_result,
-                migrated_review=migrated_review,
-                review_marker=marker,
-            )
-        )
+    manifest_bytes = manifest_path.read_bytes()
+    manifest = json.loads(manifest_bytes)
+    manifest_digest = hashlib.sha256(manifest_bytes).hexdigest()
+    claimed_root = stage_batch / f".apply-{manifest_digest}"
+    source_groups, job_sources, sealed_at = _stage_source_inventory(manifest)
+    stage_job_ids = [str(document["job_id"]) for document in manifest["documents"]]
+    audit_path = stage_batch / "visual-audit.json"
+    expected_payloads = {
+        str(document["job_id"]): str(document["staged_payload_sha256"])
+        for document in manifest["documents"]
+    }
     timestamp = re.sub(r"[^0-9]", "", utc_now())[:14]
     backups = (backup_root or store.jobs_root / ".reprocess-backups") / timestamp
-    backups.mkdir(parents=True, mode=0o700)
     commit_marker = backups / ".committed.json"
     documents: list[dict[str, Any]] = []
     completed: list[tuple[PreparedJob, Path]] = []
+    prepared: list[PreparedJob] = []
     with ExitStack() as locks:
-        for item in sorted(prepared, key=lambda candidate: candidate.job_id):
-            locks.enter_context(store.job_lock(item.job_id, exclusive=True))
-        for item in prepared:
-            if _review_marker(store.job_dir(item.job_id)) != item.review_marker:
-                raise ValueError("review changed after staging; no results were applied")
+        for job_id in sorted(stage_job_ids):
+            locks.enter_context(store.job_lock(job_id, exclusive=True))
         try:
+            for job_id in stage_job_ids:
+                store._require_stable_workspace(job_id)
+            if not _claim_namespace_is_safe(
+                job_ids=stage_job_ids,
+                stage_batch=stage_batch,
+                claimed_root=claimed_root,
+            ):
+                raise ValueError("apply-owned staging namespace is unsafe")
+            audit_digest = _validate_visual_audit(
+                stage_batch=stage_batch,
+                source_groups=source_groups,
+                sealed_at=sealed_at,
+            )
+            _require_digest(manifest_path, manifest_digest, "stage manifest")
+            _require_digest(audit_path, audit_digest, "visual audit")
+            stage_dirs: dict[str, Path] = {}
+            for document in manifest["documents"]:
+                job_id = str(document["job_id"])
+                job_dir = store.job_dir(job_id)
+                stage_dir = _locate_staged_payload(
+                    stage_batch=stage_batch,
+                    claimed_root=claimed_root,
+                    job_id=job_id,
+                )
+                stage_dirs[job_id] = stage_dir
+                _require_staged_payload(
+                    stage_dir,
+                    expected_payloads[job_id],
+                )
+                marker = _marker_from_payload(document["review_marker"])
+                if _review_marker(job_dir) != marker:
+                    raise ValueError(
+                        "review changed after staging; no results were applied"
+                    )
+                old_result = json.loads((job_dir / "result.json").read_text())
+                new_result = json.loads((stage_dir / "result.json").read_text())
+                migrated_review = json.loads(
+                    (stage_dir / "review.json").read_text()
+                )
+                source_sha256 = _file_digest(job_dir / "source.pdf")
+                if (
+                    source_sha256 != job_sources[job_id]
+                    or document.get("source_sha256") != source_sha256
+                ):
+                    raise ValueError(
+                        "staged source group does not match live source"
+                    )
+                page_count = int(source_groups[source_sha256]["page_count"])
+                if int(new_result.get("pages") or 0) != page_count:
+                    raise ValueError(
+                        "staged page count does not match source group "
+                        f"for {job_id}"
+                    )
+                _validate_result(
+                    job_dir / "source.pdf",
+                    old_result,
+                    new_result,
+                    stage_dir / "artifacts",
+                )
+                prepared.append(
+                    PreparedJob(
+                        job_id=job_id,
+                        stage_dir=stage_dir,
+                        old_result=old_result,
+                        new_result=new_result,
+                        migrated_review=migrated_review,
+                        review_marker=marker,
+                    )
+                )
+            for source_sha256, source_group in source_groups.items():
+                representative_stage = stage_dirs[
+                    str(source_group["representative_job_id"])
+                ]
+                if (
+                    _extraction_digest(representative_stage)
+                    != source_group["extraction_sha256"]
+                ):
+                    raise ValueError(
+                        f"staged extraction digest changed for {source_sha256}"
+                    )
+            prepared = _claim_staged_payloads(
+                prepared=prepared,
+                stage_batch=stage_batch,
+                claimed_root=claimed_root,
+            )
+            _require_digest(manifest_path, manifest_digest, "stage manifest")
+            _require_digest(audit_path, audit_digest, "visual audit")
+            verified_prepared: list[PreparedJob] = []
             for item in prepared:
+                _require_staged_payload(
+                    item.stage_dir,
+                    expected_payloads[item.job_id],
+                )
+                _validate_result(
+                    store.job_dir(item.job_id) / "source.pdf",
+                    item.old_result,
+                    item.new_result,
+                    item.stage_dir / "artifacts",
+                )
+                verified_prepared.append(
+                    _validate_staged_review_migration(
+                        prepared=item,
+                        current_review=store._read_review_unlocked(item.job_id),
+                    )
+                )
+            prepared = verified_prepared
+            backups.mkdir(parents=True, mode=0o700)
+            for item in prepared:
+                _require_digest(manifest_path, manifest_digest, "stage manifest")
+                _require_digest(audit_path, audit_digest, "visual audit")
+                _require_staged_payload(
+                    item.stage_dir,
+                    expected_payloads[item.job_id],
+                )
                 backup = _cutover_job(
                     store=store,
                     prepared=item,
@@ -772,15 +1415,30 @@ def apply_staged_jobs(
                 },
             )
         except BaseException:
-            for item, backup in reversed(completed):
-                _rollback_cutover_job(
-                    store=store,
-                    prepared=item,
-                    backup_dir=backup,
-                )
+            try:
+                for item, backup in reversed(completed):
+                    _rollback_cutover_job(
+                        store=store,
+                        prepared=item,
+                        backup_dir=backup,
+                    )
+            except BaseException:
+                raise
+            _release_claims_if_jobs_are_stable(
+                store=store,
+                job_ids=stage_job_ids,
+                stage_batch=stage_batch,
+                claimed_root=claimed_root,
+            )
             raise
         for item in prepared:
             (store.job_dir(item.job_id) / ".cutover.json").unlink(missing_ok=True)
+        _release_claims_if_jobs_are_stable(
+            store=store,
+            job_ids=stage_job_ids,
+            stage_batch=stage_batch,
+            claimed_root=claimed_root,
+        )
     return {
         "reprocessed": len(prepared),
         "documents": documents,
