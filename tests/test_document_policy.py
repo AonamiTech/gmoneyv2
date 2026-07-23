@@ -539,7 +539,7 @@ def test_coincidental_cross_page_sum_does_not_delete_detail() -> None:
     assert len(_apply_document_role_policy(rows)) == 3
 
 
-def test_repeated_semantic_rollups_keep_the_richest_grounded_row() -> None:
+def test_ambiguous_rollup_bridge_preserves_every_grounded_row() -> None:
     compact = row(0, RowRole.CATEGORY_ROLLUP, "package", "11457").model_copy(
         update={"description": "Package (IPD) - Coronary"}
     )
@@ -559,8 +559,200 @@ def test_repeated_semantic_rollups_keep_the_richest_grounded_row() -> None:
     selected = _apply_document_role_policy([compact, continuation, abbreviated, unrelated])
 
     assert [item.description for item in selected] == [
+        "Package (IPD) - Coronary",
         "Package Name: Coronary Angiography (CAG)",
+        "Angiography (CAG)",
         "Laboratory services",
+    ]
+
+
+def test_equal_rollups_with_one_shared_word_remain_distinct_charges() -> None:
+    catheterization = row(
+        0,
+        RowRole.CATEGORY_ROLLUP,
+        "procedure",
+        "1000",
+    ).model_copy(
+        update={
+            "description": "Procedure Charges- URINARY CATHETERIZATION",
+        }
+    )
+    enema = row(
+        1,
+        RowRole.CATEGORY_ROLLUP,
+        "procedure",
+        "1000",
+    ).model_copy(
+        update={"description": "Others-ENEMA PROCEDURE"}
+    )
+
+    selected = _apply_document_role_policy([catheterization, enema])
+
+    assert [item.description for item in selected] == [
+        "Procedure Charges- URINARY CATHETERIZATION",
+        "Others-ENEMA PROCEDURE",
+    ]
+
+
+def test_equal_same_page_rollups_with_contained_labels_remain_distinct() -> None:
+    compact = row(
+        0,
+        RowRole.CATEGORY_ROLLUP,
+        "radiology",
+        "1000",
+    ).model_copy(update={"description": "CT"})
+    expanded = row(
+        1,
+        RowRole.CATEGORY_ROLLUP,
+        "radiology",
+        "1000",
+    ).model_copy(update={"description": "CT Scan"})
+
+    selected = _apply_document_role_policy([compact, expanded])
+
+    assert [item.description for item in selected] == ["CT", "CT Scan"]
+
+
+def test_cross_page_fan_in_does_not_delete_distinct_charges() -> None:
+    catheterization = row(
+        0,
+        RowRole.CATEGORY_ROLLUP,
+        "procedure",
+        "1000",
+    ).model_copy(
+        update={
+            "description": "Urinary Catheterization",
+        }
+    )
+    bridge = row(
+        1,
+        RowRole.CATEGORY_ROLLUP,
+        "procedure",
+        "1000",
+    ).model_copy(
+        update={
+            "page_number": 2,
+            "description": "Urinary Catheterization Enema Procedure",
+        }
+    )
+    enema = row(
+        2,
+        RowRole.CATEGORY_ROLLUP,
+        "procedure",
+        "1000",
+    ).model_copy(update={"description": "Enema Procedure"})
+
+    selected = _apply_document_role_policy(
+        [catheterization, bridge, enema]
+    )
+
+    assert [item.description for item in selected] == [
+        "Urinary Catheterization",
+        "Urinary Catheterization Enema Procedure",
+        "Enema Procedure",
+    ]
+
+
+def test_exact_cross_page_rollups_without_repeat_provenance_are_preserved() -> None:
+    first = row(
+        0,
+        RowRole.CATEGORY_ROLLUP,
+        "pharmacy",
+        "2500",
+    ).model_copy(update={"description": "Pharmacy Total"})
+    repeated = row(
+        1,
+        RowRole.CATEGORY_ROLLUP,
+        "pharmacy",
+        "2500",
+    ).model_copy(
+        update={
+            "page_number": 2,
+            "description": "Pharmacy Total",
+        }
+    )
+
+    selected = _apply_document_role_policy([first, repeated])
+
+    assert len(selected) == 2
+    assert [item.page_number for item in selected] == [1, 2]
+
+
+def test_exact_cross_page_rollups_preserve_every_occurrence() -> None:
+    first = row(
+        0,
+        RowRole.CATEGORY_ROLLUP,
+        "pharmacy",
+        "2500",
+    ).model_copy(update={"description": "Pharmacy Total"})
+    second = row(
+        1,
+        RowRole.CATEGORY_ROLLUP,
+        "pharmacy",
+        "2500",
+    ).model_copy(update={"description": "Pharmacy Total"})
+    repeated = row(
+        2,
+        RowRole.CATEGORY_ROLLUP,
+        "pharmacy",
+        "2500",
+    ).model_copy(
+        update={
+            "page_number": 2,
+            "description": "Pharmacy Total",
+        }
+    )
+
+    selected = _apply_document_role_policy([first, second, repeated])
+
+    assert len(selected) == 3
+
+
+def test_cross_page_rollups_preserve_unicode_and_punctuation_semantics() -> None:
+    rows = [
+        row(
+            0,
+            RowRole.CATEGORY_ROLLUP,
+            "procedure",
+            "1000",
+        ).model_copy(update={"description": "दवा"}),
+        row(
+            1,
+            RowRole.CATEGORY_ROLLUP,
+            "procedure",
+            "1000",
+        ).model_copy(
+            update={
+                "page_number": 2,
+                "description": "जांच",
+            }
+        ),
+        row(
+            2,
+            RowRole.CATEGORY_ROLLUP,
+            "procedure",
+            "1000",
+        ).model_copy(update={"description": "A+B"}),
+        row(
+            3,
+            RowRole.CATEGORY_ROLLUP,
+            "procedure",
+            "1000",
+        ).model_copy(
+            update={
+                "page_number": 2,
+                "description": "A-B",
+            }
+        ),
+    ]
+
+    selected = _apply_document_role_policy(rows)
+
+    assert [item.description for item in selected] == [
+        "दवा",
+        "जांच",
+        "A+B",
+        "A-B",
     ]
 
 

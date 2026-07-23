@@ -1091,75 +1091,9 @@ def _apply_document_role_policy(rows: list[CanonicalRow]) -> list[CanonicalRow]:
         )
     ]
 
-    # The same package/category total is often printed once on a summary page
-    # and again above the itemized continuation.  Keep the richest grounded
-    # representation from each semantically connected, equal-amount group.
-    # Equal amounts alone are deliberately insufficient: unrelated categories
-    # can legitimately have the same total.
-    generic_rollup_words = {
-        "amount",
-        "bill",
-        "charge",
-        "charges",
-        "ipd",
-        "name",
-        "package",
-        "subtotal",
-        "total",
-    }
-
-    def rollup_words(row: CanonicalRow) -> set[str]:
-        return {
-            word
-            for word in re.findall(r"[a-z0-9]+", (row.description or "").casefold())
-            if word not in generic_rollup_words and len(word) > 1
-        }
-
-    rollup_indexes = [
-        index for index, row in enumerate(selected) if row.role is RowRole.CATEGORY_ROLLUP
-    ]
-    connected: dict[int, set[int]] = {index: {index} for index in rollup_indexes}
-    for offset, left_index in enumerate(rollup_indexes):
-        left = selected[left_index]
-        left_words = rollup_words(left)
-        if not left_words:
-            continue
-        for right_index in rollup_indexes[offset + 1 :]:
-            right = selected[right_index]
-            if left.net_amount != right.net_amount or not (left_words & rollup_words(right)):
-                continue
-            connected[left_index].add(right_index)
-            connected[right_index].add(left_index)
-
-    suppressed: set[int] = set()
-    visited: set[int] = set()
-    for start in rollup_indexes:
-        if start in visited:
-            continue
-        component: set[int] = set()
-        pending = [start]
-        while pending:
-            index = pending.pop()
-            if index in component:
-                continue
-            component.add(index)
-            pending.extend(connected[index] - component)
-        visited.update(component)
-        if len(component) < 2:
-            continue
-
-        def grounding_score(index: int) -> tuple[int, int, int, int]:
-            row = selected[index]
-            return (
-                sum(len(evidence) for evidence in row.field_evidence.values()),
-                len(rollup_words(row)),
-                len(row.description or ""),
-                row.page_number,
-            )
-
-        keep = max(component, key=grounding_score)
-        suppressed.update(component - {keep})
-    selected = [row for index, row in enumerate(selected) if index not in suppressed]
+    # Cross-page category similarity alone is not repeated-print provenance.
+    # Exact duplicate overlays are removed earlier only after pixel and
+    # full-evidence containment checks; preserve every remaining occurrence.
     return [row.model_copy(update={"row_order": order}) for order, row in enumerate(selected)]
 
 
