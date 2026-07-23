@@ -1282,7 +1282,7 @@ def test_invalid_stamp_text_is_not_published_as_a_missing_service_code() -> None
         token(6, "11457.00", (880, 70, 960, 85)),
         token(7, "Pharmacy", (100, 100, 230, 115)),
         token(8, "Gloves Sterile 7", (100, 130, 300, 145)),
-        token(9, "PATNA", (530, 130, 600, 145)),
+        token(9, "PATNA", (430, 120, 500, 155)),
         token(10, "20/01/2026 09:44:58", (700, 130, 850, 145)),
     )
     result = reconstruct_ocr_rows(
@@ -1320,7 +1320,135 @@ def test_invalid_stamp_text_is_not_published_as_a_missing_service_code() -> None
     )
     assert code_cell.raw_value is None
     assert code_cell.evidence == ()
-    assert "excluded_invalid_overlay" in code_cell.validation_flags
+    assert "excluded_oversized_overlay" in code_cell.validation_flags
+
+
+@pytest.mark.parametrize(
+    ("printed_code", "code_box"),
+    (
+        ("12345", (530, 130, 600, 145)),
+        ("ABC", (530, 130, 600, 145)),
+        ("SVC 42", (530, 130, 600, 145)),
+        ("AB_12", (530, 130, 600, 145)),
+        ("ABC", (535, 120, 605, 155)),
+        ("LB012 PATNA", (430, 120, 560, 155)),
+    ),
+)
+def test_plausible_unparsed_service_code_remains_for_strict_validation(
+    printed_code: str,
+    code_box: tuple[float, float, float, float],
+) -> None:
+    tokens = (
+        token(0, "Service Name", (100, 30, 300, 45)),
+        token(1, "Service Code", (520, 30, 620, 45)),
+        token(2, "Date", (700, 30, 760, 45)),
+        token(3, "Net Amount", (870, 30, 970, 45)),
+        token(4, "Package Name : Coronary Angiography", (100, 70, 430, 85)),
+        token(5, "20/01/2026 - 21/01/2026", (700, 70, 850, 85)),
+        token(6, "11457.00", (880, 70, 960, 85)),
+        token(7, "Pharmacy", (100, 100, 230, 115)),
+        token(8, "Gloves Sterile 7", (100, 130, 300, 145)),
+        token(9, printed_code, code_box),
+        token(10, "20/01/2026 09:44:58", (700, 130, 850, 145)),
+    )
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 20, 980, 170),
+    )
+    canonical = canonicalize_rows(
+        "d" * 64,
+        1,
+        "p1-t1",
+        "a" * 64,
+        result.rows,
+    )
+
+    linked = _link_source_tables(result.source_tables, canonical)
+
+    gloves = next(row for row in canonical if row.description == "Gloves Sterile 7")
+    assert gloves.service_code is None
+    code_column = next(
+        column
+        for column in linked[0].columns
+        if column.canonical_field == "service_code"
+    )
+    gloves_source_row = next(
+        row
+        for row in linked[0].rows
+        if row.canonical_row_id == str(gloves.id)
+    )
+    code_cell = next(
+        cell
+        for cell in gloves_source_row.cells
+        if cell.column_id == code_column.id
+    )
+    assert code_cell.raw_value == printed_code
+    assert code_cell.evidence
+    assert "excluded_oversized_overlay" not in code_cell.validation_flags
+
+
+def test_overlay_filter_resolves_reordered_source_cells_by_column_id() -> None:
+    tokens = (
+        token(0, "Service Name", (100, 30, 300, 45)),
+        token(1, "Service Code", (520, 30, 620, 45)),
+        token(2, "Date", (700, 30, 760, 45)),
+        token(3, "Net Amount", (870, 30, 970, 45)),
+        token(4, "Package Name : Coronary Angiography", (100, 70, 430, 85)),
+        token(5, "20/01/2026 - 21/01/2026", (700, 70, 850, 85)),
+        token(6, "11457.00", (880, 70, 960, 85)),
+        token(7, "Pharmacy", (100, 100, 230, 115)),
+        token(8, "Gloves Sterile 7", (100, 130, 300, 145)),
+        token(9, "PATNA", (430, 120, 500, 155)),
+        token(10, "20/01/2026 09:44:58", (700, 130, 850, 145)),
+    )
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 20, 980, 170),
+    )
+    canonical = canonicalize_rows(
+        "d" * 64,
+        1,
+        "p1-t1",
+        "a" * 64,
+        result.rows,
+    )
+    reordered = tuple(
+        table.model_copy(
+            update={
+                "rows": tuple(
+                    row.model_copy(update={"cells": tuple(reversed(row.cells))})
+                    for row in table.rows
+                )
+            }
+        )
+        for table in result.source_tables
+    )
+
+    linked = _link_source_tables(reordered, canonical)
+
+    gloves = next(row for row in canonical if row.description == "Gloves Sterile 7")
+    gloves_source_row = next(
+        row
+        for row in linked[0].rows
+        if row.canonical_row_id == str(gloves.id)
+    )
+    cells = {cell.column_id: cell for cell in gloves_source_row.cells}
+    description_column = next(
+        column
+        for column in linked[0].columns
+        if column.canonical_field == "description"
+    )
+    code_column = next(
+        column
+        for column in linked[0].columns
+        if column.canonical_field == "service_code"
+    )
+    assert cells[description_column.id].raw_value == "Gloves Sterile 7"
+    assert cells[code_column.id].raw_value is None
 
 
 def test_wrapped_repeated_header_updates_columns_without_becoming_a_row() -> None:
