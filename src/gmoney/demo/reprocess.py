@@ -441,35 +441,73 @@ def _unlinked_financial_row_is_explained(
 
     if table.table_type.value not in {"category_summary", "package_summary"}:
         return False
-    description_column = next(
-        (
-            column
-            for column in table.columns
-            if column.canonical_field == "description"
-        ),
-        None,
+    printed_descriptions = tuple(
+        cells[column.id].raw_value.strip()
+        for column in table.columns
+        if column.canonical_field == "description"
+        and cells[column.id].raw_value
+        and cells[column.id].raw_value.strip()
     )
-    if description_column is None:
+    normalized_descriptions = {
+        _normalized(description) for description in printed_descriptions
+    }
+    if len(normalized_descriptions) != 1:
         return False
-    printed_description = cells[description_column.id].raw_value
+    printed_description = printed_descriptions[0]
     printed_words = _meaningful_summary_words(printed_description)
     if not printed_words:
         return False
 
-    matches: set[str] = set()
+    normalized_printed_description = _normalized(printed_description)
+    numeric_fields = {
+        "quantity",
+        "unit_price",
+        "gross_amount",
+        "discount",
+        "net_amount",
+    }
+    mapped_numeric_values: list[tuple[str, Decimal]] = []
+    for column in table.columns:
+        field = str(column.canonical_field or "")
+        raw_value = cells[column.id].raw_value
+        if field not in numeric_fields or not raw_value or not raw_value.strip():
+            continue
+        parsed = (
+            parse_quantity(raw_value)
+            if field == "quantity"
+            else parse_decimal(raw_value)
+        )
+        if parsed is None:
+            return False
+        mapped_numeric_values.append((field, parsed))
+    exact_matches: set[str] = set()
+    summary_matches: set[str] = set()
     for row_id, canonical in canonical_rows.items():
-        if canonical.get("role") != "category_rollup":
+        if canonical.get("role") not in {
+            "detail",
+            "refund",
+            "category_rollup",
+        }:
             continue
         canonical_description = canonical.get("description")
         canonical_words = _meaningful_summary_words(canonical_description)
-        if not printed_words.issubset(canonical_words):
-            continue
-        if all(
+        if not all(
             parse_decimal(str(canonical.get(field))) == value
-            for field, value in financial_values
+            for field, value in mapped_numeric_values
         ):
-            matches.add(row_id)
-    return len(matches) == 1
+            continue
+        if _normalized(canonical_description) == normalized_printed_description:
+            exact_matches.add(row_id)
+        if (
+            canonical.get("role") == "category_rollup"
+            and printed_words.issubset(canonical_words)
+            and all(
+                parse_decimal(str(canonical.get(field))) == value
+                for field, value in financial_values
+            )
+        ):
+            summary_matches.add(row_id)
+    return bool(exact_matches) or len(summary_matches) == 1
 
 
 def _field_token_ids(row: dict[str, Any], field: str | None = None) -> set[str]:

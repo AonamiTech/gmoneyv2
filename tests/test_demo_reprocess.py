@@ -1238,6 +1238,152 @@ def test_reprocess_validation_accepts_unique_repeated_grounded_summary(
 
 
 @pytest.mark.parametrize(
+    (
+        "printed_description",
+        "second_description",
+        "printed_quantity",
+        "printed_amount",
+        "accepted",
+    ),
+    (
+        ("CONSULTING CHARGES PAR DAY", None, "2", "100.00", True),
+        ("CONSULTING CHARGES", None, "2", "100.00", False),
+        ("CONSULTING CHARGES PAR DAY", None, "2", "99.00", False),
+        ("CONSULTING CHARGES PAR DAY", None, "3", "100.00", False),
+        ("CONSULTING CHARGES PAR DAY", None, "3 Days", "100.00", False),
+        ("CONSULTING CHARGES PAR DAY", "MRI Service", "2", "100.00", False),
+    ),
+)
+def test_reprocess_validation_accepts_only_exact_repeated_detail_summary(
+    tmp_path: Path,
+    printed_description: str,
+    second_description: str | None,
+    printed_quantity: str,
+    printed_amount: str,
+    accepted: bool,
+) -> None:
+    store, job_id, old_result = setup_job(tmp_path)
+    page_sha = old_result["page_assets"][0]["artifact_sha256"]
+    new_rows = [
+        row("first-detail", page_sha),
+        row("second-detail", page_sha),
+    ]
+    for order, canonical in enumerate(new_rows):
+        canonical["row_order"] = order
+        canonical["description"] = "CONSULTING CHARGES PAR DAY"
+        canonical["quantity_raw"] = "2"
+        canonical["quantity"] = "2"
+        canonical["field_evidence"]["quantity"] = [
+            evidence(page_sha, f"quantity-{order}")
+        ]
+    printed = source_tables(new_rows, page_sha)
+    printed[0]["table_type"] = "category_summary"
+    printed[0]["columns"][1]["order"] = 2
+    printed[0]["columns"].insert(
+        1,
+        {
+            "id": "quantity",
+            "label": "Unit/Days",
+            "order": 1,
+            "canonical_field": "quantity",
+            "evidence": [evidence(page_sha, "quantity-header")],
+            "validation_flags": [],
+        },
+    )
+    for order, printed_row in enumerate(printed[0]["rows"]):
+        printed_row["cells"].insert(
+            1,
+            {
+                "column_id": "quantity",
+                "raw_value": "2",
+                "evidence": [evidence(page_sha, f"quantity-{order}")],
+                "validation_flags": [],
+            },
+        )
+    printed[0]["rows"].append(
+        {
+            "id": "p1-t1-s1-r3",
+            "order": 2,
+            "canonical_row_id": None,
+            "cells": [
+                {
+                    "column_id": "description",
+                    "raw_value": printed_description,
+                    "evidence": [evidence(page_sha, "summary-description")],
+                    "validation_flags": [],
+                },
+                {
+                    "column_id": "quantity",
+                    "raw_value": printed_quantity,
+                    "evidence": [evidence(page_sha, "summary-quantity")],
+                    "validation_flags": [],
+                },
+                {
+                    "column_id": "amount",
+                    "raw_value": printed_amount,
+                    "evidence": [evidence(page_sha, "summary-amount")],
+                    "validation_flags": [],
+                },
+            ],
+            "validation_flags": [],
+        }
+    )
+    if second_description is not None:
+        printed[0]["columns"][2]["order"] = 3
+        printed[0]["columns"].insert(
+            2,
+            {
+                "id": "second-description",
+                "label": "Service",
+                "order": 2,
+                "canonical_field": "description",
+                "evidence": [evidence(page_sha, "second-description-header")],
+                "validation_flags": [],
+            },
+        )
+        for printed_row in printed[0]["rows"][:-1]:
+            printed_row["cells"].insert(
+                2,
+                {
+                    "column_id": "second-description",
+                    "raw_value": "CONSULTING CHARGES PAR DAY",
+                    "evidence": [evidence(page_sha, "description-token")],
+                    "validation_flags": [],
+                },
+            )
+        printed[0]["rows"][-1]["cells"].insert(
+            2,
+            {
+                "column_id": "second-description",
+                "raw_value": second_description,
+                "evidence": [evidence(page_sha, "second-summary-description")],
+                "validation_flags": [],
+            },
+        )
+    new_result = {
+        **old_result,
+        "rows": new_rows,
+        "source_tables": printed,
+    }
+
+    if accepted:
+        _validate_result(
+            store.job_dir(job_id) / "source.pdf",
+            old_result,
+            new_result,
+            store.job_dir(job_id) / "artifacts",
+        )
+    else:
+        with pytest.raises(ValueError, match="unlinked source row.*financial"):
+            _validate_result(
+                store.job_dir(job_id) / "source.pdf",
+                old_result,
+                new_result,
+                store.job_dir(job_id) / "artifacts",
+            )
+
+
+@pytest.mark.parametrize(
     "printed_description",
     (
         "Total Knee Replacement",
