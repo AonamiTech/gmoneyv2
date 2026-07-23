@@ -240,6 +240,8 @@ def _unlinked_financial_row_is_explained(
         and parse_decimal(cell.raw_value) is None
     )
     normalized_label = _normalized(label_text)
+    if normalized_label in {"discount", "discount rs"}:
+        return True
     settlement_prefixes = (
         "advance received",
         "amount received",

@@ -1263,6 +1263,64 @@ def test_reprocess_validation_does_not_misclassify_billable_description_as_foote
 
 
 @pytest.mark.parametrize(
+    ("printed_label", "accepted"),
+    (("Discount (Rs.):", True), ("Discount Service", False)),
+)
+def test_reprocess_validation_only_accepts_exact_discount_settlement_rows(
+    tmp_path: Path,
+    printed_label: str,
+    accepted: bool,
+) -> None:
+    store, job_id, old_result = setup_job(tmp_path)
+    page_sha = old_result["page_assets"][0]["artifact_sha256"]
+    new_rows = [row("new-row", page_sha)]
+    printed = source_tables(new_rows, page_sha)
+    printed[0]["rows"].append(
+        {
+            "id": "p1-t1-s1-r2",
+            "order": 1,
+            "canonical_row_id": None,
+            "cells": [
+                {
+                    "column_id": "description",
+                    "raw_value": printed_label,
+                    "evidence": [evidence(page_sha, "discount-description")],
+                    "validation_flags": [],
+                },
+                {
+                    "column_id": "amount",
+                    "raw_value": "0.00",
+                    "evidence": [evidence(page_sha, "discount-amount")],
+                    "validation_flags": [],
+                },
+            ],
+            "validation_flags": [],
+        }
+    )
+    new_result = {
+        **old_result,
+        "rows": new_rows,
+        "source_tables": printed,
+    }
+
+    if accepted:
+        _validate_result(
+            store.job_dir(job_id) / "source.pdf",
+            old_result,
+            new_result,
+            store.job_dir(job_id) / "artifacts",
+        )
+    else:
+        with pytest.raises(ValueError, match="unlinked source row.*financial"):
+            _validate_result(
+                store.job_dir(job_id) / "source.pdf",
+                old_result,
+                new_result,
+                store.job_dir(job_id) / "artifacts",
+            )
+
+
+@pytest.mark.parametrize(
     ("printed_description", "canonical_description"),
     (
         ("Cardiac Investigation", "Cardiac Package Coronary"),
