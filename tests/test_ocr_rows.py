@@ -466,6 +466,97 @@ def test_financial_row_with_blank_particular_uses_grounded_serial_description() 
     assert result.rows[0].field_token_ids["description"] == ("token-4",)
 
 
+def test_source_table_excludes_distant_text_beyond_final_column_boundary() -> None:
+    tokens = (
+        token(0, "Sr.N", (50, 30, 90, 45)),
+        token(1, "Particular", (100, 30, 420, 45)),
+        token(2, "Amount Rs. Unit/Days", (610, 30, 820, 45)),
+        token(3, "Total", (880, 30, 970, 45)),
+        token(4, "2.", (50, 70, 70, 85)),
+        token(5, "CONSULTING CHARGES PAR DAY", (100, 70, 420, 85)),
+        token(6, "1,000.00", (620, 70, 700, 85)),
+        token(7, "2", (760, 70, 780, 85)),
+        token(8, "2,000", (890, 70, 960, 85)),
+        token(9, "114119", (1110, 70, 1180, 85)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(40, 20, 1200, 110),
+    )
+
+    total_column = next(
+        column
+        for column in result.source_tables[0].columns
+        if column.canonical_field == "net_amount"
+    )
+    cells = {
+        cell.column_id: cell for cell in result.source_tables[0].rows[0].cells
+    }
+    assert cells[total_column.id].raw_value == "2,000"
+    assert result.rows[0].candidate.amount == Decimal("2000")
+
+
+def test_source_table_keeps_shifted_value_within_final_lane_tolerance() -> None:
+    tokens = (
+        token(0, "Particular", (100, 30, 420, 45)),
+        token(1, "Disc", (820, 30, 860, 45)),
+        token(2, "Net Amount", (870, 30, 950, 45)),
+        token(3, "Consulting Charges", (100, 70, 360, 85)),
+        token(4, "0", (830, 70, 850, 85)),
+        token(5, "2,000", (920, 70, 980, 85)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(0, 20, 1000, 110),
+    )
+
+    total_column = next(
+        column
+        for column in result.source_tables[0].columns
+        if column.canonical_field == "net_amount"
+    )
+    cells = {
+        cell.column_id: cell for cell in result.source_tables[0].rows[0].cells
+    }
+    assert cells[total_column.id].raw_value == "2,000"
+    assert result.rows[0].candidate.amount == Decimal("2000")
+
+
+def test_source_table_keeps_shifted_outer_date_within_structured_tolerance() -> None:
+    tokens = (
+        token(0, "Particular", (100, 30, 420, 45)),
+        token(1, "Net Amount", (770, 30, 850, 45)),
+        token(2, "Date", (850, 30, 910, 45)),
+        token(3, "Consulting Charges", (100, 70, 360, 85)),
+        token(4, "2,000", (780, 70, 840, 85)),
+        token(5, "15/07/2026", (920, 70, 1000, 85)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(0, 20, 1000, 110),
+    )
+
+    date_column = next(
+        column
+        for column in result.source_tables[0].columns
+        if column.canonical_field == "service_date_raw"
+    )
+    cells = {
+        cell.column_id: cell for cell in result.source_tables[0].rows[0].cells
+    }
+    assert cells[date_column.id].raw_value == "15/07/2026"
+    assert result.rows[0].candidate.service_date == "15/07/2026"
+
+
 def test_numeric_row_marker_grouped_with_header_is_not_exposed_as_a_column() -> None:
     tokens = (
         token(0, "Sr.N", (50, 30, 90, 45)),

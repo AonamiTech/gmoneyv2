@@ -840,6 +840,28 @@ def _source_rows(
 ) -> tuple[SourceRow, ...]:
     if not columns:
         return ()
+    edge_tolerances = {
+        "service_date_raw": 0.12,
+        "quantity": 0.06,
+        "unit_price": 0.06,
+        "gross_amount": 0.06,
+        "discount": 0.06,
+        "net_amount": 0.06,
+    }
+    left_tolerance = edge_tolerances.get(columns[0].canonical_field, 0.08)
+    right_tolerance = edge_tolerances.get(columns[-1].canonical_field, 0.08)
+    outer_left = (
+        centers[0]
+        - max((centers[1] - centers[0]) / 2, width * left_tolerance)
+        if len(centers) > 1
+        else float("-inf")
+    )
+    outer_right = (
+        centers[-1]
+        + max((centers[-1] - centers[-2]) / 2, width * right_tolerance)
+        if len(centers) > 1
+        else float("inf")
+    )
     output: list[SourceRow] = []
     description_index = next(
         (
@@ -858,6 +880,8 @@ def _source_rows(
     for line_index, line in enumerate(lines[start:end], start=start):
         buckets: list[list[OcrToken]] = [[] for _ in columns]
         for token in line.tokens:
+            if not outer_left <= _center_x(token) <= outer_right:
+                continue
             column = min(
                 range(len(centers)),
                 key=lambda index: abs(_center_x(token) - centers[index]),
