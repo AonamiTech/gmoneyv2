@@ -139,9 +139,10 @@ class JobStore:
                 raise JobTransactionError("extraction_result_unavailable")
             return json.loads(path.read_text())
 
-    def read_workspace(
+    @contextmanager
+    def locked_workspace(
         self, job_id: str
-    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    ) -> Iterator[tuple[dict[str, Any], dict[str, Any], dict[str, Any]]]:
         with self.job_lock(job_id, exclusive=False):
             self._require_stable_workspace(job_id)
             state = self.read(job_id)
@@ -150,7 +151,13 @@ class JobStore:
                 raise JobTransactionError("extraction_result_unavailable")
             result = json.loads(result_path.read_text())
             review = self._read_review_unlocked(job_id)
-            return state, result, review
+            yield state, result, review
+
+    def read_workspace(
+        self, job_id: str
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        with self.locked_workspace(job_id) as workspace:
+            return workspace
 
     def read_page_bytes(
         self, job_id: str, page_number: int

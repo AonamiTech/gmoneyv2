@@ -596,7 +596,7 @@ def create_evidence_bundle(
         )
         + "\n"
     ).encode()
-    files: list[tuple[str, bytes | Path]] = [
+    files: list[tuple[str, bytes]] = [
         ("reviewed-output.json", reviewed),
         ("machine-output.json", machine),
     ]
@@ -605,19 +605,24 @@ def create_evidence_bundle(
         page_path = (artifact_root / asset["relative_path"]).resolve()
         if artifact_root not in page_path.parents or not page_path.is_file():
             raise ReviewValidationError("A page artifact is unavailable")
-        files.append((f"pages/page-{asset['page_number']}.png", page_path))
+        files.append(
+            (f"pages/page-{asset['page_number']}.png", page_path.read_bytes())
+        )
     manifest_lines: list[str] = []
-    for name, source in files:
-        content = source if isinstance(source, bytes) else source.read_bytes()
+    for name, content in files:
         digest = hashlib.sha256(content).hexdigest()
         manifest_lines.append(f"{digest}  {name}")
     files.append(("manifest.sha256", ("\n".join(manifest_lines) + "\n").encode()))
-    temporary = target.with_suffix(".tmp")
-    with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        for name, source in files:
-            if isinstance(source, bytes):
-                archive.writestr(name, source)
-            else:
-                archive.write(source, name)
-    temporary.replace(target)
+    temporary = target.with_name(f".{target.name}.{uuid4().hex}.tmp")
+    try:
+        with zipfile.ZipFile(
+            temporary,
+            "w",
+            compression=zipfile.ZIP_DEFLATED,
+        ) as archive:
+            for name, content in files:
+                archive.writestr(name, content)
+        temporary.replace(target)
+    finally:
+        temporary.unlink(missing_ok=True)
     return target

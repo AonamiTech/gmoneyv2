@@ -316,7 +316,12 @@ def list_documents(
         states = [state for state in states if state.get("status") in TERMINAL_STATUSES]
     if document_status is not None:
         states = [state for state in states if state.get("status") == document_status]
-    documents = [_public_state(state) for state in states]
+    documents: list[dict[str, Any]] = []
+    for state in states:
+        try:
+            documents.append(_public_state(state))
+        except (KeyError, JobTransactionError):
+            continue
     if query:
         needle = query.casefold().strip()
         documents = [
@@ -346,7 +351,13 @@ def list_documents(
 
 @app.get("/api/v2/documents/{job_id}")
 def get_document(job_id: str) -> dict[str, Any]:
-    return _public_state(_state_or_404(job_id))
+    try:
+        return _public_state(_state_or_404(job_id))
+    except JobTransactionError as error:
+        raise HTTPException(
+            status_code=409,
+            detail="Document workspace is temporarily unavailable",
+        ) from error
 
 
 @app.get("/api/v2/documents/{job_id}/rows")
@@ -684,6 +695,36 @@ def approve_document(
 
 @app.get("/api/v2/documents/{job_id}/exports/{export_format}")
 def export_document(job_id: str, export_format: Literal["csv", "json", "evidence.zip"]) -> Response:
+    if export_format == "evidence.zip":
+        try:
+            with store.locked_workspace(job_id) as (state, result, review):
+                if state.get("status") != "complete":
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Extraction is not complete",
+                    )
+                if review.get("approval") is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Document must be approved before export",
+                    )
+                stem = _download_stem(state["original_name"])
+                bundle = create_evidence_bundle(store, job_id, result, review)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="Document not found") from error
+        except JobTransactionError as error:
+            raise HTTPException(
+                status_code=409,
+                detail="Document workspace is temporarily unavailable",
+            ) from error
+        except ReviewValidationError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        return FileResponse(
+            bundle,
+            media_type="application/zip",
+            filename=f"{stem}-evidence.zip",
+        )
+
     result, review = _complete_result(job_id)
     if review.get("approval") is None:
         raise HTTPException(status_code=409, detail="Document must be approved before export")
@@ -701,15 +742,7 @@ def export_document(job_id: str, export_format: Literal["csv", "json", "evidence
             media_type="application/json",
             headers={"Content-Disposition": f'attachment; filename="{stem}-reviewed.json"'},
         )
-    try:
-        bundle = create_evidence_bundle(store, job_id, result, review)
-    except ReviewValidationError as error:
-        raise HTTPException(status_code=409, detail=str(error)) from error
-    return FileResponse(
-        bundle,
-        media_type="application/zip",
-        filename=f"{stem}-evidence.zip",
-    )
+    raise HTTPException(status_code=400, detail="Unsupported export format")
 
 
 @app.get("/api/v2/documents/{job_id}/pages/{page_number}")

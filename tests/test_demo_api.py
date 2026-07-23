@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import hashlib
+import io
 import json
+import threading
+import zipfile
 from pathlib import Path
 
 import fitz
@@ -687,6 +691,88 @@ def test_documents_can_be_discovered_in_newest_first_shared_queue(
     queued = client.get("/api/v2/documents", params={"status": "queued"}).json()
     assert queued["total"] == 1
     assert queued["documents"][0]["id"] == second["id"]
+
+
+def test_history_withholds_only_the_document_requiring_transaction_recovery(
+    tmp_path: Path, monkeypatch
+) -> None:
+    client, store = client_for(tmp_path, monkeypatch)
+    healthy_id, _ = completed_job(store)
+    recovering_id, _ = completed_job(store)
+    (store.job_dir(recovering_id) / ".cutover.json").write_text(
+        json.dumps(
+            {
+                "version": "job_cutover_v1",
+                "job_id": recovering_id,
+            }
+        )
+    )
+
+    response = client.get("/api/v2/documents", params={"scope": "history"})
+
+    assert response.status_code == 200
+    assert response.json()["total"] == 1
+    assert [item["id"] for item in response.json()["documents"]] == [healthy_id]
+    assert client.get(f"/api/v2/documents/{recovering_id}").status_code == 409
+
+
+def test_evidence_export_holds_workspace_lock_through_page_snapshot(
+    tmp_path: Path, monkeypatch
+) -> None:
+    client, store = client_for(tmp_path, monkeypatch)
+    job_id, _ = completed_job(store)
+    review = store.empty_review()
+    review["approval"] = {
+        "status": "approved",
+        "reviewer": "test-reviewer",
+        "approved_at": "2026-07-23T00:00:00Z",
+        "review_revision": 0,
+    }
+    (store.job_dir(job_id) / "review.json").write_text(json.dumps(review))
+    artifact = store.job_dir(job_id) / "artifacts" / "pages" / "page-1.png"
+    page_read_started = threading.Event()
+    allow_page_read = threading.Event()
+    writer_acquired = threading.Event()
+    response_holder: list[object] = []
+    original_read_bytes = Path.read_bytes
+
+    def paused_read_bytes(path: Path) -> bytes:
+        if path == artifact:
+            page_read_started.set()
+            assert allow_page_read.wait(timeout=2)
+        return original_read_bytes(path)
+
+    def request_export() -> None:
+        response_holder.append(
+            client.get(f"/api/v2/documents/{job_id}/exports/evidence.zip")
+        )
+
+    def acquire_writer() -> None:
+        with store.job_lock(job_id, exclusive=True):
+            writer_acquired.set()
+
+    monkeypatch.setattr(Path, "read_bytes", paused_read_bytes)
+    export_thread = threading.Thread(target=request_export)
+    export_thread.start()
+    assert page_read_started.wait(timeout=2)
+    writer_thread = threading.Thread(target=acquire_writer)
+    writer_thread.start()
+    assert not writer_acquired.wait(timeout=0.1)
+
+    allow_page_read.set()
+    export_thread.join(timeout=2)
+    writer_thread.join(timeout=2)
+
+    assert not export_thread.is_alive()
+    assert not writer_thread.is_alive()
+    assert writer_acquired.is_set()
+    response = response_holder[0]
+    assert response.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        page = archive.read("pages/page-1.png")
+        manifest = archive.read("manifest.sha256").decode()
+    assert page == b"PNG fixture"
+    assert f"{hashlib.sha256(page).hexdigest()}  pages/page-1.png" in manifest
 
 
 def test_worker_restart_requeues_interrupted_job(tmp_path: Path) -> None:
