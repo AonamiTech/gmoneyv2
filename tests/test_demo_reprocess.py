@@ -948,13 +948,19 @@ def test_reprocess_validation_accepts_matching_total_across_header_segments(
 
 
 @pytest.mark.parametrize(
-    "boundary_label",
-    ("Grand Total", "Total Bill Amount", "Advance Received"),
+    ("boundary_label", "boundary_metadata"),
+    (
+        ("Grand Total", None),
+        ("Total Bill Amount", None),
+        ("Advance Received", None),
+        ("Advance Received", "09/07/26, 475"),
+    ),
 )
 @pytest.mark.parametrize(("subtotal", "accepted"), (("60.00", True), ("100.00", False)))
 def test_reprocess_validation_resets_subtotal_at_financial_boundary(
     tmp_path: Path,
     boundary_label: str,
+    boundary_metadata: str | None,
     subtotal: str,
     accepted: bool,
 ) -> None:
@@ -1014,6 +1020,36 @@ def test_reprocess_validation_resets_subtotal_at_financial_boundary(
             "validation_flags": [],
         },
     ]
+    if boundary_metadata is not None:
+        for column in printed[0]["columns"]:
+            column["order"] += 1
+        printed[0]["columns"].insert(
+            0,
+            {
+                "id": "metadata",
+                "label": "Metadata",
+                "order": 0,
+                "canonical_field": None,
+                "evidence": [evidence(page_sha, "metadata-header")],
+                "validation_flags": [],
+            },
+        )
+        for printed_row in printed[0]["rows"]:
+            printed_row["cells"].insert(
+                0,
+                {
+                    "column_id": "metadata",
+                    "raw_value": None,
+                    "evidence": [],
+                    "validation_flags": ["empty_cell"],
+                },
+            )
+        printed[0]["rows"][1]["cells"][0] = {
+            "column_id": "metadata",
+            "raw_value": boundary_metadata,
+            "evidence": [evidence(page_sha, "metadata-value")],
+            "validation_flags": [],
+        }
     new_result = {
         **old_result,
         "document_total": {
@@ -1203,7 +1239,13 @@ def test_reprocess_validation_accepts_unique_repeated_grounded_summary(
 
 @pytest.mark.parametrize(
     "printed_description",
-    ("Total Knee Replacement", "Deposit Implant Charge"),
+    (
+        "Total Knee Replacement",
+        "Deposit Implant Charge",
+        "Advance Received Physiotherapy",
+        "Deposit Amount Implant Charge",
+        "Payment Details Consultation Fee",
+    ),
 )
 def test_reprocess_validation_does_not_misclassify_billable_description_as_footer(
     tmp_path: Path,
@@ -1266,6 +1308,7 @@ def test_reprocess_validation_does_not_misclassify_billable_description_as_foote
     ("printed_label", "printed_description", "variant", "accepted"),
     (
         ("Discount (Rs.):", None, "live", True),
+        ("Advance/Received Amount:", None, "live", True),
         ("Discount Service", None, "live", False),
         ("Discount", "MRI Service", "live", False),
         ("Discount", None, "extra_financial", False),
@@ -1273,7 +1316,7 @@ def test_reprocess_validation_does_not_misclassify_billable_description_as_foote
         ("Discount", None, "duplicate_description", False),
     ),
 )
-def test_reprocess_validation_only_accepts_unambiguously_labeled_discount_rows(
+def test_reprocess_validation_only_accepts_unambiguous_settlement_rows(
     tmp_path: Path,
     printed_label: str,
     printed_description: str | None,

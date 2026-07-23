@@ -241,43 +241,9 @@ def _unlinked_financial_row_is_explained(
     )
     normalized_label = _normalized(" ".join(label_values))
     discount_labels = {"discount", "discount rs"}
-    description_values = tuple(
-        cells[column.id].raw_value
-        for column in table.columns
-        if column.canonical_field == "description"
-        and cells[column.id].raw_value
-    )
-    financial_columns = tuple(
-        column
-        for column in table.columns
-        if column.canonical_field in {"net_amount", "gross_amount"}
-        and (raw_value := cells[column.id].raw_value)
-        and raw_value.strip()
-        and parse_decimal(raw_value) is not None
-    )
-    if (
-        len(description_values) == 1
-        and _normalized(description_values[0]) in discount_labels
-        and len(financial_columns) == 1
-    ):
-        return True
-    mapped_descriptions = tuple(
-        column
-        for column in table.columns
-        if column.canonical_field == "description"
-    )
-    if (
-        mapped_descriptions
-        and not description_values
-        and len(financial_columns) == 1
-    ):
-        financial_index = table.columns.index(financial_columns[0])
-        if financial_index > 0:
-            adjacent = cells[table.columns[financial_index - 1].id].raw_value
-            if adjacent and _normalized(adjacent) in discount_labels:
-                return True
-    settlement_prefixes = (
+    settlement_labels = {
         "advance received",
+        "advance received amount",
         "amount received",
         "amount to be received",
         "balance amount",
@@ -294,17 +260,62 @@ def _unlinked_financial_row_is_explained(
         "payer receivable",
         "payer received",
         "payment detail",
+        "payment details",
         "payment mode",
         "payment summary",
         "receipt detail",
+        "receipt details",
         "receipt history",
         "receipt information",
         "settlement detail",
+        "settlement details",
         "settlement mode",
         "settlement status",
         "total discount amount",
-    )
-    if normalized_label.startswith(settlement_prefixes):
+    }
+
+    def is_settlement_label(value: str) -> bool:
+        normalized = _normalized(value)
+        return normalized in discount_labels or normalized in settlement_labels
+
+    def is_structurally_grounded_settlement(
+        row_cells: dict[str, Any],
+    ) -> bool:
+        description_values = tuple(
+            row_cells[column.id].raw_value
+            for column in table.columns
+            if column.canonical_field == "description"
+            and row_cells[column.id].raw_value
+        )
+        financial_columns = tuple(
+            column
+            for column in table.columns
+            if column.canonical_field in {"net_amount", "gross_amount"}
+            and (raw_value := row_cells[column.id].raw_value)
+            and raw_value.strip()
+            and parse_decimal(raw_value) is not None
+        )
+        if len(financial_columns) != 1:
+            return False
+        if (
+            len(description_values) == 1
+            and is_settlement_label(description_values[0])
+        ):
+            return True
+        mapped_descriptions = tuple(
+            column
+            for column in table.columns
+            if column.canonical_field == "description"
+        )
+        if not mapped_descriptions or description_values:
+            return False
+        financial_index = table.columns.index(financial_columns[0])
+        if financial_index == 0:
+            return False
+        adjacent = row_cells[table.columns[financial_index - 1].id].raw_value
+        return bool(adjacent and is_settlement_label(adjacent))
+
+    if is_structurally_grounded_settlement(cells):
         return True
 
     total_payloads = [
@@ -408,7 +419,7 @@ def _unlinked_financial_row_is_explained(
             preceding_is_financial_boundary = (
                 preceding_label in total_labels
                 or preceding_label.startswith(total_prefixes)
-                or preceding_label.startswith(settlement_prefixes)
+                or is_structurally_grounded_settlement(preceding_cells)
             )
             if preceding_is_financial_boundary or (
                 preceding_label and not preceding_has_financial_value
