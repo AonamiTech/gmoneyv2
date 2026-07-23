@@ -541,7 +541,10 @@ def test_reprocess_validation_requires_all_description_tokens_in_printed_cell(
     (
         ("15/07/2026 11:31:00", True),
         ("15/07/2026 11:31:00 - MNEIPI/265604", True),
+        ("15/07/2026 11:31:00 - MNEIPI/265604 E", True),
+        ("15/07/2026 11:31:00 - MNEIPI/265604 X", False),
         ("15/07/2026 99:99:99", False),
+        ("15/07/2026 99:99:99 - MNEIPI/265604 E", False),
         ("16/07/2026 11:31:00", False),
     ),
 )

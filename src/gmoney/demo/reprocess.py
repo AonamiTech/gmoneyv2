@@ -26,7 +26,8 @@ from gmoney.extraction.typed_values import parse_decimal, parse_service_date
 
 app = typer.Typer(add_completion=False, invoke_without_command=True)
 _PRINTED_DATE_REQUEST_SUFFIX = re.compile(
-    r"\s*[-:]?\s*[A-Z][A-Z0-9-]{2,}/[A-Z0-9-]+\s*$",
+    r"\s*[-:]?\s*[A-Z][A-Z0-9-]{2,}/[A-Z0-9-]+"
+    r"(?:\s+(?P<bleed>[A-Z]{1,2}))?\s*$",
     re.IGNORECASE,
 )
 _gpu_inference_locks: dict[Path, TextIO] = {}
@@ -172,6 +173,27 @@ def _legacy_rollback_review_is_safe(
 
 def _normalized(value: object) -> str:
     return re.sub(r"[^a-z0-9]+", " ", str(value or "").casefold()).strip()
+
+
+def _printed_service_date_iso(
+    raw_value: str,
+    canonical_description: object,
+) -> str | None:
+    parsed = parse_service_date(raw_value)
+    if parsed is not None:
+        return parsed
+    request_suffix = _PRINTED_DATE_REQUEST_SUFFIX.search(raw_value)
+    if request_suffix is None:
+        return None
+    bleed = (request_suffix.group("bleed") or "").casefold()
+    if bleed:
+        first_word = next(iter(_normalized(canonical_description).split()), "")
+        if not (
+            first_word.startswith(bleed)
+            or first_word.endswith(bleed)
+        ):
+            return None
+    return parse_service_date(raw_value[: request_suffix.start()])
 
 
 _SUMMARY_WORDS = {
@@ -667,11 +689,9 @@ def _validate_result(
                         canonical_value
                     )
                     if field == "service_date_raw":
-                        printed_date_iso = parse_service_date(
-                            _PRINTED_DATE_REQUEST_SUFFIX.sub(
-                                "",
-                                cell.raw_value or "",
-                            )
+                        printed_date_iso = _printed_service_date_iso(
+                            cell.raw_value or "",
+                            canonical.get("description"),
                         )
                         value_matches = value_matches or bool(
                             canonical.get("service_date_iso")
