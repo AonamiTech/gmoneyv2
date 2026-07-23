@@ -4,6 +4,8 @@ import hashlib
 import json
 import shutil
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -875,6 +877,179 @@ def test_stage_extracts_identical_sources_once_and_preserves_per_job_reviews(
     ] == "Second reviewer correction"
     assert first_review["events"][-1]["target_id"] == first_id
     assert second_staged_review["events"][-1]["target_id"] == second_id
+
+
+def test_default_gpu_stage_holds_shared_lock_for_every_source_extraction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, first_id, first_old = setup_job(
+        tmp_path,
+        source_name="First source.pdf",
+        source=b"%PDF-first-source",
+    )
+    _, second_id, _ = setup_job(
+        tmp_path,
+        source_name="Second source.pdf",
+        source=b"%PDF-second-source",
+    )
+    page_sha = first_old["page_assets"][0]["artifact_sha256"]
+    new_rows = [row("new-row", page_sha)]
+    events: list[tuple[str, Any]] = []
+    lock_held = False
+
+    @contextmanager
+    def tracking_inference_lock(
+        locked_store: JobStore,
+    ) -> Iterator[None]:
+        nonlocal lock_held
+        assert not lock_held
+        lock_held = True
+        events.append(("lock_enter", locked_store.inference_lock_path))
+        try:
+            yield
+        finally:
+            events.append(
+                (
+                    "lock_exit",
+                    len(
+                        [
+                            event
+                            for event in events
+                            if event[0] == "extract"
+                        ]
+                    ),
+                )
+            )
+            lock_held = False
+
+    class DefaultGpuExtractor:
+        def __init__(
+            self,
+            vl_url: str,
+            *,
+            paddle_device: str,
+            vl_device: str,
+        ) -> None:
+            assert lock_held
+            events.append(
+                (
+                    "constructed",
+                    (vl_url, paddle_device, vl_device),
+                )
+            )
+
+        def extract(
+            self,
+            source: Path,
+            artifact_root: Path,
+        ) -> dict[str, Any]:
+            assert lock_held
+            events.append(("extract", source))
+            return {
+                **deepcopy(first_old),
+                "source_sha256": digest(source.read_bytes()),
+                "rows": deepcopy(new_rows),
+                "source_tables": source_tables(new_rows, page_sha),
+            }
+
+    monkeypatch.setattr(JobStore, "inference_lock", tracking_inference_lock)
+    monkeypatch.setattr(
+        reprocess_module,
+        "OfflineExtractor",
+        DefaultGpuExtractor,
+    )
+
+    staged = stage_reprocess_jobs(
+        root=tmp_path,
+        job_ids=[first_id, second_id],
+        paddle_device="gpu:0",
+        vl_device="cuda:0",
+    )
+
+    assert staged["staged"] == 2
+    assert events[0] == ("lock_enter", store.inference_lock_path)
+    assert events[1] == (
+        "constructed",
+        ("http://127.0.0.1:8111", "gpu:0", "cuda:0"),
+    )
+    assert {
+        event[1] for event in events if event[0] == "extract"
+    } == {
+        store.job_dir(first_id) / "source.pdf",
+        store.job_dir(second_id) / "source.pdf",
+    }
+    assert events[-1] == ("lock_exit", 2)
+
+
+def test_injected_reprocess_extractor_does_not_acquire_gpu_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, job_id, old_result = setup_job(tmp_path)
+    page_sha = old_result["page_assets"][0]["artifact_sha256"]
+    new_rows = [row("new-row", page_sha)]
+
+    def fail_if_locked(locked_store: JobStore) -> Iterator[None]:
+        raise AssertionError(
+            "injected extractor unexpectedly locked "
+            f"{locked_store.inference_lock_path}"
+        )
+
+    monkeypatch.setattr(JobStore, "inference_lock", fail_if_locked)
+
+    staged = stage_reprocess_jobs(
+        root=tmp_path,
+        job_ids=[job_id],
+        paddle_device="gpu:0",
+        extractor=FakeExtractor(
+            {
+                **old_result,
+                "rows": new_rows,
+                "source_tables": source_tables(new_rows, page_sha),
+            }
+        ),
+    )
+
+    assert staged["staged"] == 1
+
+
+def test_falsey_injected_reprocess_extractor_remains_dependency_free(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, job_id, old_result = setup_job(tmp_path)
+    page_sha = old_result["page_assets"][0]["artifact_sha256"]
+    new_rows = [row("new-row", page_sha)]
+
+    class FalseyExtractor(FakeExtractor):
+        def __bool__(self) -> bool:
+            return False
+
+    class UnexpectedDefaultExtractor:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            raise AssertionError("default extractor was constructed")
+
+    monkeypatch.setattr(
+        reprocess_module,
+        "OfflineExtractor",
+        UnexpectedDefaultExtractor,
+    )
+
+    staged = stage_reprocess_jobs(
+        root=tmp_path,
+        job_ids=[job_id],
+        paddle_device="gpu:0",
+        extractor=FalseyExtractor(
+            {
+                **old_result,
+                "rows": new_rows,
+                "source_tables": source_tables(new_rows, page_sha),
+            }
+        ),
+    )
+
+    assert staged["staged"] == 1
 
 
 def test_duplicate_review_change_during_staging_aborts_the_group(

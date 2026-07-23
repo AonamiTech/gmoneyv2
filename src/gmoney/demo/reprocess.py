@@ -17,7 +17,7 @@ from pydantic import ValidationError
 
 from gmoney.contracts.extraction import SourceTable
 from gmoney.demo.review import structural_issues
-from gmoney.demo.store import JobStore, utc_now
+from gmoney.demo.store import JobStore, is_gpu_device, utc_now
 from gmoney.evaluation.corpus import sha256_file
 from gmoney.extraction.offline import OfflineExtractor
 from gmoney.extraction.typed_values import parse_decimal
@@ -760,6 +760,41 @@ def stage_reprocess_jobs(
 ) -> dict[str, Any]:
     """Build and validate replacement results without mutating live jobs."""
     store = JobStore(root)
+    if extractor is None and is_gpu_device(paddle_device):
+        with store.inference_lock():
+            return _stage_reprocess_jobs(
+                store=store,
+                job_ids=job_ids,
+                stage_root=stage_root,
+                extractor=OfflineExtractor(
+                    vl_url,
+                    paddle_device=paddle_device,
+                    vl_device=vl_device,
+                ),
+            )
+    return _stage_reprocess_jobs(
+        store=store,
+        job_ids=job_ids,
+        stage_root=stage_root,
+        extractor=(
+            extractor
+            if extractor is not None
+            else OfflineExtractor(
+                vl_url,
+                paddle_device=paddle_device,
+                vl_device=vl_device,
+            )
+        ),
+    )
+
+
+def _stage_reprocess_jobs(
+    *,
+    store: JobStore,
+    job_ids: list[str] | None,
+    stage_root: Path | None,
+    extractor: Any,
+) -> dict[str, Any]:
     selected = sorted(
         set(
             job_ids
@@ -773,11 +808,6 @@ def stage_reprocess_jobs(
     timestamp = re.sub(r"[^0-9]", "", utc_now())[:14]
     staging = (stage_root or store.jobs_root / ".reprocess-staging") / timestamp
     staging.mkdir(parents=True, mode=0o700)
-    active_extractor = extractor or OfflineExtractor(
-        vl_url,
-        paddle_device=paddle_device,
-        vl_device=vl_device,
-    )
     snapshots = [
         _snapshot_job(
             store=store,
@@ -794,7 +824,7 @@ def stage_reprocess_jobs(
             store=store,
             snapshots=snapshots_by_source[source_sha256],
             stage_root=staging,
-            extractor=active_extractor,
+            extractor=extractor,
         ):
             prepared_by_id[item.job_id] = item
     prepared = [prepared_by_id[job_id] for job_id in selected]

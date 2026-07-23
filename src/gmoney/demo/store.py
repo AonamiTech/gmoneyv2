@@ -8,11 +8,15 @@ from contextlib import ExitStack, contextmanager
 from datetime import UTC, datetime, timedelta
 from fcntl import LOCK_EX, LOCK_SH, LOCK_UN, flock
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 from uuid import UUID, uuid4
 
 ACTIVE_STATUSES = {"uploading", "queued", "processing"}
 TERMINAL_STATUSES = {"complete", "failed"}
+
+
+def is_gpu_device(value: str) -> bool:
+    return value.strip().partition(":")[0].casefold() == "gpu"
 
 
 def utc_now() -> str:
@@ -50,6 +54,28 @@ class JobStore:
         except ValueError as error:
             raise KeyError(job_id) from error
         return self.jobs_root / canonical
+
+    @property
+    def inference_lock_path(self) -> Path:
+        return self.jobs_root / ".gpu-inference.lock"
+
+    def acquire_inference_lock(self) -> TextIO:
+        lock = self.inference_lock_path.open("a+")
+        try:
+            flock(lock.fileno(), LOCK_EX)
+        except BaseException:
+            lock.close()
+            raise
+        return lock
+
+    @contextmanager
+    def inference_lock(self) -> Iterator[None]:
+        lock = self.acquire_inference_lock()
+        try:
+            yield
+        finally:
+            flock(lock.fileno(), LOCK_UN)
+            lock.close()
 
     def create(self, original_name: str) -> dict[str, Any]:
         job_id = str(uuid4())
