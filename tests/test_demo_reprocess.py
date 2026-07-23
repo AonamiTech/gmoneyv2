@@ -538,7 +538,12 @@ def test_reprocess_validation_requires_all_description_tokens_in_printed_cell(
 
 @pytest.mark.parametrize(
     ("printed_date", "accepted"),
-    (("15/07/2026 11:31:00", True), ("16/07/2026 11:31:00", False)),
+    (
+        ("15/07/2026 11:31:00", True),
+        ("15/07/2026 11:31:00 - MNEIPI/265604", True),
+        ("15/07/2026 99:99:99", False),
+        ("16/07/2026 11:31:00", False),
+    ),
 )
 def test_reprocess_validation_compares_grounded_printed_time_by_canonical_date(
     tmp_path: Path,

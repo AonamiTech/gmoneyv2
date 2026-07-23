@@ -22,13 +22,13 @@ from gmoney.demo.review import structural_issues
 from gmoney.demo.store import JobStore, is_gpu_device, utc_now
 from gmoney.evaluation.corpus import sha256_file
 from gmoney.extraction.offline import OfflineExtractor
-from gmoney.extraction.typed_values import (
-    DATE_FRAGMENT,
-    parse_decimal,
-    parse_service_date,
-)
+from gmoney.extraction.typed_values import parse_decimal, parse_service_date
 
 app = typer.Typer(add_completion=False, invoke_without_command=True)
+_PRINTED_DATE_REQUEST_SUFFIX = re.compile(
+    r"\s*[-:]?\s*[A-Z][A-Z0-9-]{2,}/[A-Z0-9-]+\s*$",
+    re.IGNORECASE,
+)
 _gpu_inference_locks: dict[Path, TextIO] = {}
 _gpu_inference_locks_guard = Lock()
 _gpu_inference_locks_pid = os.getpid()
@@ -667,15 +667,12 @@ def _validate_result(
                         canonical_value
                     )
                     if field == "service_date_raw":
-                        printed_date_iso = parse_service_date(cell.raw_value)
-                        if printed_date_iso is None:
-                            printed_date_match = DATE_FRAGMENT.match(
-                                (cell.raw_value or "").lstrip()
+                        printed_date_iso = parse_service_date(
+                            _PRINTED_DATE_REQUEST_SUFFIX.sub(
+                                "",
+                                cell.raw_value or "",
                             )
-                            if printed_date_match:
-                                printed_date_iso = parse_service_date(
-                                    printed_date_match.group()
-                                )
+                        )
                         value_matches = value_matches or bool(
                             canonical.get("service_date_iso")
                             and printed_date_iso == canonical.get("service_date_iso")
