@@ -650,6 +650,53 @@ def test_reprocess_validation_rejects_printed_value_missing_from_canonical_row(
         )
 
 
+def test_reprocess_validation_accepts_grounded_day_quantity(
+    tmp_path: Path,
+) -> None:
+    store, job_id, old_result = setup_job(tmp_path)
+    page_sha = old_result["page_assets"][0]["artifact_sha256"]
+    new_rows = [row("new-row", page_sha)]
+    new_rows[0]["quantity_raw"] = "2"
+    new_rows[0]["quantity"] = "2"
+    new_rows[0]["field_evidence"]["quantity"] = [
+        evidence(page_sha, "quantity-token")
+    ]
+    printed = source_tables(new_rows, page_sha)
+    printed[0]["columns"].insert(
+        1,
+        {
+            "id": "quantity",
+            "label": "Qty.",
+            "order": 1,
+            "canonical_field": "quantity",
+            "evidence": [evidence(page_sha, "header-quantity")],
+            "validation_flags": [],
+        },
+    )
+    printed[0]["columns"][2]["order"] = 2
+    printed[0]["rows"][0]["cells"].insert(
+        1,
+        {
+            "column_id": "quantity",
+            "raw_value": "2 Days",
+            "evidence": [evidence(page_sha, "quantity-token")],
+            "validation_flags": [],
+        },
+    )
+    new_result = {
+        **old_result,
+        "rows": new_rows,
+        "source_tables": printed,
+    }
+
+    _validate_result(
+        store.job_dir(job_id) / "source.pdf",
+        old_result,
+        new_result,
+        store.job_dir(job_id) / "artifacts",
+    )
+
+
 @pytest.mark.parametrize("canonical_field", ["net_amount", "gross_amount"])
 def test_reprocess_validation_rejects_unlinked_printed_financial_total(
     tmp_path: Path,

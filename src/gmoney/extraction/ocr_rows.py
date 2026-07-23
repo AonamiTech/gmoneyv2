@@ -18,7 +18,7 @@ from gmoney.contracts.extraction import (
 )
 from gmoney.extraction.rows import CandidateLedgerRow
 from gmoney.extraction.spatial import AlignedLedgerRow
-from gmoney.extraction.typed_values import parse_decimal
+from gmoney.extraction.typed_values import DAY_QUANTITY, parse_decimal
 
 HEADER_TERMS: dict[str, tuple[str, ...]] = {
     "serial": ("sr no", "s no", "serial no", "#"),
@@ -1235,12 +1235,7 @@ def _numeric_tokens(line: OcrLine) -> list[tuple[OcrToken, Decimal]]:
                     )
                 )
                 continue
-        duration_quantity = re.fullmatch(
-            r"\s*(?P<quantity>[+-]?\d[\d,]*(?:\.\d{1,4})?)\s*"
-            r"(?:days?|day\s*\(s\))\.?\s*",
-            token.text,
-            re.IGNORECASE,
-        )
+        duration_quantity = DAY_QUANTITY.fullmatch(token.text)
         if duration_quantity is not None:
             parsed = parse_decimal(duration_quantity.group("quantity"))
             if parsed is not None:

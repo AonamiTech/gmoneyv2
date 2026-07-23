@@ -6,6 +6,11 @@ from decimal import Decimal, InvalidOperation
 
 CURRENCY = re.compile(r"(?:₹|inr|rs\.?|rupees?)", re.IGNORECASE)
 NUMERIC = re.compile(r"^[+-]?\d+(?:\.\d{1,4})?$")
+DAY_QUANTITY = re.compile(
+    r"\s*(?P<quantity>[+-]?\d[\d,]*(?:\.\d{1,4})?)\s*"
+    r"(?:days?|day\s*\(s\))\.?\s*",
+    re.IGNORECASE,
+)
 MAX_ABSOLUTE = Decimal("999999999999.9999")
 DATE_FRAGMENT = re.compile(
     r"\d{1,2}(?:[/.-]\d{1,2}[/.-]\d{2,4}|[-\s](?:Jan(?:uary)?|Feb(?:ruary)?|"
@@ -55,6 +60,12 @@ def parse_decimal(value: object) -> Decimal | None:
     if abs(number) > MAX_ABSOLUTE:
         return None
     return number
+
+
+def parse_quantity(value: object) -> Decimal | None:
+    text = str(value or "")
+    duration = DAY_QUANTITY.fullmatch(text)
+    return parse_decimal(duration.group("quantity") if duration is not None else text)
 
 
 def parse_service_date(value: object) -> str | None:

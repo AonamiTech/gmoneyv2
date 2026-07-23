@@ -22,7 +22,11 @@ from gmoney.demo.review import structural_issues
 from gmoney.demo.store import JobStore, is_gpu_device, utc_now
 from gmoney.evaluation.corpus import sha256_file
 from gmoney.extraction.offline import OfflineExtractor
-from gmoney.extraction.typed_values import parse_decimal, parse_service_date
+from gmoney.extraction.typed_values import (
+    parse_decimal,
+    parse_quantity,
+    parse_service_date,
+)
 
 app = typer.Typer(add_completion=False, invoke_without_command=True)
 _PRINTED_DATE_REQUEST_SUFFIX = re.compile(
@@ -677,7 +681,11 @@ def _validate_result(
                         f"for canonical row {source_row.canonical_row_id}"
                     )
                 if field in numeric_fields:
-                    printed_value = parse_decimal(cell.raw_value or "")
+                    printed_value = (
+                        parse_quantity(cell.raw_value or "")
+                        if field == "quantity"
+                        else parse_decimal(cell.raw_value or "")
+                    )
                     canonical_value = parse_decimal(str(canonical[field]))
                     if printed_value is None or printed_value != canonical_value:
                         raise ValueError(
