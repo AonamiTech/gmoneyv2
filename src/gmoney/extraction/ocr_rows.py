@@ -606,6 +606,11 @@ def _source_columns(
         )
     for token in header_tokens:
         if token.token_id not in recognized_ids:
+            if block.roles and (
+                parse_decimal(token.text) is not None
+                or re.fullmatch(r"\d+[.)]?", token.text.strip())
+            ):
+                continue
             entries.append((_center_x(token), token.text.strip(), None, token))
     entries.sort(key=lambda entry: entry[0])
 

@@ -284,6 +284,43 @@ def test_amount_rs_unit_days_compound_header_preserves_rate_quantity_and_total()
     assert result.rows[0].candidate.amount == Decimal("2000.00")
 
 
+def test_numeric_row_marker_grouped_with_header_is_not_exposed_as_a_column() -> None:
+    tokens = (
+        token(0, "Sr.N", (50, 30, 90, 45)),
+        token(1, "Particular", (100, 30, 420, 45)),
+        token(2, "Amount Rs. Unit/Days", (610, 30, 820, 45)),
+        token(3, "Total", (880, 30, 970, 45)),
+        token(4, "0.", (50, 39, 70, 54)),
+        token(5, "1.", (50, 70, 70, 85)),
+        token(6, "Registration", (100, 70, 360, 85)),
+        token(7, "300.00", (620, 70, 700, 85)),
+        token(8, "1", (760, 70, 780, 85)),
+        token(9, "300.00", (890, 70, 960, 85)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(40, 20, 980, 110),
+    )
+
+    assert [column.label for column in result.source_tables[0].columns] == [
+        "Sr.N",
+        "Particular",
+        "Amount Rs.",
+        "Unit/Days",
+        "Total",
+    ]
+    assert [cell.raw_value for cell in result.source_tables[0].rows[0].cells] == [
+        "1.",
+        "Registration",
+        "300.00",
+        "1",
+        "300.00",
+    ]
+
+
 def test_amount_rs_without_distinct_total_remains_the_final_amount_column() -> None:
     tokens = (
         token(0, "Particular", (100, 30, 420, 45)),
