@@ -1588,6 +1588,54 @@ def test_headerless_continuation_inherits_date_without_inventing_amount() -> Non
     assert second.rows[0].candidate.amount is None
 
 
+def test_leading_dash_suffixed_date_is_folded_into_linked_source_row() -> None:
+    tokens = (
+        token(0, "Service Name", (100, 30, 300, 45)),
+        token(1, "Date", (650, 30, 710, 45)),
+        token(2, "Net Amount", (870, 30, 970, 45)),
+        token(3, "20/01/2026 -", (650, 70, 760, 85)),
+        token(4, "Package Name: Coronary Angiography", (100, 100, 430, 115)),
+        token(5, "21/01/2026", (650, 100, 750, 115)),
+        token(6, "11,457.00", (880, 100, 960, 115)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 20, 980, 130),
+    )
+    canonical = canonicalize_rows(
+        "d" * 64,
+        1,
+        "p1-t1",
+        "a" * 64,
+        result.rows,
+    )
+    linked = _link_source_tables(result.source_tables, canonical)
+    date_column = next(
+        column
+        for column in linked[0].columns
+        if column.canonical_field == "service_date_raw"
+    )
+    source_row = next(row for row in linked[0].rows if row.canonical_row_id)
+    date_cell = next(
+        cell for cell in source_row.cells if cell.column_id == date_column.id
+    )
+    canonical_date_ids = {
+        token_id
+        for item in canonical[0].field_evidence["service_date"]
+        for token_id in item.token_ids
+    }
+    source_date_ids = {
+        token_id for item in date_cell.evidence for token_id in item.token_ids
+    }
+
+    assert canonical[0].service_date_raw == "20/01/2026 - 21/01/2026"
+    assert date_cell.raw_value == "20/01/2026 - 21/01/2026"
+    assert canonical_date_ids <= source_date_ids
+
+
 def test_headerless_date_only_continuation_keeps_every_printed_row_linkable() -> None:
     header = (
         token(0, "Service Name", (100, 30, 300, 45)),

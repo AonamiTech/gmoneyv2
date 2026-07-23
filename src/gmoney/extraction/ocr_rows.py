@@ -743,7 +743,7 @@ def _source_rows(
             and pending_prefix is None
             and len(populated) == 1
             and cells[populated[0]].raw_value
-            and DATE_SPAN.fullmatch(cells[populated[0]].raw_value.strip())
+            and DATE_PREFIX.fullmatch(cells[populated[0]].raw_value.strip())
             and line_index + 1 < end
         ):
             pending_prefix = cells
@@ -943,7 +943,7 @@ def _synthetic_source_table(
         )
         if (
             len(previous_tokens) != 1
-            or DATE_SPAN.fullmatch(previous_tokens[0].text.strip()) is None
+            or DATE_PREFIX.fullmatch(previous_tokens[0].text.strip()) is None
         ):
             break
         first_data_index -= 1
