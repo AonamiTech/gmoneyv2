@@ -806,6 +806,62 @@ def test_reprocess_validation_accepts_only_matching_section_subtotal(
             )
 
 
+def test_reprocess_validation_accepts_matching_total_across_header_segments(
+    tmp_path: Path,
+) -> None:
+    store, job_id, old_result = setup_job(tmp_path)
+    page_sha = old_result["page_assets"][0]["artifact_sha256"]
+    new_rows = [
+        row("first-segment-row", page_sha, amount="16000.00"),
+        row("second-segment-row", page_sha, amount="52230.96"),
+    ]
+    new_rows[1]["row_order"] = 1
+    printed = source_tables(new_rows, page_sha)[0]
+    first_segment = deepcopy(printed)
+    first_segment["id"] = "p1-t1-s1"
+    first_segment["rows"] = [first_segment["rows"][0]]
+    first_segment["rows"][0]["id"] = "p1-t1-s1-r1"
+    second_segment = deepcopy(printed)
+    second_segment["id"] = "p1-t1-s2"
+    second_segment["rows"] = [second_segment["rows"][1]]
+    second_segment["rows"][0]["id"] = "p1-t1-s2-r1"
+    second_segment["rows"][0]["order"] = 0
+    second_segment["rows"].append(
+        {
+            "id": "p1-t1-s2-r2",
+            "order": 1,
+            "canonical_row_id": None,
+            "cells": [
+                {
+                    "column_id": "description",
+                    "raw_value": "Total",
+                    "evidence": [evidence(page_sha, "table-total-label")],
+                    "validation_flags": [],
+                },
+                {
+                    "column_id": "amount",
+                    "raw_value": "68230.96",
+                    "evidence": [evidence(page_sha, "table-total-amount")],
+                    "validation_flags": [],
+                },
+            ],
+            "validation_flags": [],
+        }
+    )
+    new_result = {
+        **old_result,
+        "rows": new_rows,
+        "source_tables": [first_segment, second_segment],
+    }
+
+    _validate_result(
+        store.job_dir(job_id) / "source.pdf",
+        old_result,
+        new_result,
+        store.job_dir(job_id) / "artifacts",
+    )
+
+
 @pytest.mark.parametrize(
     "boundary_label",
     ("Grand Total", "Total Bill Amount", "Advance Received"),

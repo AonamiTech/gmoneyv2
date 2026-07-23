@@ -301,6 +301,41 @@ def _unlinked_financial_row_is_explained(
     ):
         return True
 
+    if normalized_label in {"total", "totals"}:
+        source_row_seen = False
+        linked_row_follows = False
+        for candidate in table.rows:
+            if candidate.id == source_row.id:
+                source_row_seen = True
+                continue
+            if source_row_seen and candidate.canonical_row_id is not None:
+                linked_row_follows = True
+                break
+        physical_table_rows = [
+            row
+            for row in canonical_rows.values()
+            if int(row.get("page_number") or 0) == table.page_number
+            and str(row.get("table_id") or "") == table.table_id
+            and row.get("role") in {"detail", "refund", "category_rollup"}
+        ]
+        if (
+            not linked_row_follows
+            and physical_table_rows
+            and all(
+                sum(
+                    (
+                        parsed
+                        for row in physical_table_rows
+                        if (parsed := parse_decimal(str(row.get(field)))) is not None
+                    ),
+                    Decimal("0"),
+                )
+                == value
+                for field, value in financial_values
+            )
+        ):
+            return True
+
     if normalized_label in {"sub total", "subtotal"}:
         section_rows: list[dict[str, Any]] = []
         for preceding in table.rows:
