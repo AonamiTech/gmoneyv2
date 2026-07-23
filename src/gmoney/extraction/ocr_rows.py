@@ -1235,6 +1235,27 @@ def _numeric_tokens(line: OcrLine) -> list[tuple[OcrToken, Decimal]]:
                     )
                 )
                 continue
+        duration_quantity = re.fullmatch(
+            r"\s*(?P<quantity>[+-]?\d[\d,]*(?:\.\d{1,4})?)\s*"
+            r"(?:days?|day\s*\(s\))\.?\s*",
+            token.text,
+            re.IGNORECASE,
+        )
+        if duration_quantity is not None:
+            parsed = parse_decimal(duration_quantity.group("quantity"))
+            if parsed is not None:
+                output.append(
+                    (
+                        _virtual_horizontal_token(
+                            token,
+                            duration_quantity.start("quantity"),
+                            duration_quantity.end("quantity"),
+                            len(token.text),
+                        ),
+                        parsed,
+                    )
+                )
+                continue
         non_currency_text = re.sub(
             r"\b(?:inr|rs|rupees?)\.?\b",
             "",

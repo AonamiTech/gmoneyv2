@@ -963,6 +963,70 @@ def test_repeated_header_ignores_numeric_section_preamble() -> None:
     assert cells[description_column.id].raw_value == (
         "IP VISIT CHARGE(ICU) (Dr. SWAPNIL JAISWAL)"
     )
+    room_rent = next(
+        row
+        for row in result.rows
+        if row.candidate.description.startswith("Room Rent")
+    )
+    assert room_rent.candidate.quantity == Decimal("2")
+
+
+def test_quantity_with_printed_days_unit_is_canonical_numeric_quantity() -> None:
+    tokens = (
+        token(0, "No.", (129, 941, 183, 978)),
+        token(1, "Code", (208, 942, 293, 978)),
+        token(2, "Service Name (Notes)", (433, 942, 764, 982)),
+        token(3, "Rate", (1489, 945, 1566, 982)),
+        token(4, "Qty.", (1666, 944, 1730, 988)),
+        token(5, "Amount", (1840, 946, 1960, 982)),
+        token(6, "Disc", (2065, 946, 2134, 983)),
+        token(7, "Net Amt.", (2184, 947, 2315, 982)),
+        token(8, "ACCOMMODATION CHARGES", (127, 1020, 604, 1050)),
+        token(9, "Total Rs. 16000.00/-", (2055, 1020, 2356, 1050)),
+        token(10, "1.A", (127, 1108, 182, 1145)),
+        token(
+            11,
+            "Room Rent (06-07-2026 to 08-07-2026 MICU)",
+            (431, 1108, 1120, 1152),
+        ),
+        token(12, "8000", (1484, 1112, 1566, 1149)),
+        token(13, "2 Days", (1626, 1112, 1738, 1155)),
+        token(14, "16000.00", (1817, 1114, 1957, 1149)),
+        token(15, "0", (2107, 1114, 2135, 1151)),
+        token(16, "16000.00", (2218, 1115, 2357, 1150)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(100, 900, 2380, 1180),
+    )
+
+    room_rent = next(
+        row
+        for row in result.rows
+        if row.candidate.description.startswith("Room Rent")
+    )
+    assert room_rent.candidate.quantity == Decimal("2")
+    table = next(
+        table
+        for table in result.source_tables
+        if any(column.canonical_field == "quantity" for column in table.columns)
+    )
+    quantity_column = next(
+        column
+        for column in table.columns
+        if column.canonical_field == "quantity"
+    )
+    quantity_cell = next(
+        cell
+        for printed_row in table.rows
+        for cell in printed_row.cells
+        if cell.column_id == quantity_column.id
+        and cell.raw_value == "2 Days"
+    )
+    assert quantity_cell.raw_value == "2 Days"
 
 
 def test_category_total_with_header_words_does_not_reset_quantity_and_rate() -> None:
