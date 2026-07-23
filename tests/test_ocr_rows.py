@@ -2936,3 +2936,28 @@ def test_aadhaar_policy_and_pin_identifiers_are_not_published_as_money_rows() ->
         box=(80, 15, 680, 125),
     )
     assert all(row.candidate.role is RowRole.UNRESOLVED for row in result.rows)
+
+
+def test_claim_policy_grid_is_metadata_not_a_charge_ledger() -> None:
+    tokens = (
+        token(0, "P2 REQ ON", (100, 25, 210, 40)),
+        token(1, "POLICY TYPE", (260, 25, 380, 40)),
+        token(2, "TREATMENT DETAILS", (430, 25, 620, 40)),
+        token(3, "CLAIM ELIGIBLE", (720, 25, 880, 40)),
+        token(4, "15/07/26, 2:55 PM", (100, 65, 250, 80)),
+        token(5, "GMC", (260, 65, 310, 80)),
+        token(6, "Laparoscopic Hysterectomy", (430, 65, 650, 80)),
+        token(7, "200000", (760, 65, 840, 80)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 15, 900, 95),
+    )
+
+    assert {table.table_type for table in result.source_tables} == {
+        TableType.METADATA
+    }
+    assert all(row.candidate.role is RowRole.UNRESOLVED for row in result.rows)

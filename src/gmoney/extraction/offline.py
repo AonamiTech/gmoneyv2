@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
 from decimal import Decimal
@@ -68,7 +69,7 @@ from gmoney.extraction.recovery import (
 )
 from gmoney.extraction.rows import extract_candidate_rows
 from gmoney.extraction.spatial import align_candidate_rows
-from gmoney.extraction.typed_values import parse_service_date
+from gmoney.extraction.typed_values import parse_decimal, parse_service_date
 from gmoney.geometry.crop import clahe_variant, crop_region, render_pdf_region
 from gmoney.geometry.render import render_pdf
 from gmoney.inference.contracts import InferenceRequest, InferenceResponse
@@ -301,6 +302,492 @@ def _deduplicate(rows: list[CanonicalRow]) -> list[CanonicalRow]:
         if current is None or score > current_score:
             selected[key] = row
     return sorted(selected.values(), key=lambda row: (row.page_number, row.row_order))
+
+
+@dataclass(frozen=True)
+class _PrintedTableFeatures:
+    descriptions: frozenset[str]
+    serials: frozenset[int]
+    numeric_values: tuple[Decimal, ...]
+    complete_financial_rows: int
+    populated_canonical_fields: int
+
+
+def _printed_table_features(table: SourceTable) -> _PrintedTableFeatures:
+    description_columns = tuple(
+        column
+        for column in table.columns
+        if column.canonical_field == "description"
+    )
+    financial_columns = tuple(
+        column
+        for column in table.columns
+        if column.canonical_field in {"gross_amount", "net_amount"}
+    )
+    numeric_columns = tuple(
+        column
+        for column in table.columns
+        if column.canonical_field
+        in {
+            "quantity",
+            "unit_price",
+            "gross_amount",
+            "discount",
+            "net_amount",
+        }
+    )
+    serial_columns = tuple(
+        column
+        for column in table.columns
+        if column.canonical_field is None
+        and (
+            "serial"
+            in re.sub(
+                r"[^a-z0-9]+", " ", column.label.casefold()
+            ).split()
+            or re.sub(
+                r"[^a-z0-9]+", "", column.label.casefold()
+            ).startswith("sr")
+        )
+    )
+    descriptions: set[str] = set()
+    serials: set[int] = set()
+    numeric_values: list[Decimal] = []
+    complete_financial_rows = 0
+    populated_fields: set[str] = set()
+    for row in table.rows:
+        cells = {cell.column_id: cell for cell in row.cells}
+        description = re.sub(
+            r"[^a-z0-9]+",
+            " ",
+            " ".join(
+                cells[column.id].raw_value or ""
+                for column in description_columns
+            ).casefold(),
+        ).strip()
+        if description:
+            descriptions.add(description)
+        row_has_financial_value = False
+        for column in numeric_columns:
+            raw_value = cells[column.id].raw_value
+            if raw_value and (parsed := parse_decimal(raw_value)) is not None:
+                numeric_values.append(parsed)
+        for column in financial_columns:
+            raw_value = cells[column.id].raw_value
+            if raw_value and parse_decimal(raw_value) is not None:
+                row_has_financial_value = True
+                if column.canonical_field:
+                    populated_fields.add(column.canonical_field)
+        if description and row_has_financial_value:
+            complete_financial_rows += 1
+        for column in serial_columns:
+            raw_value = (cells[column.id].raw_value or "").strip()
+            if re.fullmatch(r"\d{1,4}\.?", raw_value):
+                serials.add(int(raw_value.rstrip(".")))
+    return _PrintedTableFeatures(
+        descriptions=frozenset(descriptions),
+        serials=frozenset(serials),
+        numeric_values=tuple(sorted(numeric_values)),
+        complete_financial_rows=complete_financial_rows,
+        populated_canonical_fields=len(populated_fields),
+    )
+
+
+def _merged_printed_table_features(
+    tables: tuple[SourceTable, ...],
+) -> _PrintedTableFeatures:
+    features = tuple(_printed_table_features(table) for table in tables)
+    return _PrintedTableFeatures(
+        descriptions=frozenset(
+            description
+            for feature in features
+            for description in feature.descriptions
+        ),
+        serials=frozenset(
+            serial for feature in features for serial in feature.serials
+        ),
+        numeric_values=tuple(
+            sorted(
+                value
+                for feature in features
+                for value in feature.numeric_values
+            )
+        ),
+        complete_financial_rows=sum(
+            feature.complete_financial_rows for feature in features
+        ),
+        populated_canonical_fields=max(
+            (
+                feature.populated_canonical_fields
+                for feature in features
+            ),
+            default=0,
+        ),
+    )
+
+
+def _evidence_region_position(
+    evidence: Any,
+    region: tuple[float, float, float, float],
+) -> str:
+    points = evidence.polygon.points
+    if not points:
+        return "boundary"
+    left, top, right, bottom = region
+    inside = tuple(
+        left <= point.x <= right and top <= point.y <= bottom
+        for point in points
+    )
+    if all(inside):
+        return "inside"
+    polygon_left = min(point.x for point in points)
+    polygon_top = min(point.y for point in points)
+    polygon_right = max(point.x for point in points)
+    polygon_bottom = max(point.y for point in points)
+    if (
+        polygon_right < left
+        or polygon_left > right
+        or polygon_bottom < top
+        or polygon_top > bottom
+    ):
+        return "outside"
+    return "boundary"
+
+
+def _exact_embedded_crop_region(
+    *,
+    candidate_path: Path,
+    candidate_box: tuple[int, int, int, int],
+    representative_path: Path,
+) -> tuple[float, float, float, float] | None:
+    """Return the candidate-page region occupied by an exact repeated crop."""
+    candidate = cv2.imread(str(candidate_path), cv2.IMREAD_GRAYSCALE)
+    representative = cv2.imread(
+        str(representative_path),
+        cv2.IMREAD_GRAYSCALE,
+    )
+    if candidate is None or representative is None:
+        return None
+    if min(candidate.shape) < 16 or min(representative.shape) < 16:
+        return None
+    if float(candidate.std()) < 5 or float(representative.std()) < 5:
+        return None
+
+    def exact_location(
+        image: Any,
+        template: Any,
+    ) -> tuple[int, int] | None:
+        if (
+            template.shape[0] > image.shape[0]
+            or template.shape[1] > image.shape[1]
+        ):
+            return None
+        match = cv2.matchTemplate(image, template, cv2.TM_SQDIFF)
+        _, _, location, _ = cv2.minMaxLoc(match)
+        left, top = location
+        patch = image[
+            top : top + template.shape[0],
+            left : left + template.shape[1],
+        ]
+        if cv2.countNonZero(cv2.absdiff(patch, template)) != 0:
+            return None
+        return left, top
+
+    representative_location = exact_location(candidate, representative)
+    if representative_location is not None:
+        crop_left, crop_top, crop_right, crop_bottom = candidate_box
+        scale_x = (crop_right - crop_left) / candidate.shape[1]
+        scale_y = (crop_bottom - crop_top) / candidate.shape[0]
+        match_left, match_top = representative_location
+        return (
+            crop_left + match_left * scale_x,
+            crop_top + match_top * scale_y,
+            crop_left
+            + (match_left + representative.shape[1]) * scale_x,
+            crop_top
+            + (match_top + representative.shape[0]) * scale_y,
+        )
+
+    if exact_location(representative, candidate) is not None:
+        return tuple(float(value) for value in candidate_box)
+    return None
+
+
+def _residual_tables_after_exact_repeat(
+    *,
+    key: tuple[int, str],
+    tables: tuple[SourceTable, ...],
+    rows: list[CanonicalRow],
+    region: tuple[float, float, float, float],
+) -> tuple[SourceTable, ...] | None:
+    canonical_rows = tuple(
+        row
+        for row in rows
+        if (row.page_number, row.table_id) == key
+    )
+    if not canonical_rows or any(
+        not row.evidence
+        or not all(
+            _evidence_region_position(evidence, region) == "inside"
+            for evidence in row.evidence
+        )
+        for row in canonical_rows
+    ):
+        return None
+
+    residual_tables: list[SourceTable] = []
+    for table in tables:
+        residual_rows: list[Any] = []
+        for source_row in table.rows:
+            residual_cells: list[SourceCell] = []
+            has_outside_value = False
+            for cell in source_row.cells:
+                if not cell.raw_value or not cell.raw_value.strip():
+                    residual_cells.append(cell)
+                    continue
+                if not cell.evidence:
+                    return None
+                positions = tuple(
+                    _evidence_region_position(evidence, region)
+                    for evidence in cell.evidence
+                )
+                if all(position == "inside" for position in positions):
+                    residual_cells.append(
+                        cell.model_copy(
+                            update={
+                                "raw_value": None,
+                                "evidence": (),
+                                "validation_flags": tuple(
+                                    dict.fromkeys(
+                                        (
+                                            *cell.validation_flags,
+                                            "suppressed_exact_repeated_crop",
+                                        )
+                                    )
+                                ),
+                            }
+                        )
+                    )
+                else:
+                    has_outside_value = True
+                    residual_cells.append(cell)
+            if has_outside_value:
+                residual_rows.append(
+                    source_row.model_copy(
+                        update={
+                            "order": len(residual_rows),
+                            "canonical_row_id": None,
+                            "cells": tuple(residual_cells),
+                            "validation_flags": tuple(
+                                dict.fromkeys(
+                                    (
+                                        *source_row.validation_flags,
+                                        "repeated_crop_residual",
+                                    )
+                                )
+                            ),
+                        }
+                    )
+                )
+        if residual_rows:
+            residual_tables.append(
+                table.model_copy(
+                    update={
+                        "rows": tuple(residual_rows),
+                        "validation_flags": tuple(
+                            dict.fromkeys(
+                                (
+                                    *table.validation_flags,
+                                    "repeated_crop_residual",
+                                )
+                            )
+                        ),
+                    }
+                )
+            )
+    return tuple(residual_tables)
+
+
+def _suppress_repeated_printed_tables(
+    tables: list[SourceTable],
+    rows: list[CanonicalRow],
+    *,
+    crop_paths: dict[tuple[int, str], Path],
+    crop_boxes: dict[tuple[int, str], tuple[int, int, int, int]],
+) -> tuple[
+    list[SourceTable],
+    list[CanonicalRow],
+    tuple[tuple[int, str], ...],
+]:
+    """Keep one grounded rendition when a print overlay repeats across pages.
+
+    Browser-generated PDFs can paginate a fixed bill preview several times.
+    OCR overlap is only a candidate search. Suppression additionally requires
+    exact pixel containment of one physical table crop and proof that every
+    billable row from the candidate lies inside that repeated crop. This keeps
+    near-duplicate continuation pages and sibling source-table segments.
+    """
+    grouped: dict[tuple[int, str], list[SourceTable]] = {}
+    for table in tables:
+        grouped.setdefault(
+            (table.page_number, table.table_id),
+            [],
+        ).append(table)
+    physical_keys = list(grouped)
+    physical_tables = [
+        tuple(grouped[key]) for key in physical_keys
+    ]
+    features = [
+        _merged_printed_table_features(group)
+        for group in physical_tables
+    ]
+    connected: dict[int, set[int]] = {
+        index: {index} for index in range(len(physical_keys))
+    }
+    for left_index, left_key in enumerate(physical_keys):
+        left_features = features[left_index]
+        if (
+            len(left_features.serials) < 8
+            or len(left_features.descriptions) < 8
+            or len(left_features.numeric_values) < 8
+        ):
+            continue
+        for right_index in range(
+            left_index + 1,
+            len(physical_keys),
+        ):
+            right_key = physical_keys[right_index]
+            right_features = features[right_index]
+            if (
+                left_key[0] == right_key[0]
+                or len(right_features.serials) < 8
+                or len(right_features.descriptions) < 8
+                or len(right_features.numeric_values) < 8
+            ):
+                continue
+            serial_overlap = len(
+                left_features.serials & right_features.serials
+            )
+            description_overlap = len(
+                left_features.descriptions & right_features.descriptions
+            )
+            numeric_overlap = sum(
+                (
+                    Counter(left_features.numeric_values)
+                    & Counter(right_features.numeric_values)
+                ).values()
+            )
+            if (
+                serial_overlap * 5
+                < min(
+                    len(left_features.serials),
+                    len(right_features.serials),
+                )
+                * 4
+                or description_overlap * 4
+                < min(
+                    len(left_features.descriptions),
+                    len(right_features.descriptions),
+                )
+                * 3
+                or numeric_overlap * 5
+                < min(
+                    len(left_features.numeric_values),
+                    len(right_features.numeric_values),
+                )
+                * 4
+            ):
+                continue
+            connected[left_index].add(right_index)
+            connected[right_index].add(left_index)
+
+    suppressed_keys: set[tuple[int, str]] = set()
+    residual_tables_by_key: dict[
+        tuple[int, str],
+        tuple[SourceTable, ...],
+    ] = {}
+    visited: set[int] = set()
+    for start in range(len(physical_keys)):
+        if start in visited:
+            continue
+        component: set[int] = set()
+        pending = [start]
+        while pending:
+            index = pending.pop()
+            if index in component:
+                continue
+            component.add(index)
+            pending.extend(connected[index] - component)
+        visited.update(component)
+        if len(component) < 2:
+            continue
+
+        def grounding_score(index: int) -> tuple[int, int, int, int, int]:
+            table_features = features[index]
+            return (
+                table_features.complete_financial_rows,
+                table_features.populated_canonical_fields,
+                len(table_features.descriptions),
+                len(table_features.serials),
+                physical_keys[index][0],
+            )
+
+        keep = max(component, key=grounding_score)
+        keep_key = physical_keys[keep]
+        representative_path = crop_paths.get(keep_key)
+        if representative_path is None:
+            continue
+        for index in component:
+            if index == keep or index not in connected[keep]:
+                continue
+            candidate_key = physical_keys[index]
+            candidate_features = features[index]
+            if not candidate_features.serials.issubset(
+                features[keep].serials
+            ):
+                continue
+            candidate_path = crop_paths.get(candidate_key)
+            candidate_box = crop_boxes.get(candidate_key)
+            if candidate_path is None or candidate_box is None:
+                continue
+            repeated_region = _exact_embedded_crop_region(
+                candidate_path=candidate_path,
+                candidate_box=candidate_box,
+                representative_path=representative_path,
+            )
+            if repeated_region is None:
+                continue
+            residual_tables = _residual_tables_after_exact_repeat(
+                key=candidate_key,
+                tables=physical_tables[index],
+                rows=rows,
+                region=repeated_region,
+            )
+            if residual_tables is None:
+                continue
+            suppressed_keys.add(candidate_key)
+            residual_tables_by_key[candidate_key] = residual_tables
+
+    selected_tables: list[SourceTable] = []
+    emitted_residuals: set[tuple[int, str]] = set()
+    for table in tables:
+        key = (table.page_number, table.table_id)
+        if key not in suppressed_keys:
+            selected_tables.append(table)
+            continue
+        if key not in emitted_residuals:
+            selected_tables.extend(residual_tables_by_key[key])
+            emitted_residuals.add(key)
+    selected_rows = [
+        row
+        for row in rows
+        if (row.page_number, row.table_id) not in suppressed_keys
+    ]
+    return (
+        selected_tables,
+        selected_rows,
+        tuple(sorted(suppressed_keys)),
+    )
 
 
 def _source_cell_is_oversized_overlay(
@@ -1040,6 +1527,11 @@ class OfflineExtractor:
         document_id = manifest.document_sha256
         all_rows: list[CanonicalRow] = []
         all_source_tables: list[SourceTable] = []
+        source_table_crop_paths: dict[tuple[int, str], Path] = {}
+        source_table_crop_boxes: dict[
+            tuple[int, str],
+            tuple[int, int, int, int],
+        ] = {}
         document_total_candidates: list[DocumentTotalCandidate] = []
         diagnostics: list[dict[str, Any]] = []
         schema_states: list[TableSchemaState] = []
@@ -1109,6 +1601,12 @@ class OfflineExtractor:
                     page_asset.page_number,
                     safe_box,
                 )
+                source_table_crop_paths[
+                    (page_asset.page_number, table_id)
+                ] = crop.output_path
+                source_table_crop_boxes[
+                    (page_asset.page_number, table_id)
+                ] = safe_box
                 table_work.append(
                     TableWork(
                         table_id=table_id,
@@ -1704,8 +2202,18 @@ class OfflineExtractor:
             if progress:
                 progress(page_asset.page_number, len(manifest.pages))
 
-        rows = _apply_document_role_policy(_deduplicate(all_rows))
-        source_tables = _link_source_tables(all_source_tables, rows)
+        (
+            selected_source_tables,
+            selected_rows,
+            suppressed_source_tables,
+        ) = _suppress_repeated_printed_tables(
+            all_source_tables,
+            all_rows,
+            crop_paths=source_table_crop_paths,
+            crop_boxes=source_table_crop_boxes,
+        )
+        rows = _apply_document_role_policy(_deduplicate(selected_rows))
+        source_tables = _link_source_tables(selected_source_tables, rows)
         document_totals = select_document_totals(document_total_candidates)
         document_total: DocumentTotal | None = select_document_total(document_total_candidates)
         return {
@@ -1733,6 +2241,13 @@ class OfflineExtractor:
                 for page in manifest.pages
             ],
             "source_tables": [table.model_dump(mode="json") for table in source_tables],
+            "suppressed_repeated_source_tables": [
+                {
+                    "page_number": page_number,
+                    "table_id": table_id,
+                }
+                for page_number, table_id in suppressed_source_tables
+            ],
             "rows": [row.model_dump(mode="json") for row in rows],
             "diagnostics": diagnostics,
             "provider_usage": {
