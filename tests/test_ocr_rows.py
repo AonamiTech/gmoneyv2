@@ -2651,6 +2651,309 @@ def test_shifted_rightmost_net_lane_does_not_create_a_synthetic_column() -> None
     ] == ["100.00", "200.00", "300.00"]
 
 
+def test_left_aligned_total_header_uses_repeated_right_aligned_value_lane() -> None:
+    tokens = (
+        token(0, "DESCRIPTION", (100, 20, 260, 35)),
+        token(1, "UNITS", (520, 20, 580, 35)),
+        token(2, "CHARGES", (650, 20, 760, 35)),
+        token(3, "TOTAL", (830, 20, 900, 35)),
+        *tuple(
+            value
+            for row, (top, description, quantity, charge, total) in enumerate(
+                (
+                    (60, "Registration Charges", "1", "500.00", "500.00"),
+                    (90, "Single Room A/C", "4", "2500.00", "10000.00"),
+                    (120, "Lactation Counselling", "1", "1500.00", "1500.00"),
+                ),
+                start=1,
+            )
+            for value in (
+                token(row * 10, description, (100, top, 390, top + 15)),
+                token(row * 10 + 1, quantity, (530, top, 570, top + 15)),
+                token(row * 10 + 2, charge, (690, top, 760, top + 15)),
+                token(row * 10 + 3, total, (900, top, 980, top + 15)),
+            )
+        ),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 0, 1000, 160),
+    )
+
+    assert [row.candidate.description for row in result.rows] == [
+        "Registration Charges",
+        "Single Room A/C",
+        "Lactation Counselling",
+    ]
+    assert [row.candidate.amount for row in result.rows] == [
+        Decimal("500.00"),
+        Decimal("10000.00"),
+        Decimal("1500.00"),
+    ]
+    assert result.diagnostics["column_centers"]["amount"] > 0.9
+    table = result.source_tables[0]
+    assert [column.label for column in table.columns] == [
+        "DESCRIPTION",
+        "UNITS",
+        "CHARGES",
+        "TOTAL",
+    ]
+    assert [
+        [cell.raw_value for cell in row.cells]
+        for row in table.rows
+    ] == [
+        ["Registration Charges", "1", "500.00", "500.00"],
+        ["Single Room A/C", "4", "2500.00", "10000.00"],
+        ["Lactation Counselling", "1", "1500.00", "1500.00"],
+    ]
+
+
+def test_left_aligned_total_header_uses_integer_arithmetic_value_lane() -> None:
+    tokens = (
+        token(0, "DESCRIPTION", (100, 20, 260, 35)),
+        token(1, "UNITS", (520, 20, 580, 35)),
+        token(2, "CHARGES", (650, 20, 760, 35)),
+        token(3, "TOTAL", (830, 20, 900, 35)),
+        *tuple(
+            value
+            for row, (top, description, quantity, charge, total) in enumerate(
+                (
+                    (60, "Registration Charges", "1", "500", "500"),
+                    (90, "Single Room A/C", "4", "2500", "10000"),
+                    (120, "Lactation Counselling", "1", "1500", "1500"),
+                ),
+                start=1,
+            )
+            for value in (
+                token(row * 10, description, (100, top, 390, top + 15)),
+                token(row * 10 + 1, quantity, (530, top, 570, top + 15)),
+                token(row * 10 + 2, charge, (690, top, 760, top + 15)),
+                token(row * 10 + 3, total, (900, top, 980, top + 15)),
+            )
+        ),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 0, 1000, 160),
+    )
+
+    assert [row.candidate.amount for row in result.rows] == [
+        Decimal("500"),
+        Decimal("10000"),
+        Decimal("1500"),
+    ]
+    assert result.diagnostics["column_centers"]["amount"] > 0.9
+
+
+def test_left_aligned_total_header_accepts_two_consistent_rows() -> None:
+    tokens = (
+        token(0, "DESCRIPTION", (100, 20, 260, 35)),
+        token(1, "UNITS", (520, 20, 580, 35)),
+        token(2, "CHARGES", (650, 20, 760, 35)),
+        token(3, "TOTAL", (830, 20, 900, 35)),
+        token(10, "Registration Charges", (100, 60, 390, 75)),
+        token(11, "1", (530, 60, 570, 75)),
+        token(12, "500", (690, 60, 760, 75)),
+        token(13, "500", (900, 60, 980, 75)),
+        token(20, "Single Room A/C", (100, 90, 390, 105)),
+        token(21, "4", (530, 90, 570, 105)),
+        token(22, "2500", (690, 90, 760, 105)),
+        token(23, "10000", (900, 90, 980, 105)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 0, 1000, 130),
+    )
+
+    assert [row.candidate.amount for row in result.rows] == [
+        Decimal("500"),
+        Decimal("10000"),
+    ]
+    assert result.diagnostics["column_centers"]["amount"] > 0.9
+
+
+def test_left_aligned_total_header_rejects_ambiguous_right_side_lanes() -> None:
+    tokens = (
+        token(0, "DESCRIPTION", (100, 20, 260, 35)),
+        token(1, "TOTAL", (790, 20, 850, 35)),
+        *tuple(
+            value
+            for row, (top, description, total, exterior) in enumerate(
+                (
+                    (60, "Registration Charges", "500.00", "50.00"),
+                    (90, "Single Room A/C", "1000.00", "100.00"),
+                    (120, "Lactation Counselling", "1500.00", "150.00"),
+                ),
+                start=1,
+            )
+            for value in (
+                token(row * 10, description, (100, top, 390, top + 15)),
+                token(row * 10 + 1, total, (860, top, 920, top + 15)),
+                token(row * 10 + 2, exterior, (940, top, 980, top + 15)),
+            )
+        ),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 0, 1000, 160),
+    )
+
+    assert result.diagnostics["column_centers"]["amount"] < 0.86
+    assert all(
+        row.candidate.amount not in {
+            Decimal("50.00"),
+            Decimal("100.00"),
+            Decimal("150.00"),
+        }
+        for row in result.rows
+    )
+
+
+@pytest.mark.parametrize(
+    "references",
+    (
+        ("101", "102", "103"),
+        ("101.01", "102.02", "103.03"),
+    ),
+)
+def test_left_aligned_total_header_rejects_unlabeled_reference_lane(
+    references: tuple[str, str, str],
+) -> None:
+    tokens = (
+        token(0, "DESCRIPTION", (100, 20, 260, 35)),
+        token(1, "TOTAL", (790, 20, 850, 35)),
+        *tuple(
+            value
+            for row, (top, description, reference) in enumerate(
+                zip(
+                    (60, 90, 120),
+                    (
+                        "Registration Charges",
+                        "Single Room A/C",
+                        "Lactation Counselling",
+                    ),
+                    references,
+                    strict=True,
+                ),
+                start=1,
+            )
+            for value in (
+                token(row * 10, description, (100, top, 390, top + 15)),
+                token(row * 10 + 1, reference, (940, top, 980, top + 15)),
+            )
+        ),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 0, 1000, 160),
+    )
+
+    assert result.diagnostics["column_centers"]["amount"] < 0.86
+    assert all(row.candidate.amount is None for row in result.rows)
+
+
+def test_left_aligned_total_header_rejects_mixed_arithmetic_exterior_lane() -> None:
+    rows = tuple(
+        (
+            60 + index * 25,
+            f"Charge {index}",
+            "1",
+            str(index * 100),
+            str(index * 100 if index <= 2 else 9000 + index),
+        )
+        for index in range(1, 11)
+    )
+    tokens = (
+        token(0, "DESCRIPTION", (100, 20, 260, 35)),
+        token(1, "UNITS", (520, 20, 580, 35)),
+        token(2, "CHARGES", (650, 20, 760, 35)),
+        token(3, "TOTAL", (790, 20, 850, 35)),
+        *tuple(
+            value
+            for row, (top, description, quantity, charge, exterior) in enumerate(
+                rows,
+                start=1,
+            )
+            for value in (
+                token(row * 10, description, (100, top, 390, top + 15)),
+                token(row * 10 + 1, quantity, (530, top, 570, top + 15)),
+                token(row * 10 + 2, charge, (690, top, 760, top + 15)),
+                token(row * 10 + 3, exterior, (940, top, 980, top + 15)),
+            )
+        ),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 0, 1000, 340),
+    )
+
+    assert result.diagnostics["column_centers"]["amount"] < 0.86
+    assert all(
+        row.candidate.amount not in {
+            Decimal("100"),
+            Decimal("200"),
+            *(Decimal(str(9000 + index)) for index in range(3, 11)),
+        }
+        for row in result.rows
+    )
+
+
+@pytest.mark.parametrize("intermediate_header", ("CORPORATE", "DISCHARGE", "SEPARATE"))
+def test_left_aligned_total_header_requires_explicit_financial_lane_label(
+    intermediate_header: str,
+) -> None:
+    tokens = (
+        token(0, "DESCRIPTION", (100, 20, 260, 35)),
+        token(1, "UNITS", (520, 20, 580, 35)),
+        token(2, intermediate_header, (650, 20, 760, 35)),
+        token(3, "TOTAL", (790, 20, 850, 35)),
+        *tuple(
+            value
+            for row, (top, quantity, intermediate, exterior) in enumerate(
+                (
+                    (60, "1", "500", "500"),
+                    (90, "2", "500", "1000"),
+                    (120, "3", "500", "1500"),
+                ),
+                start=1,
+            )
+            for value in (
+                token(row * 10, f"Charge {row}", (100, top, 390, top + 15)),
+                token(row * 10 + 1, quantity, (530, top, 570, top + 15)),
+                token(row * 10 + 2, intermediate, (690, top, 760, top + 15)),
+                token(row * 10 + 3, exterior, (940, top, 980, top + 15)),
+            )
+        ),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 0, 1000, 160),
+    )
+
+    assert result.diagnostics["column_centers"]["amount"] < 0.86
+
+
 @pytest.mark.parametrize(
     ("printed_code", "code_box", "rotated"),
     (

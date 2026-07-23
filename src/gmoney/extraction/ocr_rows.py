@@ -647,6 +647,134 @@ def _printed_header_centers(
     return tuple(sorted((center - left) / width for center in centers))
 
 
+def _snap_amount_to_stable_lane(
+    labeled_amount: float | None,
+    stable_centers: tuple[float, ...],
+    printed_header_centers: tuple[float, ...],
+    *,
+    wide_snap_is_proven: bool = False,
+) -> float | None:
+    if not stable_centers:
+        return labeled_amount
+    if labeled_amount is None:
+        return stable_centers[-1]
+    nearby = min(stable_centers, key=lambda center: abs(center - labeled_amount))
+    if abs(nearby - labeled_amount) <= 0.06:
+        return nearby
+    rightward_centers = tuple(
+        center for center in stable_centers if center > labeled_amount
+    )
+    if (
+        printed_header_centers
+        and labeled_amount >= max(printed_header_centers) - 0.015
+        and len(rightward_centers) == 1
+        and rightward_centers[0] - labeled_amount <= 0.15
+        and wide_snap_is_proven
+    ):
+        return rightward_centers[0]
+    return labeled_amount
+
+
+def _wide_amount_snap_has_arithmetic_proof(
+    lines: tuple[OcrLine, ...],
+    block: HeaderBlock,
+    stable_centers: tuple[float, ...],
+    *,
+    left: float,
+    width: float,
+) -> bool:
+    roles = block.roles
+    description = roles.get("description")
+    quantity = roles.get("quantity")
+    amount = roles.get("amount")
+    if description is None or quantity is None or amount is None:
+        return False
+    if "total" not in _normalize(amount.text):
+        return False
+
+    quantity_header_center = (_center_x(quantity) - left) / width
+    amount_header_center = (_center_x(amount) - left) / width
+    quantity_centers = tuple(
+        center
+        for center in stable_centers
+        if abs(center - quantity_header_center) <= 0.06
+    )
+    rightward_centers = tuple(
+        center for center in stable_centers if center > amount_header_center
+    )
+    rate_centers = tuple(
+        center
+        for center in stable_centers
+        if quantity_header_center + 0.04 < center < amount_header_center - 0.025
+    )
+    if (
+        len(quantity_centers) != 1
+        or len(rate_centers) != 1
+        or len(rightward_centers) != 1
+    ):
+        return False
+
+    header_tokens = tuple(
+        token
+        for line in lines[block.start : block.end + 1]
+        for token in line.tokens
+    )
+    if not any(
+        quantity_header_center
+        < (_center_x(token) - left) / width
+        < amount_header_center
+        and re.search(
+            r"\b(?:charges?|rates?|prices?)\b",
+            _normalize(token.text),
+        )
+        for token in header_tokens
+    ):
+        return False
+
+    lane_centers = (
+        quantity_centers[0],
+        rate_centers[0],
+        rightward_centers[0],
+    )
+    matches = 0
+    comparable = 0
+    for line in lines[block.end + 1 :]:
+        numeric = _numeric_tokens(line)
+        selected: list[NumericValue] = []
+        for center in lane_centers:
+            candidates = tuple(
+                value
+                for value in numeric
+                if abs(((_center_x(value.token) - left) / width) - center) <= 0.04
+            )
+            if not candidates:
+                break
+            selected.append(
+                min(
+                    candidates,
+                    key=lambda value: abs(
+                        ((_center_x(value.token) - left) / width) - center
+                    ),
+                )
+            )
+        if len(selected) != 3:
+            continue
+        identities = {
+            _numeric_identity(value.token, value.value)
+            for value in selected
+        }
+        if len(identities) != 3:
+            continue
+        comparable += 1
+        quantity_value, rate_value, total_value = (
+            value.value for value in selected
+        )
+        if abs((quantity_value * rate_value) - total_value) <= Decimal("0.01"):
+            matches += 1
+    minimum_support = max(2, round(len(lines[block.end + 1 :]) * 0.1))
+    return matches >= minimum_support and matches == comparable
+
+
 SOURCE_CANONICAL_FIELDS: dict[str, str | None] = {
     "serial": None,
     "description": "description",
@@ -2299,14 +2427,30 @@ def reconstruct_ocr_rows(
             column_centers.update(detected_centers)
             inherited = True
 
-    if stable_centers:
-        labeled_amount = column_centers.get("amount")
-        if labeled_amount is None:
-            column_centers["amount"] = stable_centers[-1]
-        else:
-            nearby = min(stable_centers, key=lambda center: abs(center - labeled_amount))
-            if abs(nearby - labeled_amount) <= 0.06:
-                column_centers["amount"] = nearby
+    snapped_amount = _snap_amount_to_stable_lane(
+        column_centers.get("amount"),
+        stable_centers,
+        (
+            _printed_header_centers(
+                lines,
+                primary_header,
+                left=left,
+                width=width,
+            )
+            if header_valid
+            else ()
+        ),
+        wide_snap_is_proven=header_valid
+        and _wide_amount_snap_has_arithmetic_proof(
+            lines[:first_segment_end],
+            primary_header,
+            stable_centers,
+            left=left,
+            width=width,
+        ),
+    )
+    if snapped_amount is not None:
+        column_centers["amount"] = snapped_amount
 
     summary_lines = [values for line in data_lines if len(values := _numeric_tokens(line)) >= 3]
     zero_tail_summary = bool(
@@ -2497,17 +2641,25 @@ def reconstruct_ocr_rows(
                 width,
             )
             column_centers = _column_centers(repeated_roles, left=left, width=width)
-            if segment_stable_centers:
-                labeled_amount = column_centers.get("amount")
-                if labeled_amount is None:
-                    column_centers["amount"] = segment_stable_centers[-1]
-                else:
-                    nearby = min(
-                        segment_stable_centers,
-                        key=lambda center: abs(center - labeled_amount),
-                    )
-                    if abs(nearby - labeled_amount) <= 0.06:
-                        column_centers["amount"] = nearby
+            snapped_amount = _snap_amount_to_stable_lane(
+                column_centers.get("amount"),
+                segment_stable_centers,
+                _printed_header_centers(
+                    lines,
+                    repeated_block,
+                    left=left,
+                    width=width,
+                ),
+                wide_snap_is_proven=_wide_amount_snap_has_arithmetic_proof(
+                    lines[:next_header],
+                    repeated_block,
+                    segment_stable_centers,
+                    left=left,
+                    width=width,
+                ),
+            )
+            if snapped_amount is not None:
+                column_centers["amount"] = snapped_amount
             stable_centers = segment_stable_centers
             amount_center = column_centers.get("amount")
             description_header_centers = _printed_header_centers(
