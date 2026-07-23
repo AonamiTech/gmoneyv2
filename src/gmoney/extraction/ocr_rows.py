@@ -732,6 +732,7 @@ def _missing_numeric_column_centers(
     start: int,
     end: int,
     existing_centers: tuple[float, ...],
+    all_columns_unmapped: bool,
     width: float,
 ) -> tuple[float, ...]:
     numeric_lines = tuple(
@@ -767,6 +768,8 @@ def _missing_numeric_column_centers(
         if len(cluster) < support_required:
             continue
         center = median(item[1] for item in cluster)
+        if min(abs(center - existing) for existing in ordered_existing) <= width * 0.06:
+            continue
         neighbors = next(
             (
                 (left, right)
@@ -779,11 +782,12 @@ def _missing_numeric_column_centers(
             ),
             None,
         )
+        if neighbors is None and not all_columns_unmapped:
+            continue
         if (
-            neighbors is None
-            or center - neighbors[0] <= width * 0.06
-            or neighbors[1] - center <= width * 0.06
-            or abs(center - (neighbors[0] + neighbors[1]) / 2) > width * 0.03
+            neighbors is not None
+            and abs(center - (neighbors[0] + neighbors[1]) / 2)
+            > width * (0.04 if all_columns_unmapped else 0.03)
         ):
             continue
         missing.append(center)
@@ -837,6 +841,10 @@ def _source_columns(
             start=data_start,
             end=data_end,
             existing_centers=tuple(entry[0] for entry in entries),
+            all_columns_unmapped=all(
+                canonical_field is None
+                for _, _, canonical_field, _ in entries
+            ),
             width=width,
         )
     )

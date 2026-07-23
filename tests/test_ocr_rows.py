@@ -2146,7 +2146,95 @@ def test_printed_table_synthesizes_repeated_unlabeled_numeric_column() -> None:
         assert cells[table.columns[5].id].raw_value == "570.00"
 
 
-@pytest.mark.parametrize("gross_center", (760, 770))
+def test_printed_summary_synthesizes_all_repeated_unlabeled_amount_lanes() -> None:
+    tokens = (
+        token(0, "Cash Summary", (120, 20, 390, 35)),
+        token(1, "Credit Summary", (870, 20, 1160, 35)),
+        token(2, "Total Summary", (1650, 20, 1920, 35)),
+        *tuple(
+            value
+            for row, (top, cash_label, credit_value, total_label, total_value) in enumerate(
+                (
+                    (60, "Total Cash Sales", "22678.93", "Total Sales", "22678.93"),
+                    (90, "Total Cash Return", "2957.97", "Total Return", "2957.97"),
+                    (120, "Net Cash Sales", "19720.96", "Total Sales", "19720.96"),
+                ),
+                start=1,
+            )
+            for value in (
+                token(row * 10, cash_label, (130, top, 420, top + 15)),
+                token(row * 10 + 1, "0.00", (680, top, 755, top + 15)),
+                token(
+                    row * 10 + 2,
+                    cash_label.replace("Cash", "Credit"),
+                    (870, top, 1180, top + 15),
+                ),
+                token(row * 10 + 3, credit_value, (1360, top, 1520, top + 15)),
+                token(row * 10 + 4, total_label, (1650, top, 1860, top + 15)),
+                token(row * 10 + 5, total_value, (2060, top, 2220, top + 15)),
+            )
+        ),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(100, 0, 2300, 160),
+    )
+
+    table = result.source_tables[0]
+    assert [column.label for column in table.columns] == [
+        "Cash Summary",
+        "Column 2",
+        "Credit Summary",
+        "Column 4",
+        "Total Summary",
+        "Column 6",
+    ]
+    assert [
+        [cell.raw_value for cell in row.cells]
+        for row in table.rows
+    ] == [
+        [
+            "Total Cash Sales",
+            "0.00",
+            "Total Credit Sales",
+            "22678.93",
+            "Total Sales",
+            "22678.93",
+        ],
+        [
+            "Total Cash Return",
+            "0.00",
+            "Total Credit Return",
+            "2957.97",
+            "Total Return",
+            "2957.97",
+        ],
+        [
+            "Net Cash Sales",
+            "0.00",
+            "Net Credit Sales",
+            "19720.96",
+            "Total Sales",
+            "19720.96",
+        ],
+    ]
+    canonical = canonicalize_rows(
+        "d" * 64,
+        1,
+        "p1-t1",
+        "a" * 64,
+        result.rows,
+    )
+    linked = _link_source_tables(result.source_tables, canonical)
+    assert [row.canonical_row_id for row in linked[0].rows] == [
+        str(row.id) for row in canonical
+    ]
+
+
+@pytest.mark.parametrize("gross_center", (760, 770, 774))
 def test_shifted_mapped_numeric_lane_does_not_create_a_synthetic_column(
     gross_center: int,
 ) -> None:
@@ -2188,6 +2276,51 @@ def test_shifted_mapped_numeric_lane_does_not_create_a_synthetic_column(
     for row, expected in zip(table.rows, ("100.00", "200.00", "300.00"), strict=True):
         cells = {cell.column_id: cell for cell in row.cells}
         assert cells[gross_column.id].raw_value == expected
+
+
+def test_shifted_rightmost_net_lane_does_not_create_a_synthetic_column() -> None:
+    tokens = (
+        token(0, "Sr. No.", (80, 30, 150, 45)),
+        token(1, "Description", (220, 30, 480, 45)),
+        token(2, "Net Amount", (850, 30, 950, 45)),
+        *tuple(
+            value
+            for row, top in enumerate((70, 100, 130), start=1)
+            for value in (
+                token(row * 10, str(row), (100, top, 130, top + 15)),
+                token(row * 10 + 1, f"Item {row}", (220, top, 480, top + 15)),
+                token(
+                    row * 10 + 2,
+                    f"{row * 100}.00",
+                    (930, top, 990, top + 15),
+                ),
+            )
+        ),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(60, 20, 1000, 170),
+    )
+
+    table = result.source_tables[0]
+    assert all(
+        column.validation_flags != ("synthetic_header",)
+        for column in table.columns
+    )
+    net_column = next(
+        column for column in table.columns if column.canonical_field == "net_amount"
+    )
+    assert [
+        next(
+            cell.raw_value
+            for cell in source_row.cells
+            if cell.column_id == net_column.id
+        )
+        for source_row in table.rows
+    ] == ["100.00", "200.00", "300.00"]
 
 
 @pytest.mark.parametrize(
