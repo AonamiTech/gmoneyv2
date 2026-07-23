@@ -12,6 +12,8 @@ WORKDIR /app
 COPY pyproject.toml README.md ./
 COPY src ./src
 RUN pip install --no-cache-dir \
+      --timeout 600 \
+      --retries 10 \
       --index-url https://www.paddlepaddle.org.cn/packages/stable/cu118/ \
       paddlepaddle-gpu==3.2.2 \
     && pip install --no-cache-dir '.[inference-gpu]' \
