@@ -632,6 +632,279 @@ def test_reprocess_validation_rejects_unlinked_printed_financial_total(
         )
 
 
+def test_reprocess_validation_accepts_verified_total_and_settlement_source_rows(
+    tmp_path: Path,
+) -> None:
+    store, job_id, old_result = setup_job(tmp_path)
+    page_sha = old_result["page_assets"][0]["artifact_sha256"]
+    new_rows = [row("new-row", page_sha)]
+    printed = source_tables(new_rows, page_sha)
+    printed[0]["rows"].extend(
+        [
+            {
+                "id": "p1-t1-s1-r2",
+                "order": 1,
+                "canonical_row_id": None,
+                "cells": [
+                    {
+                        "column_id": "description",
+                        "raw_value": "Total Bill Amount",
+                        "evidence": [evidence(page_sha, "total-description")],
+                        "validation_flags": [],
+                    },
+                    {
+                        "column_id": "amount",
+                        "raw_value": "100.00",
+                        "evidence": [evidence(page_sha, "total-amount")],
+                        "validation_flags": [],
+                    },
+                ],
+                "validation_flags": [],
+            },
+            {
+                "id": "p1-t1-s1-r3",
+                "order": 2,
+                "canonical_row_id": None,
+                "cells": [
+                    {
+                        "column_id": "description",
+                        "raw_value": "Advance Received",
+                        "evidence": [evidence(page_sha, "advance-description")],
+                        "validation_flags": [],
+                    },
+                    {
+                        "column_id": "amount",
+                        "raw_value": "0.00",
+                        "evidence": [evidence(page_sha, "advance-amount")],
+                        "validation_flags": [],
+                    },
+                ],
+                "validation_flags": [],
+            },
+        ]
+    )
+    for order, label in enumerate(
+        ("Total", "Totals", "Sub Total", "Subtotal"),
+        start=3,
+    ):
+        printed[0]["rows"].append(
+            {
+                "id": f"p1-t1-s1-r{order + 1}",
+                "order": order,
+                "canonical_row_id": None,
+                "cells": [
+                    {
+                        "column_id": "description",
+                        "raw_value": label,
+                        "evidence": [evidence(page_sha, f"short-total-description-{order}")],
+                        "validation_flags": [],
+                    },
+                    {
+                        "column_id": "amount",
+                        "raw_value": "100.00",
+                        "evidence": [evidence(page_sha, f"short-total-amount-{order}")],
+                        "validation_flags": [],
+                    },
+                ],
+                "validation_flags": [],
+            }
+        )
+    new_result = {
+        **old_result,
+        "document_total": {
+            "total_version": "document_total_v2",
+            "amount_raw": "100.00",
+            "amount": "100.00",
+            "label": "Total Bill Amount",
+            "kind": "bill_total",
+            "scope": "document",
+            "page_number": 1,
+            "evidence": {
+                **evidence(page_sha, "total-description"),
+                "token_ids": ["total-description", "total-amount"],
+            },
+            "confidence": 0.99,
+            "source_route": "page_ocr_final_total",
+        },
+        "document_totals": [],
+        "rows": new_rows,
+        "source_tables": printed,
+    }
+
+    _validate_result(
+        store.job_dir(job_id) / "source.pdf",
+        old_result,
+        new_result,
+        store.job_dir(job_id) / "artifacts",
+    )
+
+
+def test_reprocess_validation_accepts_unique_repeated_grounded_summary(
+    tmp_path: Path,
+) -> None:
+    store, job_id, old_result = setup_job(tmp_path)
+    page_sha = old_result["page_assets"][0]["artifact_sha256"]
+    new_rows = [row("new-row", page_sha, role="category_rollup")]
+    new_rows[0]["description"] = "Package Name: Coronary Angiography (CAG)"
+    printed = source_tables(new_rows, page_sha)
+    printed[0]["table_type"] = "category_summary"
+    printed[0]["rows"].append(
+        {
+            "id": "p1-t1-s1-r2",
+            "order": 1,
+            "canonical_row_id": None,
+            "cells": [
+                {
+                    "column_id": "description",
+                    "raw_value": "Package (IPD) - Coronary",
+                    "evidence": [evidence(page_sha, "duplicate-description")],
+                    "validation_flags": [],
+                },
+                {
+                    "column_id": "amount",
+                    "raw_value": "100.00",
+                    "evidence": [evidence(page_sha, "duplicate-amount")],
+                    "validation_flags": [],
+                },
+            ],
+            "validation_flags": [],
+        }
+    )
+    new_result = {
+        **old_result,
+        "rows": new_rows,
+        "source_tables": printed,
+    }
+
+    _validate_result(
+        store.job_dir(job_id) / "source.pdf",
+        old_result,
+        new_result,
+        store.job_dir(job_id) / "artifacts",
+    )
+
+
+@pytest.mark.parametrize(
+    "printed_description",
+    ("Total Knee Replacement", "Deposit Implant Charge"),
+)
+def test_reprocess_validation_does_not_misclassify_billable_description_as_footer(
+    tmp_path: Path,
+    printed_description: str,
+) -> None:
+    store, job_id, old_result = setup_job(tmp_path)
+    page_sha = old_result["page_assets"][0]["artifact_sha256"]
+    new_rows = [row("new-row", page_sha)]
+    printed = source_tables(new_rows, page_sha)
+    printed[0]["rows"].append(
+        {
+            "id": "p1-t1-s1-r2",
+            "order": 1,
+            "canonical_row_id": None,
+            "cells": [
+                {
+                    "column_id": "description",
+                    "raw_value": printed_description,
+                    "evidence": [evidence(page_sha, "unlinked-description")],
+                    "validation_flags": [],
+                },
+                {
+                    "column_id": "amount",
+                    "raw_value": "100.00",
+                    "evidence": [evidence(page_sha, "unlinked-amount")],
+                    "validation_flags": [],
+                },
+            ],
+            "validation_flags": [],
+        }
+    )
+    new_result = {
+        **old_result,
+        "document_total": {
+            "total_version": "document_total_v2",
+            "amount_raw": "100.00",
+            "amount": "100.00",
+            "label": "Total Bill Amount",
+            "kind": "bill_total",
+            "scope": "document",
+            "page_number": 1,
+            "evidence": evidence(page_sha, "document-total"),
+            "confidence": 0.99,
+            "source_route": "page_ocr_final_total",
+        },
+        "rows": new_rows,
+        "source_tables": printed,
+    }
+
+    with pytest.raises(ValueError, match="unlinked source row.*financial"):
+        _validate_result(
+            store.job_dir(job_id) / "source.pdf",
+            old_result,
+            new_result,
+            store.job_dir(job_id) / "artifacts",
+        )
+
+
+@pytest.mark.parametrize(
+    ("printed_description", "canonical_description"),
+    (
+        ("Cardiac Investigation", "Cardiac Package Coronary"),
+        ("Package Cardiac Investigation", "Cardiac Package Coronary"),
+        ("Package Coronary Care Unit", "Package Name Coronary Angiography CAG"),
+        (
+            "Department Summary Cardiac Investigation",
+            "Department Summary Cardiac Surgery",
+        ),
+    ),
+)
+def test_reprocess_validation_rejects_weak_one_word_summary_match(
+    tmp_path: Path,
+    printed_description: str,
+    canonical_description: str,
+) -> None:
+    store, job_id, old_result = setup_job(tmp_path)
+    page_sha = old_result["page_assets"][0]["artifact_sha256"]
+    new_rows = [row("new-row", page_sha, role="category_rollup")]
+    new_rows[0]["description"] = canonical_description
+    printed = source_tables(new_rows, page_sha)
+    printed[0]["table_type"] = "category_summary"
+    printed[0]["rows"].append(
+        {
+            "id": "p1-t1-s1-r2",
+            "order": 1,
+            "canonical_row_id": None,
+            "cells": [
+                {
+                    "column_id": "description",
+                    "raw_value": printed_description,
+                    "evidence": [evidence(page_sha, "unlinked-description")],
+                    "validation_flags": [],
+                },
+                {
+                    "column_id": "amount",
+                    "raw_value": "100.00",
+                    "evidence": [evidence(page_sha, "unlinked-amount")],
+                    "validation_flags": [],
+                },
+            ],
+            "validation_flags": [],
+        }
+    )
+    new_result = {
+        **old_result,
+        "rows": new_rows,
+        "source_tables": printed,
+    }
+
+    with pytest.raises(ValueError, match="unlinked source row.*financial"):
+        _validate_result(
+            store.job_dir(job_id) / "source.pdf",
+            old_result,
+            new_result,
+            store.job_dir(job_id) / "artifacts",
+        )
+
+
 def test_reprocess_validation_allows_unlinked_non_ledger_text_without_amount(
     tmp_path: Path,
 ) -> None:

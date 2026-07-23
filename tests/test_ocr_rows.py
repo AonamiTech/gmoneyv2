@@ -1342,6 +1342,73 @@ def test_description_before_subtotal_extends_previous_serial_row() -> None:
     assert result.rows[0].candidate.description == ("Package(IPD) - Coronary Angiography (CAG)")
     assert result.rows[0].candidate.amount == Decimal("11457.00")
     assert result.rows[0].candidate.role is RowRole.CATEGORY_ROLLUP
+    canonical = canonicalize_rows(
+        "d" * 64,
+        1,
+        "p1-t1",
+        "a" * 64,
+        result.rows,
+    )
+    linked = _link_source_tables(result.source_tables, canonical)
+    linked_row = next(row for row in linked[0].rows if row.canonical_row_id is not None)
+    description_column = next(
+        column
+        for column in linked[0].columns
+        if column.canonical_field == "description"
+    )
+    assert next(
+        cell.raw_value
+        for cell in linked_row.cells
+        if cell.column_id == description_column.id
+    ) == "Package(IPD) - Coronary Angiography (CAG)"
+
+
+def test_nonanchored_note_before_total_stays_separate_in_printed_table() -> None:
+    tokens = (
+        token(0, "Description", (100, 30, 300, 45)),
+        token(1, "Amount", (870, 30, 970, 45)),
+        token(2, "Procedure Charges", (100, 70, 330, 85)),
+        token(3, "100.00", (880, 70, 960, 85)),
+        token(4, "Insurance Note", (450, 100, 550, 115)),
+        token(5, "Total", (770, 130, 830, 145)),
+        token(6, "100.00", (880, 130, 960, 145)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 20, 980, 160),
+    )
+    canonical = canonicalize_rows(
+        "d" * 64,
+        1,
+        "p1-t1",
+        "a" * 64,
+        result.rows,
+    )
+    linked = _link_source_tables(result.source_tables, canonical)
+    description_column = next(
+        column
+        for column in linked[0].columns
+        if column.canonical_field == "description"
+    )
+    printed_descriptions = [
+        next(
+            cell.raw_value
+            for cell in source_row.cells
+            if cell.column_id == description_column.id
+        )
+        for source_row in linked[0].rows
+        if any(
+            cell.raw_value
+            for cell in source_row.cells
+            if cell.column_id == description_column.id
+        )
+    ]
+
+    assert [row.description for row in canonical] == ["Procedure Charges"]
+    assert printed_descriptions[:2] == ["Procedure Charges", "Insurance Note"]
 
 
 def test_payment_details_before_total_does_not_extend_previous_charge() -> None:
@@ -1519,6 +1586,77 @@ def test_headerless_continuation_inherits_date_without_inventing_amount() -> Non
     assert second.rows[0].candidate.role is RowRole.INFORMATIONAL
     assert second.rows[0].candidate.service_date == "21/01/2026 11:47:02"
     assert second.rows[0].candidate.amount is None
+
+
+def test_headerless_date_only_continuation_keeps_every_printed_row_linkable() -> None:
+    header = (
+        token(0, "Service Name", (100, 30, 300, 45)),
+        token(1, "Date", (650, 30, 710, 45)),
+        token(2, "Net Amount", (870, 30, 970, 45)),
+        token(3, "Package", (100, 70, 280, 85)),
+        token(4, "20/01/2026", (650, 70, 750, 85)),
+        token(5, "100.00", (880, 70, 960, 85)),
+    )
+    first = reconstruct_ocr_rows(
+        header,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 20, 980, 100),
+    )
+    continuation = tuple(
+        value.model_copy(update={"page_number": 2, "token_id": f"p2-{value.token_id}"})
+        for value in (
+            token(6, "20/01/2026 09:44:58", (650, 5, 800, 20)),
+            token(7, "Euroflex Ns 500ml", (100, 40, 330, 55)),
+            token(8, "20/01/2026 09:44:58", (650, 40, 800, 55)),
+            token(9, "Extension Set", (100, 70, 300, 85)),
+            token(10, "20/01/2026 09:44:58", (650, 70, 800, 85)),
+            token(11, "Total", (770, 100, 830, 115)),
+            token(12, "100.00", (880, 100, 960, 115)),
+        )
+    )
+
+    second = reconstruct_ocr_rows(
+        continuation,
+        page_number=2,
+        table_id="p2-t1",
+        box=(80, 0, 980, 125),
+        prior_schemas=(first.schema,) if first.schema else (),
+    )
+    canonical = canonicalize_rows(
+        "d" * 64,
+        2,
+        "p2-t1",
+        "a" * 64,
+        second.rows,
+    )
+    linked = _link_source_tables(second.source_tables, canonical)
+    linked_descriptions = {
+        row.canonical_row_id
+        for table in linked
+        for row in table.rows
+        if row.canonical_row_id is not None
+    }
+
+    assert [row.candidate.description for row in second.rows] == [
+        "Euroflex Ns 500ml",
+        "Extension Set",
+    ]
+    assert linked_descriptions == {str(row.id) for row in canonical}
+    assert any(
+        "Euroflex Ns 500ml" in {cell.raw_value for cell in row.cells}
+        for table in second.source_tables
+        for row in table.rows
+    )
+    source_token_ids = {
+        token_id
+        for table in second.source_tables
+        for row in table.rows
+        for cell in row.cells
+        for item in cell.evidence
+        for token_id in item.token_ids
+    }
+    assert "p2-token-6" in source_token_ids
 
 
 def test_client_pharmacy_aliases_keep_date_product_gross_and_net_in_their_lanes() -> None:

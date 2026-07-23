@@ -169,6 +169,140 @@ def _normalized(value: object) -> str:
     return re.sub(r"[^a-z0-9]+", " ", str(value or "").casefold()).strip()
 
 
+_SUMMARY_WORDS = {
+    "amount",
+    "bill",
+    "charge",
+    "charges",
+    "ipd",
+    "name",
+    "package",
+    "service",
+    "services",
+    "summary",
+    "total",
+}
+
+
+def _meaningful_summary_words(value: object) -> set[str]:
+    return {
+        word
+        for word in _normalized(value).split()
+        if len(word) >= 3 and word not in _SUMMARY_WORDS
+    }
+
+
+def _unlinked_financial_row_is_explained(
+    *,
+    table: SourceTable,
+    source_row: Any,
+    cells: dict[str, Any],
+    financial_values: tuple[tuple[str, Any], ...],
+    canonical_rows: dict[str, dict[str, Any]],
+    result: dict[str, Any],
+) -> bool:
+    """Accept grounded raw aggregates that intentionally are not ledger rows."""
+    label_text = " ".join(
+        cell.raw_value.strip()
+        for cell in source_row.cells
+        if cell.raw_value and cell.raw_value.strip()
+        and parse_decimal(cell.raw_value) is None
+    )
+    normalized_label = _normalized(label_text)
+    settlement_prefixes = (
+        "advance received",
+        "amount received",
+        "amount to be received",
+        "balance amount",
+        "balance due",
+        "company amount",
+        "corporate amount",
+        "deposit amount",
+        "deposit received",
+        "net tpa",
+        "patient amount",
+        "patient balance",
+        "patient received",
+        "payer amount",
+        "payer receivable",
+        "payer received",
+        "payment detail",
+        "payment mode",
+        "payment summary",
+        "receipt detail",
+        "receipt history",
+        "receipt information",
+        "settlement detail",
+        "settlement mode",
+        "settlement status",
+        "total discount amount",
+    )
+    if normalized_label.startswith(settlement_prefixes):
+        return True
+
+    total_payloads = [
+        payload
+        for payload in (
+            result.get("document_total"),
+            *(result.get("document_totals") or []),
+        )
+        if isinstance(payload, dict) and parse_decimal(str(payload.get("amount"))) is not None
+    ]
+    total_amounts = {
+        parse_decimal(str(payload["amount"]))
+        for payload in total_payloads
+    }
+    total_labels = {"total", "totals", "sub total", "subtotal"}
+    total_prefixes = (
+        "grand total",
+        "gross bill amount",
+        "net bill amount",
+        "net payable",
+        "total bill amount",
+        "total gross bill value",
+        "total payable amount",
+    )
+    if (
+        normalized_label in total_labels
+        or normalized_label.startswith(total_prefixes)
+    ) and all(
+        value in total_amounts for _, value in financial_values
+    ):
+        return True
+
+    if table.table_type.value not in {"category_summary", "package_summary"}:
+        return False
+    description_column = next(
+        (
+            column
+            for column in table.columns
+            if column.canonical_field == "description"
+        ),
+        None,
+    )
+    if description_column is None:
+        return False
+    printed_description = cells[description_column.id].raw_value
+    printed_words = _meaningful_summary_words(printed_description)
+    if not printed_words:
+        return False
+
+    matches: set[str] = set()
+    for row_id, canonical in canonical_rows.items():
+        if canonical.get("role") != "category_rollup":
+            continue
+        canonical_description = canonical.get("description")
+        canonical_words = _meaningful_summary_words(canonical_description)
+        if not printed_words.issubset(canonical_words):
+            continue
+        if all(
+            parse_decimal(str(canonical.get(field))) == value
+            for field, value in financial_values
+        ):
+            matches.add(row_id)
+    return len(matches) == 1
+
+
 def _field_token_ids(row: dict[str, Any], field: str | None = None) -> set[str]:
     evidence_by_field = row.get("field_evidence") or {}
     evidence = evidence_by_field.get(field, []) if field else [
@@ -387,19 +521,26 @@ def _validate_result(
         for source_row in table.rows:
             cells = {cell.column_id: cell for cell in source_row.cells}
             if source_row.canonical_row_id is None:
-                for column in table.columns:
-                    if column.canonical_field not in {"net_amount", "gross_amount"}:
-                        continue
-                    raw_value = cells[column.id].raw_value
-                    if (
-                        raw_value
-                        and raw_value.strip()
-                        and parse_decimal(raw_value) is not None
-                    ):
-                        raise ValueError(
-                            "unlinked source row contains a mapped financial value: "
-                            f"{source_row.id}"
-                        )
+                financial_values = tuple(
+                    (str(column.canonical_field), parsed)
+                    for column in table.columns
+                    if column.canonical_field in {"net_amount", "gross_amount"}
+                    and (raw_value := cells[column.id].raw_value)
+                    and raw_value.strip()
+                    and (parsed := parse_decimal(raw_value)) is not None
+                )
+                if financial_values and not _unlinked_financial_row_is_explained(
+                    table=table,
+                    source_row=source_row,
+                    cells=cells,
+                    financial_values=financial_values,
+                    canonical_rows=canonical_rows,
+                    result=new_result,
+                ):
+                    raise ValueError(
+                        "unlinked source row contains a mapped financial value: "
+                        f"{source_row.id}"
+                    )
                 continue
             canonical = canonical_rows.get(source_row.canonical_row_id)
             if canonical is None:

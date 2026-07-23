@@ -692,6 +692,7 @@ def _source_rows(
     source_table_id: str,
     columns: tuple[SourceColumn, ...],
     centers: tuple[float, ...],
+    width: float,
     original_by_id: dict[str, OcrToken],
     table_id: str,
 ) -> tuple[SourceRow, ...]:
@@ -706,7 +707,13 @@ def _source_rows(
         ),
         None,
     )
-    for line in lines[start:end]:
+    financial_indexes = tuple(
+        index
+        for index, column in enumerate(columns)
+        if column.canonical_field in {"net_amount", "gross_amount"}
+    )
+    pending_prefix: list[SourceCell] | None = None
+    for line_index, line in enumerate(lines[start:end], start=start):
         buckets: list[list[OcrToken]] = [[] for _ in columns]
         for token in line.tokens:
             column = min(
@@ -732,6 +739,44 @@ def _source_rows(
             continue
         populated = tuple(index for index, cell in enumerate(cells) if cell.raw_value)
         if (
+            not output
+            and pending_prefix is None
+            and len(populated) == 1
+            and cells[populated[0]].raw_value
+            and DATE_SPAN.fullmatch(cells[populated[0]].raw_value.strip())
+            and line_index + 1 < end
+        ):
+            pending_prefix = cells
+            continue
+        if pending_prefix is not None:
+            for index, prefix in enumerate(pending_prefix):
+                if not prefix.raw_value:
+                    continue
+                current = cells[index]
+                same_value = bool(
+                    current.raw_value
+                    and re.sub(r"\s+", "", current.raw_value).casefold()
+                    == re.sub(r"\s+", "", prefix.raw_value).casefold()
+                )
+                raw_value = (
+                    current.raw_value
+                    if same_value
+                    else " ".join(
+                        value
+                        for value in (prefix.raw_value, current.raw_value)
+                        if value
+                    )
+                )
+                cells[index] = current.model_copy(
+                    update={
+                        "raw_value": raw_value,
+                        "evidence": (*prefix.evidence, *current.evidence),
+                        "validation_flags": () if raw_value else ("empty_cell",),
+                    }
+                )
+            pending_prefix = None
+            populated = tuple(index for index, cell in enumerate(cells) if cell.raw_value)
+        if (
             output
             and description_index is not None
             and populated == (description_index,)
@@ -743,9 +788,21 @@ def _source_rows(
                 previous_description.raw_value
                 and continuation.raw_value
                 and not _is_payment_footer_description(continuation.raw_value)
-                and _is_description_continuation(
-                    continuation.raw_value,
-                    previous_description.raw_value,
+                and (
+                    _is_description_continuation(
+                        continuation.raw_value,
+                        previous_description.raw_value,
+                    )
+                    or (
+                        any(
+                            previous_cells[index].raw_value
+                            for index in financial_indexes
+                        )
+                        and line_index + 1 < end
+                        and _is_structural_total_line(lines[line_index + 1])
+                        and min(_bounds(token)[0] for token in line.tokens)
+                        <= centers[description_index] + width * 0.08
+                    )
                 )
             ):
                 previous_cells[description_index] = previous_description.model_copy(
@@ -780,6 +837,7 @@ def _build_source_tables(
     page_number: int,
     table_id: str,
     table_type: TableType,
+    width: float,
 ) -> tuple[SourceTable, ...]:
     blocks = (primary, *repeated)
     output: list[SourceTable] = []
@@ -794,6 +852,7 @@ def _build_source_tables(
             source_table_id=source_table_id,
             columns=columns,
             centers=centers,
+            width=width,
             original_by_id=original_by_id,
             table_id=table_id,
         )
@@ -869,11 +928,25 @@ def _synthetic_source_table(
         (index, line)
         for index, line in indexed_lines
         if len(tuple(token for token in line.tokens if token.text.strip())) >= 2
-        and _numeric_tokens(line)
+        and (
+            _numeric_tokens(line)
+            or any(DATE_SPAN.search(token.text) for token in line.tokens)
+        )
     )
     if not candidate_lines:
         return ()
     first_data_index = candidate_lines[0][0]
+    while first_data_index > 0:
+        previous = lines[first_data_index - 1]
+        previous_tokens = tuple(
+            token for token in previous.tokens if token.text.strip()
+        )
+        if (
+            len(previous_tokens) != 1
+            or DATE_SPAN.fullmatch(previous_tokens[0].text.strip()) is None
+        ):
+            break
+        first_data_index -= 1
     data_lines = tuple(line for index, line in indexed_lines if index >= first_data_index)
     centers = [
         _center_x(token)
@@ -908,6 +981,7 @@ def _synthetic_source_table(
         source_table_id=source_table_id,
         columns=columns,
         centers=tuple(centers),
+        width=width,
         original_by_id=original_by_id,
         table_id=table_id,
     )
@@ -2211,6 +2285,7 @@ def reconstruct_ocr_rows(
             page_number=page_number,
             table_id=table_id,
             table_type=table_type,
+            width=width,
         )
         if source_header is not None
         else _synthetic_source_table(
