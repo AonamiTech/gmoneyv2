@@ -128,6 +128,35 @@ def _height(token: OcrToken) -> float:
     return max(1.0, bottom - top)
 
 
+def _cell_reading_order(
+    tokens: tuple[OcrToken, ...] | list[OcrToken],
+) -> tuple[OcrToken, ...]:
+    """Read a cell by local text bands instead of globally sorting it by x."""
+    if not tokens:
+        return ()
+    tolerance = max(2.0, median(_height(token) for token in tokens) * 0.35)
+    bands: list[list[OcrToken]] = []
+    for token in sorted(tokens, key=lambda item: (_center_y(item), _center_x(item))):
+        band = next(
+            (
+                candidate
+                for candidate in reversed(bands)
+                if abs(_center_y(token) - median(_center_y(item) for item in candidate))
+                <= tolerance
+            ),
+            None,
+        )
+        if band is None:
+            bands.append([token])
+        else:
+            band.append(token)
+    return tuple(
+        token
+        for band in bands
+        for token in sorted(band, key=lambda item: (_center_x(item), _center_y(item)))
+    )
+
+
 def tokens_in_box(
     tokens: tuple[OcrToken, ...],
     box: tuple[int, int, int, int],
@@ -644,6 +673,14 @@ def _source_rows(
     if not columns:
         return ()
     output: list[SourceRow] = []
+    description_index = next(
+        (
+            index
+            for index, column in enumerate(columns)
+            if column.canonical_field == "description"
+        ),
+        None,
+    )
     for line in lines[start:end]:
         buckets: list[list[OcrToken]] = [[] for _ in columns]
         for token in line.tokens:
@@ -656,7 +693,7 @@ def _source_rows(
             continue
         cells: list[SourceCell] = []
         for column, bucket in zip(columns, buckets, strict=True):
-            ordered = tuple(sorted(bucket, key=_center_x))
+            ordered = _cell_reading_order(bucket)
             raw_value = " ".join(token.text.strip() for token in ordered if token.text.strip())
             cells.append(
                 SourceCell(
@@ -668,6 +705,36 @@ def _source_rows(
             )
         if not any(cell.raw_value for cell in cells):
             continue
+        populated = tuple(index for index, cell in enumerate(cells) if cell.raw_value)
+        if (
+            output
+            and description_index is not None
+            and populated == (description_index,)
+        ):
+            previous_cells = list(output[-1].cells)
+            previous_description = previous_cells[description_index]
+            continuation = cells[description_index]
+            if (
+                previous_description.raw_value
+                and continuation.raw_value
+                and _is_description_continuation(
+                    continuation.raw_value,
+                    previous_description.raw_value,
+                )
+            ):
+                previous_cells[description_index] = previous_description.model_copy(
+                    update={
+                        "raw_value": (
+                            f"{previous_description.raw_value} {continuation.raw_value}"
+                        ),
+                        "evidence": (
+                            *previous_description.evidence,
+                            *continuation.evidence,
+                        ),
+                    }
+                )
+                output[-1] = output[-1].model_copy(update={"cells": tuple(previous_cells)})
+                continue
         output.append(
             SourceRow(
                 id=f"{source_table_id}-r{len(output) + 1}",
@@ -996,10 +1063,12 @@ def _classify_table(
     has_serial: bool,
     row_count: int,
     *,
+    header_text: str = "",
     has_ledger_header: bool = False,
     zero_tail_summary: bool = False,
 ) -> TableType:
     normalized = _normalize(text)
+    normalized_header = _normalize(header_text)
     metadata_hits = sum(
         term in normalized
         for term in (
@@ -1085,9 +1154,10 @@ def _classify_table(
         for term in ("payment mode", "amount paid", "amount received", "receipt ref")
     ):
         return TableType.PAYMENT
-    if any(
-        term in normalized for term in ("test name", "pathology", "laboratory", "investigation")
-    ):
+    laboratory_terms = ("test name", "pathology", "laboratory", "investigation")
+    if any(term in normalized_header for term in laboratory_terms) or sum(
+        normalized.count(term) for term in laboratory_terms
+    ) >= 2:
         return TableType.LABORATORY
     if has_serial and row_count <= 20 and "particular" in normalized:
         return TableType.CATEGORY_SUMMARY
@@ -1308,6 +1378,20 @@ def _is_description_continuation(text: str, previous: str) -> bool:
     )
 
 
+def _is_payment_footer_description(text: str) -> bool:
+    normalized = _normalize(text)
+    return normalized.startswith(
+        (
+            "payment detail",
+            "payment information",
+            "payment mode",
+            "receipt detail",
+            "receipt information",
+            "settlement detail",
+        )
+    )
+
+
 def _clip_token_to_lane(
     token: OcrToken,
     minimum: float,
@@ -1512,10 +1596,15 @@ def reconstruct_ocr_rows(
         >= 0.7
     )
     table_text = " ".join(line.text for line in lines)
+    header_text = " ".join(
+        line.text
+        for line in (lines[header_start : header_index + 1] if header_valid else ())
+    )
     table_type = _classify_table(
         table_text,
         header_valid and "serial" in header_roles,
         len(data_lines),
+        header_text=header_text,
         has_ledger_header=header_valid,
         zero_tail_summary=zero_tail_summary,
     )
@@ -1544,15 +1633,54 @@ def reconstruct_ocr_rows(
         table_type,
     )
     aligned: list[AlignedLedgerRow] = []
+    aligned_description_raw: list[str] = []
     pending_description_tokens: list[OcrToken] = []
     pending_service_date: str | None = None
     pending_service_date_ids: tuple[str, ...] = ()
     current_section: str | None = None
 
+    def pending_description_is_proven_continuation(
+        continuation_tokens: list[OcrToken],
+        continuation_raw: str,
+    ) -> bool:
+        if not aligned or _is_payment_footer_description(continuation_raw):
+            return False
+        description_center = column_centers.get("description")
+        if description_center is None:
+            return False
+        continuation_left = min(
+            (_bounds(token)[0] - left) / width for token in continuation_tokens
+        )
+        anchored = (
+            description_min - 0.03
+            <= continuation_left
+            <= description_center + 0.08
+        )
+        if not anchored:
+            return False
+        if _is_description_continuation(
+            continuation_raw,
+            aligned_description_raw[-1],
+        ):
+            return True
+        previous_tokens = [
+            original_by_id[token_id]
+            for token_id in aligned[-1].field_token_ids.get("description", ())
+            if token_id in original_by_id
+        ]
+        if not previous_tokens:
+            return False
+        previous_left = min(
+            (_bounds(token)[0] - left) / width for token in previous_tokens
+        )
+        return abs(continuation_left - previous_left) <= 0.03
+
     def extend_previous_description(
-        continuation_tokens: list[OcrToken], continuation_text: str
+        continuation_tokens: list[OcrToken], continuation_raw: str
     ) -> None:
         previous = aligned[-1]
+        combined_raw = f"{aligned_description_raw[-1]} {continuation_raw}".strip()
+        combined_description, _, _ = _clean_description(combined_raw)
         continuation_ids = tuple(token.token_id for token in continuation_tokens)
         description_ids = tuple(
             dict.fromkeys((*previous.field_token_ids.get("description", ()), *continuation_ids))
@@ -1570,7 +1698,7 @@ def reconstruct_ocr_rows(
             previous,
             candidate=replace(
                 previous.candidate,
-                description=(f"{previous.candidate.description or ''} {continuation_text}").strip(),
+                description=combined_description,
             ),
             field_token_ids={
                 **previous.field_token_ids,
@@ -1581,11 +1709,13 @@ def reconstruct_ocr_rows(
             ),
             evidence_box=combined_box,
         )
+        aligned_description_raw[-1] = combined_raw
 
     def append_aligned(
         *,
         candidate: CandidateLedgerRow,
         field_tokens: dict[str, tuple[str, ...]],
+        raw_description: str,
     ) -> None:
         evidence_tokens = tuple(
             dict.fromkeys(token_id for ids in field_tokens.values() for token_id in ids)
@@ -1608,6 +1738,7 @@ def reconstruct_ocr_rows(
                 source_routes=("ocr_spatial_graph",),
             )
         )
+        aligned_description_raw.append(raw_description)
 
     for source_row, line in enumerate(data_lines, start=(header_index + 1 if header_valid else 0)):
         repeated_block = repeated_header_by_line.get(source_row)
@@ -1710,16 +1841,24 @@ def reconstruct_ocr_rows(
                 character.isdigit() for character in normalized.replace(" ", "")
             ):
                 line_description_tokens.append(description_token)
+        line_description_tokens = list(_cell_reading_order(line_description_tokens))
 
         if _is_structural_total_line(line):
             if pending_description_tokens and aligned:
-                continuation_text, _, _ = _clean_description(
-                    " ".join(token.text for token in pending_description_tokens)
+                continuation_raw = " ".join(
+                    token.text for token in pending_description_tokens
                 )
-                if continuation_text:
+                continuation_text, _, _ = _clean_description(continuation_raw)
+                if (
+                    continuation_text
+                    and pending_description_is_proven_continuation(
+                        pending_description_tokens,
+                        continuation_raw,
+                    )
+                ):
                     extend_previous_description(
                         pending_description_tokens,
-                        continuation_text,
+                        continuation_raw,
                     )
             pending_description_tokens = []
             continue
@@ -1775,7 +1914,11 @@ def reconstruct_ocr_rows(
                         ),
                         source_route="ocr_spatial_graph",
                     )
-                    append_aligned(candidate=candidate, field_tokens=field_tokens)
+                    append_aligned(
+                        candidate=candidate,
+                        field_tokens=field_tokens,
+                        raw_description=description_text,
+                    )
                 continue
             if (
                 not line_description_tokens
@@ -1788,18 +1931,20 @@ def reconstruct_ocr_rows(
             # Defer deciding whether a text-only line is a section label or a
             # description split from its numeric row until the following line.
             if line_description_tokens:
-                continuation_text, _, _ = _clean_description(
-                    " ".join(token.text for token in line_description_tokens)
+                continuation_raw = " ".join(
+                    token.text for token in line_description_tokens
                 )
+                continuation_text, _, _ = _clean_description(continuation_raw)
                 if (
                     aligned
                     and continuation_text
+                    and not _is_payment_footer_description(continuation_raw)
                     and _is_description_continuation(
-                        continuation_text,
-                        aligned[-1].candidate.description or "",
+                        continuation_raw,
+                        aligned_description_raw[-1],
                     )
                 ):
-                    extend_previous_description(line_description_tokens, continuation_text)
+                    extend_previous_description(line_description_tokens, continuation_raw)
                     pending_description_tokens = []
                 else:
                     pending_description_tokens = line_description_tokens
@@ -1944,7 +2089,11 @@ def reconstruct_ocr_rows(
             source_route="ocr_spatial_graph",
             validation_flags=tuple(validation_flags),
         )
-        append_aligned(candidate=candidate, field_tokens=field_tokens)
+        append_aligned(
+            candidate=candidate,
+            field_tokens=field_tokens,
+            raw_description=description_text,
+        )
 
     source_header = (
         HeaderBlock(

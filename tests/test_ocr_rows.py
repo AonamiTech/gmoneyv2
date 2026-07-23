@@ -78,6 +78,49 @@ def test_reconstructs_split_description_and_uses_rightmost_amount() -> None:
     assert result.rows[0].field_token_ids["amount"] == ("token-8",)
 
 
+def test_multiline_description_cells_use_top_to_bottom_reading_order() -> None:
+    tokens = (
+        token(0, "Description", (100, 30, 300, 45)),
+        token(1, "Amount", (850, 30, 950, 45)),
+        token(
+            2,
+            "Dressing and Plaster Charges-EVALUATION",
+            (100, 70, 500, 90),
+        ),
+        token(3, "UNDER ANAESTHRSIA", (100, 78, 340, 98)),
+        token(4, "500.00", (870, 70, 940, 90)),
+        token(5, "Procedure Charges-URINARY", (100, 115, 430, 135)),
+        token(6, "CATHETERIZATION", (100, 123, 300, 143)),
+        token(7, "750.00", (870, 115, 940, 135)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 20, 980, 160),
+    )
+
+    expected = [
+        "Dressing and Plaster Charges-EVALUATION UNDER ANAESTHRSIA",
+        "Procedure Charges-URINARY CATHETERIZATION",
+    ]
+    assert [row.candidate.description for row in result.rows] == expected
+    description_column = next(
+        column
+        for column in result.source_tables[0].columns
+        if column.canonical_field == "description"
+    )
+    assert [
+        next(
+            cell.raw_value
+            for cell in row.cells
+            if cell.column_id == description_column.id
+        )
+        for row in result.source_tables[0].rows
+    ] == expected
+
+
 def test_upright_skew_is_deskewed_before_row_grouping() -> None:
     slope = -0.025
     tokens = (
@@ -111,6 +154,33 @@ def test_upright_skew_is_deskewed_before_row_grouping() -> None:
     assert result.schema is not None
     assert result.schema.table_type is TableType.CATEGORY_SUMMARY
     assert result.diagnostics["deskew_slope"] == slope
+
+
+def test_single_laboratory_charge_does_not_reclassify_general_ledger() -> None:
+    tokens = (
+        token(0, "Description", (100, 30, 300, 45)),
+        token(1, "Amount", (850, 30, 950, 45)),
+        token(2, "Laboratory Charges", (100, 70, 330, 85)),
+        token(3, "2,400.00", (870, 70, 950, 85)),
+        token(4, "Procedure Charges", (100, 100, 330, 115)),
+        token(5, "4,500.00", (870, 100, 950, 115)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 20, 980, 130),
+    )
+
+    assert result.schema is not None
+    assert result.schema.table_type is TableType.ITEM_LEDGER
+    assert result.source_tables[0].table_type is TableType.ITEM_LEDGER
+    assert [row.candidate.table_type for row in result.rows] == [
+        TableType.ITEM_LEDGER,
+        TableType.ITEM_LEDGER,
+    ]
+    assert result.rows[0].candidate.category == "laboratory"
 
 
 def test_merged_discount_and_amount_token_uses_rightmost_value() -> None:
@@ -763,6 +833,51 @@ def test_description_continuation_after_amount_extends_previous_row() -> None:
     )
 
 
+def test_printed_connector_merges_grounded_canonical_and_source_rows() -> None:
+    tokens = (
+        token(0, "Description", (100, 30, 300, 45)),
+        token(1, "Amount", (850, 30, 950, 45)),
+        token(
+            2,
+            "Special Instruments/Equipments Charges-",
+            (100, 70, 500, 85),
+        ),
+        token(3, "8,500.00", (870, 70, 950, 85)),
+        token(4, "CIRCUMCISION STAPLER ZSR", (100, 100, 430, 115)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 20, 980, 130),
+    )
+
+    expected = "Special Instruments/Equipments Charges- CIRCUMCISION STAPLER ZSR"
+    assert len(result.rows) == 1
+    assert result.rows[0].candidate.description == expected
+    assert result.rows[0].field_token_ids["description"] == ("token-2", "token-4")
+    assert {"token-2", "token-3", "token-4"} <= set(result.rows[0].evidence_token_ids)
+
+    source_table = result.source_tables[0]
+    assert len(source_table.rows) == 1
+    assert [row.order for row in source_table.rows] == [0]
+    description_column = next(
+        column for column in source_table.columns if column.canonical_field == "description"
+    )
+    description_cell = next(
+        cell
+        for cell in source_table.rows[0].cells
+        if cell.column_id == description_column.id
+    )
+    assert description_cell.raw_value == expected
+    assert {"token-2", "token-4"} <= {
+        token_id
+        for evidence in description_cell.evidence
+        for token_id in evidence.token_ids
+    }
+
+
 def test_provider_fusion_preserves_printed_amount_and_evidence() -> None:
     tokens = (
         token(0, "Description", (100, 30, 250, 45)),
@@ -1113,6 +1228,44 @@ def test_description_before_subtotal_extends_previous_serial_row() -> None:
     assert result.rows[0].candidate.description == ("Package(IPD) - Coronary Angiography (CAG)")
     assert result.rows[0].candidate.amount == Decimal("11457.00")
     assert result.rows[0].candidate.role is RowRole.CATEGORY_ROLLUP
+
+
+def test_payment_details_before_total_does_not_extend_previous_charge() -> None:
+    tokens = (
+        token(0, "Service Name", (200, 30, 430, 45)),
+        token(1, "Total Amount", (870, 30, 970, 45)),
+        token(2, "Procedure Charges", (200, 70, 430, 85)),
+        token(3, "11,457.00", (880, 70, 960, 85)),
+        token(4, "Payment Details", (600, 100, 760, 115)),
+        token(5, "Total Bill Amount", (650, 130, 830, 145)),
+        token(6, "11,457.00", (880, 130, 960, 145)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(180, 20, 980, 160),
+    )
+
+    assert len(result.rows) == 1
+    assert result.rows[0].candidate.description == "Procedure Charges"
+    assert "token-4" not in result.rows[0].evidence_token_ids
+
+    canonical = canonicalize_rows(
+        "d" * 64,
+        1,
+        "p1-t1",
+        "a" * 64,
+        result.rows,
+    )
+    linked = _link_source_tables(result.source_tables, canonical)
+    payment_source_row = next(
+        row
+        for row in linked[0].rows
+        if any(cell.raw_value == "Payment Details" for cell in row.cells)
+    )
+    assert payment_source_row.canonical_row_id is None
 
 
 def test_headerless_continuation_inherits_date_without_inventing_amount() -> None:
