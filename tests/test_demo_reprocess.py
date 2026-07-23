@@ -688,6 +688,108 @@ def test_reprocess_validation_accepts_only_matching_section_subtotal(
             )
 
 
+@pytest.mark.parametrize(
+    "boundary_label",
+    ("Grand Total", "Total Bill Amount", "Advance Received"),
+)
+@pytest.mark.parametrize(("subtotal", "accepted"), (("60.00", True), ("100.00", False)))
+def test_reprocess_validation_resets_subtotal_at_financial_boundary(
+    tmp_path: Path,
+    boundary_label: str,
+    subtotal: str,
+    accepted: bool,
+) -> None:
+    store, job_id, old_result = setup_job(tmp_path)
+    page_sha = old_result["page_assets"][0]["artifact_sha256"]
+    new_rows = [
+        row("first-row", page_sha, role="category_rollup", amount="40.00"),
+        row("second-row", page_sha, role="category_rollup", amount="60.00"),
+    ]
+    printed = source_tables(new_rows, page_sha)
+    printed[0]["table_type"] = "category_summary"
+    first, second = printed[0]["rows"]
+    first["order"] = 0
+    second["id"] = "p1-t1-s1-r3"
+    second["order"] = 2
+    printed[0]["rows"] = [
+        first,
+        {
+            "id": "p1-t1-s1-r2",
+            "order": 1,
+            "canonical_row_id": None,
+            "cells": [
+                {
+                    "column_id": "description",
+                    "raw_value": boundary_label,
+                    "evidence": [evidence(page_sha, "grand-total-description")],
+                    "validation_flags": [],
+                },
+                {
+                    "column_id": "amount",
+                    "raw_value": "40.00",
+                    "evidence": [evidence(page_sha, "grand-total-amount")],
+                    "validation_flags": [],
+                },
+            ],
+            "validation_flags": [],
+        },
+        second,
+        {
+            "id": "p1-t1-s1-r4",
+            "order": 3,
+            "canonical_row_id": None,
+            "cells": [
+                {
+                    "column_id": "description",
+                    "raw_value": "Sub Total",
+                    "evidence": [evidence(page_sha, "subtotal-description")],
+                    "validation_flags": [],
+                },
+                {
+                    "column_id": "amount",
+                    "raw_value": subtotal,
+                    "evidence": [evidence(page_sha, "subtotal-amount")],
+                    "validation_flags": [],
+                },
+            ],
+            "validation_flags": [],
+        },
+    ]
+    new_result = {
+        **old_result,
+        "document_total": {
+            "total_version": "document_total_v2",
+            "amount_raw": "40.00",
+            "amount": "40.00",
+            "label": "Grand Total",
+            "kind": "bill_total",
+            "scope": "document",
+            "page_number": 1,
+            "evidence": evidence(page_sha, "grand-total-amount"),
+            "confidence": 0.99,
+            "source_route": "page_ocr_final_total",
+        },
+        "rows": new_rows,
+        "source_tables": printed,
+    }
+
+    if accepted:
+        _validate_result(
+            store.job_dir(job_id) / "source.pdf",
+            old_result,
+            new_result,
+            store.job_dir(job_id) / "artifacts",
+        )
+    else:
+        with pytest.raises(ValueError, match="unlinked source row.*financial"):
+            _validate_result(
+                store.job_dir(job_id) / "source.pdf",
+                old_result,
+                new_result,
+                store.job_dir(job_id) / "artifacts",
+            )
+
+
 def test_reprocess_validation_accepts_verified_total_and_settlement_source_rows(
     tmp_path: Path,
 ) -> None:

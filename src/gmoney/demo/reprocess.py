@@ -304,7 +304,12 @@ def _unlinked_financial_row_is_explained(
                 is not None
                 for column in table.columns
             )
-            if preceding_label in total_labels or (
+            preceding_is_financial_boundary = (
+                preceding_label in total_labels
+                or preceding_label.startswith(total_prefixes)
+                or preceding_label.startswith(settlement_prefixes)
+            )
+            if preceding_is_financial_boundary or (
                 preceding_label and not preceding_has_financial_value
             ):
                 section_rows.clear()
