@@ -739,8 +739,8 @@ def _source_rows(
                     raw_value=raw_value or None,
                     evidence=_source_evidence(ordered, original_by_id, table_id),
                     validation_flags=(
-                        ("rotated_text",)
-                        if raw_value and any(_is_rotated_text(token) for token in ordered)
+                        ("all_text_rotated",)
+                        if raw_value and all(_is_rotated_text(token) for token in ordered)
                         else (() if raw_value else ("empty_cell",))
                     ),
                 )

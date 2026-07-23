@@ -453,7 +453,7 @@ def _link_source_tables(
                                 "service_code", cell.raw_value
                             )
                             and not _contains_service_code_fragment(cell.raw_value)
-                            and "rotated_text" in cell.validation_flags
+                            and "all_text_rotated" in cell.validation_flags
                             and _source_cell_is_oversized_overlay(
                                 cell,
                                 columns_by_id[cell.column_id],
