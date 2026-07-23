@@ -684,18 +684,6 @@ def _validate_result(
                 canonical_present = canonical_value is not None and (
                     not isinstance(canonical_value, str) or bool(canonical_value.strip())
                 )
-                if printed_present and not canonical_present:
-                    raise ValueError(
-                        f"{field} has a printed value but is missing canonical value "
-                        f"for canonical row {source_row.canonical_row_id}"
-                    )
-                if canonical_present and not printed_present:
-                    raise ValueError(
-                        f"{field} has a canonical value but is missing printed value "
-                        f"for canonical row {source_row.canonical_row_id}"
-                    )
-                if not printed_present:
-                    continue
                 evidence_field = evidence_fields[field]
                 field_token_ids = {
                     str(token_id)
@@ -704,6 +692,43 @@ def _validate_result(
                     )
                     for token_id in item.get("token_ids") or []
                 }
+                if printed_present and not canonical_present:
+                    raise ValueError(
+                        f"{field} has a printed value but is missing canonical value "
+                        f"for canonical row {source_row.canonical_row_id}"
+                    )
+                if canonical_present and not printed_present:
+                    serial_description_is_grounded = bool(
+                        field == "description"
+                        and "missing_printed_description"
+                        in (canonical.get("validation_flags") or [])
+                        and re.fullmatch(r"\d+[.)]?", str(canonical_value).strip())
+                        and field_token_ids
+                        and any(
+                            column_candidate.canonical_field is None
+                            and _normalized(column_candidate.label)
+                            in {"#", "s no", "serial no", "sr n", "sr no"}
+                            and (serial_cell := cells[column_candidate.id]).raw_value
+                            and serial_cell.raw_value.strip()
+                            == str(canonical_value).strip()
+                            and field_token_ids.issubset(
+                                {
+                                    token_id
+                                    for item in serial_cell.evidence
+                                    for token_id in item.token_ids
+                                }
+                            )
+                            for column_candidate in table.columns
+                        )
+                    )
+                    if serial_description_is_grounded:
+                        continue
+                    raise ValueError(
+                        f"{field} has a canonical value but is missing printed value "
+                        f"for canonical row {source_row.canonical_row_id}"
+                    )
+                if not printed_present:
+                    continue
                 cell_token_ids = {
                     token_id
                     for item in cell.evidence

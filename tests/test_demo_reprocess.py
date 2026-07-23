@@ -14,6 +14,7 @@ from typing import Any
 
 import pytest
 
+from gmoney.contracts.evidence import OcrToken, Point, Polygon
 from gmoney.demo import reprocess as reprocess_module
 from gmoney.demo.reprocess import (
     _validate_result,
@@ -23,6 +24,9 @@ from gmoney.demo.reprocess import (
     stage_reprocess_jobs,
 )
 from gmoney.demo.store import JobStore, JobTransactionError, ReviewRevisionConflict
+from gmoney.extraction.canonicalize import canonicalize_rows
+from gmoney.extraction.ocr_rows import reconstruct_ocr_rows
+from gmoney.extraction.offline import _link_source_tables
 
 VISUAL_AUDIT_CHECKS = {
     "hospital_identity",
@@ -532,6 +536,87 @@ def test_reprocess_validation_requires_all_description_tokens_in_printed_cell(
             store.job_dir(job_id) / "source.pdf",
             old_result,
             new_result,
+            store.job_dir(job_id) / "artifacts",
+        )
+
+
+def test_reprocess_validation_requires_exact_serial_grounding_for_blank_particular(
+    tmp_path: Path,
+) -> None:
+    store, job_id, old_result = setup_job(tmp_path)
+    page_sha = old_result["page_assets"][0]["artifact_sha256"]
+
+    def printed_token(
+        index: int,
+        text: str,
+        box: tuple[float, float, float, float],
+    ) -> OcrToken:
+        left, top, right, bottom = box
+        return OcrToken(
+            token_id=f"token-{index}",
+            page_number=1,
+            text=text,
+            confidence=0.99,
+            polygon=Polygon(
+                points=(
+                    Point(x=left, y=top),
+                    Point(x=right, y=top),
+                    Point(x=right, y=bottom),
+                    Point(x=left, y=bottom),
+                )
+            ),
+            artifact_sha256=page_sha,
+            model_name="fixture",
+            model_version="1",
+        )
+
+    reconstructed = reconstruct_ocr_rows(
+        (
+            printed_token(0, "Sr.N", (50, 30, 90, 45)),
+            printed_token(1, "Particular", (100, 30, 420, 45)),
+            printed_token(2, "Amount Rs. Unit/Days", (610, 30, 820, 45)),
+            printed_token(3, "Total", (880, 30, 970, 45)),
+            printed_token(4, "0.", (50, 70, 70, 85)),
+            printed_token(5, "300.00", (620, 70, 700, 85)),
+            printed_token(6, "1", (760, 70, 780, 85)),
+            printed_token(7, "300.00", (890, 70, 960, 85)),
+        ),
+        page_number=1,
+        table_id="p1-t1",
+        box=(40, 20, 980, 110),
+    )
+    canonical = canonicalize_rows(
+        old_result["document_id"],
+        1,
+        "p1-t1",
+        page_sha,
+        reconstructed.rows,
+    )
+    linked_tables = _link_source_tables(reconstructed.source_tables, canonical)
+    assert len(canonical) == 1
+    assert linked_tables[0].rows[0].canonical_row_id == str(canonical[0].id)
+
+    new_result = {
+        **old_result,
+        "rows": [item.model_dump(mode="json") for item in canonical],
+        "source_tables": [item.model_dump(mode="json") for item in linked_tables],
+    }
+    _validate_result(
+        store.job_dir(job_id) / "source.pdf",
+        old_result,
+        new_result,
+        store.job_dir(job_id) / "artifacts",
+    )
+
+    mismatched_serial = deepcopy(new_result)
+    serial_cell = mismatched_serial["source_tables"][0]["rows"][0]["cells"][0]
+    assert serial_cell["raw_value"] == "0."
+    serial_cell["raw_value"] = "0)"
+    with pytest.raises(ValueError, match="description.*missing printed value"):
+        _validate_result(
+            store.job_dir(job_id) / "source.pdf",
+            old_result,
+            mismatched_serial,
             store.job_dir(job_id) / "artifacts",
         )
 

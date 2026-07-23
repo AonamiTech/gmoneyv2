@@ -377,6 +377,95 @@ def test_amount_rs_unit_days_compound_header_preserves_rate_quantity_and_total()
     assert result.rows[0].candidate.amount == Decimal("2000.00")
 
 
+def test_staggered_amount_rs_unit_days_header_keeps_rate_before_total() -> None:
+    tokens = (
+        token(0, "Total", (880, 20, 970, 35)),
+        token(1, "Sr.N", (50, 45, 90, 60)),
+        token(2, "Amount Rs. Unit/Days", (610, 45, 820, 60)),
+        token(3, "Particular", (100, 70, 420, 85)),
+        token(4, "1.", (50, 110, 70, 125)),
+        token(5, "Registration", (100, 110, 360, 125)),
+        token(6, "300.00", (620, 110, 700, 125)),
+        token(7, "1", (760, 110, 780, 125)),
+        token(8, "300.00", (890, 110, 960, 125)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(40, 10, 980, 150),
+    )
+
+    assert result.rows[0].candidate.rate == Decimal("300.00")
+    assert result.rows[0].candidate.quantity == Decimal("1")
+    assert result.rows[0].candidate.amount == Decimal("300.00")
+    assert [
+        (column.label, column.canonical_field)
+        for column in result.source_tables[0].columns
+    ] == [
+        ("Sr.N", None),
+        ("Particular", "description"),
+        ("Amount Rs.", "unit_price"),
+        ("Unit/Days", "quantity"),
+        ("Total", "net_amount"),
+    ]
+
+
+def test_amount_rs_unit_days_without_total_remains_amount_and_quantity() -> None:
+    tokens = (
+        token(0, "Particular", (100, 30, 420, 45)),
+        token(1, "Amount Rs. Unit/Days", (610, 30, 820, 45)),
+        token(2, "Consulting Charges", (100, 70, 360, 85)),
+        token(3, "1,000.00", (620, 70, 700, 85)),
+        token(4, "2", (760, 70, 780, 85)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(40, 20, 980, 110),
+    )
+
+    assert result.rows[0].candidate.rate is None
+    assert result.rows[0].candidate.quantity == Decimal("2")
+    assert result.rows[0].candidate.amount == Decimal("1000.00")
+    assert any(
+        column.canonical_field == "net_amount"
+        for column in result.source_tables[0].columns
+    )
+
+
+def test_financial_row_with_blank_particular_uses_grounded_serial_description() -> None:
+    tokens = (
+        token(0, "Sr.N", (50, 30, 90, 45)),
+        token(1, "Particular", (100, 30, 420, 45)),
+        token(2, "Amount Rs. Unit/Days", (610, 30, 820, 45)),
+        token(3, "Total", (880, 30, 970, 45)),
+        token(4, "0.", (50, 70, 70, 85)),
+        token(5, "300.00", (620, 70, 700, 85)),
+        token(6, "1", (760, 70, 780, 85)),
+        token(7, "300.00", (890, 70, 960, 85)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(40, 20, 980, 110),
+    )
+
+    assert len(result.rows) == 1
+    candidate = result.rows[0].candidate
+    assert candidate.description == "0."
+    assert candidate.rate == Decimal("300.00")
+    assert candidate.quantity == Decimal("1")
+    assert candidate.amount == Decimal("300.00")
+    assert "missing_printed_description" in candidate.validation_flags
+    assert result.rows[0].field_token_ids["description"] == ("token-4",)
+
+
 def test_numeric_row_marker_grouped_with_header_is_not_exposed_as_a_column() -> None:
     tokens = (
         token(0, "Sr.N", (50, 30, 90, 45)),

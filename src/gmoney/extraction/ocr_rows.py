@@ -21,7 +21,7 @@ from gmoney.extraction.spatial import AlignedLedgerRow
 from gmoney.extraction.typed_values import DAY_QUANTITY, parse_decimal
 
 HEADER_TERMS: dict[str, tuple[str, ...]] = {
-    "serial": ("sr no", "s no", "serial no", "#"),
+    "serial": ("sr no", "sr n", "s no", "serial no", "#"),
     "description": (
         "description",
         "particular",
@@ -485,11 +485,30 @@ def _header_lines_are_adjacent(previous: OcrLine, current: OcrLine) -> bool:
 def _merge_header_roles(
     current: dict[str, OcrToken], incoming: dict[str, OcrToken]
 ) -> dict[str, OcrToken]:
+    recovered_rate: OcrToken | None = None
+    for compound, other in ((current, incoming), (incoming, current)):
+        compound_amount = compound.get("amount")
+        compound_quantity = compound.get("quantity")
+        other_amount = other.get("amount")
+        if (
+            compound_amount is not None
+            and compound_quantity is not None
+            and compound_amount.token_id == compound_quantity.token_id
+            and "amount rs" in _normalize(compound_amount.text)
+            and other_amount is not None
+            and other_amount.token_id != compound_amount.token_id
+            and _center_x(other_amount) > _center_x(compound_amount)
+        ):
+            recovered_rate = compound_amount
+            break
+
     merged = dict(current)
     for role, token in incoming.items():
         existing = merged.get(role)
         if existing is None or (role == "amount" and _center_x(token) > _center_x(existing)):
             merged[role] = token
+    if recovered_rate is not None and "rate" not in merged:
+        merged["rate"] = recovered_rate
     return merged
 
 
@@ -2443,10 +2462,38 @@ def reconstruct_ocr_rows(
         description, embedded_date, embedded_request = _clean_description(description_text)
         service_date = structured_values.get("service_date") or embedded_date
         request_no = structured_values.get("request_no") or embedded_request
+        missing_printed_description = False
         if not description:
-            continue
+            serial_center = column_centers.get("serial")
+            serial_token = (
+                min(
+                    (
+                        token
+                        for token in line.tokens
+                        if re.fullmatch(r"\d+[.)]?", token.text.strip())
+                    ),
+                    key=lambda token: abs(
+                        ((_center_x(token) - left) / width) - serial_center
+                    ),
+                    default=None,
+                )
+                if serial_center is not None
+                else None
+            )
+            if (
+                serial_token is None
+                or abs(((_center_x(serial_token) - left) / width) - serial_center) > 0.06
+            ):
+                continue
+            description_tokens = [serial_token]
+            description_text = serial_token.text.strip()
+            description = description_text
+            missing_printed_description = True
         normalized_description = _normalize(description)
-        if len(re.sub(r"[^a-z0-9]", "", normalized_description)) < 3:
+        if (
+            not missing_printed_description
+            and len(re.sub(r"[^a-z0-9]", "", normalized_description)) < 3
+        ):
             continue
         if _is_total_description(normalized_description):
             continue
@@ -2526,6 +2573,8 @@ def reconstruct_ocr_rows(
         if amount < 0 and role is RowRole.DETAIL:
             role = RowRole.REFUND
         validation_flags: list[str] = []
+        if missing_printed_description:
+            validation_flags.append("missing_printed_description")
         if "quantity" in column_centers and values["quantity"] is None:
             validation_flags.append("missing_labeled_quantity")
         if "rate" in column_centers and values["rate"] is None:
