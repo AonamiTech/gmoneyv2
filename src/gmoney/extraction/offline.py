@@ -763,24 +763,44 @@ class OfflineExtractor:
                     )
                 )
                 continue
-            local_tokens = paddle_ocr_tokens(response.output, work.page_number, artifact_sha256)
-            image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
-            if image is None:
-                raise ValueError(f"cannot read recovered crop: {image_path}")
-            mapped_tokens = map_crop_tokens_to_page(
-                local_tokens,
-                work.box,
-                image.shape[1],
-                image.shape[0],
-                page_artifact_sha256,
-            )
-            reconstruction = reconstruct_ocr_rows(
-                mapped_tokens,
-                page_number=work.page_number,
-                table_id=work.table_id,
-                box=work.box,
-                prior_schemas=prior_schemas,
-            )
+            try:
+                local_tokens = paddle_ocr_tokens(
+                    response.output,
+                    work.page_number,
+                    artifact_sha256,
+                )
+                image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+                if image is None:
+                    raise ValueError(f"cannot read recovered crop: {image_path}")
+                mapped_tokens = map_crop_tokens_to_page(
+                    local_tokens,
+                    work.box,
+                    image.shape[1],
+                    image.shape[0],
+                    page_artifact_sha256,
+                )
+                reconstruction = reconstruct_ocr_rows(
+                    mapped_tokens,
+                    page_number=work.page_number,
+                    table_id=work.table_id,
+                    box=work.box,
+                    prior_schemas=prior_schemas,
+                )
+            except Exception as error:
+                attempts.append(
+                    RecoveryAttempt(
+                        stage=RecoveryStage.CROP_OCR,
+                        artifact_sha256=artifact_sha256,
+                        cache_hit=cache_hit,
+                        latency_ms=response.latency_ms,
+                        status="failed",
+                        reason=(
+                            f"{variant}:reconstruction_error:"
+                            f"{type(error).__name__}"
+                        ),
+                    )
+                )
+                continue
             reconstructed.append(
                 (
                     variant,

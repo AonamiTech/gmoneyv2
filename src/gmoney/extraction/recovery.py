@@ -15,6 +15,7 @@ from gmoney.contracts.phase3 import (
     RecoveryStage,
     RouteDecision,
 )
+from gmoney.extraction.canonicalize import is_publishable_aligned_row
 from gmoney.extraction.ocr_rows import ReconstructionResult
 from gmoney.extraction.rows import CandidateLedgerRow
 from gmoney.extraction.spatial import AlignedLedgerRow
@@ -98,6 +99,7 @@ def _mapped_field_coverage(reconstruction: ReconstructionResult) -> int:
     return sum(
         1
         for row in reconstruction.rows
+        if is_publishable_aligned_row(row)
         for field, token_ids in row.field_token_ids.items()
         if field in MAPPED_CANONICAL_FIELDS
         and token_ids
@@ -117,8 +119,11 @@ def _populated_source_cells(reconstruction: ReconstructionResult) -> int:
 
 def reconstruction_quality(reconstruction: ReconstructionResult) -> tuple[int, ...]:
     arithmetic_mismatches, missing_labeled_fields = _field_quality_defects(reconstruction)
+    publishable_rows = tuple(
+        row for row in reconstruction.rows if is_publishable_aligned_row(row)
+    )
     grounded_rows = sum(
-        bool(row.evidence_token_ids and row.evidence_box) for row in reconstruction.rows
+        bool(row.evidence_token_ids and row.evidence_box) for row in publishable_rows
     )
     source_rows = sum(len(table.rows) for table in reconstruction.source_tables)
     return (
@@ -126,17 +131,34 @@ def reconstruction_quality(reconstruction: ReconstructionResult) -> tuple[int, .
         -missing_labeled_fields,
         _mapped_field_coverage(reconstruction),
         _populated_source_cells(reconstruction),
-        len(reconstruction.rows),
+        len(publishable_rows),
         grounded_rows,
         source_rows,
     )
+
+
+def _table_type(reconstruction: ReconstructionResult) -> TableType:
+    if reconstruction.schema is not None:
+        return reconstruction.schema.table_type
+    try:
+        return TableType(str(reconstruction.diagnostics.get("table_type") or "unknown"))
+    except ValueError:
+        return TableType.UNKNOWN
 
 
 def safely_improves_reconstruction(
     baseline: ReconstructionResult,
     candidate: ReconstructionResult,
 ) -> bool:
-    if len(candidate.rows) < len(baseline.rows):
+    baseline_type = _table_type(baseline)
+    candidate_type = _table_type(candidate)
+    if is_terminal_non_ledger(candidate):
+        return False
+    if baseline_type is not TableType.UNKNOWN and candidate_type is not baseline_type:
+        return False
+    baseline_publishable = sum(is_publishable_aligned_row(row) for row in baseline.rows)
+    candidate_publishable = sum(is_publishable_aligned_row(row) for row in candidate.rows)
+    if candidate_publishable < baseline_publishable:
         return False
     if any(
         candidate_count > baseline_count

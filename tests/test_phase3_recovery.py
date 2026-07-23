@@ -55,6 +55,8 @@ def _aligned_row(
     rate: Decimal | None = Decimal("100"),
     flags: tuple[str, ...] = (),
     mapped_fields: tuple[str, ...] = ("description", "rate", "amount"),
+    role: RowRole = RowRole.DETAIL,
+    table_type: TableType = TableType.ITEM_LEDGER,
 ) -> AlignedLedgerRow:
     field_token_ids = {
         field: (f"token-{source_row}-{field}",) for field in mapped_fields
@@ -62,13 +64,13 @@ def _aligned_row(
     return AlignedLedgerRow(
         candidate=CandidateLedgerRow(
             source_row=source_row,
-            role=RowRole.DETAIL,
+            role=role,
             cells=(description, str(quantity or ""), str(rate or ""), "100"),
             description=description,
             quantity=quantity,
             rate=rate,
             amount=Decimal("100"),
-            table_type=TableType.ITEM_LEDGER,
+            table_type=table_type,
             source_route="ocr_spatial_graph",
             validation_flags=flags,
         ),
@@ -306,6 +308,81 @@ def test_candidate_with_fewer_canonical_rows_cannot_replace_baseline() -> None:
     assert not safely_improves_reconstruction(baseline, candidate)
 
 
+def test_candidate_with_same_aligned_count_but_fewer_publishable_rows_is_rejected() -> None:
+    baseline = _reconstruction(
+        (
+            _aligned_row(0, flags=("missing_labeled_quantity",)),
+            _aligned_row(1),
+        )
+    )
+    candidate = _reconstruction(
+        (
+            _aligned_row(
+                0,
+                quantity=Decimal("1"),
+                mapped_fields=("description", "quantity", "rate", "amount"),
+            ),
+            _aligned_row(
+                1,
+                quantity=Decimal("1"),
+                mapped_fields=("description", "quantity", "rate", "amount"),
+                role=RowRole.SECTION_TOTAL,
+            ),
+        )
+    )
+
+    assert len(candidate.rows) == len(baseline.rows)
+    assert not safely_improves_reconstruction(baseline, candidate)
+
+
+def test_nonpublishable_rows_cannot_hide_mapped_field_coverage_regression() -> None:
+    baseline = _reconstruction(
+        (
+            _aligned_row(
+                0,
+                quantity=Decimal("1"),
+                mapped_fields=("description", "quantity", "rate", "amount"),
+            ),
+            _aligned_row(1, mapped_fields=(), role=RowRole.SECTION_TOTAL),
+        )
+    )
+    candidate = _reconstruction(
+        (
+            _aligned_row(0, mapped_fields=("description", "amount")),
+            _aligned_row(
+                1,
+                quantity=Decimal("1"),
+                mapped_fields=("description", "quantity", "rate", "amount"),
+                role=RowRole.SECTION_TOTAL,
+            ),
+        )
+    )
+
+    assert not safely_improves_reconstruction(baseline, candidate)
+
+
+@pytest.mark.parametrize("table_type", (TableType.PAYMENT, TableType.LABORATORY))
+def test_incompatible_terminal_or_table_type_candidate_is_rejected(
+    table_type: TableType,
+) -> None:
+    baseline = _reconstruction(
+        (_aligned_row(0, flags=("missing_labeled_quantity",)),)
+    )
+    candidate = _reconstruction(
+        (
+            _aligned_row(
+                0,
+                quantity=Decimal("1"),
+                mapped_fields=("description", "quantity", "rate", "amount"),
+                table_type=table_type,
+            ),
+        ),
+        table_type=table_type,
+    )
+
+    assert not safely_improves_reconstruction(baseline, candidate)
+
+
 @pytest.mark.parametrize(
     "candidate",
     (
@@ -381,9 +458,15 @@ def test_source_cell_regression_does_not_veto_better_grounded_field_quality() ->
     assert safely_improves_reconstruction(baseline, candidate)
 
 
-def test_crop_recovery_reconstructs_all_variants_and_selects_best_grounded_candidate(
+@pytest.mark.parametrize(
+    "bad_first_variant",
+    (False, True),
+    ids=("rank-all-variants", "continue-after-bad-first-variant"),
+)
+def test_crop_recovery_isolates_and_ranks_grounded_variants(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    bad_first_variant: bool,
 ) -> None:
     page_artifact_sha256 = "a" * 64
     high_artifact_sha256 = "b" * 64
@@ -429,10 +512,10 @@ def test_crop_recovery_reconstructs_all_variants_and_selects_best_grounded_candi
             False,
         ),
     )
-    monkeypatch.setattr(
-        offline_module,
-        "paddle_ocr_tokens",
-        lambda output, page_number, artifact_sha256: tuple(
+    def fake_paddle_tokens(output, page_number, artifact_sha256):
+        if bad_first_variant and output["variant"] == "high_resolution":
+            raise ValueError("bad high-resolution OCR payload")
+        return tuple(
             _ocr_token(
                 text,
                 artifact_sha256,
@@ -452,8 +535,9 @@ def test_crop_recovery_reconstructs_all_variants_and_selects_best_grounded_candi
                     ("amount", "100"),
                 )
             )
-        ),
-    )
+        )
+
+    monkeypatch.setattr(offline_module, "paddle_ocr_tokens", fake_paddle_tokens)
     monkeypatch.setattr(
         offline_module.cv2,
         "imread",
@@ -527,7 +611,9 @@ def test_crop_recovery_reconstructs_all_variants_and_selects_best_grounded_candi
     assert recovered is not None
     assert recovered.rows[0].candidate.validation_flags == ()
     assert recovered.rows[0].candidate.quantity == Decimal("1")
-    assert [len(tokens) for tokens in observed_token_batches] == [3, 4]
+    assert [len(tokens) for tokens in observed_token_batches] == (
+        [4] if bad_first_variant else [3, 4]
+    )
     observed_tokens = tuple(
         token for tokens in observed_token_batches for token in tokens
     )
@@ -539,8 +625,9 @@ def test_crop_recovery_reconstructs_all_variants_and_selects_best_grounded_candi
     crop_attempts = [
         attempt for attempt in attempts if attempt.stage is RecoveryStage.CROP_OCR
     ]
-    assert [attempt.status for attempt in crop_attempts] == [
-        "no_improvement",
-        "recovered",
-    ]
+    assert [attempt.status for attempt in crop_attempts] == (
+        ["failed", "recovered"]
+        if bad_first_variant
+        else ["no_improvement", "recovered"]
+    )
     assert [attempt.accepted_rows for attempt in crop_attempts] == [0, 1]

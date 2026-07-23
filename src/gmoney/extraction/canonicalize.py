@@ -19,6 +19,24 @@ BILLABLE_ROLES = {RowRole.DETAIL, RowRole.REFUND, RowRole.CATEGORY_ROLLUP}
 PUBLISHED_ROLES = {*BILLABLE_ROLES, RowRole.INFORMATIONAL}
 
 
+def is_publishable_aligned_row(row: AlignedLedgerRow) -> bool:
+    candidate = row.candidate
+    if candidate.role not in PUBLISHED_ROLES:
+        return False
+    if not candidate.description or not row.evidence_box:
+        return False
+    if not row.field_token_ids.get("description"):
+        return False
+    if candidate.role in BILLABLE_ROLES and (
+        candidate.amount is None or not row.field_token_ids.get("amount")
+    ):
+        return False
+    return candidate.role is not RowRole.INFORMATIONAL or any(
+        row.field_token_ids.get(field)
+        for field in ("service_date", "request_no", "service_code", "hsn_code")
+    )
+
+
 def _page_type(table_type: TableType) -> PageType:
     return {
         TableType.PHARMACY: PageType.PHARMACY,
@@ -73,21 +91,7 @@ def canonicalize_rows(
     output: list[CanonicalRow] = []
     for row in aligned:
         candidate = row.candidate
-        if candidate.role not in PUBLISHED_ROLES:
-            continue
-        if not candidate.description or not row.evidence_box:
-            continue
-
-        description_ids = row.field_token_ids.get("description", ())
-        amount_ids = row.field_token_ids.get("amount", ())
-        if not description_ids:
-            continue
-        if candidate.role in BILLABLE_ROLES and (candidate.amount is None or not amount_ids):
-            continue
-        if candidate.role is RowRole.INFORMATIONAL and not any(
-            row.field_token_ids.get(field)
-            for field in ("service_date", "request_no", "service_code", "hsn_code")
-        ):
+        if not is_publishable_aligned_row(row):
             continue
         all_token_ids = tuple(
             dict.fromkeys(
