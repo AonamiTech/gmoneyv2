@@ -11,7 +11,7 @@ from typing import Annotated, Any, Literal
 import fitz
 from fastapi import FastAPI, File, Header, HTTPException, Query, Response, UploadFile, status
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from gmoney.contracts.extraction import SourceTable
 from gmoney.demo.review import (
@@ -21,7 +21,6 @@ from gmoney.demo.review import (
     evidence_for_page,
     export_csv,
     export_payload,
-    load_result,
     normalize_changes,
     project_hospital,
     project_rows,
@@ -35,6 +34,7 @@ from gmoney.demo.store import (
     ACTIVE_STATUSES,
     TERMINAL_STATUSES,
     JobStore,
+    JobTransactionError,
     ReviewRevisionConflict,
     utc_now,
     utc_text,
@@ -151,13 +151,18 @@ def _state_or_404(job_id: str) -> dict[str, Any]:
 
 
 def _complete_result(job_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
-    state = _state_or_404(job_id)
+    try:
+        state, result, review = store.read_workspace(job_id)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="Document not found") from error
+    except JobTransactionError as error:
+        raise HTTPException(
+            status_code=409,
+            detail="Document workspace is temporarily unavailable",
+        ) from error
     if state.get("status") != "complete":
         raise HTTPException(status_code=409, detail="Extraction is not complete")
-    try:
-        return load_result(store, job_id), store.read_review(job_id)
-    except ReviewValidationError as error:
-        raise HTTPException(status_code=409, detail=str(error)) from error
+    return result, review
 
 
 def _expected_revision(value: str | None) -> int:
@@ -396,8 +401,20 @@ def get_source_tables(
 ) -> dict[str, Any]:
     result, _ = _complete_result(job_id)
     source_payload = result.get("source_tables")
+    source_present = "source_tables" in result
     available = bool(source_payload)
-    tables = [SourceTable.model_validate(table) for table in source_payload or []]
+    unavailable_reason = (
+        None
+        if available
+        else ("no_source_tables" if source_present else "legacy_result")
+    )
+    try:
+        tables = [SourceTable.model_validate(table) for table in source_payload or []]
+    except ValidationError as error:
+        raise HTTPException(
+            status_code=409,
+            detail="Printed extraction failed grounding validation; reprocess this bill",
+        ) from error
     if source_page is not None:
         tables = [table for table in tables if table.page_number == source_page]
 
@@ -412,22 +429,29 @@ def get_source_tables(
             selected_rows.append((table_index, row))
 
     total = len(selected_rows)
-    window = selected_rows[offset : offset + limit]
-    rows_by_table: dict[int, list[Any]] = {}
-    for table_index, row in window:
-        rows_by_table.setdefault(table_index, []).append(row)
-    public_tables = [
-        table.model_copy(update={"rows": tuple(rows_by_table[index])})
-        for index, table in enumerate(tables)
-        if index in rows_by_table
-    ]
+    window = list(enumerate(selected_rows, start=1))[offset : offset + limit]
+    rows_by_table: dict[int, list[tuple[Any, int]]] = {}
+    for ordinal, (table_index, row) in window:
+        rows_by_table.setdefault(table_index, []).append((row, ordinal))
+    public_tables: list[dict[str, Any]] = []
+    for index, table in enumerate(tables):
+        if index not in rows_by_table:
+            continue
+        payload = table.model_dump(mode="json")
+        payload["rows"] = []
+        for row, ordinal in rows_by_table[index]:
+            row_payload = row.model_dump(mode="json")
+            row_payload["ordinal"] = ordinal
+            payload["rows"].append(row_payload)
+        public_tables.append(payload)
     return {
         "document_id": result["document_id"],
         "available": available,
+        "unavailable_reason": unavailable_reason,
         "total": total,
         "offset": offset,
         "limit": limit,
-        "tables": [table.model_dump(mode="json") for table in public_tables],
+        "tables": public_tables,
     }
 
 
@@ -689,25 +713,18 @@ def export_document(job_id: str, export_format: Literal["csv", "json", "evidence
 
 
 @app.get("/api/v2/documents/{job_id}/pages/{page_number}")
-def get_page(job_id: str, page_number: int) -> FileResponse:
-    state = _state_or_404(job_id)
+def get_page(job_id: str, page_number: int) -> Response:
+    try:
+        state, page = store.read_page_bytes(job_id, page_number)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="Document not found") from error
+    except JobTransactionError as error:
+        if str(error) == "page_not_found":
+            raise HTTPException(status_code=404, detail="Page not found") from error
+        raise HTTPException(status_code=409, detail="Page is not available") from error
     if state.get("status") not in {"processing", "complete"}:
         raise HTTPException(status_code=409, detail="Page is not available")
-    try:
-        result = load_result(store, job_id)
-    except ReviewValidationError as error:
-        raise HTTPException(status_code=409, detail="Page is not available") from error
-    asset = next(
-        (item for item in result.get("page_assets", []) if item["page_number"] == page_number),
-        None,
-    )
-    if not asset:
-        raise HTTPException(status_code=404, detail="Page not found")
-    artifact_root = (store.job_dir(job_id) / "artifacts").resolve()
-    path = (artifact_root / asset["relative_path"]).resolve()
-    if artifact_root not in path.parents or not path.is_file():
-        raise HTTPException(status_code=404, detail="Page not found")
-    return FileResponse(path, media_type="image/png")
+    return Response(content=page, media_type="image/png")
 
 
 @app.delete("/api/v2/documents/{job_id}", status_code=status.HTTP_204_NO_CONTENT)

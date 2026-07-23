@@ -293,6 +293,92 @@ def _deduplicate(rows: list[CanonicalRow]) -> list[CanonicalRow]:
     return sorted(selected.values(), key=lambda row: (row.page_number, row.row_order))
 
 
+def _link_source_tables(
+    tables: tuple[SourceTable, ...] | list[SourceTable],
+    canonical_rows: tuple[CanonicalRow, ...] | list[CanonicalRow],
+) -> tuple[SourceTable, ...]:
+    """Link printed rows only when OCR field evidence identifies one canonical row."""
+
+    def evidence_ids(items: object) -> set[str]:
+        return {
+            token_id
+            for item in items or ()
+            for token_id in getattr(item, "token_ids", ())
+        }
+
+    linked_tables: list[SourceTable] = []
+    for table in tables:
+        candidates = tuple(
+            row
+            for row in canonical_rows
+            if row.page_number == table.page_number and row.table_id == table.table_id
+        )
+        linked_rows = []
+        for source_row in table.rows:
+            source_ids = {
+                token_id
+                for cell in source_row.cells
+                for evidence in cell.evidence
+                for token_id in evidence.token_ids
+            }
+            scored: list[tuple[tuple[int, int, int], CanonicalRow]] = []
+            for candidate in candidates:
+                description_ids = evidence_ids(
+                    candidate.field_evidence.get("description", ())
+                )
+                if candidate.role in {
+                    RowRole.DETAIL,
+                    RowRole.REFUND,
+                    RowRole.CATEGORY_ROLLUP,
+                }:
+                    anchor_ids = evidence_ids(candidate.field_evidence.get("amount", ()))
+                elif candidate.role is RowRole.INFORMATIONAL:
+                    anchor_ids = set().union(
+                        *(
+                            evidence_ids(candidate.field_evidence.get(field, ()))
+                            for field in (
+                                "service_date",
+                                "request_no",
+                                "service_code",
+                                "hsn_code",
+                            )
+                        )
+                    )
+                else:
+                    anchor_ids = description_ids
+                anchor_overlap = len(anchor_ids & source_ids)
+                if anchor_overlap == 0:
+                    continue
+                all_ids = evidence_ids(candidate.evidence)
+                scored.append(
+                    (
+                        (
+                            anchor_overlap,
+                            len(description_ids & source_ids),
+                            len(all_ids & source_ids),
+                        ),
+                        candidate,
+                    )
+                )
+            scored.sort(key=lambda item: item[0], reverse=True)
+            canonical_row_id = None
+            flags = source_row.validation_flags
+            if scored and (len(scored) == 1 or scored[0][0] != scored[1][0]):
+                canonical_row_id = str(scored[0][1].id)
+            elif scored:
+                flags = tuple(dict.fromkeys((*flags, "canonical_link_ambiguous")))
+            linked_rows.append(
+                source_row.model_copy(
+                    update={
+                        "canonical_row_id": canonical_row_id,
+                        "validation_flags": flags,
+                    }
+                )
+            )
+        linked_tables.append(table.model_copy(update={"rows": tuple(linked_rows)}))
+    return tuple(linked_tables)
+
+
 def _apply_document_role_policy(rows: list[CanonicalRow]) -> list[CanonicalRow]:
     """Apply the authoritative finest-available charge policy.
 
@@ -1388,6 +1474,7 @@ class OfflineExtractor:
                 progress(page_asset.page_number, len(manifest.pages))
 
         rows = _apply_document_role_policy(_deduplicate(all_rows))
+        source_tables = _link_source_tables(all_source_tables, rows)
         document_totals = select_document_totals(document_total_candidates)
         document_total: DocumentTotal | None = select_document_total(document_total_candidates)
         return {
@@ -1414,7 +1501,7 @@ class OfflineExtractor:
                 }
                 for page in manifest.pages
             ],
-            "source_tables": [table.model_dump(mode="json") for table in all_source_tables],
+            "source_tables": [table.model_dump(mode="json") for table in source_tables],
             "rows": [row.model_dump(mode="json") for row in rows],
             "diagnostics": diagnostics,
             "provider_usage": {

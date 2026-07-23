@@ -189,6 +189,7 @@ tbody tr.informational td { background: rgba(47,111,173,.045); }
 tbody tr.informational td:nth-child(6) { color: var(--muted); }
 tbody tr.rejected td { opacity: .48; text-decoration: line-through; }
 .empty-ledger { display: grid; place-items: center; min-height: 220px; color: var(--muted); font: italic 18px var(--serif); }
+.printed-unavailable { padding: 10px 16px; border-bottom: 1px solid var(--line); background: #fff8e8; color: #6d5016; font-size: 12px; line-height: 1.45; }
 .pagination { min-height: 42px; margin-top: auto; display: flex; align-items: center; justify-content: space-between; padding: 0 12px; border-top: 1px solid var(--line); color: var(--muted); font-size: 8px; letter-spacing: .08em; text-transform: uppercase; }
 .pagination button, .page-switch button { border: 0; color: inherit; background: transparent; cursor: pointer; }
 .pagination button:disabled, .page-switch button:disabled { opacity: .3; cursor: default; }

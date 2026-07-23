@@ -128,6 +128,7 @@ type SourceCell = {
 type SourceRow = {
   id: string;
   order: number;
+  ordinal: number;
   canonical_row_id: string | null;
   cells: SourceCell[];
   validation_flags: string[];
@@ -144,6 +145,7 @@ type SourceTable = {
 type SourceTablesResult = {
   document_id: string;
   available: boolean;
+  unavailable_reason: "legacy_result" | "no_source_tables" | null;
   total: number;
   offset: number;
   limit: number;
@@ -873,6 +875,12 @@ export default function Home() {
     hospitalEditMode && hospital?.page_number === viewPage ? points(hospital.evidence) : "";
 
   const printedAvailable = sourceTablesResult?.available ?? false;
+  const printedUnavailableCopy =
+    sourceTablesResult?.unavailable_reason === "legacy_result"
+      ? "Printed columns are unavailable for this older extraction. Reprocess this bill to enable them."
+      : sourceTablesResult?.unavailable_reason === "no_source_tables"
+        ? "No printed table structure was detected; normalized rows are shown."
+        : null;
   const ledgerTotal =
     ledgerMode === "printed"
       ? (sourceTablesResult?.total ?? 0)
@@ -1131,6 +1139,11 @@ export default function Home() {
                         </span>
                       </span>
                     </div>
+                    {printedUnavailableCopy && (
+                      <div className="printed-unavailable" role="note">
+                        {printedUnavailableCopy}
+                      </div>
+                    )}
                     <div className="table-shell">
                       {ledgerMode === "printed" ? (
                         <>
@@ -1172,7 +1185,7 @@ export default function Home() {
                                         setDraftPolygon(null);
                                       }}
                                     >
-                                      <td>{String(offset + row.order + 1).padStart(2, "0")}</td>
+                                      <td>{String(row.ordinal).padStart(2, "0")}</td>
                                       {table.columns.map((column) => {
                                         const cell = row.cells.find(
                                           (candidate) => candidate.column_id === column.id,
@@ -1189,7 +1202,7 @@ export default function Home() {
                             <div className="empty-ledger">
                               {printedAvailable
                                 ? "No printed rows match this view."
-                                : "Printed columns require this bill to be reprocessed."}
+                                : printedUnavailableCopy}
                             </div>
                           )}
                         </>

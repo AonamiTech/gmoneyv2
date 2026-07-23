@@ -97,6 +97,7 @@ const review = {
 const sourceTables = {
   document_id: "d".repeat(64),
   available: true,
+  unavailable_reason: null,
   total: 1,
   offset: 0,
   limit: 150,
@@ -133,6 +134,7 @@ const sourceTables = {
         {
           id: "p1-t1-s1-r1",
           order: 0,
+          ordinal: 1,
           canonical_row_id: "row-1",
           cells: [
             {
@@ -180,10 +182,14 @@ async function advance(milliseconds: number) {
 
 describe("evidence page navigation", () => {
   let activeRequests = 0;
+  let sourcePayload: Omit<typeof sourceTables, "unavailable_reason"> & {
+    unavailable_reason: "legacy_result" | "no_source_tables" | null;
+  } = sourceTables;
 
   beforeEach(() => {
     vi.useFakeTimers();
     activeRequests = 0;
+    sourcePayload = structuredClone(sourceTables);
     vi.stubGlobal(
       "fetch",
       vi.fn((input: RequestInfo | URL) => {
@@ -219,7 +225,7 @@ describe("evidence page navigation", () => {
           });
         }
         if (url.includes("/source-tables?")) {
-          return json(structuredClone(sourceTables));
+          return json(structuredClone(sourcePayload));
         }
         if (url.includes("/rows?")) return json(structuredClone(rowsResult));
         if (url.endsWith("/review")) return json(structuredClone(review));
@@ -263,5 +269,80 @@ describe("evidence page navigation", () => {
     fireEvent.click(screen.getByRole("button", { name: "Normalized" }));
 
     expect(screen.getByRole("columnheader", { name: "Rate" })).toBeInTheDocument();
+  });
+
+  test("printed rows use server ordinals across multiple tables", async () => {
+    const second = structuredClone(sourceTables.tables[0]);
+    second.id = "p1-t2-s1";
+    second.table_id = "p1-t2";
+    second.rows[0].id = "p1-t2-s1-r1";
+    second.rows[0].order = 0;
+    second.rows[0].ordinal = 151;
+    sourcePayload = {
+      ...structuredClone(sourceTables),
+      total: 2,
+      tables: [
+        {
+          ...structuredClone(sourceTables.tables[0]),
+          rows: [
+            {
+              ...structuredClone(sourceTables.tables[0].rows[0]),
+              order: 149,
+              ordinal: 150,
+            },
+          ],
+        },
+        second,
+      ],
+    };
+
+    render(<Home />);
+    await advance(250);
+    await advance(250);
+
+    expect(screen.getByRole("cell", { name: "150" })).toBeInTheDocument();
+    expect(screen.getByRole("cell", { name: "151" })).toBeInTheDocument();
+  });
+
+  test("legacy printed-column explanation remains visible in normalized mode", async () => {
+    sourcePayload = {
+      ...structuredClone(sourceTables),
+      available: false,
+      unavailable_reason: "legacy_result",
+      total: 0,
+      tables: [],
+    };
+
+    render(<Home />);
+    await advance(250);
+    await advance(250);
+
+    expect(
+      screen.getByText(
+        "Printed columns are unavailable for this older extraction. Reprocess this bill to enable them.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Printed columns" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Normalized" })).toHaveClass("active");
+  });
+
+  test("new empty extraction explains that no printed table was detected", async () => {
+    sourcePayload = {
+      ...structuredClone(sourceTables),
+      available: false,
+      unavailable_reason: "no_source_tables",
+      total: 0,
+      tables: [],
+    };
+
+    render(<Home />);
+    await advance(250);
+    await advance(250);
+
+    expect(
+      screen.getByText(
+        "No printed table structure was detected; normalized rows are shown.",
+      ),
+    ).toBeInTheDocument();
   });
 });

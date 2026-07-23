@@ -2,10 +2,12 @@ from decimal import Decimal
 
 from gmoney.contracts.evidence import OcrToken, Point, Polygon
 from gmoney.contracts.extraction import RowRole, TableType
+from gmoney.extraction.canonicalize import canonicalize_rows
 from gmoney.extraction.ocr_rows import (
     fuse_provider_descriptions,
     reconstruct_ocr_rows,
 )
+from gmoney.extraction.offline import _link_source_tables
 from gmoney.extraction.rows import CandidateLedgerRow
 
 
@@ -342,6 +344,100 @@ def test_source_table_keeps_unknown_columns_and_raw_ocr_cells() -> None:
         "4,500.00",
     ]
     assert all(cell.evidence for cell in source_tables[0].rows[0].cells)
+
+
+def test_source_table_keeps_fully_unknown_grounded_headers() -> None:
+    tokens = (
+        token(0, "Charge", (100, 30, 360, 45)),
+        token(1, "Co-pay %", (520, 30, 610, 45)),
+        token(2, "Value", (850, 30, 950, 45)),
+        token(3, "Procedure", (100, 70, 300, 85)),
+        token(4, "10", (540, 70, 570, 85)),
+        token(5, "4,500.00", (860, 70, 940, 85)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 20, 980, 110),
+    )
+
+    assert [column.label for column in result.source_tables[0].columns] == [
+        "Charge",
+        "Co-pay %",
+        "Value",
+    ]
+    assert [column.canonical_field for column in result.source_tables[0].columns] == [
+        None,
+        None,
+        None,
+    ]
+    assert [cell.raw_value for cell in result.source_tables[0].rows[0].cells] == [
+        "Procedure",
+        "10",
+        "4,500.00",
+    ]
+
+
+def test_source_table_row_links_to_its_grounded_canonical_row() -> None:
+    tokens = (
+        token(0, "Particular", (100, 30, 360, 45)),
+        token(1, "Amount", (850, 30, 950, 45)),
+        token(2, "Procedure", (100, 70, 300, 85)),
+        token(3, "4,500.00", (860, 70, 940, 85)),
+    )
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 20, 980, 110),
+    )
+    canonical = canonicalize_rows(
+        "d" * 64,
+        1,
+        "p1-t1",
+        "a" * 64,
+        result.rows,
+    )
+
+    linked = _link_source_tables(result.source_tables, canonical)
+
+    assert linked[0].rows[0].canonical_row_id == str(canonical[0].id)
+
+
+def test_source_table_synthesizes_grounded_columns_without_a_header() -> None:
+    tokens = (
+        token(0, "Procedure", (100, 30, 300, 45)),
+        token(1, "10", (540, 30, 570, 45)),
+        token(2, "4,500.00", (860, 30, 940, 45)),
+        token(3, "Medicine", (100, 70, 300, 85)),
+        token(4, "20", (540, 70, 570, 85)),
+        token(5, "2,000.00", (860, 70, 940, 85)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 20, 980, 110),
+    )
+
+    assert [column.label for column in result.source_tables[0].columns] == [
+        "Column 1",
+        "Column 2",
+        "Column 3",
+    ]
+    assert all(
+        column.validation_flags == ("synthetic_header",)
+        for column in result.source_tables[0].columns
+    )
+    assert [
+        [cell.raw_value for cell in row.cells] for row in result.source_tables[0].rows
+    ] == [
+        ["Procedure", "10", "4,500.00"],
+        ["Medicine", "20", "2,000.00"],
+    ]
 
 
 def test_repeated_shifted_headers_reassign_rate_and_quantity_lanes() -> None:

@@ -2,7 +2,7 @@ from decimal import Decimal
 from enum import StrEnum
 from typing import Any
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from gmoney.contracts.common import ContractModel, VersionedContract
 from gmoney.contracts.evidence import Polygon
@@ -84,6 +84,17 @@ class SourceColumn(ContractModel):
     order: int = Field(ge=0)
     canonical_field: str | None = None
     evidence: tuple[EvidenceRef, ...] = ()
+    validation_flags: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def require_grounded_or_synthetic_header(self) -> "SourceColumn":
+        grounded = any(item.token_ids for item in self.evidence)
+        synthetic = "synthetic_header" in self.validation_flags
+        if not grounded and not synthetic:
+            raise ValueError("source header requires grounded OCR evidence")
+        if grounded and synthetic:
+            raise ValueError("grounded source header cannot be marked synthetic")
+        return self
 
 
 class SourceCell(ContractModel):
@@ -91,6 +102,14 @@ class SourceCell(ContractModel):
     raw_value: str | None = None
     evidence: tuple[EvidenceRef, ...] = ()
     validation_flags: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def require_grounded_value(self) -> "SourceCell":
+        if self.raw_value and self.raw_value.strip() and not any(
+            item.token_ids for item in self.evidence
+        ):
+            raise ValueError("non-empty source cell requires grounded OCR evidence")
+        return self
 
 
 class SourceRow(ContractModel):
@@ -109,6 +128,26 @@ class SourceTable(ContractModel):
     columns: tuple[SourceColumn, ...]
     rows: tuple[SourceRow, ...]
     validation_flags: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def require_consistent_grid(self) -> "SourceTable":
+        if not self.columns or not self.rows:
+            raise ValueError("source table requires columns and rows")
+        column_ids = tuple(column.id for column in self.columns)
+        if len(set(column_ids)) != len(column_ids):
+            raise ValueError("source table column ids must be unique")
+        if tuple(column.order for column in self.columns) != tuple(range(len(self.columns))):
+            raise ValueError("source table columns must use contiguous order")
+        if len({row.id for row in self.rows}) != len(self.rows):
+            raise ValueError("source table row ids must be unique")
+        if tuple(row.order for row in self.rows) != tuple(range(len(self.rows))):
+            raise ValueError("source table rows must use contiguous order")
+        expected = set(column_ids)
+        for row in self.rows:
+            actual = tuple(cell.column_id for cell in row.cells)
+            if len(actual) != len(expected) or set(actual) != expected:
+                raise ValueError("source row requires exactly one cell per column")
+        return self
 
 
 class DocumentTotal(ContractModel):

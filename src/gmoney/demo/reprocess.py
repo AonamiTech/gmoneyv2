@@ -4,17 +4,21 @@ import json
 import os
 import re
 import shutil
+from contextlib import ExitStack
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Annotated, Any
 
 import typer
+from pydantic import ValidationError
 
+from gmoney.contracts.extraction import SourceTable
 from gmoney.demo.review import structural_issues
 from gmoney.demo.store import JobStore, utc_now
 from gmoney.evaluation.corpus import sha256_file
 from gmoney.extraction.offline import OfflineExtractor
+from gmoney.extraction.typed_values import parse_decimal
 
 app = typer.Typer(add_completion=False, invoke_without_command=True)
 
@@ -32,8 +36,16 @@ class PreparedJob:
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    with temporary.open("w") as output:
+        output.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        output.flush()
+        os.fsync(output.fileno())
     temporary.replace(path)
+    directory = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 
 
 def _file_digest(path: Path) -> str:
@@ -231,6 +243,94 @@ def _validate_result(
             if row.get("net_amount") is None or "amount" not in fields:
                 raise ValueError(f"billable row lacks grounded amount: {row.get('id')}")
 
+    source_payload = new_result.get("source_tables")
+    if new_result.get("rows") and not source_payload:
+        raise ValueError("canonical rows require validated source tables")
+    try:
+        source_tables = [
+            SourceTable.model_validate(table) for table in source_payload or []
+        ]
+    except ValidationError as error:
+        raise ValueError(f"source tables failed grounding validation: {error}") from error
+
+    canonical_rows = {
+        str(row["id"]): row for row in new_result.get("rows", [])
+    }
+    linked_ids: set[str] = set()
+    evidence_fields = {
+        "description": "description",
+        "service_date_raw": "service_date",
+        "request_no": "request_no",
+        "service_code": "service_code",
+        "hsn_code": "hsn_code",
+        "quantity": "quantity",
+        "unit_price": "rate",
+        "gross_amount": "gross_amount",
+        "discount": "discount",
+        "net_amount": "amount",
+    }
+    numeric_fields = {
+        "quantity",
+        "unit_price",
+        "gross_amount",
+        "discount",
+        "net_amount",
+    }
+    for table in source_tables:
+        for source_row in table.rows:
+            if source_row.canonical_row_id is None:
+                continue
+            canonical = canonical_rows.get(source_row.canonical_row_id)
+            if canonical is None:
+                raise ValueError(
+                    f"source row links unknown canonical row: {source_row.canonical_row_id}"
+                )
+            if source_row.canonical_row_id in linked_ids:
+                raise ValueError(
+                    f"canonical row has multiple source links: {source_row.canonical_row_id}"
+                )
+            linked_ids.add(source_row.canonical_row_id)
+            cells = {cell.column_id: cell for cell in source_row.cells}
+            for column in table.columns:
+                field = column.canonical_field
+                if field is None or canonical.get(field) is None:
+                    continue
+                if field == "description":
+                    continue
+                evidence_field = evidence_fields[field]
+                field_token_ids = {
+                    str(token_id)
+                    for item in (canonical.get("field_evidence") or {}).get(
+                        evidence_field, []
+                    )
+                    for token_id in item.get("token_ids") or []
+                }
+                cell = cells[column.id]
+                cell_token_ids = {
+                    token_id
+                    for item in cell.evidence
+                    for token_id in item.token_ids
+                }
+                if not field_token_ids or not field_token_ids.issubset(cell_token_ids):
+                    raise ValueError(
+                        f"{field} evidence is not in its mapped source cell "
+                        f"for canonical row {source_row.canonical_row_id}"
+                    )
+                if field in numeric_fields:
+                    printed_value = parse_decimal(cell.raw_value or "")
+                    canonical_value = parse_decimal(str(canonical[field]))
+                    if printed_value is None or printed_value != canonical_value:
+                        raise ValueError(
+                            f"{field} value does not match its mapped source cell "
+                            f"for canonical row {source_row.canonical_row_id}"
+                        )
+    for row_id, row_payload in canonical_rows.items():
+        if (
+            "ocr_spatial_graph" in (row_payload.get("source_routes") or [])
+            and row_id not in linked_ids
+        ):
+            raise ValueError(f"canonical OCR row lacks a source-table link: {row_id}")
+
 
 def _prepare_job(
     *,
@@ -240,23 +340,24 @@ def _prepare_job(
     extractor: Any,
 ) -> PreparedJob:
     job_dir = store.job_dir(job_id)
-    state = store.read(job_id)
-    if state.get("status") != "complete":
-        raise ValueError("only complete jobs can be reprocessed")
     source = job_dir / "source.pdf"
     result_path = job_dir / "result.json"
     artifact_root = job_dir / "artifacts"
-    if not source.is_file() or not result_path.is_file() or not artifact_root.is_dir():
-        raise ValueError("source, result, or artifacts are missing")
-
-    old_result = json.loads(result_path.read_text())
-    review = store.read_review(job_id)
-    marker = _review_marker(job_dir)
     stage_dir = stage_root / job_id
     if stage_dir.exists():
         raise ValueError(f"staging directory already exists: {stage_dir}")
     stage_dir.mkdir(parents=True, mode=0o700)
-    shutil.copytree(artifact_root, stage_dir / "artifacts")
+    with store.job_lock(job_id, exclusive=False):
+        store._require_stable_workspace(job_id)
+        state = store.read(job_id)
+        if state.get("status") != "complete":
+            raise ValueError("only complete jobs can be reprocessed")
+        if not source.is_file() or not result_path.is_file() or not artifact_root.is_dir():
+            raise ValueError("source, result, or artifacts are missing")
+        old_result = json.loads(result_path.read_text())
+        review = store._read_review_unlocked(job_id)
+        marker = _review_marker(job_dir)
+        shutil.copytree(artifact_root, stage_dir / "artifacts")
     new_result = extractor.extract(source, stage_dir / "artifacts")
     _validate_result(source, old_result, new_result, stage_dir / "artifacts")
     migrated_review = _migrate_review(job_id, old_result, new_result, review)
@@ -277,36 +378,124 @@ def _cutover_job(
     store: JobStore,
     prepared: PreparedJob,
     backup_root: Path,
+    commit_marker: Path,
 ) -> Path:
     job_dir = store.job_dir(prepared.job_id)
-    if _review_marker(job_dir) != prepared.review_marker:
-        raise ValueError("review changed while reprocessing; staged result was not applied")
     backup_dir = backup_root / prepared.job_id
+    journal_path = job_dir / ".cutover.json"
+
+    def restore_path(name: str) -> None:
+        live = job_dir / name
+        backup = backup_dir / name
+        staged = prepared.stage_dir / name
+        if not backup.exists():
+            return
+        if live.exists():
+            if not staged.exists():
+                live.replace(staged)
+            elif live.is_dir():
+                shutil.rmtree(live)
+            else:
+                live.unlink()
+        backup.replace(live)
+
     if backup_dir.exists():
         raise ValueError(f"backup directory already exists: {backup_dir}")
     backup_dir.mkdir(parents=True, mode=0o700)
-    shutil.copy2(job_dir / "state.json", backup_dir / "state.json")
-    if (job_dir / "review.json").is_file():
-        shutil.copy2(job_dir / "review.json", backup_dir / "review.json")
-
-    (job_dir / "artifacts").replace(backup_dir / "artifacts")
-    (prepared.stage_dir / "artifacts").replace(job_dir / "artifacts")
-    (job_dir / "result.json").replace(backup_dir / "result.json")
-    (prepared.stage_dir / "result.json").replace(job_dir / "result.json")
-    _atomic_json(job_dir / "review.json", prepared.migrated_review)
-    hospital = prepared.new_result.get("hospital") or {}
-    store.update(
-        prepared.job_id,
-        status="complete",
-        page=int(prepared.new_result.get("pages") or 0),
-        pages=int(prepared.new_result.get("pages") or 0),
-        row_count=len(prepared.new_result.get("rows", [])),
-        hospital_name=hospital.get("name"),
-        hospital_confidence=hospital.get("confidence"),
-        error=None,
-        reprocessed_at=utc_now(),
+    _atomic_json(
+        journal_path,
+        {
+            "version": "job_cutover_v1",
+            "job_id": prepared.job_id,
+            "stage_dir": str(prepared.stage_dir),
+            "backup_dir": str(backup_dir),
+            "commit_marker": str(commit_marker),
+            "started_at": utc_now(),
+        },
     )
+    try:
+        shutil.copy2(job_dir / "state.json", backup_dir / "state.json")
+        if (job_dir / "review.json").is_file():
+            shutil.copy2(job_dir / "review.json", backup_dir / "review.json")
+
+        (job_dir / "artifacts").replace(backup_dir / "artifacts")
+        (prepared.stage_dir / "artifacts").replace(job_dir / "artifacts")
+        (job_dir / "result.json").replace(backup_dir / "result.json")
+        (prepared.stage_dir / "result.json").replace(job_dir / "result.json")
+        _atomic_json(job_dir / "review.json", prepared.migrated_review)
+        hospital = prepared.new_result.get("hospital") or {}
+        store.update(
+            prepared.job_id,
+            status="complete",
+            page=int(prepared.new_result.get("pages") or 0),
+            pages=int(prepared.new_result.get("pages") or 0),
+            row_count=len(prepared.new_result.get("rows", [])),
+            hospital_name=hospital.get("name"),
+            hospital_confidence=hospital.get("confidence"),
+            error=None,
+            reprocessed_at=utc_now(),
+        )
+    except BaseException:
+        try:
+            restore_path("result.json")
+            restore_path("artifacts")
+            _atomic_json(
+                job_dir / "state.json",
+                json.loads((backup_dir / "state.json").read_text()),
+            )
+            if (backup_dir / "review.json").is_file():
+                _atomic_json(
+                    job_dir / "review.json",
+                    json.loads((backup_dir / "review.json").read_text()),
+                )
+            elif (job_dir / "review.json").is_file():
+                (job_dir / "review.json").unlink()
+            journal_path.unlink(missing_ok=True)
+            shutil.rmtree(backup_dir, ignore_errors=True)
+        except BaseException as recovery_error:
+            raise RuntimeError(
+                f"cutover recovery required for job {prepared.job_id}"
+            ) from recovery_error
+        raise
     return backup_dir
+
+
+def _rollback_cutover_job(
+    *,
+    store: JobStore,
+    prepared: PreparedJob,
+    backup_dir: Path,
+) -> None:
+    job_dir = store.job_dir(prepared.job_id)
+
+    def restore_path(name: str) -> None:
+        live = job_dir / name
+        backup = backup_dir / name
+        staged = prepared.stage_dir / name
+        if live.exists():
+            if not staged.exists():
+                live.replace(staged)
+            elif live.is_dir():
+                shutil.rmtree(live)
+            else:
+                live.unlink()
+        backup.replace(live)
+
+    restore_path("result.json")
+    restore_path("artifacts")
+    _atomic_json(
+        job_dir / "state.json",
+        json.loads((backup_dir / "state.json").read_text()),
+    )
+    if (backup_dir / "review.json").is_file():
+        _atomic_json(
+            job_dir / "review.json",
+            json.loads((backup_dir / "review.json").read_text()),
+        )
+    elif (job_dir / "review.json").is_file():
+        (job_dir / "review.json").unlink()
+    (job_dir / ".cutover.json").unlink(missing_ok=True)
+    shutil.rmtree(backup_dir, ignore_errors=True)
 
 
 def reprocess_jobs(
@@ -478,18 +667,51 @@ def apply_staged_jobs(
     timestamp = re.sub(r"[^0-9]", "", utc_now())[:14]
     backups = (backup_root or store.jobs_root / ".reprocess-backups") / timestamp
     backups.mkdir(parents=True, mode=0o700)
+    commit_marker = backups / ".committed.json"
     documents: list[dict[str, Any]] = []
-    for item in prepared:
-        backup = _cutover_job(store=store, prepared=item, backup_root=backups)
-        documents.append(
-            {
-                "job_id": item.job_id,
-                "source_name": item.old_result.get("source_name"),
-                "rows_before": len(item.old_result.get("rows", [])),
-                "rows_after": len(item.new_result.get("rows", [])),
-                "backup": str(backup),
-            }
-        )
+    completed: list[tuple[PreparedJob, Path]] = []
+    with ExitStack() as locks:
+        for item in sorted(prepared, key=lambda candidate: candidate.job_id):
+            locks.enter_context(store.job_lock(item.job_id, exclusive=True))
+        for item in prepared:
+            if _review_marker(store.job_dir(item.job_id)) != item.review_marker:
+                raise ValueError("review changed after staging; no results were applied")
+        try:
+            for item in prepared:
+                backup = _cutover_job(
+                    store=store,
+                    prepared=item,
+                    backup_root=backups,
+                    commit_marker=commit_marker,
+                )
+                completed.append((item, backup))
+                documents.append(
+                    {
+                        "job_id": item.job_id,
+                        "source_name": item.old_result.get("source_name"),
+                        "rows_before": len(item.old_result.get("rows", [])),
+                        "rows_after": len(item.new_result.get("rows", [])),
+                        "backup": str(backup),
+                    }
+                )
+            _atomic_json(
+                commit_marker,
+                {
+                    "version": "reprocess_batch_commit_v1",
+                    "committed_at": utc_now(),
+                    "job_ids": [item.job_id for item in prepared],
+                },
+            )
+        except BaseException:
+            for item, backup in reversed(completed):
+                _rollback_cutover_job(
+                    store=store,
+                    prepared=item,
+                    backup_dir=backup,
+                )
+            raise
+        for item in prepared:
+            (store.job_dir(item.job_id) / ".cutover.json").unlink(missing_ok=True)
     return {
         "reprocessed": len(prepared),
         "documents": documents,

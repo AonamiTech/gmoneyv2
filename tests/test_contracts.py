@@ -4,6 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 from gmoney.contracts.evidence import Point, Polygon, TransformChain
+from gmoney.contracts.extraction import SourceCell, SourceColumn, SourceTable
 from gmoney.contracts.gold import GoldAnnotation
 from gmoney.settings import Settings
 
@@ -42,6 +43,78 @@ def test_gold_amount_is_decimal() -> None:
         }
     )
     assert annotation.rows[0].amount == Decimal("10.25")
+
+
+def test_non_empty_source_cell_requires_token_grounding() -> None:
+    with pytest.raises(ValidationError, match="grounded OCR evidence"):
+        SourceCell(column_id="c1", raw_value="invented")
+
+
+def test_real_source_header_requires_token_grounding() -> None:
+    with pytest.raises(ValidationError, match="grounded OCR evidence"):
+        SourceColumn(id="c1", label="Amount", order=0)
+
+
+def test_synthetic_source_header_is_explicitly_flagged() -> None:
+    column = SourceColumn(
+        id="c1",
+        label="Column 1",
+        order=0,
+        validation_flags=("synthetic_header",),
+    )
+    assert column.evidence == ()
+
+
+def test_source_table_requires_exactly_one_cell_per_column() -> None:
+    grounded = {
+        "page_number": 1,
+        "table_id": "p1-t1",
+        "polygon": {
+            "points": [
+                {"x": 1, "y": 1},
+                {"x": 10, "y": 1},
+                {"x": 10, "y": 10},
+                {"x": 1, "y": 10},
+            ]
+        },
+        "artifact_sha256": "a" * 64,
+        "token_ids": ["token-1"],
+    }
+    with pytest.raises(ValidationError, match="exactly one cell per column"):
+        SourceTable.model_validate(
+            {
+                "id": "p1-t1-s1",
+                "page_number": 1,
+                "table_id": "p1-t1",
+                "columns": [
+                    {
+                        "id": "c1",
+                        "label": "First",
+                        "order": 0,
+                        "evidence": [grounded],
+                    },
+                    {
+                        "id": "c2",
+                        "label": "Second",
+                        "order": 1,
+                        "evidence": [grounded],
+                    },
+                ],
+                "rows": [
+                    {
+                        "id": "r1",
+                        "order": 0,
+                        "cells": [
+                            {
+                                "column_id": "c1",
+                                "raw_value": "value",
+                                "evidence": [grounded],
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
 
 
 def test_settings_accepts_standard_gemini_key_without_exposing_it(monkeypatch) -> None:

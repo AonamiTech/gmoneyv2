@@ -724,6 +724,94 @@ def _build_source_tables(
     return tuple(output)
 
 
+def _raw_source_header(lines: tuple[OcrLine, ...], width: float) -> HeaderBlock | None:
+    """Find a non-canonical header from its geometry and following numeric rows."""
+    for index, line in enumerate(lines[:-1]):
+        header_tokens = tuple(token for token in line.tokens if token.text.strip())
+        if len(header_tokens) < 2 or any(
+            parse_decimal(token.text) is not None for token in header_tokens
+        ):
+            continue
+        following = lines[index + 1 : min(len(lines), index + 4)]
+        candidates = [
+            candidate
+            for candidate in following
+            if len(candidate.tokens) >= 2 and len(_numeric_tokens(candidate)) >= 1
+        ]
+        if not candidates:
+            continue
+        aligned = max(
+            sum(
+                min(abs(_center_x(header) - _center_x(value)) for value in candidate.tokens)
+                <= width * 0.08
+                for header in header_tokens
+            )
+            for candidate in candidates
+        )
+        if aligned >= 2:
+            return HeaderBlock(start=index, end=index, roles={})
+    return None
+
+
+def _synthetic_source_table(
+    lines: tuple[OcrLine, ...],
+    *,
+    original_by_id: dict[str, OcrToken],
+    page_number: int,
+    table_id: str,
+    table_type: TableType,
+    width: float,
+) -> tuple[SourceTable, ...]:
+    data_lines = tuple(line for line in lines if any(token.text.strip() for token in line.tokens))
+    if not data_lines:
+        return ()
+    centers = [_center_x(token) for token in data_lines[0].tokens if token.text.strip()]
+    if len(centers) < 2:
+        return ()
+    for line in data_lines[1:]:
+        for token in line.tokens:
+            if not token.text.strip():
+                continue
+            center = _center_x(token)
+            nearest = min(range(len(centers)), key=lambda index: abs(centers[index] - center))
+            if abs(centers[nearest] - center) > width * 0.08:
+                centers.append(center)
+    centers.sort()
+    columns = tuple(
+        SourceColumn(
+            id=f"c{index + 1}",
+            label=f"Column {index + 1}",
+            order=index,
+            validation_flags=("synthetic_header",),
+        )
+        for index in range(len(centers))
+    )
+    source_table_id = f"{table_id}-s1"
+    rows = _source_rows(
+        data_lines,
+        start=0,
+        end=len(data_lines),
+        source_table_id=source_table_id,
+        columns=columns,
+        centers=tuple(centers),
+        original_by_id=original_by_id,
+        table_id=table_id,
+    )
+    if not rows:
+        return ()
+    return (
+        SourceTable(
+            id=source_table_id,
+            page_number=page_number,
+            table_id=table_id,
+            table_type=table_type,
+            columns=columns,
+            rows=rows,
+            validation_flags=("synthetic_headers", "unmapped_columns"),
+        ),
+    )
+
+
 def _description_lane(
     centers: dict[str, float],
     stable_centers: tuple[float, ...],
@@ -1837,22 +1925,34 @@ def reconstruct_ocr_rows(
         )
         append_aligned(candidate=candidate, field_tokens=field_tokens)
 
+    source_header = (
+        HeaderBlock(
+            start=header_start,
+            end=header_index,
+            roles=header_roles,
+        )
+        if header_valid
+        else _raw_source_header(lines, width)
+    )
     source_tables = (
         _build_source_tables(
             lines,
-            primary=HeaderBlock(
-                start=header_start,
-                end=header_index,
-                roles=header_roles,
-            ),
-            repeated=repeated_header_blocks,
+            primary=source_header,
+            repeated=repeated_header_blocks if header_valid else (),
             original_by_id=original_by_id,
             page_number=page_number,
             table_id=table_id,
             table_type=table_type,
         )
-        if header_valid
-        else ()
+        if source_header is not None
+        else _synthetic_source_table(
+            lines,
+            original_by_id=original_by_id,
+            page_number=page_number,
+            table_id=table_id,
+            table_type=table_type,
+            width=width,
+        )
     )
     return ReconstructionResult(
         rows=tuple(aligned),

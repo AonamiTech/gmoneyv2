@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from gmoney.demo.store import JobStore, utc_now
+from gmoney.demo.store import JobStore, JobTransactionError, utc_now
 
 EDITABLE_TEXT_FIELDS = {
     "description",
@@ -67,10 +67,10 @@ class ReviewValidationError(ValueError):
 
 
 def load_result(store: JobStore, job_id: str) -> dict[str, Any]:
-    path = store.job_dir(job_id) / "result.json"
-    if not path.is_file():
-        raise ReviewValidationError("Extraction result is unavailable")
-    return json.loads(path.read_text())
+    try:
+        return store.read_result(job_id)
+    except JobTransactionError as error:
+        raise ReviewValidationError("Extraction result is unavailable") from error
 
 
 def public_page_assets(result: dict[str, Any]) -> list[dict[str, Any]]:

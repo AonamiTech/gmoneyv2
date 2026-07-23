@@ -159,6 +159,8 @@ def test_source_tables_endpoint_returns_dynamic_columns_and_raw_cells(
 
     assert response.status_code == 200
     assert response.json()["available"] is True
+    assert response.json()["unavailable_reason"] is None
+    assert response.json()["tables"][0]["rows"][0]["ordinal"] == 1
     assert response.json()["tables"][0]["columns"][1]["label"] == "Co-pay %"
     assert response.json()["tables"][0]["rows"][0]["cells"][1]["raw_value"] == "10"
     assert (
@@ -170,7 +172,122 @@ def test_source_tables_endpoint_returns_dynamic_columns_and_raw_cells(
     legacy = client.get(f"/api/v2/documents/{job_id}/source-tables")
     assert legacy.status_code == 200
     assert legacy.json()["available"] is False
+    assert legacy.json()["unavailable_reason"] == "legacy_result"
     assert legacy.json()["tables"] == []
+
+    result["source_tables"] = []
+    (store.job_dir(job_id) / "result.json").write_text(json.dumps(result))
+    empty = client.get(f"/api/v2/documents/{job_id}/source-tables")
+    assert empty.status_code == 200
+    assert empty.json()["available"] is False
+    assert empty.json()["unavailable_reason"] == "no_source_tables"
+
+
+def test_source_table_pagination_returns_global_ordinals_across_tables(
+    tmp_path: Path, monkeypatch
+) -> None:
+    client, store = client_for(tmp_path, monkeypatch)
+    job_id, result = completed_job(store)
+    grounded = result["rows"][0]["evidence"]
+
+    def table(table_number: int) -> dict[str, object]:
+        return {
+            "id": f"p1-t{table_number}-s1",
+            "page_number": 1,
+            "table_id": f"p1-t{table_number}",
+            "table_type": "item_ledger",
+            "columns": [
+                {
+                    "id": "particular",
+                    "label": "Particular",
+                    "order": 0,
+                    "canonical_field": "description",
+                    "evidence": grounded,
+                }
+            ],
+            "rows": [
+                {
+                    "id": f"p1-t{table_number}-s1-r{row_number}",
+                    "order": row_number - 1,
+                    "canonical_row_id": None,
+                    "cells": [
+                        {
+                            "column_id": "particular",
+                            "raw_value": f"Table {table_number} row {row_number}",
+                            "evidence": grounded,
+                            "validation_flags": [],
+                        }
+                    ],
+                    "validation_flags": [],
+                }
+                for row_number in (1, 2)
+            ],
+            "validation_flags": [],
+        }
+
+    result["source_tables"] = [table(1), table(2)]
+    (store.job_dir(job_id) / "result.json").write_text(json.dumps(result))
+
+    response = client.get(
+        f"/api/v2/documents/{job_id}/source-tables?offset=1&limit=2"
+    )
+
+    assert response.status_code == 200
+    rows = [
+        row_payload
+        for table_payload in response.json()["tables"]
+        for row_payload in table_payload["rows"]
+    ]
+    assert [row_payload["ordinal"] for row_payload in rows] == [2, 3]
+    assert [row_payload["id"] for row_payload in rows] == [
+        "p1-t1-s1-r2",
+        "p1-t2-s1-r1",
+    ]
+
+
+def test_source_table_endpoint_rejects_ungrounded_stored_values(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _, store = client_for(tmp_path, monkeypatch)
+    client = TestClient(api.app, raise_server_exceptions=False)
+    job_id, result = completed_job(store)
+    grounded = result["rows"][0]["evidence"]
+    result["source_tables"] = [
+        {
+            "id": "p1-t1-s1",
+            "page_number": 1,
+            "table_id": "p1-t1",
+            "columns": [
+                {
+                    "id": "c1",
+                    "label": "Particular",
+                    "order": 0,
+                    "evidence": grounded,
+                }
+            ],
+            "rows": [
+                {
+                    "id": "r1",
+                    "order": 0,
+                    "cells": [
+                        {
+                            "column_id": "c1",
+                            "raw_value": "invented",
+                            "evidence": [],
+                        }
+                    ],
+                }
+            ],
+        }
+    ]
+    (store.job_dir(job_id) / "result.json").write_text(json.dumps(result))
+
+    response = client.get(f"/api/v2/documents/{job_id}/source-tables")
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == (
+        "Printed extraction failed grounding validation; reprocess this bill"
+    )
 
 
 def completed_job(
