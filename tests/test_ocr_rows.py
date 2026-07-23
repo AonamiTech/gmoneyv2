@@ -455,6 +455,118 @@ def test_source_table_keeps_unknown_columns_and_raw_ocr_cells() -> None:
     assert all(cell.evidence for cell in source_tables[0].rows[0].cells)
 
 
+def test_unmapped_text_column_is_isolated_from_canonical_description() -> None:
+    tokens = (
+        token(0, "Description", (100, 30, 360, 45)),
+        token(1, "Coverage", (500, 30, 650, 45)),
+        token(2, "Amount", (850, 30, 950, 45)),
+        token(3, "Procedure", (100, 70, 300, 85)),
+        token(4, "Cashless", (510, 70, 630, 85)),
+        token(5, "4,500.00", (860, 70, 940, 85)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 20, 980, 110),
+    )
+    canonical = canonicalize_rows(
+        "d" * 64,
+        1,
+        "p1-t1",
+        "a" * 64,
+        result.rows,
+    )
+    linked = _link_source_tables(result.source_tables, canonical)
+
+    assert canonical[0].description == "Procedure"
+    assert result.rows[0].field_token_ids["description"] == ("token-3",)
+    assert [cell.raw_value for cell in linked[0].rows[0].cells] == [
+        "Procedure",
+        "Cashless",
+        "4,500.00",
+    ]
+    description_column = next(
+        column for column in linked[0].columns if column.canonical_field == "description"
+    )
+    description_cell = next(
+        cell
+        for cell in linked[0].rows[0].cells
+        if cell.column_id == description_column.id
+    )
+    assert {
+        token_id
+        for item in description_cell.evidence
+        for token_id in item.token_ids
+    } == {"token-3"}
+
+
+def test_unmapped_text_column_before_description_is_isolated() -> None:
+    tokens = (
+        token(0, "Coverage", (100, 30, 250, 45)),
+        token(1, "Description", (400, 30, 650, 45)),
+        token(2, "Amount", (850, 30, 950, 45)),
+        token(3, "Cashless", (110, 70, 230, 85)),
+        token(4, "Procedure", (410, 70, 610, 85)),
+        token(5, "4,500.00", (860, 70, 940, 85)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 20, 980, 110),
+    )
+
+    assert result.rows[0].candidate.description == "Procedure"
+    assert result.rows[0].field_token_ids["description"] == ("token-4",)
+    assert [cell.raw_value for cell in result.source_tables[0].rows[0].cells] == [
+        "Cashless",
+        "Procedure",
+        "4,500.00",
+    ]
+
+
+def test_repeated_header_repartitions_unmapped_column_before_description() -> None:
+    tokens = (
+        token(0, "Description", (100, 30, 350, 45)),
+        token(1, "Coverage", (500, 30, 650, 45)),
+        token(2, "Amount", (850, 30, 950, 45)),
+        token(3, "Procedure one", (100, 70, 320, 85)),
+        token(4, "Cashless", (510, 70, 630, 85)),
+        token(5, "4,500.00", (860, 70, 940, 85)),
+        token(6, "Coverage", (90, 110, 220, 125)),
+        token(7, "Description", (300, 110, 520, 125)),
+        token(8, "Plan", (620, 110, 700, 125)),
+        token(9, "Amount", (850, 110, 950, 125)),
+        token(10, "Reimbursed", (100, 150, 210, 165)),
+        token(11, "Procedure two", (310, 150, 500, 165)),
+        token(12, "Cashless", (620, 150, 700, 165)),
+        token(13, "3,000.00", (860, 150, 940, 165)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 20, 980, 190),
+    )
+
+    assert result.diagnostics["header_segments"] == 2
+    assert [row.candidate.description for row in result.rows] == [
+        "Procedure one",
+        "Procedure two",
+    ]
+    assert [
+        [cell.raw_value for cell in table.rows[0].cells]
+        for table in result.source_tables
+    ] == [
+        ["Procedure one", "Cashless", "4,500.00"],
+        ["Reimbursed", "Procedure two", "Cashless", "3,000.00"],
+    ]
+
+
 def test_source_table_keeps_fully_unknown_grounded_headers() -> None:
     tokens = (
         token(0, "Charge", (100, 30, 360, 45)),

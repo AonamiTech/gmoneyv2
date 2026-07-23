@@ -526,6 +526,31 @@ def _column_centers(
     return {role: (_center_x(token) - left) / width for role, token in roles.items()}
 
 
+def _printed_header_centers(
+    lines: tuple[OcrLine, ...],
+    block: HeaderBlock,
+    *,
+    left: float,
+    width: float,
+) -> tuple[float, ...]:
+    header_tokens = tuple(
+        token
+        for line in lines[block.start : block.end + 1]
+        for token in line.tokens
+        if token.text.strip()
+    )
+    recognized_ids = {token.token_id for token in block.roles.values()}
+    centers = [_center_x(token) for token in block.roles.values()]
+    centers.extend(
+        _center_x(token)
+        for token in header_tokens
+        if token.token_id not in recognized_ids
+        and parse_decimal(token.text) is None
+        and not re.fullmatch(r"\d+[.)]?", token.text.strip())
+    )
+    return tuple(sorted((center - left) / width for center in centers))
+
+
 SOURCE_CANONICAL_FIELDS: dict[str, str | None] = {
     "serial": None,
     "description": "description",
@@ -943,6 +968,41 @@ def _description_lane(
             first_numeric_center or 1.0,
         )
     return description_min, description_max
+
+
+def _description_cell_boundaries(
+    centers: dict[str, float],
+    printed_header_centers: tuple[float, ...],
+) -> tuple[float | None, float | None]:
+    description_center = centers.get("description")
+    previous_printed_center = max(
+        (
+            center
+            for center in printed_header_centers
+            if description_center is not None and center < description_center - 0.04
+        ),
+        default=None,
+    )
+    next_printed_center = min(
+        (
+            center
+            for center in printed_header_centers
+            if description_center is not None and center > description_center + 0.04
+        ),
+        default=None,
+    )
+    return (
+        (
+            (previous_printed_center + description_center) / 2
+            if description_center is not None and previous_printed_center is not None
+            else None
+        ),
+        (
+            (description_center + next_printed_center) / 2
+            if description_center is not None and next_printed_center is not None
+            else None
+        ),
+    )
 
 
 def _numeric_tokens(line: OcrLine) -> list[tuple[OcrToken, Decimal]]:
@@ -1540,6 +1600,11 @@ def reconstruct_ocr_rows(
             key=lambda item: (len(item[1]), -item[0]),
         )
     header_valid = _valid_header(header_roles)
+    primary_header = HeaderBlock(
+        start=header_start,
+        end=header_index,
+        roles=header_roles,
+    )
     data_lines = lines[header_index + 1 :] if header_valid else lines
     repeated_header_blocks = tuple(
         block for block in merged_headers if header_valid and block.start > header_index
@@ -1639,10 +1704,24 @@ def reconstruct_ocr_rows(
         )
 
     amount_center = column_centers.get("amount")
+    description_header_centers = (
+        _printed_header_centers(
+            lines,
+            primary_header,
+            left=left,
+            width=width,
+        )
+        if header_valid
+        else ()
+    )
     description_min, description_max = _description_lane(
         column_centers,
         stable_centers,
         table_type,
+    )
+    description_cell_min, description_cell_max = _description_cell_boundaries(
+        column_centers,
+        description_header_centers,
     )
     aligned: list[AlignedLedgerRow] = []
     aligned_description_raw: list[str] = []
@@ -1781,10 +1860,20 @@ def reconstruct_ocr_rows(
                         column_centers["amount"] = nearby
             stable_centers = segment_stable_centers
             amount_center = column_centers.get("amount")
+            description_header_centers = _printed_header_centers(
+                lines,
+                repeated_block,
+                left=left,
+                width=width,
+            )
             description_min, description_max = _description_lane(
                 column_centers,
                 stable_centers,
                 table_type,
+            )
+            description_cell_min, description_cell_max = _description_cell_boundaries(
+                column_centers,
+                description_header_centers,
             )
             continue
         numeric = _numeric_tokens(line)
@@ -1836,6 +1925,11 @@ def reconstruct_ocr_rows(
             if token.token_id in reserved_ids:
                 continue
             if _is_header_token(token):
+                continue
+            relative_center = (_center_x(token) - left) / width
+            if description_cell_min is not None and relative_center < description_cell_min:
+                continue
+            if description_cell_max is not None and relative_center >= description_cell_max:
                 continue
             description_token = _clip_token_to_lane(
                 token,
@@ -2107,15 +2201,7 @@ def reconstruct_ocr_rows(
             raw_description=description_text,
         )
 
-    source_header = (
-        HeaderBlock(
-            start=header_start,
-            end=header_index,
-            roles=header_roles,
-        )
-        if header_valid
-        else _raw_source_header(lines, width)
-    )
+    source_header = primary_header if header_valid else _raw_source_header(lines, width)
     source_tables = (
         _build_source_tables(
             lines,

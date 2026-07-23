@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass
 from decimal import Decimal
 from difflib import SequenceMatcher
+from functools import lru_cache
 
 from gmoney.contracts.evidence import OcrToken, Point, Polygon
 from gmoney.contracts.extraction import RowRole, TableType
@@ -146,6 +147,167 @@ def _table_type(reconstruction: ReconstructionResult) -> TableType:
         return TableType.UNKNOWN
 
 
+def _description_similarity(
+    baseline: AlignedLedgerRow,
+    candidate: AlignedLedgerRow,
+) -> float:
+    baseline_description = re.sub(
+        r"[^a-z0-9]+",
+        " ",
+        baseline.candidate.description.casefold(),
+    ).strip()
+    candidate_description = re.sub(
+        r"[^a-z0-9]+",
+        " ",
+        candidate.candidate.description.casefold(),
+    ).strip()
+    if not baseline_description or not candidate_description:
+        return 0.0
+    return SequenceMatcher(
+        None,
+        baseline_description,
+        candidate_description,
+    ).ratio()
+
+
+def _geometry_is_compatible(
+    baseline: AlignedLedgerRow,
+    candidate: AlignedLedgerRow,
+) -> bool:
+    if baseline.evidence_box is None or candidate.evidence_box is None:
+        return False
+    _, baseline_top, _, baseline_bottom = baseline.evidence_box
+    _, candidate_top, _, candidate_bottom = candidate.evidence_box
+    baseline_height = max(1.0, baseline_bottom - baseline_top)
+    candidate_height = max(1.0, candidate_bottom - candidate_top)
+    overlap = min(baseline_bottom, candidate_bottom) - max(
+        baseline_top,
+        candidate_top,
+    )
+    if overlap > 0:
+        return True
+    baseline_center = (baseline_top + baseline_bottom) / 2
+    candidate_center = (candidate_top + candidate_bottom) / 2
+    return abs(baseline_center - candidate_center) <= max(
+        baseline_height,
+        candidate_height,
+    ) / 2
+
+
+def _row_match_score(
+    baseline: AlignedLedgerRow,
+    candidate: AlignedLedgerRow,
+    *,
+    baseline_order: int,
+    candidate_order: int,
+) -> tuple[int, ...] | None:
+    description_similarity = _description_similarity(baseline, candidate)
+    if description_similarity < 0.75:
+        return None
+    source_row_matches = (
+        baseline.candidate.source_row == candidate.candidate.source_row
+    )
+    geometry_matches = _geometry_is_compatible(baseline, candidate)
+    order_distance = abs(baseline_order - candidate_order)
+    if not source_row_matches and not (geometry_matches and order_distance <= 1):
+        return None
+    source_row_distance = abs(
+        baseline.candidate.source_row - candidate.candidate.source_row
+    )
+    return (
+        int(source_row_matches),
+        int(geometry_matches),
+        int(order_distance == 0),
+        round(description_similarity * 1000),
+        -source_row_distance,
+        -order_distance,
+    )
+
+
+def _match_publishable_rows(
+    baseline: ReconstructionResult,
+    candidate: ReconstructionResult,
+) -> tuple[tuple[AlignedLedgerRow, AlignedLedgerRow], ...] | None:
+    baseline_rows = tuple(
+        row for row in baseline.rows if is_publishable_aligned_row(row)
+    )
+    candidate_rows = tuple(
+        row for row in candidate.rows if is_publishable_aligned_row(row)
+    )
+    if len(candidate_rows) < len(baseline_rows):
+        return None
+    zero_score = (0, 0, 0, 0, 0, 0)
+
+    @lru_cache
+    def best_match(
+        baseline_order: int,
+        candidate_start: int,
+    ) -> tuple[tuple[int, ...], int, tuple[int, ...]] | None:
+        if baseline_order == len(baseline_rows):
+            return zero_score, 1, ()
+        remaining = len(baseline_rows) - baseline_order - 1
+        best: tuple[tuple[int, ...], int, tuple[int, ...]] | None = None
+        for candidate_order in range(
+            candidate_start,
+            len(candidate_rows) - remaining,
+        ):
+            row_score = _row_match_score(
+                baseline_rows[baseline_order],
+                candidate_rows[candidate_order],
+                baseline_order=baseline_order,
+                candidate_order=candidate_order,
+            )
+            if row_score is None:
+                continue
+            suffix = best_match(baseline_order + 1, candidate_order + 1)
+            if suffix is None:
+                continue
+            suffix_score, suffix_count, suffix_mapping = suffix
+            total_score = tuple(
+                current + following
+                for current, following in zip(
+                    row_score,
+                    suffix_score,
+                    strict=True,
+                )
+            )
+            mapping = (candidate_order, *suffix_mapping)
+            if best is None or total_score > best[0]:
+                best = total_score, suffix_count, mapping
+            elif total_score == best[0]:
+                best = best[0], min(2, best[1] + suffix_count), best[2]
+        return best
+
+    match = best_match(0, 0)
+    if match is None or match[1] != 1:
+        return None
+    return tuple(
+        (baseline_row, candidate_rows[candidate_order])
+        for baseline_row, candidate_order in zip(
+            baseline_rows,
+            match[2],
+            strict=True,
+        )
+    )
+
+
+def _preserves_grounded_fields(
+    matches: tuple[tuple[AlignedLedgerRow, AlignedLedgerRow], ...],
+) -> bool:
+    for baseline, candidate in matches:
+        for field in MAPPED_CANONICAL_FIELDS:
+            if (
+                baseline.field_token_ids.get(field)
+                and _is_populated(getattr(baseline.candidate, field, None))
+                and (
+                    not candidate.field_token_ids.get(field)
+                    or not _is_populated(getattr(candidate.candidate, field, None))
+                )
+            ):
+                return False
+    return True
+
+
 def safely_improves_reconstruction(
     baseline: ReconstructionResult,
     candidate: ReconstructionResult,
@@ -168,6 +330,9 @@ def safely_improves_reconstruction(
             strict=True,
         )
     ):
+        return False
+    matched_rows = _match_publishable_rows(baseline, candidate)
+    if matched_rows is None or not _preserves_grounded_fields(matched_rows):
         return False
     if _mapped_field_coverage(candidate) < _mapped_field_coverage(baseline):
         return False

@@ -5,12 +5,13 @@ import json
 import os
 import re
 import shutil
-from contextlib import ExitStack
+from contextlib import ExitStack, suppress
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Annotated, Any
+from threading import Lock
+from typing import Annotated, Any, TextIO
 
 import typer
 from pydantic import ValidationError
@@ -23,6 +24,22 @@ from gmoney.extraction.offline import OfflineExtractor
 from gmoney.extraction.typed_values import parse_decimal
 
 app = typer.Typer(add_completion=False, invoke_without_command=True)
+_gpu_inference_locks: dict[Path, TextIO] = {}
+_gpu_inference_locks_guard = Lock()
+_gpu_inference_locks_pid = os.getpid()
+
+
+def _reset_gpu_inference_locks_after_fork() -> None:
+    global _gpu_inference_locks_guard, _gpu_inference_locks_pid
+    for lock in _gpu_inference_locks.values():
+        with suppress(OSError):
+            lock.close()
+    _gpu_inference_locks.clear()
+    _gpu_inference_locks_guard = Lock()
+    _gpu_inference_locks_pid = os.getpid()
+
+
+os.register_at_fork(after_in_child=_reset_gpu_inference_locks_after_fork)
 
 
 @dataclass(frozen=True)
@@ -429,11 +446,7 @@ def _validate_result(
                     for item in cell.evidence
                     for token_id in item.token_ids
                 }
-                evidence_matches = (
-                    bool(field_token_ids & cell_token_ids)
-                    if field == "description"
-                    else field_token_ids.issubset(cell_token_ids)
-                )
+                evidence_matches = field_token_ids.issubset(cell_token_ids)
                 if not field_token_ids or not evidence_matches:
                     raise ValueError(
                         f"{field} evidence is not in its mapped source cell "
@@ -761,17 +774,23 @@ def stage_reprocess_jobs(
     """Build and validate replacement results without mutating live jobs."""
     store = JobStore(root)
     if extractor is None and is_gpu_device(paddle_device):
-        with store.inference_lock():
-            return _stage_reprocess_jobs(
-                store=store,
-                job_ids=job_ids,
-                stage_root=stage_root,
-                extractor=OfflineExtractor(
-                    vl_url,
-                    paddle_device=paddle_device,
-                    vl_device=vl_device,
-                ),
-            )
+        if _gpu_inference_locks_pid != os.getpid():
+            _reset_gpu_inference_locks_after_fork()
+        lock_path = store.inference_lock_path.resolve()
+        with _gpu_inference_locks_guard:
+            retained_lock = _gpu_inference_locks.get(lock_path)
+            if retained_lock is None or retained_lock.closed:
+                _gpu_inference_locks[lock_path] = store.acquire_inference_lock()
+        return _stage_reprocess_jobs(
+            store=store,
+            job_ids=job_ids,
+            stage_root=stage_root,
+            extractor=OfflineExtractor(
+                vl_url,
+                paddle_device=paddle_device,
+                vl_device=vl_device,
+            ),
+        )
     return _stage_reprocess_jobs(
         store=store,
         job_ids=job_ids,

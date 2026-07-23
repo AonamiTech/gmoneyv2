@@ -51,6 +51,7 @@ def _aligned_row(
     source_row: int,
     *,
     description: str = "Anaesthetist",
+    service_date: str | None = None,
     quantity: Decimal | None = None,
     rate: Decimal | None = Decimal("100"),
     flags: tuple[str, ...] = (),
@@ -67,6 +68,7 @@ def _aligned_row(
             role=role,
             cells=(description, str(quantity or ""), str(rate or ""), "100"),
             description=description,
+            service_date=service_date,
             quantity=quantity,
             rate=rate,
             amount=Decimal("100"),
@@ -358,6 +360,65 @@ def test_nonpublishable_rows_cannot_hide_mapped_field_coverage_regression() -> N
         )
     )
 
+    assert not safely_improves_reconstruction(baseline, candidate)
+
+
+def test_equal_aggregate_candidate_cannot_replace_a_different_source_row() -> None:
+    baseline = _reconstruction(
+        (
+            _aligned_row(
+                0,
+                description="Anaesthetist",
+                flags=("missing_labeled_quantity",),
+            ),
+            _aligned_row(1, description="Assistant surgeon"),
+        )
+    )
+    candidate = _reconstruction(
+        (
+            _aligned_row(
+                0,
+                description="Anaesthetist",
+                quantity=Decimal("1"),
+                mapped_fields=("description", "quantity", "rate", "amount"),
+            ),
+            _aligned_row(7, description="Blood bank charge"),
+        )
+    )
+
+    assert reconstruction_quality(candidate) > reconstruction_quality(baseline)
+    assert not safely_improves_reconstruction(baseline, candidate)
+
+
+def test_field_gain_on_one_row_cannot_hide_grounded_date_loss_on_another() -> None:
+    baseline = _reconstruction(
+        (
+            _aligned_row(
+                0,
+                description="Anaesthetist",
+                flags=("missing_labeled_quantity",),
+            ),
+            _aligned_row(
+                1,
+                description="Assistant surgeon",
+                service_date="20/01/2026",
+                mapped_fields=("description", "service_date", "rate", "amount"),
+            ),
+        )
+    )
+    candidate = _reconstruction(
+        (
+            _aligned_row(
+                0,
+                description="Anaesthetist",
+                quantity=Decimal("1"),
+                mapped_fields=("description", "quantity", "rate", "amount"),
+            ),
+            _aligned_row(1, description="Assistant surgeon"),
+        )
+    )
+
+    assert reconstruction_quality(candidate) > reconstruction_quality(baseline)
     assert not safely_improves_reconstruction(baseline, candidate)
 
 

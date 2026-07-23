@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import multiprocessing
+import os
 import shutil
 import threading
-from collections.abc import Iterator
-from contextlib import contextmanager
+import time
+from contextlib import suppress
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -30,6 +32,167 @@ VISUAL_AUDIT_CHECKS = {
     "explicit_totals",
     "non_ledger_exclusion",
 }
+
+
+def _run_default_gpu_stage_then_wait(
+    root_value: str,
+    job_id: str,
+    old_result: dict[str, Any],
+    fail: bool,
+    sender: Any,
+) -> None:
+    page_sha = old_result["page_assets"][0]["artifact_sha256"]
+    new_rows = [row("new-row", page_sha)]
+
+    class ProcessGpuExtractor:
+        def __init__(
+            self,
+            vl_url: str,
+            *,
+            paddle_device: str,
+            vl_device: str,
+        ) -> None:
+            pass
+
+        def extract(
+            self,
+            source: Path,
+            artifact_root: Path,
+        ) -> dict[str, Any]:
+            if fail:
+                raise RuntimeError("maintenance extraction failed")
+            return {
+                **deepcopy(old_result),
+                "rows": deepcopy(new_rows),
+                "source_tables": source_tables(new_rows, page_sha),
+            }
+
+    reprocess_module.OfflineExtractor = ProcessGpuExtractor
+    try:
+        stage_reprocess_jobs(
+            root=Path(root_value),
+            job_ids=[job_id],
+            paddle_device="gpu:0",
+            vl_device="cuda:0",
+        )
+    except RuntimeError as error:
+        sender.send(("failed", str(error), os.getpid()))
+    else:
+        sender.send(("staged", None, os.getpid()))
+    while True:
+        time.sleep(1)
+
+
+def _report_reprocess_lock_entry(root_value: str, sender: Any) -> None:
+    store = JobStore(Path(root_value))
+    sender.send(("ready", str(store.inference_lock_path)))
+    with store.inference_lock():
+        sender.send(("entered", str(store.inference_lock_path)))
+    sender.close()
+
+
+def _run_default_gpu_stage_then_fork_competing_stage(
+    root_value: str,
+    job_id: str,
+    old_result: dict[str, Any],
+    owner_sender: Any,
+    child_sender: Any,
+) -> None:
+    page_sha = old_result["page_assets"][0]["artifact_sha256"]
+    new_rows = [row("new-row", page_sha)]
+
+    class ProcessGpuExtractor:
+        def __init__(
+            self,
+            vl_url: str,
+            *,
+            paddle_device: str,
+            vl_device: str,
+        ) -> None:
+            pass
+
+        def extract(
+            self,
+            source: Path,
+            artifact_root: Path,
+        ) -> dict[str, Any]:
+            return {
+                **deepcopy(old_result),
+                "rows": deepcopy(new_rows),
+                "source_tables": source_tables(new_rows, page_sha),
+            }
+
+    reprocess_module.OfflineExtractor = ProcessGpuExtractor
+    stage_reprocess_jobs(
+        root=Path(root_value),
+        job_ids=[job_id],
+        stage_root=Path(root_value) / "owner-stage",
+        paddle_device="gpu:0",
+    )
+    owner_sender.send(("owner_staged", os.getpid()))
+    child_pid = os.fork()
+    if child_pid == 0:
+        owner_sender.close()
+        try:
+            stage_reprocess_jobs(
+                root=Path(root_value),
+                job_ids=[job_id],
+                stage_root=Path(root_value) / "child-stage",
+                paddle_device="gpu:0",
+            )
+            child_sender.send(("child_staged", os.getpid()))
+        finally:
+            child_sender.close()
+        os._exit(0)
+    child_sender.close()
+    owner_sender.send(("child_started", child_pid))
+    while True:
+        time.sleep(1)
+
+
+def _run_default_gpu_stage_then_fork_survivor(
+    root_value: str,
+    job_id: str,
+    old_result: dict[str, Any],
+    sender: Any,
+) -> None:
+    page_sha = old_result["page_assets"][0]["artifact_sha256"]
+    new_rows = [row("new-row", page_sha)]
+
+    class ProcessGpuExtractor:
+        def __init__(
+            self,
+            vl_url: str,
+            *,
+            paddle_device: str,
+            vl_device: str,
+        ) -> None:
+            pass
+
+        def extract(
+            self,
+            source: Path,
+            artifact_root: Path,
+        ) -> dict[str, Any]:
+            return {
+                **deepcopy(old_result),
+                "rows": deepcopy(new_rows),
+                "source_tables": source_tables(new_rows, page_sha),
+            }
+
+    reprocess_module.OfflineExtractor = ProcessGpuExtractor
+    stage_reprocess_jobs(
+        root=Path(root_value),
+        job_ids=[job_id],
+        paddle_device="gpu:0",
+    )
+    survivor_pid = os.fork()
+    if survivor_pid == 0:
+        sender.close()
+        while True:
+            time.sleep(1)
+    sender.send(("forked_survivor", os.getpid(), survivor_pid))
+    sender.close()
 
 
 def digest(value: bytes) -> str:
@@ -337,6 +500,34 @@ def test_reprocess_validation_rejects_mapped_field_in_the_wrong_source_cell(
     }
 
     with pytest.raises(ValueError, match="net_amount.*source cell"):
+        _validate_result(
+            store.job_dir(job_id) / "source.pdf",
+            old_result,
+            new_result,
+            store.job_dir(job_id) / "artifacts",
+        )
+
+
+def test_reprocess_validation_requires_all_description_tokens_in_printed_cell(
+    tmp_path: Path,
+) -> None:
+    store, job_id, old_result = setup_job(tmp_path)
+    page_sha = old_result["page_assets"][0]["artifact_sha256"]
+    new_rows = [row("new-row", page_sha)]
+    new_rows[0]["field_evidence"]["description"].append(
+        evidence(page_sha, "coverage-token")
+    )
+    printed = source_tables(new_rows, page_sha)
+    printed[0]["rows"][0]["cells"][0]["evidence"] = [
+        evidence(page_sha, "description-token")
+    ]
+    new_result = {
+        **old_result,
+        "rows": new_rows,
+        "source_tables": printed,
+    }
+
+    with pytest.raises(ValueError, match="description evidence.*source cell"):
         _validate_result(
             store.job_dir(job_id) / "source.pdf",
             old_result,
@@ -896,32 +1087,18 @@ def test_default_gpu_stage_holds_shared_lock_for_every_source_extraction(
     page_sha = first_old["page_assets"][0]["artifact_sha256"]
     new_rows = [row("new-row", page_sha)]
     events: list[tuple[str, Any]] = []
-    lock_held = False
 
-    @contextmanager
-    def tracking_inference_lock(
-        locked_store: JobStore,
-    ) -> Iterator[None]:
-        nonlocal lock_held
-        assert not lock_held
-        lock_held = True
+    class TrackingLock:
+        closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    tracking_lock = TrackingLock()
+
+    def tracking_inference_lock(locked_store: JobStore) -> TrackingLock:
         events.append(("lock_enter", locked_store.inference_lock_path))
-        try:
-            yield
-        finally:
-            events.append(
-                (
-                    "lock_exit",
-                    len(
-                        [
-                            event
-                            for event in events
-                            if event[0] == "extract"
-                        ]
-                    ),
-                )
-            )
-            lock_held = False
+        return tracking_lock
 
     class DefaultGpuExtractor:
         def __init__(
@@ -931,7 +1108,7 @@ def test_default_gpu_stage_holds_shared_lock_for_every_source_extraction(
             paddle_device: str,
             vl_device: str,
         ) -> None:
-            assert lock_held
+            assert not tracking_lock.closed
             events.append(
                 (
                     "constructed",
@@ -944,7 +1121,7 @@ def test_default_gpu_stage_holds_shared_lock_for_every_source_extraction(
             source: Path,
             artifact_root: Path,
         ) -> dict[str, Any]:
-            assert lock_held
+            assert not tracking_lock.closed
             events.append(("extract", source))
             return {
                 **deepcopy(first_old),
@@ -953,33 +1130,278 @@ def test_default_gpu_stage_holds_shared_lock_for_every_source_extraction(
                 "source_tables": source_tables(new_rows, page_sha),
             }
 
-    monkeypatch.setattr(JobStore, "inference_lock", tracking_inference_lock)
+    monkeypatch.setattr(JobStore, "acquire_inference_lock", tracking_inference_lock)
     monkeypatch.setattr(
         reprocess_module,
         "OfflineExtractor",
         DefaultGpuExtractor,
     )
 
-    staged = stage_reprocess_jobs(
-        root=tmp_path,
-        job_ids=[first_id, second_id],
-        paddle_device="gpu:0",
-        vl_device="cuda:0",
-    )
+    try:
+        staged = stage_reprocess_jobs(
+            root=tmp_path,
+            job_ids=[first_id, second_id],
+            paddle_device="gpu:0",
+            vl_device="cuda:0",
+        )
 
-    assert staged["staged"] == 2
-    assert events[0] == ("lock_enter", store.inference_lock_path)
-    assert events[1] == (
-        "constructed",
-        ("http://127.0.0.1:8111", "gpu:0", "cuda:0"),
+        assert staged["staged"] == 2
+        assert events[0] == ("lock_enter", store.inference_lock_path)
+        assert events[1] == (
+            "constructed",
+            ("http://127.0.0.1:8111", "gpu:0", "cuda:0"),
+        )
+        assert {
+            event[1] for event in events if event[0] == "extract"
+        } == {
+            store.job_dir(first_id) / "source.pdf",
+            store.job_dir(second_id) / "source.pdf",
+        }
+        assert not tracking_lock.closed
+    finally:
+        retained = getattr(reprocess_module, "_gpu_inference_locks", {})
+        for lock in retained.values():
+            lock.close()
+        retained.clear()
+
+
+def test_repeated_default_gpu_stages_reuse_the_process_lifetime_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, job_id, old_result = setup_job(tmp_path)
+    page_sha = old_result["page_assets"][0]["artifact_sha256"]
+    new_rows = [row("new-row", page_sha)]
+    acquire_calls: list[Path] = []
+    original_acquire = JobStore.acquire_inference_lock
+
+    def tracking_acquire(locked_store: JobStore) -> Any:
+        acquire_calls.append(locked_store.inference_lock_path)
+        return original_acquire(locked_store)
+
+    class DefaultGpuExtractor:
+        def __init__(
+            self,
+            vl_url: str,
+            *,
+            paddle_device: str,
+            vl_device: str,
+        ) -> None:
+            pass
+
+        def extract(
+            self,
+            source: Path,
+            artifact_root: Path,
+        ) -> dict[str, Any]:
+            return {
+                **deepcopy(old_result),
+                "rows": deepcopy(new_rows),
+                "source_tables": source_tables(new_rows, page_sha),
+            }
+
+    monkeypatch.setattr(JobStore, "acquire_inference_lock", tracking_acquire)
+    monkeypatch.setattr(reprocess_module, "OfflineExtractor", DefaultGpuExtractor)
+
+    try:
+        for stage_name in ("first", "second"):
+            staged = stage_reprocess_jobs(
+                root=tmp_path,
+                job_ids=[job_id],
+                stage_root=tmp_path / stage_name,
+                paddle_device="gpu:0",
+            )
+            assert staged["staged"] == 1
+        assert acquire_calls == [store.inference_lock_path]
+    finally:
+        retained = getattr(reprocess_module, "_gpu_inference_locks", {})
+        for lock in retained.values():
+            lock.close()
+        retained.clear()
+
+
+@pytest.mark.parametrize(
+    ("fail", "expected"),
+    (
+        (False, ("staged", None)),
+        (True, ("failed", "maintenance extraction failed")),
+    ),
+    ids=("success", "exception"),
+)
+def test_default_gpu_stage_keeps_lock_until_maintenance_process_exits(
+    tmp_path: Path,
+    fail: bool,
+    expected: tuple[str, str | None],
+) -> None:
+    store, job_id, old_result = setup_job(tmp_path)
+    holder_context = multiprocessing.get_context("fork")
+    holder_receiver, holder_sender = holder_context.Pipe(duplex=False)
+    holder = holder_context.Process(
+        target=_run_default_gpu_stage_then_wait,
+        args=(str(tmp_path), job_id, old_result, fail, holder_sender),
     )
-    assert {
-        event[1] for event in events if event[0] == "extract"
-    } == {
-        store.job_dir(first_id) / "source.pdf",
-        store.job_dir(second_id) / "source.pdf",
-    }
-    assert events[-1] == ("lock_exit", 2)
+    holder.start()
+    holder_sender.close()
+    contender = None
+    contender_receiver = None
+    try:
+        assert holder_receiver.poll(5)
+        status, detail, holder_pid = holder_receiver.recv()
+        assert (status, detail) == expected
+        assert holder_pid == holder.pid
+
+        contender_context = multiprocessing.get_context("spawn")
+        contender_receiver, contender_sender = contender_context.Pipe(duplex=False)
+        contender = contender_context.Process(
+            target=_report_reprocess_lock_entry,
+            args=(str(tmp_path), contender_sender),
+        )
+        contender.start()
+        contender_sender.close()
+        assert contender_receiver.poll(5)
+        assert contender_receiver.recv() == (
+            "ready",
+            str(store.inference_lock_path),
+        )
+        assert not contender_receiver.poll(0.25)
+
+        holder.terminate()
+        holder.join(timeout=5)
+        assert holder.pid == holder_pid
+        assert not holder.is_alive()
+
+        assert contender_receiver.poll(5)
+        assert contender_receiver.recv() == (
+            "entered",
+            str(store.inference_lock_path),
+        )
+    finally:
+        holder_receiver.close()
+        if holder.is_alive():
+            holder.terminate()
+            holder.join(timeout=5)
+        if contender_receiver is not None:
+            contender_receiver.close()
+        if contender is not None:
+            contender.join(timeout=5)
+            if contender.is_alive():
+                contender.terminate()
+                contender.join(timeout=5)
+
+    assert holder.exitcode is not None
+    assert contender is not None
+    assert contender.exitcode == 0
+
+
+def test_forked_competing_stage_reacquires_after_owner_process_exits(
+    tmp_path: Path,
+) -> None:
+    _, job_id, old_result = setup_job(tmp_path)
+    context = multiprocessing.get_context("fork")
+    owner_receiver, owner_sender = context.Pipe(duplex=False)
+    child_receiver, child_sender = context.Pipe(duplex=False)
+    owner = context.Process(
+        target=_run_default_gpu_stage_then_fork_competing_stage,
+        args=(
+            str(tmp_path),
+            job_id,
+            old_result,
+            owner_sender,
+            child_sender,
+        ),
+    )
+    owner.start()
+    owner_sender.close()
+    child_sender.close()
+    child_pid = None
+    try:
+        assert owner_receiver.poll(5)
+        assert owner_receiver.recv() == ("owner_staged", owner.pid)
+        assert owner_receiver.poll(5)
+        event, child_pid = owner_receiver.recv()
+        assert event == "child_started"
+        assert not child_receiver.poll(0.25)
+
+        owner.terminate()
+        owner.join(timeout=5)
+        assert not owner.is_alive()
+
+        assert child_receiver.poll(5)
+        assert child_receiver.recv() == ("child_staged", child_pid)
+    finally:
+        owner_receiver.close()
+        child_receiver.close()
+        if owner.is_alive():
+            owner.terminate()
+            owner.join(timeout=5)
+        if child_pid is not None:
+            with suppress(ProcessLookupError):
+                os.kill(child_pid, 15)
+
+    assert owner.exitcode is not None
+
+
+def test_forked_unrelated_child_does_not_extend_owner_lock_lifetime(
+    tmp_path: Path,
+) -> None:
+    store, job_id, old_result = setup_job(tmp_path)
+    owner_context = multiprocessing.get_context("fork")
+    owner_receiver, owner_sender = owner_context.Pipe(duplex=False)
+    owner = owner_context.Process(
+        target=_run_default_gpu_stage_then_fork_survivor,
+        args=(str(tmp_path), job_id, old_result, owner_sender),
+    )
+    owner.start()
+    owner_sender.close()
+    survivor_pid = None
+    contender = None
+    contender_receiver = None
+    try:
+        assert owner_receiver.poll(5)
+        event, owner_pid, survivor_pid = owner_receiver.recv()
+        assert event == "forked_survivor"
+        assert owner_pid == owner.pid
+        owner.join(timeout=5)
+        assert not owner.is_alive()
+        os.kill(survivor_pid, 0)
+
+        contender_context = multiprocessing.get_context("spawn")
+        contender_receiver, contender_sender = contender_context.Pipe(duplex=False)
+        contender = contender_context.Process(
+            target=_report_reprocess_lock_entry,
+            args=(str(tmp_path), contender_sender),
+        )
+        contender.start()
+        contender_sender.close()
+        assert contender_receiver.poll(5)
+        assert contender_receiver.recv() == (
+            "ready",
+            str(store.inference_lock_path),
+        )
+        assert contender_receiver.poll(5)
+        assert contender_receiver.recv() == (
+            "entered",
+            str(store.inference_lock_path),
+        )
+    finally:
+        owner_receiver.close()
+        if owner.is_alive():
+            owner.terminate()
+            owner.join(timeout=5)
+        if contender_receiver is not None:
+            contender_receiver.close()
+        if contender is not None:
+            contender.join(timeout=5)
+            if contender.is_alive():
+                contender.terminate()
+                contender.join(timeout=5)
+        if survivor_pid is not None:
+            with suppress(ProcessLookupError):
+                os.kill(survivor_pid, 15)
+
+    assert owner.exitcode == 0
+    assert contender is not None
+    assert contender.exitcode == 0
 
 
 def test_injected_reprocess_extractor_does_not_acquire_gpu_lock(
@@ -990,13 +1412,13 @@ def test_injected_reprocess_extractor_does_not_acquire_gpu_lock(
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
     new_rows = [row("new-row", page_sha)]
 
-    def fail_if_locked(locked_store: JobStore) -> Iterator[None]:
+    def fail_if_locked(locked_store: JobStore) -> Any:
         raise AssertionError(
             "injected extractor unexpectedly locked "
             f"{locked_store.inference_lock_path}"
         )
 
-    monkeypatch.setattr(JobStore, "inference_lock", fail_if_locked)
+    monkeypatch.setattr(JobStore, "acquire_inference_lock", fail_if_locked)
 
     staged = stage_reprocess_jobs(
         root=tmp_path,
