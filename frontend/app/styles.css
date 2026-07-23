@@ -8,6 +8,7 @@
   --line: rgba(20, 35, 31, 0.18);
   --serif: "Iowan Old Style", "Baskerville", "Times New Roman", serif;
   --sans: "Avenir Next", "Gill Sans", "Trebuchet MS", sans-serif;
+  --mono: "Courier Prime", "Courier New", monospace;
 }
 
 * { box-sizing: border-box; }
@@ -150,7 +151,18 @@ main::after { content: ""; position: fixed; width: 560px; height: 560px; right: 
 .split-resizer span::after { left: 2px; top: 0; }
 .split-resizer:hover, .split-resizer:focus-visible { background: var(--signal); outline: none; }
 .ledger-caption, .evidence-head { height: 48px; flex: 0 0 48px; padding: 0 16px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--line); text-transform: uppercase; font-size: 10px; letter-spacing: .13em; }
+.ledger-caption-actions { display: flex; align-items: center; gap: 13px; }
+.ledger-mode-switch { display: flex; padding: 2px; border: 1px solid var(--ink); background: rgba(255,255,255,.24); }
+.ledger-mode-switch button { padding: 5px 8px; border: 0; color: var(--muted); background: transparent; font-size: 7px; letter-spacing: .08em; text-transform: uppercase; cursor: pointer; }
+.ledger-mode-switch button.active { color: var(--paper); background: var(--ink); }
+.ledger-mode-switch button:disabled { opacity: .35; cursor: not-allowed; }
 .table-shell { flex: 1 1 auto; min-height: 0; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
+.source-table-group + .source-table-group { border-top: 4px double var(--ink); }
+.source-table-label { position: sticky; left: 0; display: flex; justify-content: space-between; min-width: 100%; padding: 8px 11px; color: var(--muted); background: #d9d3c4; border-bottom: 1px solid var(--line); font-size: 7px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
+.source-table { table-layout: auto; }
+.source-table th, .source-table td { min-width: 118px; text-align: left; white-space: normal; vertical-align: top; }
+.source-table th:first-child, .source-table td:first-child { min-width: 48px; width: 48px; text-align: right; }
+.source-table td:not(:first-child) { font-family: var(--mono); font-size: 11px; overflow-wrap: anywhere; }
 table { width: 100%; min-width: 770px; table-layout: fixed; border-collapse: collapse; font-size: 12px; }
 .number-column { width: 48px; }
 .description-column { width: auto; }

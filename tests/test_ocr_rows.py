@@ -256,6 +256,94 @@ def test_compact_unitprice_header_preserves_rate_quantity_and_amount_columns() -
     assert result.rows[1].candidate.quantity == Decimal("1.00")
 
 
+def test_amount_rs_unit_days_compound_header_preserves_rate_quantity_and_total() -> None:
+    tokens = (
+        token(0, "Sr.N", (50, 30, 90, 45)),
+        token(1, "Particular", (100, 30, 420, 45)),
+        token(2, "Amount Rs. Unit/Days", (610, 30, 820, 45)),
+        token(3, "Total", (880, 30, 970, 45)),
+        token(4, "1", (50, 70, 70, 85)),
+        token(5, "Consulting Charges", (100, 70, 360, 85)),
+        token(6, "1,000.00", (620, 70, 700, 85)),
+        token(7, "2", (760, 70, 780, 85)),
+        token(8, "2,000.00", (890, 70, 960, 85)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(40, 20, 980, 110),
+    )
+
+    assert len(result.rows) == 1
+    assert result.rows[0].candidate.rate == Decimal("1000.00")
+    assert result.rows[0].candidate.quantity == Decimal("2")
+    assert result.rows[0].candidate.amount == Decimal("2000.00")
+
+
+def test_amount_rs_without_distinct_total_remains_the_final_amount_column() -> None:
+    tokens = (
+        token(0, "Particular", (100, 30, 420, 45)),
+        token(1, "Amount Rs.", (850, 30, 950, 45)),
+        token(2, "Consulting Charges", (100, 70, 360, 85)),
+        token(3, "2,000.00", (870, 70, 950, 85)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 20, 980, 110),
+    )
+
+    assert result.rows[0].candidate.rate is None
+    assert result.rows[0].candidate.amount == Decimal("2000.00")
+    assert [
+        (column.label, column.canonical_field) for column in result.source_tables[0].columns
+    ] == [
+        ("Particular", "description"),
+        ("Amount Rs.", "net_amount"),
+    ]
+
+
+def test_source_table_keeps_unknown_columns_and_raw_ocr_cells() -> None:
+    tokens = (
+        token(0, "Particular", (100, 30, 360, 45)),
+        token(1, "Co-pay %", (520, 30, 610, 45)),
+        token(2, "Amount", (850, 30, 950, 45)),
+        token(3, "Procedure", (100, 70, 300, 85)),
+        token(4, "10", (540, 70, 570, 85)),
+        token(5, "4,500.00", (860, 70, 940, 85)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 20, 980, 110),
+    )
+    source_tables = getattr(result, "source_tables", ())
+
+    assert len(source_tables) == 1
+    assert [column.label for column in source_tables[0].columns] == [
+        "Particular",
+        "Co-pay %",
+        "Amount",
+    ]
+    assert [column.canonical_field for column in source_tables[0].columns] == [
+        "description",
+        None,
+        "net_amount",
+    ]
+    assert [cell.raw_value for cell in source_tables[0].rows[0].cells] == [
+        "Procedure",
+        "10",
+        "4,500.00",
+    ]
+    assert all(cell.evidence for cell in source_tables[0].rows[0].cells)
+
+
 def test_repeated_shifted_headers_reassign_rate_and_quantity_lanes() -> None:
     tokens = (
         token(0, "Description", (100, 30, 300, 45)),
@@ -675,9 +763,7 @@ def test_footer_totals_short_fragments_and_standalone_expiry_are_not_rows() -> N
         if row.candidate.role is RowRole.DETAIL
     ] == [("Medicine", Decimal("100.00"))]
     assert [
-        row.candidate.description
-        for row in result.rows
-        if row.candidate.role is RowRole.UNRESOLVED
+        row.candidate.description for row in result.rows if row.candidate.role is RowRole.UNRESOLVED
     ] == ["ExpDate"]
 
 
@@ -776,9 +862,10 @@ def test_wrapped_header_keeps_date_code_and_amount_in_distinct_lanes() -> None:
         box=(80, 10, 980, 170),
     )
     assert result.diagnostics["header_found"] is True
-    assert result.diagnostics["column_centers"]["amount"] > result.diagnostics[
-        "column_centers"
-    ]["service_date"]
+    assert (
+        result.diagnostics["column_centers"]["amount"]
+        > result.diagnostics["column_centers"]["service_date"]
+    )
     assert len(result.rows) == 2
     charge, component = (row.candidate for row in result.rows)
     assert charge.amount == Decimal("11457.00")
@@ -858,9 +945,7 @@ def test_description_before_subtotal_extends_previous_serial_row() -> None:
         box=(70, 20, 980, 190),
     )
     assert len(result.rows) == 1
-    assert result.rows[0].candidate.description == (
-        "Package(IPD) - Coronary Angiography (CAG)"
-    )
+    assert result.rows[0].candidate.description == ("Package(IPD) - Coronary Angiography (CAG)")
     assert result.rows[0].candidate.amount == Decimal("11457.00")
     assert result.rows[0].candidate.role is RowRole.CATEGORY_ROLLUP
 

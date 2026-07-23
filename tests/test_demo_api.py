@@ -100,6 +100,79 @@ def test_completed_rows_and_page_are_scoped_to_uuid(tmp_path: Path, monkeypatch)
     assert client.get("/api/v2/documents/not-a-uuid").status_code == 404
 
 
+def test_source_tables_endpoint_returns_dynamic_columns_and_raw_cells(
+    tmp_path: Path, monkeypatch
+) -> None:
+    client, store = client_for(tmp_path, monkeypatch)
+    job_id, result = completed_job(store)
+    evidence = result["rows"][0]["evidence"]
+    result["source_tables"] = [
+        {
+            "id": "p1-t1-s1",
+            "page_number": 1,
+            "table_id": "p1-t1",
+            "table_type": "item_ledger",
+            "columns": [
+                {
+                    "id": "particular",
+                    "label": "Particular",
+                    "order": 0,
+                    "canonical_field": "description",
+                    "evidence": evidence,
+                },
+                {
+                    "id": "co-pay",
+                    "label": "Co-pay %",
+                    "order": 1,
+                    "canonical_field": None,
+                    "evidence": evidence,
+                },
+            ],
+            "rows": [
+                {
+                    "id": "p1-t1-s1-r1",
+                    "order": 0,
+                    "canonical_row_id": "machine-row",
+                    "cells": [
+                        {
+                            "column_id": "particular",
+                            "raw_value": "Consultation",
+                            "evidence": evidence,
+                            "validation_flags": [],
+                        },
+                        {
+                            "column_id": "co-pay",
+                            "raw_value": "10",
+                            "evidence": evidence,
+                            "validation_flags": [],
+                        },
+                    ],
+                    "validation_flags": [],
+                }
+            ],
+            "validation_flags": [],
+        }
+    ]
+    (store.job_dir(job_id) / "result.json").write_text(json.dumps(result))
+
+    response = client.get(f"/api/v2/documents/{job_id}/source-tables")
+
+    assert response.status_code == 200
+    assert response.json()["available"] is True
+    assert response.json()["tables"][0]["columns"][1]["label"] == "Co-pay %"
+    assert response.json()["tables"][0]["rows"][0]["cells"][1]["raw_value"] == "10"
+    assert (
+        client.get(f"/api/v2/documents/{job_id}/source-tables?query=missing").json()["total"] == 0
+    )
+
+    del result["source_tables"]
+    (store.job_dir(job_id) / "result.json").write_text(json.dumps(result))
+    legacy = client.get(f"/api/v2/documents/{job_id}/source-tables")
+    assert legacy.status_code == 200
+    assert legacy.json()["available"] is False
+    assert legacy.json()["tables"] == []
+
+
 def completed_job(
     store: JobStore,
     *,
@@ -419,9 +492,10 @@ def test_hospital_name_correction_is_revisioned_grounded_and_exported(
     rows = client.get(f"/api/v2/documents/{job_id}/rows").json()
     assert rows["hospital"]["name"] == "Reviewer Verified Hospital"
 
-    assert client.post(
-        f"/api/v2/documents/{job_id}/approval", headers={"If-Match": "1"}
-    ).status_code == 200
+    assert (
+        client.post(f"/api/v2/documents/{job_id}/approval", headers={"If-Match": "1"}).status_code
+        == 200
+    )
     exported = client.get(f"/api/v2/documents/{job_id}/exports/json").json()
     assert exported["hospital"]["name"] == "Reviewer Verified Hospital"
     csv_export = client.get(f"/api/v2/documents/{job_id}/exports/csv").text
@@ -437,17 +511,13 @@ def test_structural_issue_blocks_approval_then_exports_are_available(
         "table_id": "p1-t1",
         "table_type": "item_ledger",
         "phase3_route": {"reasons": ["low_yield"]},
-        "recovery_attempts": [
-            {"stage": "review", "status": "pending", "reason": "low_yield"}
-        ],
+        "recovery_attempts": [{"stage": "review", "status": "pending", "reason": "low_yield"}],
     }
     job_id, _ = completed_job(store, description="=FORMULA", diagnostics=[diagnostic])
     review = client.get(f"/api/v2/documents/{job_id}/review").json()
     assert review["issues_open"] == 1
     issue_id = review["issues"][0]["id"]
-    blocked = client.post(
-        f"/api/v2/documents/{job_id}/approval", headers={"If-Match": "0"}
-    )
+    blocked = client.post(f"/api/v2/documents/{job_id}/approval", headers={"If-Match": "0"})
     assert blocked.status_code == 422
 
     resolved = client.patch(
@@ -456,9 +526,7 @@ def test_structural_issue_blocks_approval_then_exports_are_available(
         json={"status": "resolved", "reason": "Compared against the visible page"},
     )
     assert resolved.status_code == 200
-    approved = client.post(
-        f"/api/v2/documents/{job_id}/approval", headers={"If-Match": "1"}
-    )
+    approved = client.post(f"/api/v2/documents/{job_id}/approval", headers={"If-Match": "1"})
     assert approved.status_code == 200
     assert approved.json()["approval"]["status"] == "approved"
 

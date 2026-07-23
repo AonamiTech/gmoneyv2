@@ -78,6 +78,39 @@ class EvidenceRef(ContractModel):
     token_ids: tuple[str, ...] = ()
 
 
+class SourceColumn(ContractModel):
+    id: str
+    label: str
+    order: int = Field(ge=0)
+    canonical_field: str | None = None
+    evidence: tuple[EvidenceRef, ...] = ()
+
+
+class SourceCell(ContractModel):
+    column_id: str
+    raw_value: str | None = None
+    evidence: tuple[EvidenceRef, ...] = ()
+    validation_flags: tuple[str, ...] = ()
+
+
+class SourceRow(ContractModel):
+    id: str
+    order: int = Field(ge=0)
+    canonical_row_id: str | None = None
+    cells: tuple[SourceCell, ...]
+    validation_flags: tuple[str, ...] = ()
+
+
+class SourceTable(ContractModel):
+    id: str
+    page_number: int = Field(ge=1)
+    table_id: str
+    table_type: TableType = TableType.UNKNOWN
+    columns: tuple[SourceColumn, ...]
+    rows: tuple[SourceRow, ...]
+    validation_flags: tuple[str, ...] = ()
+
+
 class DocumentTotal(ContractModel):
     total_version: str = "document_total_v2"
     amount_raw: str

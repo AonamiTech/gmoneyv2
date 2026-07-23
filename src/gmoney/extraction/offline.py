@@ -12,7 +12,14 @@ from uuid import uuid4
 import cv2
 import typer
 
-from gmoney.contracts.extraction import CanonicalRow, DocumentTotal, PageType, RowRole, TableType
+from gmoney.contracts.extraction import (
+    CanonicalRow,
+    DocumentTotal,
+    PageType,
+    RowRole,
+    SourceTable,
+    TableType,
+)
 from gmoney.contracts.phase3 import (
     AdjudicationRequest,
     GeminiMode,
@@ -423,10 +430,7 @@ def _apply_profile_constraints(reconstruction, profile):
             role = RowRole.REFUND
         elif role in {RowRole.CATEGORY_ROLLUP, RowRole.PAYMENT}:
             role = RowRole.DETAIL
-        updates = {
-            field: None
-            for field in optional_fields & set(profile.unsupported_fields)
-        }
+        updates = {field: None for field in optional_fields & set(profile.unsupported_fields)}
         rows.append(
             replace(
                 row,
@@ -720,6 +724,7 @@ class OfflineExtractor:
             progress(0, len(manifest.pages))
         document_id = manifest.document_sha256
         all_rows: list[CanonicalRow] = []
+        all_source_tables: list[SourceTable] = []
         document_total_candidates: list[DocumentTotalCandidate] = []
         diagnostics: list[dict[str, Any]] = []
         schema_states: list[TableSchemaState] = []
@@ -965,8 +970,7 @@ class OfflineExtractor:
                     )
                     and (
                         profile_heavy_sample
-                        or
-                        not parsed_rows
+                        or not parsed_rows
                         or is_implausibly_low_yield(reconstruction)
                         or reconstruction.diagnostics.get("orientation") != "upright"
                         or (
@@ -1108,8 +1112,7 @@ class OfflineExtractor:
                         )
                     )
                 profile_heavy_disagreement = bool(
-                    profile_heavy_sample
-                    and _heavy_disagrees(reconstruction, provider_candidates)
+                    profile_heavy_sample and _heavy_disagrees(reconstruction, provider_candidates)
                 )
                 fused_rows = (
                     reconstruction.rows
@@ -1200,9 +1203,7 @@ class OfflineExtractor:
                             )
                             try:
                                 response, gemini_cache_hit = cached_adjudication(
-                                    artifact_root
-                                    / "inference"
-                                    / f"{work.table_id}.gemini.json",
+                                    artifact_root / "inference" / f"{work.table_id}.gemini.json",
                                     request,
                                     self.gemini,
                                 )
@@ -1227,9 +1228,7 @@ class OfflineExtractor:
                                 if not gemini_cache_hit:
                                     gemini_cost += response.measured_cost_usd
                                 try:
-                                    image = cv2.imread(
-                                        str(redaction.path), cv2.IMREAD_COLOR
-                                    )
+                                    image = cv2.imread(str(redaction.path), cv2.IMREAD_COLOR)
                                     if image is None:
                                         raise ValueError("cannot read redacted crop")
                                     grounded = ground_adjudication(
@@ -1246,9 +1245,7 @@ class OfflineExtractor:
                                         ),
                                     )
                                 except Exception as error:
-                                    gemini_block_reason = (
-                                        f"grounding_error:{type(error).__name__}"
-                                    )
+                                    gemini_block_reason = f"grounding_error:{type(error).__name__}"
                                     recovery_attempts.append(
                                         RecoveryAttempt(
                                             stage=RecoveryStage.GEMINI,
@@ -1263,10 +1260,7 @@ class OfflineExtractor:
                                 else:
                                     gemini_grounded_rows = len(grounded.rows)
                                     gemini_rejected_reasons = grounded.rejected_reasons
-                                    if (
-                                        self.gemini_mode is GeminiMode.ENABLED
-                                        and grounded.rows
-                                    ):
+                                    if self.gemini_mode is GeminiMode.ENABLED and grounded.rows:
                                         parsed_rows.extend(
                                             canonicalize_rows(
                                                 document_id,
@@ -1291,13 +1285,8 @@ class OfflineExtractor:
                                             ),
                                             status=(
                                                 "challenger"
-                                                if self.gemini_mode
-                                                is GeminiMode.CHALLENGER
-                                                else (
-                                                    "recovered"
-                                                    if grounded.rows
-                                                    else "rejected"
-                                                )
+                                                if self.gemini_mode is GeminiMode.CHALLENGER
+                                                else ("recovered" if grounded.rows else "rejected")
                                             ),
                                             reason=(
                                                 ",".join(grounded.rejected_reasons)
@@ -1347,6 +1336,7 @@ class OfflineExtractor:
                         )
                     )
                 all_rows.extend(parsed_rows)
+                all_source_tables.extend(reconstruction.source_tables)
                 diagnostics.append(
                     {
                         "page_number": page_asset.page_number,
@@ -1407,9 +1397,7 @@ class OfflineExtractor:
             "document_total": (
                 document_total.model_dump(mode="json") if document_total is not None else None
             ),
-            "document_totals": [
-                total.model_dump(mode="json") for total in document_totals
-            ],
+            "document_totals": [total.model_dump(mode="json") for total in document_totals],
             "document_id": document_id,
             "hospital_id": self.hospital_id,
             "hospital": hospital,
@@ -1426,6 +1414,7 @@ class OfflineExtractor:
                 }
                 for page in manifest.pages
             ],
+            "source_tables": [table.model_dump(mode="json") for table in all_source_tables],
             "rows": [row.model_dump(mode="json") for row in rows],
             "diagnostics": diagnostics,
             "provider_usage": {
@@ -1434,9 +1423,7 @@ class OfflineExtractor:
                 "gemini_measured_cost_usd": str(gemini_cost),
                 "gemini_provider_disabled_reason": gemini_provider_disabled_reason,
                 "gemini_promotion_manifest_sha256": (
-                    self.gemini_promotion.frozen_manifest_sha256
-                    if self.gemini_promotion
-                    else None
+                    self.gemini_promotion.frozen_manifest_sha256 if self.gemini_promotion else None
                 ),
             },
         }

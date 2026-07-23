@@ -13,6 +13,7 @@ from fastapi import FastAPI, File, Header, HTTPException, Query, Response, Uploa
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
+from gmoney.contracts.extraction import SourceTable
 from gmoney.demo.review import (
     ReviewValidationError,
     approval_blockers,
@@ -129,9 +130,9 @@ def _public_state(state: dict[str, Any]) -> dict[str, Any]:
     public["hospital_name_source"] = "machine" if state.get("hospital_name") else None
     if state.get("status") == "complete":
         try:
-            hospital_override = store.read_review(state["id"]).get(
-                "document_overrides", {}
-            ).get("hospital")
+            hospital_override = (
+                store.read_review(state["id"]).get("document_overrides", {}).get("hospital")
+            )
         except KeyError:
             hospital_override = None
         if hospital_override:
@@ -382,6 +383,51 @@ def get_rows(
         "offset": offset,
         "limit": limit,
         "rows": rows[offset : offset + limit],
+    }
+
+
+@app.get("/api/v2/documents/{job_id}/source-tables")
+def get_source_tables(
+    job_id: str,
+    offset: Annotated[int, Query(ge=0)] = 0,
+    limit: Annotated[int, Query(ge=1, le=500)] = 200,
+    query: Annotated[str | None, Query(max_length=200)] = None,
+    source_page: Annotated[int | None, Query(ge=1)] = None,
+) -> dict[str, Any]:
+    result, _ = _complete_result(job_id)
+    source_payload = result.get("source_tables")
+    available = bool(source_payload)
+    tables = [SourceTable.model_validate(table) for table in source_payload or []]
+    if source_page is not None:
+        tables = [table for table in tables if table.page_number == source_page]
+
+    needle = query.casefold().strip() if query else ""
+    selected_rows: list[tuple[int, Any]] = []
+    for table_index, table in enumerate(tables):
+        for row in table.rows:
+            if needle and not any(
+                needle in str(cell.raw_value or "").casefold() for cell in row.cells
+            ):
+                continue
+            selected_rows.append((table_index, row))
+
+    total = len(selected_rows)
+    window = selected_rows[offset : offset + limit]
+    rows_by_table: dict[int, list[Any]] = {}
+    for table_index, row in window:
+        rows_by_table.setdefault(table_index, []).append(row)
+    public_tables = [
+        table.model_copy(update={"rows": tuple(rows_by_table[index])})
+        for index, table in enumerate(tables)
+        if index in rows_by_table
+    ]
+    return {
+        "document_id": result["document_id"],
+        "available": available,
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "tables": [table.model_dump(mode="json") for table in public_tables],
     }
 
 

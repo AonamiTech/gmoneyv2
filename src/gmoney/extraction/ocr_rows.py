@@ -7,7 +7,15 @@ from difflib import SequenceMatcher
 from statistics import median
 
 from gmoney.contracts.evidence import OcrToken, Point, Polygon
-from gmoney.contracts.extraction import RowRole, TableType
+from gmoney.contracts.extraction import (
+    EvidenceRef,
+    RowRole,
+    SourceCell,
+    SourceColumn,
+    SourceRow,
+    SourceTable,
+    TableType,
+)
 from gmoney.extraction.rows import CandidateLedgerRow
 from gmoney.extraction.spatial import AlignedLedgerRow
 from gmoney.extraction.typed_values import parse_decimal
@@ -44,7 +52,14 @@ HEADER_TERMS: dict[str, tuple[str, ...]] = {
     "batch": ("batch no", "bath no", "batch"),
     "expiry": ("expiry", "exp"),
     "quantity": ("quantity", "qty", "nos", "unit days", "units"),
-    "rate": ("unit price", "unitprice", "unit rate", "unitrate", "rate"),
+    "rate": (
+        "amount rs",
+        "unit price",
+        "unitprice",
+        "unit rate",
+        "unitrate",
+        "rate",
+    ),
     "gross_amount": ("gross amount", "service amount", "service amt"),
     "discount": ("discount", "disc amt", "disc"),
     "amount": (
@@ -154,6 +169,7 @@ class ReconstructionResult:
     rows: tuple[AlignedLedgerRow, ...]
     schema: TableSchemaState | None
     diagnostics: dict[str, object]
+    source_tables: tuple[SourceTable, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -199,8 +215,7 @@ def _normalize_orientation(
             edges = [(points[index], points[(index + 1) % 4]) for index in range(4)]
             start, end = max(
                 edges,
-                key=lambda edge: (edge[1].x - edge[0].x) ** 2
-                + (edge[1].y - edge[0].y) ** 2,
+                key=lambda edge: (edge[1].x - edge[0].x) ** 2 + (edge[1].y - edge[0].y) ** 2,
             )
             if abs(end.x - start.x) <= 5:
                 continue
@@ -222,11 +237,7 @@ def _normalize_orientation(
                         points=tuple(
                             Point(
                                 x=point.x,
-                                y=(
-                                    point.y
-                                    - slope * (point.x - anchor_x)
-                                    + y_offset
-                                ),
+                                y=(point.y - slope * (point.x - anchor_x) + y_offset),
                             )
                             for point in token.polygon.points
                         )
@@ -294,9 +305,7 @@ def _normalize_orientation(
         return (currency_lane, header_strength)
 
     clockwise_tokens, clockwise_slope = deskew(rotate(True), normalize_origin=True)
-    counterclockwise_tokens, counterclockwise_slope = deskew(
-        rotate(False), normalize_origin=True
-    )
+    counterclockwise_tokens, counterclockwise_slope = deskew(rotate(False), normalize_origin=True)
     if reading_order_score(clockwise_tokens) >= reading_order_score(counterclockwise_tokens):
         rotated = clockwise_tokens
         orientation = "clockwise_90"
@@ -359,22 +368,20 @@ def _header_roles(line: OcrLine) -> dict[str, OcrToken]:
             if role == "service_code" and "hsn_code" in matches:
                 continue
             role_token = (
-                _virtual_horizontal_token(token, start, end, len(normalized))
-                if compound
-                else token
+                _virtual_horizontal_token(token, start, end, len(normalized)) if compound else token
             )
             if role != "amount" or role not in roles or _center_x(token) > _center_x(roles[role]):
                 roles[role] = role_token
+    rate = roles.get("rate")
+    amount = roles.get("amount")
+    if rate is not None and amount is not None and rate.token_id == amount.token_id:
+        roles.pop("rate")
     return roles
 
 
 def _is_header_token(token: OcrToken) -> bool:
     normalized = _normalize(token.text)
-    if any(
-        normalized == _normalize(term)
-        for terms in HEADER_TERMS.values()
-        for term in terms
-    ):
+    if any(normalized == _normalize(term) for terms in HEADER_TERMS.values() for term in terms):
         return True
     if len(_header_roles(OcrLine((token,)))) > 1:
         return True
@@ -462,9 +469,7 @@ def _header_blocks(lines: tuple[OcrLine, ...]) -> tuple[HeaderBlock, ...]:
     for start in range(len(lines)):
         roles: dict[str, OcrToken] = {}
         start_words = set(re.findall(r"[a-z]+", _normalize(lines[start].text)))
-        if not _header_roles(lines[start]) and not (
-            start_words and start_words <= fragment_words
-        ):
+        if not _header_roles(lines[start]) and not (start_words and start_words <= fragment_words):
             continue
         for end in range(start, min(len(lines), start + 3)):
             roles = _merge_header_roles(roles, _header_roles(lines[end]))
@@ -490,6 +495,233 @@ def _column_centers(
     width: float,
 ) -> dict[str, float]:
     return {role: (_center_x(token) - left) / width for role, token in roles.items()}
+
+
+SOURCE_CANONICAL_FIELDS: dict[str, str | None] = {
+    "serial": None,
+    "description": "description",
+    "service_date": "service_date_raw",
+    "request_no": "request_no",
+    "service_code": "service_code",
+    "hsn_code": "hsn_code",
+    "company": None,
+    "batch": None,
+    "expiry": None,
+    "quantity": "quantity",
+    "rate": "unit_price",
+    "gross_amount": "gross_amount",
+    "discount": "discount",
+    "amount": "net_amount",
+}
+
+
+def _source_label(role: str, token: OcrToken, shared_token: bool) -> str:
+    raw = re.sub(r"\s+", " ", token.text).strip()
+    normalized = _normalize(raw)
+    if not shared_token:
+        return raw
+    if role == "rate" and "amount rs" in normalized:
+        return "Amount Rs."
+    if role == "quantity" and "unit days" in normalized:
+        return "Unit/Days"
+    return {
+        "serial": "Sr. No.",
+        "description": "Particular",
+        "service_date": "Date",
+        "request_no": "Request No.",
+        "service_code": "Service Code",
+        "hsn_code": "HSN Code",
+        "company": "Company",
+        "batch": "Batch",
+        "expiry": "Expiry",
+        "quantity": "Quantity",
+        "rate": "Rate",
+        "gross_amount": "Gross Amount",
+        "discount": "Discount",
+        "amount": "Amount",
+    }[role]
+
+
+def _source_evidence(
+    tokens: tuple[OcrToken, ...],
+    original_by_id: dict[str, OcrToken],
+    table_id: str,
+) -> tuple[EvidenceRef, ...]:
+    originals = tuple(
+        original_by_id[token.token_id] for token in tokens if token.token_id in original_by_id
+    )
+    if not originals:
+        return ()
+    boxes = [_bounds(token) for token in originals]
+    left = min(box[0] for box in boxes)
+    top = min(box[1] for box in boxes)
+    right = max(box[2] for box in boxes)
+    bottom = max(box[3] for box in boxes)
+    first = originals[0]
+    return (
+        EvidenceRef(
+            page_number=first.page_number,
+            table_id=table_id,
+            polygon=Polygon(
+                points=(
+                    Point(x=left, y=top),
+                    Point(x=right, y=top),
+                    Point(x=right, y=bottom),
+                    Point(x=left, y=bottom),
+                )
+            ),
+            artifact_sha256=first.artifact_sha256,
+            token_ids=tuple(dict.fromkeys(token.token_id for token in originals)),
+        ),
+    )
+
+
+def _source_columns(
+    lines: tuple[OcrLine, ...],
+    block: HeaderBlock,
+    original_by_id: dict[str, OcrToken],
+    table_id: str,
+) -> tuple[tuple[SourceColumn, ...], tuple[float, ...]]:
+    header_tokens = tuple(
+        token
+        for line in lines[block.start : block.end + 1]
+        for token in line.tokens
+        if token.text.strip()
+    )
+    role_token_counts: dict[str, int] = {}
+    for token in block.roles.values():
+        role_token_counts[token.token_id] = role_token_counts.get(token.token_id, 0) + 1
+
+    entries: list[tuple[float, str, str | None, OcrToken]] = []
+    recognized_ids: set[str] = set()
+    for role, token in block.roles.items():
+        recognized_ids.add(token.token_id)
+        entries.append(
+            (
+                _center_x(token),
+                _source_label(role, token, role_token_counts[token.token_id] > 1),
+                SOURCE_CANONICAL_FIELDS.get(role),
+                token,
+            )
+        )
+    for token in header_tokens:
+        if token.token_id not in recognized_ids:
+            entries.append((_center_x(token), token.text.strip(), None, token))
+    entries.sort(key=lambda entry: entry[0])
+
+    columns: list[SourceColumn] = []
+    centers: list[float] = []
+    for order, (center, label, canonical_field, token) in enumerate(entries):
+        columns.append(
+            SourceColumn(
+                id=f"c{order + 1}",
+                label=label,
+                order=order,
+                canonical_field=canonical_field,
+                evidence=_source_evidence((token,), original_by_id, table_id),
+            )
+        )
+        centers.append(center)
+    return tuple(columns), tuple(centers)
+
+
+def _source_rows(
+    lines: tuple[OcrLine, ...],
+    *,
+    start: int,
+    end: int,
+    source_table_id: str,
+    columns: tuple[SourceColumn, ...],
+    centers: tuple[float, ...],
+    original_by_id: dict[str, OcrToken],
+    table_id: str,
+) -> tuple[SourceRow, ...]:
+    if not columns:
+        return ()
+    output: list[SourceRow] = []
+    for line in lines[start:end]:
+        buckets: list[list[OcrToken]] = [[] for _ in columns]
+        for token in line.tokens:
+            column = min(
+                range(len(centers)),
+                key=lambda index: abs(_center_x(token) - centers[index]),
+            )
+            buckets[column].append(token)
+        if not any(buckets):
+            continue
+        cells: list[SourceCell] = []
+        for column, bucket in zip(columns, buckets, strict=True):
+            ordered = tuple(sorted(bucket, key=_center_x))
+            raw_value = " ".join(token.text.strip() for token in ordered if token.text.strip())
+            cells.append(
+                SourceCell(
+                    column_id=column.id,
+                    raw_value=raw_value or None,
+                    evidence=_source_evidence(ordered, original_by_id, table_id),
+                    validation_flags=(() if raw_value else ("empty_cell",)),
+                )
+            )
+        if not any(cell.raw_value for cell in cells):
+            continue
+        output.append(
+            SourceRow(
+                id=f"{source_table_id}-r{len(output) + 1}",
+                order=len(output),
+                cells=tuple(cells),
+            )
+        )
+    return tuple(output)
+
+
+def _build_source_tables(
+    lines: tuple[OcrLine, ...],
+    *,
+    primary: HeaderBlock,
+    repeated: tuple[HeaderBlock, ...],
+    original_by_id: dict[str, OcrToken],
+    page_number: int,
+    table_id: str,
+    table_type: TableType,
+) -> tuple[SourceTable, ...]:
+    blocks = (primary, *repeated)
+    output: list[SourceTable] = []
+    for segment, block in enumerate(blocks, start=1):
+        source_table_id = f"{table_id}-s{segment}"
+        columns, centers = _source_columns(lines, block, original_by_id, table_id)
+        next_start = blocks[segment].start if segment < len(blocks) else len(lines)
+        rows = _source_rows(
+            lines,
+            start=block.end + 1,
+            end=next_start,
+            source_table_id=source_table_id,
+            columns=columns,
+            centers=centers,
+            original_by_id=original_by_id,
+            table_id=table_id,
+        )
+        if not columns or not rows:
+            continue
+        output.append(
+            SourceTable(
+                id=source_table_id,
+                page_number=page_number,
+                table_id=table_id,
+                table_type=table_type,
+                columns=columns,
+                rows=rows,
+                validation_flags=(
+                    ("unmapped_columns",)
+                    if any(
+                        column.canonical_field is None
+                        and _normalize(column.label)
+                        not in {"sr no", "sr n", "s no", "serial no", "no", "#"}
+                        for column in columns
+                    )
+                    else ()
+                ),
+            )
+        )
+    return tuple(output)
 
 
 def _description_lane(
@@ -685,26 +917,18 @@ def _classify_table(
             "discharge",
         )
     )
-    if (
-        metadata_hits >= 2
-        and row_count <= 24
-        and not has_serial
-        and not has_ledger_header
-    ):
+    if metadata_hits >= 2 and row_count <= 24 and not has_serial and not has_ledger_header:
         return TableType.METADATA
     if "break up of charges" in normalized or "package break up" in normalized:
         return TableType.PACKAGE_SUMMARY
-    if (
-        row_count <= 24
-        and all(
-            term in normalized
-            for term in (
-                "service name",
-                "bill amount",
-                "discount amount",
-                "total amount",
-                "total bill amount",
-            )
+    if row_count <= 24 and all(
+        term in normalized
+        for term in (
+            "service name",
+            "bill amount",
+            "discount amount",
+            "total amount",
+            "total bill amount",
         )
     ):
         return TableType.CATEGORY_SUMMARY
@@ -713,10 +937,7 @@ def _classify_table(
             term in normalized
             for term in ("service name", "patient amount", "company amount", "total amount")
         )
-        or all(
-            term in normalized
-            for term in ("service name", "patient", "company", "grand total")
-        )
+        or all(term in normalized for term in ("service name", "patient", "company", "grand total"))
         or zero_tail_summary
         or any(
             term in normalized
@@ -1034,11 +1255,7 @@ def _closest_field_token(
     if not candidates:
         return None
     selected = min(candidates, key=lambda token: abs(((_center_x(token) - left) / width) - target))
-    return (
-        selected
-        if abs(((_center_x(selected) - left) / width) - target) <= 0.08
-        else None
-    )
+    return selected if abs(((_center_x(selected) - left) / width) - target) <= 0.08 else None
 
 
 def _structured_text_fields(
@@ -1073,9 +1290,7 @@ def _closest_numeric(
     used: set[tuple[str, float, Decimal]],
 ) -> tuple[OcrToken, Decimal] | None:
     available = [
-        (token, value)
-        for token, value in numeric
-        if _numeric_identity(token, value) not in used
+        (token, value) for token, value in numeric if _numeric_identity(token, value) not in used
     ]
     if not available:
         return None
@@ -1099,9 +1314,7 @@ def reconstruct_ocr_rows(
 ) -> ReconstructionResult:
     original_scoped = tokens_in_box(tokens, box)
     original_by_id = {token.token_id: token for token in original_scoped}
-    scoped, geometry_box, orientation, deskew_slope = _normalize_orientation(
-        original_scoped, box
-    )
+    scoped, geometry_box, orientation, deskew_slope = _normalize_orientation(original_scoped, box)
     left, _, right, _ = geometry_box
     width = max(1.0, right - left)
     lines = _lines(scoped)
@@ -1233,13 +1446,9 @@ def reconstruct_ocr_rows(
         previous = aligned[-1]
         continuation_ids = tuple(token.token_id for token in continuation_tokens)
         description_ids = tuple(
-            dict.fromkeys(
-                (*previous.field_token_ids.get("description", ()), *continuation_ids)
-            )
+            dict.fromkeys((*previous.field_token_ids.get("description", ()), *continuation_ids))
         )
-        continuation_boxes = [
-            _bounds(original_by_id[token_id]) for token_id in continuation_ids
-        ]
+        continuation_boxes = [_bounds(original_by_id[token_id]) for token_id in continuation_ids]
         previous_box = previous.evidence_box
         assert previous_box is not None
         combined_box = (
@@ -1252,9 +1461,7 @@ def reconstruct_ocr_rows(
             previous,
             candidate=replace(
                 previous.candidate,
-                description=(
-                    f"{previous.candidate.description or ''} {continuation_text}"
-                ).strip(),
+                description=(f"{previous.candidate.description or ''} {continuation_text}").strip(),
             ),
             field_token_ids={
                 **previous.field_token_ids,
@@ -1349,8 +1556,7 @@ def reconstruct_ocr_rows(
             current_date = structured_values.get("service_date")
             same_date = bool(
                 current_date
-                and re.sub(r"\s+", "", current_date)
-                == re.sub(r"\s+", "", pending_service_date)
+                and re.sub(r"\s+", "", current_date) == re.sub(r"\s+", "", pending_service_date)
             )
             structured_values["service_date"] = (
                 pending_service_date
@@ -1368,9 +1574,7 @@ def reconstruct_ocr_rows(
             pending_service_date = None
             pending_service_date_ids = ()
         reserved_ids = {
-            token_id
-            for token_ids in structured_evidence.values()
-            for token_id in token_ids
+            token_id for token_ids in structured_evidence.values() for token_id in token_ids
         }
         if amount_token is not None:
             reserved_ids.add(amount_token.token_id)
@@ -1426,17 +1630,11 @@ def reconstruct_ocr_rows(
                 elif pending_description_tokens:
                     line_description_tokens = pending_description_tokens
                     pending_description_tokens = []
-                description_text = " ".join(
-                    token.text for token in line_description_tokens
-                )
-                description, embedded_date, embedded_request = _clean_description(
-                    description_text
-                )
+                description_text = " ".join(token.text for token in line_description_tokens)
+                description, embedded_date, embedded_request = _clean_description(description_text)
                 if description and len(re.sub(r"[^a-z0-9]", "", _normalize(description))) >= 3:
                     field_tokens = {
-                        "description": tuple(
-                            token.token_id for token in line_description_tokens
-                        ),
+                        "description": tuple(token.token_id for token in line_description_tokens),
                         **structured_evidence,
                     }
                     service_date = structured_values.get("service_date") or embedded_date
@@ -1639,6 +1837,23 @@ def reconstruct_ocr_rows(
         )
         append_aligned(candidate=candidate, field_tokens=field_tokens)
 
+    source_tables = (
+        _build_source_tables(
+            lines,
+            primary=HeaderBlock(
+                start=header_start,
+                end=header_index,
+                roles=header_roles,
+            ),
+            repeated=repeated_header_blocks,
+            original_by_id=original_by_id,
+            page_number=page_number,
+            table_id=table_id,
+            table_type=table_type,
+        )
+        if header_valid
+        else ()
+    )
     return ReconstructionResult(
         rows=tuple(aligned),
         schema=schema,
@@ -1654,6 +1869,7 @@ def reconstruct_ocr_rows(
             "column_centers": column_centers,
             "header_segments": 1 + len(repeated_header_indexes) if header_valid else 0,
         },
+        source_tables=source_tables,
     )
 
 

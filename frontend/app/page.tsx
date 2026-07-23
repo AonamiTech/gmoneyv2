@@ -112,6 +112,43 @@ type RowsResult = {
   limit: number;
   rows: Row[];
 };
+type SourceColumn = {
+  id: string;
+  label: string;
+  order: number;
+  canonical_field: string | null;
+  evidence: Evidence[];
+};
+type SourceCell = {
+  column_id: string;
+  raw_value: string | null;
+  evidence: Evidence[];
+  validation_flags: string[];
+};
+type SourceRow = {
+  id: string;
+  order: number;
+  canonical_row_id: string | null;
+  cells: SourceCell[];
+  validation_flags: string[];
+};
+type SourceTable = {
+  id: string;
+  page_number: number;
+  table_id: string;
+  table_type: string;
+  columns: SourceColumn[];
+  rows: SourceRow[];
+  validation_flags: string[];
+};
+type SourceTablesResult = {
+  document_id: string;
+  available: boolean;
+  total: number;
+  offset: number;
+  limit: number;
+  tables: SourceTable[];
+};
 type ReviewIssue = {
   id: string;
   page_number: number;
@@ -255,8 +292,11 @@ export default function Home() {
   const [railView, setRailView] = useState<"active" | "history">("history");
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
   const [rowsResult, setRowsResult] = useState<RowsResult | null>(null);
+  const [sourceTablesResult, setSourceTablesResult] = useState<SourceTablesResult | null>(null);
   const [review, setReview] = useState<ReviewSummary | null>(null);
   const [selectedRowId, setSelectedRowId] = useState<string | null>(null);
+  const [selectedSourceRowId, setSelectedSourceRowId] = useState<string | null>(null);
+  const [ledgerMode, setLedgerMode] = useState<"printed" | "normalized">("printed");
   const [health, setHealth] = useState<Health | null>(null);
   const [query, setQuery] = useState("");
   const [disposition, setDisposition] = useState("");
@@ -303,6 +343,26 @@ export default function Home() {
   const visibleJobs = railView === "active" ? activeJobs : historyJobs;
   const selectedJob = jobs.find((job) => job.id === selectedJobId) ?? null;
   const selectedRow = rowsResult?.rows.find((row) => row.id === selectedRowId) ?? null;
+  const selectedRowPage = selectedRow?.page_number ?? null;
+  const selectedSource = useMemo(() => {
+    for (const table of sourceTablesResult?.tables ?? []) {
+      const row = table.rows.find((candidate) => candidate.id === selectedSourceRowId);
+      if (row) return { table, row };
+    }
+    return null;
+  }, [selectedSourceRowId, sourceTablesResult]);
+  const selectedSourcePage = selectedSource?.table.page_number ?? null;
+  const selectedSourceDescriptionEvidence =
+    selectedSource?.row.cells.find(
+      (cell) =>
+        selectedSource.table.columns.find((column) => column.id === cell.column_id)
+          ?.canonical_field === "description",
+    )?.evidence[0] ??
+    selectedSource?.row.cells.find((cell) => cell.evidence.length)?.evidence[0];
+  const selectedSourceAmountEvidence =
+    [...(selectedSource?.row.cells ?? [])]
+      .reverse()
+      .find((cell) => cell.evidence.length)?.evidence[0];
   const pageAsset = rowsResult?.page_assets.find((asset) => asset.page_number === viewPage);
   const hospital = rowsResult?.hospital ?? review?.hospital ?? null;
   const refreshHealth = useCallback(() => {
@@ -385,22 +445,41 @@ export default function Home() {
   const loadWorkspace = useCallback(async () => {
     if (!selectedJob || selectedJob.status !== "complete") return;
     const params = new URLSearchParams({ offset: String(offset), limit: String(PAGE_SIZE) });
+    const sourceParams = new URLSearchParams({
+      offset: String(offset),
+      limit: String(PAGE_SIZE),
+    });
     if (query.trim()) params.set("query", query.trim());
+    if (query.trim()) sourceParams.set("query", query.trim());
     if (disposition) params.set("disposition", disposition);
     if (pageFilter) params.set("source_page", pageFilter);
+    if (pageFilter) sourceParams.set("source_page", pageFilter);
     try {
-      const [rows, summary] = await Promise.all([
+      const [rows, sources, summary] = await Promise.all([
         request<RowsResult>(`/api/v2/documents/${selectedJob.id}/rows?${params}`),
+        request<SourceTablesResult>(
+          `/api/v2/documents/${selectedJob.id}/source-tables?${sourceParams}`,
+        ),
         request<ReviewSummary>(`/api/v2/documents/${selectedJob.id}/review`),
       ]);
       setRowsResult(rows);
+      setSourceTablesResult(sources);
       setReview(summary);
       setSelectedRowId((current) =>
         current && rows.rows.some((row) => row.id === current)
           ? current
           : (rows.rows[0]?.id ?? null),
       );
-      if (!rows.rows.length && offset > 0) setOffset(Math.max(0, offset - PAGE_SIZE));
+      const sourceRows = sources.tables.flatMap((table) => table.rows);
+      setSelectedSourceRowId((current) =>
+        current && sourceRows.some((row) => row.id === current)
+          ? current
+          : (sourceRows[0]?.id ?? null),
+      );
+      setLedgerMode((current) => (sources.available ? current : "normalized"));
+      if (!rows.rows.length && !sourceRows.length && offset > 0) {
+        setOffset(Math.max(0, offset - PAGE_SIZE));
+      }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "The result could not be loaded.");
     }
@@ -408,6 +487,7 @@ export default function Home() {
 
   useEffect(() => {
     setRowsResult(null);
+    setSourceTablesResult(null);
     setReview(null);
     setOffset(0);
     setQuery("");
@@ -419,6 +499,8 @@ export default function Home() {
     setFocusedPrintedTotal(null);
     setDrawMode(null);
     setDraftPolygon(null);
+    setSelectedSourceRowId(null);
+    setLedgerMode("printed");
   }, [selectedJobId]);
 
   useEffect(() => {
@@ -427,8 +509,14 @@ export default function Home() {
   }, [loadWorkspace]);
 
   useEffect(() => {
-    if (selectedRow) setViewPage(selectedRow.page_number);
-  }, [selectedRow]);
+    if (selectedRowPage) setViewPage(selectedRowPage);
+  }, [selectedRowId, selectedRowPage]);
+
+  useEffect(() => {
+    if (ledgerMode === "printed" && selectedSourcePage) {
+      setViewPage(selectedSourcePage);
+    }
+  }, [ledgerMode, selectedSourceRowId, selectedSourcePage]);
 
   const uploadFiles = useCallback(
     async (files: File[]) => {
@@ -714,7 +802,9 @@ export default function Home() {
       ? focusedPrintedTotal?.evidence
       : hospitalEditMode
         ? hospital?.evidence
-        : selectedRow?.field_evidence?.description?.[0] ?? selectedRow?.evidence?.[0];
+        : ledgerMode === "printed"
+          ? selectedSourceDescriptionEvidence
+          : selectedRow?.field_evidence?.description?.[0] ?? selectedRow?.evidence?.[0];
     focusEvidenceSource(source);
   };
 
@@ -751,6 +841,16 @@ export default function Home() {
         total: total?.page_number === viewPage ? points(total.evidence) : "",
       };
     }
+    if (ledgerMode === "printed") {
+      if (!selectedSource || selectedSource.table.page_number !== viewPage) {
+        return { description: "", amount: "", total: "" };
+      }
+      return {
+        description: points(selectedSourceDescriptionEvidence),
+        amount: points(selectedSourceAmountEvidence),
+        total: "",
+      };
+    }
     if (!selectedRow || selectedRow.page_number !== viewPage) {
       return { description: "", amount: "", total: "" };
     }
@@ -759,10 +859,24 @@ export default function Home() {
       amount: points(selectedRow.field_evidence?.amount?.[0]),
       total: "",
     };
-  }, [focusedPrintedTotal, selectedRow, totalEvidenceActive, viewPage]);
+  }, [
+    focusedPrintedTotal,
+    ledgerMode,
+    selectedRow,
+    selectedSource,
+    selectedSourceAmountEvidence,
+    selectedSourceDescriptionEvidence,
+    totalEvidenceActive,
+    viewPage,
+  ]);
   const hospitalEvidence =
     hospitalEditMode && hospital?.page_number === viewPage ? points(hospital.evidence) : "";
 
+  const printedAvailable = sourceTablesResult?.available ?? false;
+  const ledgerTotal =
+    ledgerMode === "printed"
+      ? (sourceTablesResult?.total ?? 0)
+      : (rowsResult?.total ?? 0);
   const arrival = !jobs.length;
   const workerCapacity = health?.worker_capacity ?? 1;
 
@@ -974,7 +1088,7 @@ export default function Home() {
 
                 <div className="review-toolbar">
                   <input aria-label="Search rows" placeholder="Search charge, section, code…" value={query} onChange={(event) => { setQuery(event.target.value); setOffset(0); }} />
-                  <select aria-label="Filter disposition" value={disposition} onChange={(event) => { setDisposition(event.target.value); setOffset(0); }}>
+                  <select aria-label="Filter disposition" disabled={ledgerMode === "printed"} title={ledgerMode === "printed" ? "Disposition applies to normalized rows" : undefined} value={disposition} onChange={(event) => { setDisposition(event.target.value); setOffset(0); }}>
                     <option value="">All dispositions</option><option value="accepted">Accepted</option><option value="pending">Pending</option><option value="rejected">Rejected</option><option value="unreadable">Unreadable</option>
                   </select>
                   <input className="page-filter" aria-label="Filter page" type="number" min="1" max={rowsResult.pages} placeholder="Page" value={pageFilter} onChange={(event) => { setPageFilter(event.target.value); setOffset(0); }} />
@@ -988,45 +1102,138 @@ export default function Home() {
                   style={{ "--ledger-share": `${splitPercent}%` } as CSSProperties}
                 >
                   <div className="ledger-pane">
-                    <div className="ledger-caption"><span>{selectedJob.original_name}</span><span>{rowsResult.total.toLocaleString("en-IN")} matching · revision {review.revision}</span></div>
+                    <div className="ledger-caption">
+                      <span>{selectedJob.original_name}</span>
+                      <span className="ledger-caption-actions">
+                        <span>{ledgerTotal.toLocaleString("en-IN")} matching · revision {review.revision}</span>
+                        <span className="ledger-mode-switch" role="group" aria-label="Ledger columns">
+                          <button
+                            type="button"
+                            className={ledgerMode === "printed" ? "active" : ""}
+                            disabled={!printedAvailable}
+                            onClick={() => {
+                              setLedgerMode("printed");
+                              setOffset(0);
+                            }}
+                          >
+                            Printed columns
+                          </button>
+                          <button
+                            type="button"
+                            className={ledgerMode === "normalized" ? "active" : ""}
+                            onClick={() => {
+                              setLedgerMode("normalized");
+                              setOffset(0);
+                            }}
+                          >
+                            Normalized
+                          </button>
+                        </span>
+                      </span>
+                    </div>
                     <div className="table-shell">
-                      <table>
-                        <colgroup>
-                          <col className="number-column" />
-                          <col className="description-column" />
-                          <col className="date-column" />
-                          <col className="quantity-column" />
-                          <col className="money-column" />
-                          <col className="money-column" />
-                          <col className="money-column" />
-                        </colgroup>
-                        <thead><tr><th>#</th><th>Service / charge</th><th>Date</th><th>Qty</th><th>Rate</th><th>Gross</th><th>Net amount</th></tr></thead>
-                        <tbody>
-                          {rowsResult.rows.map((row, index) => (
-                            <tr key={row.id} className={`${selectedRowId === row.id ? "selected" : ""} ${row.role} ${row.review_disposition} ${row.review.modified ? "modified" : ""}`} onClick={() => { setSelectedRowId(row.id); setEditMode(false); setAddMode(false); setHospitalEditMode(false); setFocusedPrintedTotal(null); setDraftPolygon(null); }}>
-                              <td>{String(offset + index + 1).padStart(2, "0")}</td>
-                              <td>
-                                <b>{row.description || "Unlabelled row"}</b>
-                                <small>
-                                  <i className={row.review_disposition} /> {row.role === "informational" ? "included in package · informational" : row.review_disposition} · p.{row.page_number}
-                                  {row.review.modified ? " · reviewer changed" : ""}
-                                  {row.validation_flags?.some((flag) => ["missing_labeled_quantity", "missing_labeled_unit_price", "line_arithmetic_mismatch"].includes(flag))
-                                    ? " · field warning"
-                                    : ""}
-                                </small>
-                              </td>
-                              <td className="service-date" title={row.service_date_raw ?? undefined}>{serviceDate(row.service_date_iso, row.service_date_raw)}</td>
-                              <td>{row.quantity ?? "—"}</td><td>{money(row.unit_price)}</td><td>{money(row.gross_amount)}</td><td>{money(row.net_amount)}</td>
-                            </tr>
+                      {ledgerMode === "printed" ? (
+                        <>
+                          {sourceTablesResult?.tables.map((table) => (
+                            <section className="source-table-group" key={table.id}>
+                              <div className="source-table-label">
+                                <span>Page {table.page_number} · {table.table_type.replaceAll("_", " ")}</span>
+                                <span>
+                                  {table.columns.some((column) => column.canonical_field === null)
+                                    ? "Unmapped columns retained"
+                                    : "All columns mapped"}
+                                </span>
+                              </div>
+                              <table
+                                className="source-table"
+                                style={{ minWidth: `${Math.max(720, 56 + table.columns.length * 140)}px` }}
+                              >
+                                <thead>
+                                  <tr>
+                                    <th>#</th>
+                                    {table.columns.map((column) => (
+                                      <th key={column.id}>{column.label}</th>
+                                    ))}
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {table.rows.map((row) => (
+                                    <tr
+                                      key={row.id}
+                                      className={selectedSourceRowId === row.id ? "selected" : ""}
+                                      onClick={() => {
+                                        setSelectedSourceRowId(row.id);
+                                        setSelectedRowId(row.canonical_row_id);
+                                        setViewPage(table.page_number);
+                                        setEditMode(false);
+                                        setAddMode(false);
+                                        setHospitalEditMode(false);
+                                        setFocusedPrintedTotal(null);
+                                        setDraftPolygon(null);
+                                      }}
+                                    >
+                                      <td>{String(offset + row.order + 1).padStart(2, "0")}</td>
+                                      {table.columns.map((column) => {
+                                        const cell = row.cells.find(
+                                          (candidate) => candidate.column_id === column.id,
+                                        );
+                                        return <td key={column.id}>{cell?.raw_value || "—"}</td>;
+                                      })}
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                            </section>
                           ))}
-                        </tbody>
-                      </table>
-                      {!rowsResult.rows.length && <div className="empty-ledger">No rows match this view.</div>}
+                          {!sourceTablesResult?.tables.length && (
+                            <div className="empty-ledger">
+                              {printedAvailable
+                                ? "No printed rows match this view."
+                                : "Printed columns require this bill to be reprocessed."}
+                            </div>
+                          )}
+                        </>
+                      ) : (
+                        <>
+                          <table>
+                            <colgroup>
+                              <col className="number-column" />
+                              <col className="description-column" />
+                              <col className="date-column" />
+                              <col className="quantity-column" />
+                              <col className="money-column" />
+                              <col className="money-column" />
+                              <col className="money-column" />
+                            </colgroup>
+                            <thead><tr><th>#</th><th>Service / charge</th><th>Date</th><th>Qty</th><th>Rate</th><th>Gross</th><th>Net amount</th></tr></thead>
+                            <tbody>
+                              {rowsResult.rows.map((row, index) => (
+                                <tr key={row.id} className={`${selectedRowId === row.id ? "selected" : ""} ${row.role} ${row.review_disposition} ${row.review.modified ? "modified" : ""}`} onClick={() => { setSelectedRowId(row.id); setEditMode(false); setAddMode(false); setHospitalEditMode(false); setFocusedPrintedTotal(null); setDraftPolygon(null); }}>
+                                  <td>{String(offset + index + 1).padStart(2, "0")}</td>
+                                  <td>
+                                    <b>{row.description || "Unlabelled row"}</b>
+                                    <small>
+                                      <i className={row.review_disposition} /> {row.role === "informational" ? "included in package · informational" : row.review_disposition} · p.{row.page_number}
+                                      {row.review.modified ? " · reviewer changed" : ""}
+                                      {row.validation_flags?.some((flag) => ["missing_labeled_quantity", "missing_labeled_unit_price", "line_arithmetic_mismatch"].includes(flag))
+                                        ? " · field warning"
+                                        : ""}
+                                    </small>
+                                  </td>
+                                  <td className="service-date" title={row.service_date_raw ?? undefined}>{serviceDate(row.service_date_iso, row.service_date_raw)}</td>
+                                  <td>{row.quantity ?? "—"}</td><td>{money(row.unit_price)}</td><td>{money(row.gross_amount)}</td><td>{money(row.net_amount)}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                          {!rowsResult.rows.length && <div className="empty-ledger">No rows match this view.</div>}
+                        </>
+                      )}
                     </div>
                     <div className="pagination">
                       <button disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - PAGE_SIZE))}>← Previous</button>
-                      <span>{rowsResult.total ? `${offset + 1}–${Math.min(offset + PAGE_SIZE, rowsResult.total)} of ${rowsResult.total}` : "0 rows"}</span>
-                      <button disabled={offset + PAGE_SIZE >= rowsResult.total} onClick={() => setOffset(offset + PAGE_SIZE)}>Next →</button>
+                      <span>{ledgerTotal ? `${offset + 1}–${Math.min(offset + PAGE_SIZE, ledgerTotal)} of ${ledgerTotal}` : "0 rows"}</span>
+                      <button disabled={offset + PAGE_SIZE >= ledgerTotal} onClick={() => setOffset(offset + PAGE_SIZE)}>Next →</button>
                     </div>
                   </div>
 
@@ -1101,7 +1308,17 @@ export default function Home() {
                         <button onClick={focusEvidence}>Focus total ↗</button>
                       </div>
                     )}
-                    {selectedRow && !addMode && !hospitalEditMode && !totalEvidenceActive && (
+                    {ledgerMode === "printed" && selectedSource && !addMode && !hospitalEditMode && !totalEvidenceActive && (
+                      <div className="evidence-note">
+                        <span>P{selectedSource.table.page_number}</span>
+                        <div>
+                          <strong>{selectedSource.row.cells.find((cell) => cell.raw_value)?.raw_value ?? "Printed row"}</strong>
+                          <p>Raw printed row · {selectedSource.table.columns.length} source columns retained</p>
+                        </div>
+                        <button onClick={focusEvidence}>Focus row ↗</button>
+                      </div>
+                    )}
+                    {ledgerMode === "normalized" && selectedRow && !addMode && !hospitalEditMode && !totalEvidenceActive && (
                       <div className="evidence-note">
                         <span>{String((rowsResult.rows.findIndex((row) => row.id === selectedRow.id) + offset + 1)).padStart(2, "0")}</span>
                         <div><strong>{selectedRow.description}</strong><p>{selectedRow.role === "informational" ? "Included package component · no separate printed amount" : money(selectedRow.net_amount)} · grounded on page {selectedRow.page_number}</p></div>
