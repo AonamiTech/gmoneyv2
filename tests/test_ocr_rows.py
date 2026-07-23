@@ -1268,6 +1268,92 @@ def test_payment_details_before_total_does_not_extend_previous_charge() -> None:
     assert payment_source_row.canonical_row_id is None
 
 
+def test_connector_before_payment_details_keeps_linked_printed_description() -> None:
+    tokens = (
+        token(0, "Description", (100, 30, 430, 45)),
+        token(1, "Amount", (870, 30, 970, 45)),
+        token(2, "Procedure Charges-", (100, 70, 350, 85)),
+        token(3, "11,457.00", (880, 70, 960, 85)),
+        token(4, "Payment Details", (100, 100, 270, 115)),
+        token(5, "Total Bill Amount", (650, 130, 830, 145)),
+        token(6, "11,457.00", (880, 130, 960, 145)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 20, 980, 160),
+    )
+
+    assert len(result.rows) == 1
+    assert result.rows[0].candidate.description == "Procedure Charges"
+    canonical = canonicalize_rows(
+        "d" * 64,
+        1,
+        "p1-t1",
+        "a" * 64,
+        result.rows,
+    )
+    linked = _link_source_tables(result.source_tables, canonical)
+    description_column = next(
+        column
+        for column in linked[0].columns
+        if column.canonical_field == "description"
+    )
+    charge_source_row = next(
+        row
+        for row in linked[0].rows
+        if row.canonical_row_id == str(canonical[0].id)
+    )
+    printed_description = next(
+        cell.raw_value
+        for cell in charge_source_row.cells
+        if cell.column_id == description_column.id
+    )
+    assert printed_description is not None
+    assert printed_description.rstrip(" -") == canonical[0].description
+    assert "Payment Details" not in printed_description
+    payment_source_row = next(
+        row
+        for row in linked[0].rows
+        if any(cell.raw_value == "Payment Details" for cell in row.cells)
+    )
+    assert payment_source_row.canonical_row_id is None
+
+
+def test_connector_before_amount_paid_does_not_merge_source_footer() -> None:
+    tokens = (
+        token(0, "Description", (100, 30, 430, 45)),
+        token(1, "Amount", (870, 30, 970, 45)),
+        token(2, "Procedure Charges-", (100, 70, 350, 85)),
+        token(3, "11,457.00", (880, 70, 960, 85)),
+        token(4, "Amount Paid", (100, 100, 270, 115)),
+        token(5, "Total Bill Amount", (650, 130, 830, 145)),
+        token(6, "11,457.00", (880, 130, 960, 145)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 20, 980, 160),
+    )
+
+    assert result.rows[0].candidate.description == "Procedure Charges"
+    description_column = next(
+        column
+        for column in result.source_tables[0].columns
+        if column.canonical_field == "description"
+    )
+    assert [
+        cell.raw_value
+        for row in result.source_tables[0].rows
+        for cell in row.cells
+        if cell.column_id == description_column.id and cell.raw_value
+    ][:2] == ["Procedure Charges-", "Amount Paid"]
+
+
 def test_headerless_continuation_inherits_date_without_inventing_amount() -> None:
     header = (
         token(0, "Service Name", (100, 30, 300, 45)),

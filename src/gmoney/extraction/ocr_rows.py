@@ -717,6 +717,7 @@ def _source_rows(
             if (
                 previous_description.raw_value
                 and continuation.raw_value
+                and not _is_payment_footer_description(continuation.raw_value)
                 and _is_description_continuation(
                     continuation.raw_value,
                     previous_description.raw_value,
@@ -1382,6 +1383,7 @@ def _is_payment_footer_description(text: str) -> bool:
     normalized = _normalize(text)
     return normalized.startswith(
         (
+            "amount paid",
             "payment detail",
             "payment information",
             "payment mode",
