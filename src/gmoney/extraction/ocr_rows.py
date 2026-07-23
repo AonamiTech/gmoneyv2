@@ -128,6 +128,12 @@ def _height(token: OcrToken) -> float:
     return max(1.0, bottom - top)
 
 
+def _is_rotated_text(token: OcrToken) -> bool:
+    first, second = token.polygon.points[:2]
+    horizontal_run = abs(second.x - first.x)
+    return horizontal_run > 0 and abs(second.y - first.y) > horizontal_run * 0.05
+
+
 def _cell_reading_order(
     tokens: tuple[OcrToken, ...] | list[OcrToken],
 ) -> tuple[OcrToken, ...]:
@@ -732,7 +738,11 @@ def _source_rows(
                     column_id=column.id,
                     raw_value=raw_value or None,
                     evidence=_source_evidence(ordered, original_by_id, table_id),
-                    validation_flags=(() if raw_value else ("empty_cell",)),
+                    validation_flags=(
+                        ("rotated_text",)
+                        if raw_value and any(_is_rotated_text(token) for token in ordered)
+                        else (() if raw_value else ("empty_cell",))
+                    ),
                 )
             )
         if not any(cell.raw_value for cell in cells):

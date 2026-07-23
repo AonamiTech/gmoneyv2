@@ -55,6 +55,27 @@ def skewed_token(
     )
 
 
+def rotated_token(
+    index: int,
+    text: str,
+    box: tuple[float, float, float, float],
+    rise: float,
+) -> OcrToken:
+    left, top, right, bottom = box
+    return token(index, text, box).model_copy(
+        update={
+            "polygon": Polygon(
+                points=(
+                    Point(x=left, y=top),
+                    Point(x=right, y=top + rise),
+                    Point(x=right, y=bottom + rise),
+                    Point(x=left, y=bottom),
+                )
+            )
+        }
+    )
+
+
 def test_reconstructs_split_description_and_uses_rightmost_amount() -> None:
     tokens = (
         token(0, "Patient", (10, 5, 80, 15)),
@@ -1282,7 +1303,7 @@ def test_invalid_stamp_text_is_not_published_as_a_missing_service_code() -> None
         token(6, "11457.00", (880, 70, 960, 85)),
         token(7, "Pharmacy", (100, 100, 230, 115)),
         token(8, "Gloves Sterile 7", (100, 130, 300, 145)),
-        token(9, "PATNA", (430, 120, 500, 155)),
+        rotated_token(9, "PATNA", (430, 120, 500, 155), 10),
         token(10, "20/01/2026 09:44:58", (700, 130, 850, 145)),
     )
     result = reconstruct_ocr_rows(
@@ -1324,20 +1345,27 @@ def test_invalid_stamp_text_is_not_published_as_a_missing_service_code() -> None
 
 
 @pytest.mark.parametrize(
-    ("printed_code", "code_box"),
+    ("printed_code", "code_box", "rotated"),
     (
-        ("12345", (530, 130, 600, 145)),
-        ("ABC", (530, 130, 600, 145)),
-        ("SVC 42", (530, 130, 600, 145)),
-        ("AB_12", (530, 130, 600, 145)),
-        ("ABC", (535, 120, 605, 155)),
-        ("LB012 PATNA", (430, 120, 560, 155)),
+        ("12345", (530, 130, 600, 145), False),
+        ("ABC", (530, 130, 600, 145), False),
+        ("SVC 42", (530, 130, 600, 145), False),
+        ("AB_12", (530, 130, 600, 145), False),
+        ("ABC", (535, 120, 605, 155), False),
+        ("ABC", (430, 120, 500, 155), False),
+        ("LB012 PATNA", (430, 120, 560, 155), True),
     ),
 )
 def test_plausible_unparsed_service_code_remains_for_strict_validation(
     printed_code: str,
     code_box: tuple[float, float, float, float],
+    rotated: bool,
 ) -> None:
+    printed_code_token = (
+        rotated_token(9, printed_code, code_box, 10)
+        if rotated
+        else token(9, printed_code, code_box)
+    )
     tokens = (
         token(0, "Service Name", (100, 30, 300, 45)),
         token(1, "Service Code", (520, 30, 620, 45)),
@@ -1348,7 +1376,7 @@ def test_plausible_unparsed_service_code_remains_for_strict_validation(
         token(6, "11457.00", (880, 70, 960, 85)),
         token(7, "Pharmacy", (100, 100, 230, 115)),
         token(8, "Gloves Sterile 7", (100, 130, 300, 145)),
-        token(9, printed_code, code_box),
+        printed_code_token,
         token(10, "20/01/2026 09:44:58", (700, 130, 850, 145)),
     )
     result = reconstruct_ocr_rows(
@@ -1400,7 +1428,7 @@ def test_overlay_filter_resolves_reordered_source_cells_by_column_id() -> None:
         token(6, "11457.00", (880, 70, 960, 85)),
         token(7, "Pharmacy", (100, 100, 230, 115)),
         token(8, "Gloves Sterile 7", (100, 130, 300, 145)),
-        token(9, "PATNA", (430, 120, 500, 155)),
+        rotated_token(9, "PATNA", (430, 120, 500, 155), 10),
         token(10, "20/01/2026 09:44:58", (700, 130, 850, 145)),
     )
     result = reconstruct_ocr_rows(
