@@ -1380,18 +1380,28 @@ def _is_description_continuation(text: str, previous: str) -> bool:
 
 
 def _is_payment_footer_description(text: str) -> bool:
-    normalized = _normalize(text)
-    return normalized.startswith(
-        (
-            "amount paid",
-            "payment detail",
-            "payment information",
-            "payment mode",
-            "receipt detail",
-            "receipt information",
-            "settlement detail",
-        )
-    )
+    words = _normalize(text).split()
+    if not words:
+        return False
+    if words[0] == "amount":
+        return bool({"paid", "received"} & set(words[1:]))
+    subject = words[0].removesuffix("s")
+    if subject not in {"payment", "receipt", "settlement"}:
+        return False
+    qualifiers = set(words[1:])
+    return bool(
+        {
+            "breakup",
+            "detail",
+            "details",
+            "history",
+            "information",
+            "mode",
+            "status",
+            "summary",
+        }
+        & qualifiers
+    ) or {"break", "up"} <= qualifiers
 
 
 def _clip_token_to_lane(

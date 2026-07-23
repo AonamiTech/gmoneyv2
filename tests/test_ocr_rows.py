@@ -1,5 +1,7 @@
 from decimal import Decimal
 
+import pytest
+
 from gmoney.contracts.evidence import OcrToken, Point, Polygon
 from gmoney.contracts.extraction import RowRole, TableType
 from gmoney.extraction.canonicalize import canonicalize_rows
@@ -1268,13 +1270,27 @@ def test_payment_details_before_total_does_not_extend_previous_charge() -> None:
     assert payment_source_row.canonical_row_id is None
 
 
-def test_connector_before_payment_details_keeps_linked_printed_description() -> None:
+@pytest.mark.parametrize(
+    "footer_text",
+    (
+        "Payment Details",
+        "Receipt Information",
+        "Settlement Mode",
+        "Payment Summary",
+        "Receipt History",
+        "Settlement Status",
+        "Payment Breakup",
+    ),
+)
+def test_connector_before_payment_heading_keeps_linked_printed_description(
+    footer_text: str,
+) -> None:
     tokens = (
         token(0, "Description", (100, 30, 430, 45)),
         token(1, "Amount", (870, 30, 970, 45)),
         token(2, "Procedure Charges-", (100, 70, 350, 85)),
         token(3, "11,457.00", (880, 70, 960, 85)),
-        token(4, "Payment Details", (100, 100, 270, 115)),
+        token(4, footer_text, (100, 100, 270, 115)),
         token(5, "Total Bill Amount", (650, 130, 830, 145)),
         token(6, "11,457.00", (880, 130, 960, 145)),
     )
@@ -1313,22 +1329,25 @@ def test_connector_before_payment_details_keeps_linked_printed_description() -> 
     )
     assert printed_description is not None
     assert printed_description.rstrip(" -") == canonical[0].description
-    assert "Payment Details" not in printed_description
+    assert footer_text not in printed_description
     payment_source_row = next(
         row
         for row in linked[0].rows
-        if any(cell.raw_value == "Payment Details" for cell in row.cells)
+        if any(cell.raw_value == footer_text for cell in row.cells)
     )
     assert payment_source_row.canonical_row_id is None
 
 
-def test_connector_before_amount_paid_does_not_merge_source_footer() -> None:
+@pytest.mark.parametrize("footer_text", ("Amount Paid", "Amount Received"))
+def test_connector_before_amount_footer_does_not_merge_source_footer(
+    footer_text: str,
+) -> None:
     tokens = (
         token(0, "Description", (100, 30, 430, 45)),
         token(1, "Amount", (870, 30, 970, 45)),
         token(2, "Procedure Charges-", (100, 70, 350, 85)),
         token(3, "11,457.00", (880, 70, 960, 85)),
-        token(4, "Amount Paid", (100, 100, 270, 115)),
+        token(4, footer_text, (100, 100, 270, 115)),
         token(5, "Total Bill Amount", (650, 130, 830, 145)),
         token(6, "11,457.00", (880, 130, 960, 145)),
     )
@@ -1351,7 +1370,7 @@ def test_connector_before_amount_paid_does_not_merge_source_footer() -> None:
         for row in result.source_tables[0].rows
         for cell in row.cells
         if cell.column_id == description_column.id and cell.raw_value
-    ][:2] == ["Procedure Charges-", "Amount Paid"]
+    ][:2] == ["Procedure Charges-", footer_text]
 
 
 def test_headerless_continuation_inherits_date_without_inventing_amount() -> None:
