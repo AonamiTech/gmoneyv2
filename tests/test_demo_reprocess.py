@@ -347,6 +347,209 @@ def test_reprocess_preserves_job_and_review_with_backup(tmp_path: Path) -> None:
     assert rolled_back["restored"] == 1
     assert json.loads((store.job_dir(job_id) / "result.json").read_text()) == old_result
     assert store.read_review(job_id)["revision"] == 1
+    displaced = Path(rolled_back["displaced_root"])
+    assert displaced.parent == store.jobs_root / ".reprocess-rollback-current"
+    assert json.loads((displaced / ".rollback.json").read_text())["version"] == (
+        "reprocess_rollback_batch_v1"
+    )
+    assert json.loads((displaced / ".committed.json").read_text())["version"] == (
+        "reprocess_rollback_commit_v1"
+    )
+    assert not (store.job_dir(job_id) / ".cutover.json").exists()
+
+
+def test_manual_rollback_rejects_review_created_after_deployment(tmp_path: Path) -> None:
+    store, job_id, old_result = setup_job(tmp_path)
+    page_sha = old_result["page_assets"][0]["artifact_sha256"]
+    new_rows = [row("new-row", page_sha)]
+    applied = reprocess_jobs(
+        root=tmp_path,
+        job_ids=[job_id],
+        apply=True,
+        extractor=FakeExtractor(
+            {
+                **old_result,
+                "rows": new_rows,
+                "source_tables": source_tables(new_rows, page_sha),
+            }
+        ),
+    )
+    current_result = json.loads((store.job_dir(job_id) / "result.json").read_text())
+    store.mutate_review(
+        job_id,
+        2,
+        lambda review: {
+            **review,
+            "events": [*review["events"], {"action": "post-deployment-review"}],
+        },
+    )
+
+    with pytest.raises(ValueError, match="review changed after deployment"):
+        rollback_jobs(root=tmp_path, backup_batch=Path(applied["backup_root"]))
+
+    assert json.loads((store.job_dir(job_id) / "result.json").read_text()) == current_result
+    assert store.read_review(job_id)["revision"] == 3
+    assert store.read_review(job_id)["events"][-1]["action"] == "post-deployment-review"
+
+
+def test_manual_rollback_final_review_compare_and_swap(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store, job_id, old_result = setup_job(tmp_path)
+    page_sha = old_result["page_assets"][0]["artifact_sha256"]
+    new_rows = [row("new-row", page_sha)]
+    applied = reprocess_jobs(
+        root=tmp_path,
+        job_ids=[job_id],
+        apply=True,
+        extractor=FakeExtractor(
+            {
+                **old_result,
+                "rows": new_rows,
+                "source_tables": source_tables(new_rows, page_sha),
+            }
+        ),
+    )
+    current_result = json.loads((store.job_dir(job_id) / "result.json").read_text())
+    original_job_lock = JobStore.job_lock
+    injected = False
+
+    def racing_job_lock(
+        self: JobStore, locked_job_id: str, *, exclusive: bool
+    ) -> Any:
+        nonlocal injected
+        if exclusive and not injected:
+            injected = True
+            review_path = self.job_dir(locked_job_id) / "review.json"
+            review = json.loads(review_path.read_text())
+            review["revision"] += 1
+            review["events"].append({"action": "concurrent-review"})
+            review_path.write_text(json.dumps(review))
+        return original_job_lock(self, locked_job_id, exclusive=exclusive)
+
+    monkeypatch.setattr(JobStore, "job_lock", racing_job_lock)
+
+    with pytest.raises(ValueError, match="review changed during rollback"):
+        rollback_jobs(root=tmp_path, backup_batch=Path(applied["backup_root"]))
+
+    assert json.loads((store.job_dir(job_id) / "result.json").read_text()) == current_result
+    assert store.read_review(job_id)["revision"] == 3
+    assert store.read_review(job_id)["events"][-1]["action"] == "concurrent-review"
+
+
+def test_manual_rollback_batch_failure_restores_live_and_backup_batches(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store, first_id, first_old = setup_job(tmp_path)
+    _, second_id, second_old = setup_job(tmp_path)
+    page_sha = first_old["page_assets"][0]["artifact_sha256"]
+    new_rows = [row("new-row", page_sha)]
+    applied = reprocess_jobs(
+        root=tmp_path,
+        job_ids=[first_id, second_id],
+        apply=True,
+        extractor=FakeExtractor(
+            {
+                **first_old,
+                "rows": new_rows,
+                "source_tables": source_tables(new_rows, page_sha),
+            }
+        ),
+    )
+    backup_batch = Path(applied["backup_root"])
+    current_results = {
+        job_id: json.loads((store.job_dir(job_id) / "result.json").read_text())
+        for job_id in (first_id, second_id)
+    }
+    failed_id = sorted((first_id, second_id))[1]
+    failed_backup = backup_batch / failed_id / "result.json"
+    failed_live = store.job_dir(failed_id) / "result.json"
+    original_replace = Path.replace
+    injected = False
+
+    def failing_replace(path: Path, target: Path) -> Path:
+        nonlocal injected
+        if not injected and path == failed_backup and target == failed_live:
+            injected = True
+            raise OSError("injected manual rollback failure")
+        return original_replace(path, target)
+
+    monkeypatch.setattr(Path, "replace", failing_replace)
+
+    with pytest.raises(OSError, match="injected manual rollback failure"):
+        rollback_jobs(root=tmp_path, backup_batch=backup_batch)
+
+    for job_id, old_result in ((first_id, first_old), (second_id, second_old)):
+        assert json.loads((store.job_dir(job_id) / "result.json").read_text()) == (
+            current_results[job_id]
+        )
+        assert store.read_review(job_id)["revision"] == 2
+        assert json.loads((backup_batch / job_id / "result.json").read_text()) == old_result
+        assert (backup_batch / job_id / "artifacts" / "pages" / "page-1.png").is_file()
+        assert not (store.job_dir(job_id) / ".cutover.json").exists()
+
+
+def test_store_recovery_restores_interrupted_manual_rollback(tmp_path: Path) -> None:
+    store, job_id, old_result = setup_job(tmp_path)
+    page_sha = old_result["page_assets"][0]["artifact_sha256"]
+    new_rows = [row("new-row", page_sha)]
+    applied = reprocess_jobs(
+        root=tmp_path,
+        job_ids=[job_id],
+        apply=True,
+        extractor=FakeExtractor(
+            {
+                **old_result,
+                "rows": new_rows,
+                "source_tables": source_tables(new_rows, page_sha),
+            }
+        ),
+    )
+    backup_dir = Path(applied["backup_root"]) / job_id
+    job_dir = store.job_dir(job_id)
+    current_result = json.loads((job_dir / "result.json").read_text())
+    current_review = store.read_review(job_id)
+    displaced_root = (
+        store.jobs_root / ".reprocess-rollback-current" / "interrupted"
+    )
+    displaced = displaced_root / job_id
+    displaced.mkdir(parents=True)
+    shutil.copy2(job_dir / "state.json", displaced / "state.json")
+    shutil.copy2(job_dir / "review.json", displaced / "review.json")
+    (job_dir / "artifacts").replace(displaced / "artifacts")
+    (job_dir / "result.json").replace(displaced / "result.json")
+    (backup_dir / "artifacts").replace(job_dir / "artifacts")
+    (backup_dir / "result.json").replace(job_dir / "result.json")
+    (job_dir / "state.json").write_text((backup_dir / "state.json").read_text())
+    (job_dir / "review.json").write_text((backup_dir / "review.json").read_text())
+    commit_marker = displaced_root / ".committed.json"
+    (displaced_root / ".rollback.json").write_text(
+        json.dumps(
+            {
+                "version": "reprocess_rollback_batch_v1",
+                "job_ids": [job_id],
+            }
+        )
+    )
+    (job_dir / ".cutover.json").write_text(
+        json.dumps(
+            {
+                "version": "job_rollback_v1",
+                "job_id": job_id,
+                "backup_dir": str(backup_dir),
+                "displaced_dir": str(displaced),
+                "commit_marker": str(commit_marker),
+            }
+        )
+    )
+
+    store.recover()
+
+    assert json.loads((job_dir / "result.json").read_text()) == current_result
+    assert store.read_review(job_id) == current_review
+    assert json.loads((backup_dir / "result.json").read_text()) == old_result
+    assert (backup_dir / "artifacts" / "pages" / "page-1.png").is_file()
+    assert not (job_dir / ".cutover.json").exists()
 
 
 def test_reprocess_stops_if_review_changes_during_staging(tmp_path: Path) -> None:

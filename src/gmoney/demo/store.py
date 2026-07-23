@@ -4,7 +4,7 @@ import json
 import os
 import shutil
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import UTC, datetime, timedelta
 from fcntl import LOCK_EX, LOCK_SH, LOCK_UN, flock
 from pathlib import Path
@@ -262,6 +262,88 @@ class JobStore:
         journal_path.unlink()
         shutil.rmtree(backup_dir, ignore_errors=True)
 
+    def _restore_rollback_job_unlocked(
+        self,
+        job_id: str,
+        journal: dict[str, Any],
+    ) -> None:
+        if (
+            journal.get("version") != "job_rollback_v1"
+            or journal.get("job_id") != job_id
+        ):
+            raise JobTransactionError("unsupported_cutover_journal")
+        job_dir = self.job_dir(job_id)
+        backup_dir = Path(str(journal["backup_dir"]))
+        displaced_dir = Path(str(journal["displaced_dir"]))
+        commit_marker = Path(str(journal["commit_marker"]))
+        if (
+            backup_dir.name != job_id
+            or displaced_dir.name != job_id
+            or commit_marker.parent != displaced_dir.parent
+        ):
+            raise JobTransactionError("invalid_cutover_journal_paths")
+
+        for name in ("result.json", "artifacts"):
+            live = job_dir / name
+            backup = backup_dir / name
+            displaced = displaced_dir / name
+            if not backup.exists() and live.exists():
+                live.replace(backup)
+            if displaced.exists():
+                if live.is_dir():
+                    shutil.rmtree(live)
+                elif live.exists():
+                    live.unlink()
+                displaced.replace(live)
+
+        state_snapshot = displaced_dir / "state.json"
+        if state_snapshot.is_file():
+            self._restore_payload(
+                job_dir / "state.json",
+                json.loads(state_snapshot.read_text()),
+            )
+        review_snapshot = displaced_dir / "review.json"
+        if review_snapshot.is_file():
+            self._restore_payload(
+                job_dir / "review.json",
+                json.loads(review_snapshot.read_text()),
+            )
+        elif (job_dir / "review.json").is_file():
+            (job_dir / "review.json").unlink()
+
+    def _recover_rollback_batch(
+        self,
+        journals: list[tuple[str, Path, dict[str, Any]]],
+    ) -> None:
+        ordered = sorted(journals, key=lambda item: item[0])
+        commit_markers = {
+            str(journal.get("commit_marker")) for _, _, journal in ordered
+        }
+        if len(commit_markers) != 1:
+            raise JobTransactionError("inconsistent_rollback_batch")
+        commit_marker = Path(commit_markers.pop())
+        with ExitStack() as locks:
+            for job_id, _, _ in ordered:
+                locks.enter_context(self.job_lock(job_id, exclusive=True))
+            for job_id, journal_path, journal in ordered:
+                current = json.loads(journal_path.read_text())
+                if current != journal:
+                    raise JobTransactionError("cutover_journal_changed")
+                if (
+                    current.get("version") != "job_rollback_v1"
+                    or current.get("job_id") != job_id
+                ):
+                    raise JobTransactionError("unsupported_cutover_journal")
+            if commit_marker.is_file():
+                for _, journal_path, _ in ordered:
+                    journal_path.unlink()
+                return
+            for job_id, _, journal in reversed(ordered):
+                self._restore_rollback_job_unlocked(job_id, journal)
+            for _, journal_path, _ in ordered:
+                journal_path.unlink()
+            shutil.rmtree(commit_marker.parent, ignore_errors=True)
+
     def states(self) -> list[dict[str, Any]]:
         states: list[dict[str, Any]] = []
         for state_path in self.jobs_root.glob("*/state.json"):
@@ -281,10 +363,22 @@ class JobStore:
         )
 
     def recover(self) -> None:
+        rollback_batches: dict[
+            str, list[tuple[str, Path, dict[str, Any]]]
+        ] = {}
         for journal_path in self.jobs_root.glob("*/.cutover.json"):
             job_id = journal_path.parent.name
+            journal = json.loads(journal_path.read_text())
+            if journal.get("version") == "job_rollback_v1":
+                rollback_batches.setdefault(
+                    str(journal.get("commit_marker")),
+                    [],
+                ).append((job_id, journal_path, journal))
+                continue
             with self.job_lock(job_id, exclusive=True):
                 self._recover_cutover_unlocked(job_id)
+        for journals in rollback_batches.values():
+            self._recover_rollback_batch(journals)
         for state in self.states():
             if state.get("status") == "processing":
                 state.update(status="queued", error=None, page=0)

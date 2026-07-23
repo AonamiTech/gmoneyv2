@@ -33,6 +33,14 @@ class PreparedJob:
     review_marker: tuple[bool, str | None]
 
 
+@dataclass(frozen=True)
+class RollbackJob:
+    job_id: str
+    backup_dir: Path
+    displaced_dir: Path
+    review_marker: tuple[bool, str | None]
+
+
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
@@ -64,6 +72,28 @@ def _marker_payload(marker: tuple[bool, str | None]) -> dict[str, Any]:
 def _marker_from_payload(payload: dict[str, Any]) -> tuple[bool, str | None]:
     return bool(payload.get("exists")), (
         str(payload["sha256"]) if payload.get("sha256") is not None else None
+    )
+
+
+def _legacy_rollback_review_is_safe(
+    *,
+    job_id: str,
+    backup_review: dict[str, Any],
+    current_review: dict[str, Any],
+) -> bool:
+    backup_events = backup_review.get("events") or []
+    current_events = current_review.get("events") or []
+    if int(current_review.get("revision") or 0) != int(
+        backup_review.get("revision") or 0
+    ) + 1:
+        return False
+    if current_events[:-1] != backup_events or not current_events:
+        return False
+    deployment_event = current_events[-1]
+    return (
+        deployment_event.get("action") == "document_reprocessed"
+        and deployment_event.get("target_id") == job_id
+        and deployment_event.get("reviewer") == "system-reprocessor"
     )
 
 
@@ -719,14 +749,26 @@ def apply_staged_jobs(
                         "rows_before": len(item.old_result.get("rows", [])),
                         "rows_after": len(item.new_result.get("rows", [])),
                         "backup": str(backup),
+                        "deployed_review_marker": _marker_payload(
+                            _review_marker(store.job_dir(item.job_id))
+                        ),
                     }
                 )
             _atomic_json(
                 commit_marker,
                 {
-                    "version": "reprocess_batch_commit_v1",
+                    "version": "reprocess_batch_commit_v2",
                     "committed_at": utc_now(),
                     "job_ids": [item.job_id for item in prepared],
+                    "documents": [
+                        {
+                            "job_id": document["job_id"],
+                            "deployed_review_marker": document[
+                                "deployed_review_marker"
+                            ],
+                        }
+                        for document in documents
+                    ],
                 },
             )
         except BaseException:
@@ -750,40 +792,198 @@ def apply_staged_jobs(
 def rollback_jobs(*, root: Path, backup_batch: Path) -> dict[str, Any]:
     store = JobStore(root)
     backup_jobs = sorted(path for path in backup_batch.iterdir() if path.is_dir())
+    commit_path = backup_batch / ".committed.json"
+    if not commit_path.is_file():
+        raise ValueError("backup batch has no commit marker")
+    commit = json.loads(commit_path.read_text())
+    commit_version = commit.get("version")
+    if commit_version not in {"reprocess_batch_commit_v1", "reprocess_batch_commit_v2"}:
+        raise ValueError("unsupported backup batch commit marker")
+    expected_markers = {
+        str(document["job_id"]): _marker_from_payload(
+            document["deployed_review_marker"]
+        )
+        for document in commit.get("documents", [])
+        if document.get("deployed_review_marker") is not None
+    }
+    expected_ids = sorted(str(job_id) for job_id in commit.get("job_ids", []))
+    if expected_ids != [backup.name for backup in backup_jobs]:
+        raise ValueError("backup batch document inventory does not match its commit marker")
+
     for backup in backup_jobs:
-        if not (backup / "result.json").is_file() or not (backup / "artifacts").is_dir():
+        if (
+            not (backup / "result.json").is_file()
+            or not (backup / "artifacts").is_dir()
+            or not (backup / "state.json").is_file()
+        ):
             raise ValueError(f"backup is incomplete: {backup}")
         store.read(backup.name)
-    timestamp = re.sub(r"[^0-9]", "", utc_now())[:14]
-    displaced_root = root / "reprocess-rollback-current" / timestamp
-    displaced_root.mkdir(parents=True, mode=0o700)
-    restored: list[dict[str, str]] = []
+
+    review_markers: dict[str, tuple[bool, str | None]] = {}
     for backup in backup_jobs:
         job_id = backup.name
-        job_dir = store.job_dir(job_id)
-        displaced = displaced_root / job_id
-        displaced.mkdir(mode=0o700)
-        (job_dir / "artifacts").replace(displaced / "artifacts")
-        (job_dir / "result.json").replace(displaced / "result.json")
-        (backup / "artifacts").replace(job_dir / "artifacts")
-        (backup / "result.json").replace(job_dir / "result.json")
-        _atomic_json(job_dir / "state.json", json.loads((backup / "state.json").read_text()))
-        if (backup / "review.json").is_file():
-            _atomic_json(
-                job_dir / "review.json",
-                json.loads((backup / "review.json").read_text()),
-            )
-        elif (job_dir / "review.json").is_file():
-            (job_dir / "review.json").unlink()
-        restored.append(
-            {
-                "job_id": job_id,
-                "displaced_result": str(displaced),
-            }
+        with store.job_lock(job_id, exclusive=False):
+            store._require_stable_workspace(job_id)
+            current_review = store._read_review_unlocked(job_id)
+            current_marker = _review_marker(store.job_dir(job_id))
+            if commit_version == "reprocess_batch_commit_v2":
+                if expected_markers.get(job_id) != current_marker:
+                    raise ValueError(
+                        "review changed after deployment; rollback aborted"
+                    )
+            else:
+                backup_review = (
+                    json.loads((backup / "review.json").read_text())
+                    if (backup / "review.json").is_file()
+                    else store.empty_review()
+                )
+                if not _legacy_rollback_review_is_safe(
+                    job_id=job_id,
+                    backup_review=backup_review,
+                    current_review=current_review,
+                ):
+                    raise ValueError(
+                        "review changed after deployment; rollback aborted"
+                    )
+            review_markers[job_id] = current_marker
+
+    timestamp = re.sub(r"[^0-9]", "", utc_now())[:14]
+    displaced_root = (
+        store.jobs_root / ".reprocess-rollback-current" / timestamp
+    )
+    rollback_marker = displaced_root / ".rollback.json"
+    rollback_commit = displaced_root / ".committed.json"
+    rollback_jobs = [
+        RollbackJob(
+            job_id=backup.name,
+            backup_dir=backup,
+            displaced_dir=displaced_root / backup.name,
+            review_marker=review_markers[backup.name],
         )
+        for backup in backup_jobs
+    ]
+
+    with ExitStack() as locks:
+        for item in rollback_jobs:
+            locks.enter_context(store.job_lock(item.job_id, exclusive=True))
+        for item in rollback_jobs:
+            store._require_stable_workspace(item.job_id)
+            if _review_marker(store.job_dir(item.job_id)) != item.review_marker:
+                raise ValueError(
+                    "review changed during rollback; no documents were restored"
+                )
+
+        displaced_root.mkdir(parents=True, mode=0o700)
+        _atomic_json(
+            rollback_marker,
+            {
+                "version": "reprocess_rollback_batch_v1",
+                "started_at": utc_now(),
+                "backup_batch": str(backup_batch),
+                "job_ids": [item.job_id for item in rollback_jobs],
+                "review_markers": {
+                    item.job_id: _marker_payload(item.review_marker)
+                    for item in rollback_jobs
+                },
+            },
+        )
+        try:
+            for item in rollback_jobs:
+                job_dir = store.job_dir(item.job_id)
+                item.displaced_dir.mkdir(mode=0o700)
+                shutil.copy2(
+                    job_dir / "state.json",
+                    item.displaced_dir / "state.json",
+                )
+                if (job_dir / "review.json").is_file():
+                    shutil.copy2(
+                        job_dir / "review.json",
+                        item.displaced_dir / "review.json",
+                    )
+            for item in rollback_jobs:
+                _atomic_json(
+                    store.job_dir(item.job_id) / ".cutover.json",
+                    {
+                        "version": "job_rollback_v1",
+                        "job_id": item.job_id,
+                        "backup_dir": str(item.backup_dir),
+                        "displaced_dir": str(item.displaced_dir),
+                        "commit_marker": str(rollback_commit),
+                        "started_at": utc_now(),
+                    },
+                )
+            for item in rollback_jobs:
+                job_dir = store.job_dir(item.job_id)
+                (job_dir / "artifacts").replace(
+                    item.displaced_dir / "artifacts"
+                )
+                (job_dir / "result.json").replace(
+                    item.displaced_dir / "result.json"
+                )
+                (item.backup_dir / "artifacts").replace(
+                    job_dir / "artifacts"
+                )
+                (item.backup_dir / "result.json").replace(
+                    job_dir / "result.json"
+                )
+                _atomic_json(
+                    job_dir / "state.json",
+                    json.loads((item.backup_dir / "state.json").read_text()),
+                )
+                if (item.backup_dir / "review.json").is_file():
+                    _atomic_json(
+                        job_dir / "review.json",
+                        json.loads(
+                            (item.backup_dir / "review.json").read_text()
+                        ),
+                    )
+                elif (job_dir / "review.json").is_file():
+                    (job_dir / "review.json").unlink()
+            _atomic_json(
+                rollback_commit,
+                {
+                    "version": "reprocess_rollback_commit_v1",
+                    "committed_at": utc_now(),
+                    "job_ids": [item.job_id for item in rollback_jobs],
+                },
+            )
+        except BaseException:
+            try:
+                for item in reversed(rollback_jobs):
+                    store._restore_rollback_job_unlocked(
+                        item.job_id,
+                        {
+                            "version": "job_rollback_v1",
+                            "job_id": item.job_id,
+                            "backup_dir": str(item.backup_dir),
+                            "displaced_dir": str(item.displaced_dir),
+                            "commit_marker": str(rollback_commit),
+                        },
+                    )
+                for item in rollback_jobs:
+                    (store.job_dir(item.job_id) / ".cutover.json").unlink(
+                        missing_ok=True
+                    )
+                shutil.rmtree(displaced_root)
+            except BaseException as recovery_error:
+                raise RuntimeError(
+                    "manual rollback recovery is required before jobs can be read"
+                ) from recovery_error
+            raise
+
+        for item in rollback_jobs:
+            (store.job_dir(item.job_id) / ".cutover.json").unlink(missing_ok=True)
+
+    documents = [
+        {
+            "job_id": item.job_id,
+            "displaced_result": str(item.displaced_dir),
+        }
+        for item in rollback_jobs
+    ]
     return {
-        "restored": len(restored),
-        "documents": restored,
+        "restored": len(documents),
+        "documents": documents,
         "displaced_root": str(displaced_root),
     }
 
