@@ -42,6 +42,7 @@ from gmoney.extraction.document_total import (
 )
 from gmoney.extraction.hospital import detect_hospital
 from gmoney.extraction.ocr_rows import (
+    ReconstructionResult,
     TableSchemaState,
     fuse_provider_descriptions,
     reconstruct_ocr_rows,
@@ -56,6 +57,9 @@ from gmoney.extraction.recovery import (
     is_implausibly_low_yield,
     is_terminal_non_ledger,
     map_crop_tokens_to_page,
+    needs_field_quality_recovery,
+    reconstruction_quality,
+    safely_improves_reconstruction,
 )
 from gmoney.extraction.rows import extract_candidate_rows
 from gmoney.extraction.spatial import align_candidate_rows
@@ -665,10 +669,10 @@ class OfflineExtractor:
         source: Path,
         artifact_root: Path,
         work: TableWork,
-        prior_schemas,
+        prior_schemas: tuple[TableSchemaState, ...],
         page_artifact_sha256: str,
-        minimum_rows: int = 0,
-    ):
+        baseline: ReconstructionResult,
+    ) -> tuple[ReconstructionResult | None, tuple[RecoveryAttempt, ...]]:
         attempts: list[RecoveryAttempt] = []
         try:
             high_resolution = render_pdf_region(
@@ -730,7 +734,7 @@ class OfflineExtractor:
                     f"{work.table_id}.400dpi-clahe.ocr.json",
                 )
             )
-        selected = None
+        reconstructed: list[tuple[str, str, bool, int, ReconstructionResult]] = []
         for variant, image_path, artifact_sha256, cache_name in assets:
             request = InferenceRequest(
                 request_id=str(uuid4()),
@@ -777,26 +781,45 @@ class OfflineExtractor:
                 box=work.box,
                 prior_schemas=prior_schemas,
             )
-            improved = len(reconstruction.rows) > minimum_rows
+            reconstructed.append(
+                (
+                    variant,
+                    artifact_sha256,
+                    cache_hit,
+                    response.latency_ms,
+                    reconstruction,
+                )
+            )
+        safe_candidates = [
+            item
+            for item in reconstructed
+            if safely_improves_reconstruction(baseline, item[-1])
+        ]
+        selected_item = max(
+            safe_candidates,
+            key=lambda item: reconstruction_quality(item[-1]),
+            default=None,
+        )
+        for item in reconstructed:
+            variant, artifact_sha256, cache_hit, latency_ms, reconstruction = item
+            selected = item is selected_item
             attempts.append(
                 RecoveryAttempt(
                     stage=RecoveryStage.CROP_OCR,
                     artifact_sha256=artifact_sha256,
                     cache_hit=cache_hit,
-                    latency_ms=response.latency_ms,
+                    latency_ms=latency_ms,
                     produced_rows=len(reconstruction.rows),
-                    accepted_rows=len(reconstruction.rows) if improved else 0,
+                    accepted_rows=len(reconstruction.rows) if selected else 0,
                     status=(
                         "recovered"
-                        if improved
+                        if selected
                         else ("no_improvement" if reconstruction.rows else "no_rows")
                     ),
                     reason=f"input_variant:{variant}",
                 )
             )
-            if improved:
-                selected = reconstruction
-                break
+        selected = selected_item[-1] if selected_item is not None else None
         return selected, tuple(attempts)
 
     def extract(
@@ -991,7 +1014,9 @@ class OfflineExtractor:
                 )
                 recovery_attempts: list[RecoveryAttempt] = []
                 if not is_terminal_non_ledger(reconstruction) and (
-                    not parsed_rows or is_implausibly_low_yield(reconstruction)
+                    not parsed_rows
+                    or is_implausibly_low_yield(reconstruction)
+                    or needs_field_quality_recovery(reconstruction)
                 ):
                     recovered, attempts = self._recover_crop_ocr(
                         source=source,
@@ -999,7 +1024,7 @@ class OfflineExtractor:
                         work=work,
                         prior_schemas=tuple(schema_states),
                         page_artifact_sha256=work.page_artifact_sha256,
-                        minimum_rows=len(reconstruction.rows),
+                        baseline=reconstruction,
                     )
                     recovery_attempts.extend(attempts)
                     if recovered is not None:

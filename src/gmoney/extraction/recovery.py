@@ -20,6 +20,28 @@ from gmoney.extraction.rows import CandidateLedgerRow
 from gmoney.extraction.spatial import AlignedLedgerRow
 from gmoney.extraction.typed_values import parse_decimal
 
+FIELD_QUALITY_FLAGS = frozenset(
+    {
+        "missing_labeled_quantity",
+        "missing_labeled_unit_price",
+        "line_arithmetic_mismatch",
+    }
+)
+MAPPED_CANONICAL_FIELDS = frozenset(
+    {
+        "description",
+        "service_date",
+        "request_no",
+        "service_code",
+        "hsn_code",
+        "quantity",
+        "rate",
+        "gross_amount",
+        "discount",
+        "amount",
+    }
+)
+
 
 @dataclass(frozen=True)
 class GroundingResult:
@@ -42,6 +64,94 @@ def is_terminal_non_ledger(reconstruction: ReconstructionResult) -> bool:
     return table_type in {TableType.METADATA.value, TableType.PAYMENT.value}
 
 
+def needs_field_quality_recovery(reconstruction: ReconstructionResult) -> bool:
+    if is_terminal_non_ledger(reconstruction):
+        return False
+    return any(
+        FIELD_QUALITY_FLAGS.intersection(
+            getattr(getattr(row, "candidate", None), "validation_flags", ())
+        )
+        for row in reconstruction.rows
+    )
+
+
+def _field_quality_defects(reconstruction: ReconstructionResult) -> tuple[int, int]:
+    flags = tuple(
+        flag
+        for row in reconstruction.rows
+        for flag in row.candidate.validation_flags
+    )
+    return (
+        flags.count("line_arithmetic_mismatch"),
+        sum(
+            flags.count(flag)
+            for flag in ("missing_labeled_quantity", "missing_labeled_unit_price")
+        ),
+    )
+
+
+def _is_populated(value: object) -> bool:
+    return value is not None and (not isinstance(value, str) or bool(value.strip()))
+
+
+def _mapped_field_coverage(reconstruction: ReconstructionResult) -> int:
+    return sum(
+        1
+        for row in reconstruction.rows
+        for field, token_ids in row.field_token_ids.items()
+        if field in MAPPED_CANONICAL_FIELDS
+        and token_ids
+        and _is_populated(getattr(row.candidate, field, None))
+    )
+
+
+def _populated_source_cells(reconstruction: ReconstructionResult) -> int:
+    return sum(
+        1
+        for table in reconstruction.source_tables
+        for row in table.rows
+        for cell in row.cells
+        if _is_populated(cell.raw_value)
+    )
+
+
+def reconstruction_quality(reconstruction: ReconstructionResult) -> tuple[int, ...]:
+    arithmetic_mismatches, missing_labeled_fields = _field_quality_defects(reconstruction)
+    grounded_rows = sum(
+        bool(row.evidence_token_ids and row.evidence_box) for row in reconstruction.rows
+    )
+    source_rows = sum(len(table.rows) for table in reconstruction.source_tables)
+    return (
+        -arithmetic_mismatches,
+        -missing_labeled_fields,
+        _mapped_field_coverage(reconstruction),
+        _populated_source_cells(reconstruction),
+        len(reconstruction.rows),
+        grounded_rows,
+        source_rows,
+    )
+
+
+def safely_improves_reconstruction(
+    baseline: ReconstructionResult,
+    candidate: ReconstructionResult,
+) -> bool:
+    if len(candidate.rows) < len(baseline.rows):
+        return False
+    if any(
+        candidate_count > baseline_count
+        for candidate_count, baseline_count in zip(
+            _field_quality_defects(candidate),
+            _field_quality_defects(baseline),
+            strict=True,
+        )
+    ):
+        return False
+    if _mapped_field_coverage(candidate) < _mapped_field_coverage(baseline):
+        return False
+    return reconstruction_quality(candidate) > reconstruction_quality(baseline)
+
+
 def decide_recovery(
     reconstruction: ReconstructionResult,
     *,
@@ -55,6 +165,8 @@ def decide_recovery(
             reasons.append(RecoveryReason.ZERO_YIELD)
         elif is_implausibly_low_yield(reconstruction):
             reasons.append(RecoveryReason.LOW_YIELD)
+        if needs_field_quality_recovery(reconstruction):
+            reasons.append(RecoveryReason.VALIDATION_FAILURE)
         if reconstruction.schema is None:
             reasons.append(RecoveryReason.NO_SCHEMA)
         if reconstruction.diagnostics.get("table_type") == TableType.UNKNOWN.value:
@@ -77,7 +189,9 @@ def decide_recovery(
             stages.append(RecoveryStage.GEMINI)
         stages.append(RecoveryStage.REVIEW)
     route = "profile_fast" if profile_match and profile_match.selected else "local_ocr"
-    if reasons and route != "profile_fast":
+    if reasons and (
+        route != "profile_fast" or RecoveryReason.VALIDATION_FAILURE in reasons
+    ):
         route = "local_recovery"
     return RouteDecision(
         route=route,
