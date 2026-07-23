@@ -8,6 +8,7 @@ import shutil
 from contextlib import ExitStack, suppress
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
+from decimal import Decimal
 from difflib import SequenceMatcher
 from pathlib import Path
 from threading import Lock
@@ -269,6 +270,57 @@ def _unlinked_financial_row_is_explained(
         value in total_amounts for _, value in financial_values
     ):
         return True
+
+    if normalized_label in {"sub total", "subtotal"}:
+        section_rows: list[dict[str, Any]] = []
+        for preceding in table.rows:
+            if preceding.id == source_row.id:
+                break
+            preceding_cells = {
+                cell.column_id: cell for cell in preceding.cells
+            }
+            if preceding.canonical_row_id is not None:
+                canonical = canonical_rows.get(preceding.canonical_row_id)
+                if canonical and canonical.get("role") in {
+                    "detail",
+                    "refund",
+                    "category_rollup",
+                }:
+                    section_rows.append(canonical)
+                continue
+            preceding_label = _normalized(
+                " ".join(
+                    cell.raw_value.strip()
+                    for cell in preceding.cells
+                    if cell.raw_value
+                    and cell.raw_value.strip()
+                    and parse_decimal(cell.raw_value) is None
+                )
+            )
+            preceding_has_financial_value = any(
+                column.canonical_field in {"net_amount", "gross_amount"}
+                and preceding_cells[column.id].raw_value
+                and parse_decimal(preceding_cells[column.id].raw_value or "")
+                is not None
+                for column in table.columns
+            )
+            if preceding_label in total_labels or (
+                preceding_label and not preceding_has_financial_value
+            ):
+                section_rows.clear()
+        if section_rows and all(
+            sum(
+                (
+                    parsed
+                    for row in section_rows
+                    if (parsed := parse_decimal(str(row.get(field)))) is not None
+                ),
+                Decimal("0"),
+            )
+            == value
+            for field, value in financial_values
+        ):
+            return True
 
     if table.table_type.value not in {"category_summary", "package_summary"}:
         return False
