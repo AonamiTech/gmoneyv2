@@ -50,6 +50,32 @@ def test_non_empty_source_cell_requires_token_grounding() -> None:
         SourceCell(column_id="c1", raw_value="invented")
 
 
+@pytest.mark.parametrize("token_id", ["", "   "])
+def test_non_empty_source_cell_rejects_blank_token_ids(token_id: str) -> None:
+    with pytest.raises(ValidationError, match="non-blank"):
+        SourceCell.model_validate(
+            {
+                "column_id": "c1",
+                "raw_value": "invented",
+                "evidence": [
+                    {
+                        "page_number": 1,
+                        "polygon": {
+                            "points": [
+                                {"x": 1, "y": 1},
+                                {"x": 10, "y": 1},
+                                {"x": 10, "y": 10},
+                                {"x": 1, "y": 10},
+                            ]
+                        },
+                        "artifact_sha256": "a" * 64,
+                        "token_ids": [token_id],
+                    }
+                ],
+            }
+        )
+
+
 def test_real_source_header_requires_token_grounding() -> None:
     with pytest.raises(ValidationError, match="grounded OCR evidence"):
         SourceColumn(id="c1", label="Amount", order=0)

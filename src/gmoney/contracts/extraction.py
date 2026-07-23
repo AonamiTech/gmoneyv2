@@ -2,7 +2,7 @@ from decimal import Decimal
 from enum import StrEnum
 from typing import Any
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 
 from gmoney.contracts.common import ContractModel, VersionedContract
 from gmoney.contracts.evidence import Polygon
@@ -76,6 +76,13 @@ class EvidenceRef(ContractModel):
     polygon: Polygon
     artifact_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     token_ids: tuple[str, ...] = ()
+
+    @field_validator("token_ids")
+    @classmethod
+    def require_non_blank_token_ids(cls, token_ids: tuple[str, ...]) -> tuple[str, ...]:
+        if any(not token_id.strip() for token_id in token_ids):
+            raise ValueError("evidence token IDs must be non-blank strings")
+        return token_ids
 
 
 class SourceColumn(ContractModel):

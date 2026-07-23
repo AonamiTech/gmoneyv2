@@ -767,13 +767,29 @@ def _synthetic_source_table(
     table_type: TableType,
     width: float,
 ) -> tuple[SourceTable, ...]:
-    data_lines = tuple(line for line in lines if any(token.text.strip() for token in line.tokens))
-    if not data_lines:
+    indexed_lines = tuple(
+        (index, line)
+        for index, line in enumerate(lines)
+        if any(token.text.strip() for token in line.tokens)
+    )
+    candidate_lines = tuple(
+        (index, line)
+        for index, line in indexed_lines
+        if len(tuple(token for token in line.tokens if token.text.strip())) >= 2
+        and _numeric_tokens(line)
+    )
+    if not candidate_lines:
         return ()
-    centers = [_center_x(token) for token in data_lines[0].tokens if token.text.strip()]
+    first_data_index = candidate_lines[0][0]
+    data_lines = tuple(line for index, line in indexed_lines if index >= first_data_index)
+    centers = [
+        _center_x(token)
+        for token in candidate_lines[0][1].tokens
+        if token.text.strip()
+    ]
     if len(centers) < 2:
         return ()
-    for line in data_lines[1:]:
+    for _, line in candidate_lines[1:]:
         for token in line.tokens:
             if not token.text.strip():
                 continue

@@ -265,6 +265,49 @@ def test_reprocess_validation_rejects_mapped_field_in_the_wrong_source_cell(
         )
 
 
+def test_reprocess_validation_rejects_printed_value_missing_from_canonical_row(
+    tmp_path: Path,
+) -> None:
+    store, job_id, old_result = setup_job(tmp_path)
+    page_sha = old_result["page_assets"][0]["artifact_sha256"]
+    new_rows = [row("new-row", page_sha)]
+    printed = source_tables(new_rows, page_sha)
+    printed[0]["columns"].insert(
+        1,
+        {
+            "id": "quantity",
+            "label": "Qty",
+            "order": 1,
+            "canonical_field": "quantity",
+            "evidence": [evidence(page_sha, "header-quantity")],
+            "validation_flags": [],
+        },
+    )
+    printed[0]["columns"][2]["order"] = 2
+    printed[0]["rows"][0]["cells"].insert(
+        1,
+        {
+            "column_id": "quantity",
+            "raw_value": "2",
+            "evidence": [evidence(page_sha, "quantity-token")],
+            "validation_flags": [],
+        },
+    )
+    new_result = {
+        **old_result,
+        "rows": new_rows,
+        "source_tables": printed,
+    }
+
+    with pytest.raises(ValueError, match="quantity.*missing canonical value"):
+        _validate_result(
+            store.job_dir(job_id) / "source.pdf",
+            old_result,
+            new_result,
+            store.job_dir(job_id) / "artifacts",
+        )
+
+
 def test_reprocess_preserves_job_and_review_with_backup(tmp_path: Path) -> None:
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]

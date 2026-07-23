@@ -477,6 +477,38 @@ def test_source_table_synthesizes_grounded_columns_without_a_header() -> None:
     ]
 
 
+def test_source_table_skips_title_before_headerless_rows() -> None:
+    tokens = (
+        token(0, "Charges", (100, 5, 300, 20)),
+        token(1, "Procedure", (100, 40, 300, 55)),
+        token(2, "10", (540, 40, 570, 55)),
+        token(3, "4,500.00", (860, 40, 940, 55)),
+        token(4, "Medicine", (100, 70, 300, 85)),
+        token(5, "20", (540, 70, 570, 85)),
+        token(6, "2,000.00", (860, 70, 940, 85)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 0, 980, 100),
+    )
+
+    assert len(result.rows) == 2
+    assert [column.label for column in result.source_tables[0].columns] == [
+        "Column 1",
+        "Column 2",
+        "Column 3",
+    ]
+    assert [
+        [cell.raw_value for cell in row.cells] for row in result.source_tables[0].rows
+    ] == [
+        ["Procedure", "10", "4,500.00"],
+        ["Medicine", "20", "2,000.00"],
+    ]
+
+
 def test_repeated_shifted_headers_reassign_rate_and_quantity_lanes() -> None:
     tokens = (
         token(0, "Description", (100, 30, 300, 45)),

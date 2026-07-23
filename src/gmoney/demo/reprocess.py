@@ -293,9 +293,25 @@ def _validate_result(
             cells = {cell.column_id: cell for cell in source_row.cells}
             for column in table.columns:
                 field = column.canonical_field
-                if field is None or canonical.get(field) is None:
+                if field is None:
                     continue
-                if field == "description":
+                cell = cells[column.id]
+                canonical_value = canonical.get(field)
+                printed_present = bool(cell.raw_value and cell.raw_value.strip())
+                canonical_present = canonical_value is not None and (
+                    not isinstance(canonical_value, str) or bool(canonical_value.strip())
+                )
+                if printed_present and not canonical_present:
+                    raise ValueError(
+                        f"{field} has a printed value but is missing canonical value "
+                        f"for canonical row {source_row.canonical_row_id}"
+                    )
+                if canonical_present and not printed_present:
+                    raise ValueError(
+                        f"{field} has a canonical value but is missing printed value "
+                        f"for canonical row {source_row.canonical_row_id}"
+                    )
+                if not printed_present:
                     continue
                 evidence_field = evidence_fields[field]
                 field_token_ids = {
@@ -305,13 +321,17 @@ def _validate_result(
                     )
                     for token_id in item.get("token_ids") or []
                 }
-                cell = cells[column.id]
                 cell_token_ids = {
                     token_id
                     for item in cell.evidence
                     for token_id in item.token_ids
                 }
-                if not field_token_ids or not field_token_ids.issubset(cell_token_ids):
+                evidence_matches = (
+                    bool(field_token_ids & cell_token_ids)
+                    if field == "description"
+                    else field_token_ids.issubset(cell_token_ids)
+                )
+                if not field_token_ids or not evidence_matches:
                     raise ValueError(
                         f"{field} evidence is not in its mapped source cell "
                         f"for canonical row {source_row.canonical_row_id}"
@@ -324,6 +344,13 @@ def _validate_result(
                             f"{field} value does not match its mapped source cell "
                             f"for canonical row {source_row.canonical_row_id}"
                         )
+                elif field != "description" and _normalized(
+                    cell.raw_value
+                ) != _normalized(canonical_value):
+                    raise ValueError(
+                        f"{field} value does not match its mapped source cell "
+                        f"for canonical row {source_row.canonical_row_id}"
+                    )
     for row_id, row_payload in canonical_rows.items():
         if (
             "ocr_spatial_graph" in (row_payload.get("source_routes") or [])
