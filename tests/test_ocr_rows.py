@@ -786,6 +786,111 @@ def test_wrapped_header_allows_numeric_label_beside_named_columns() -> None:
     ]
 
 
+def test_header_does_not_absorb_distant_metadata_line() -> None:
+    tokens = (
+        token(0, "Discharge Date: 08-07-2026 03:58 PM", (100, 10, 400, 25)),
+        token(1, "TPA: MEDICLAIM", (500, 10, 650, 25)),
+        token(2, "No.", (100, 100, 150, 115)),
+        token(3, "Code", (200, 100, 270, 115)),
+        token(4, "Service Name", (400, 100, 650, 115)),
+        token(5, "Amount", (850, 100, 950, 115)),
+        token(6, "1.A", (100, 140, 150, 155)),
+        token(7, "Room Rent", (400, 140, 600, 155)),
+        token(8, "16,000.00", (850, 140, 950, 155)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 0, 980, 180),
+    )
+
+    assert [column.label for column in result.source_tables[0].columns] == [
+        "No.",
+        "Code",
+        "Service Name",
+        "Amount",
+    ]
+
+
+def test_structured_field_does_not_borrow_from_adjacent_printed_column() -> None:
+    tokens = (
+        token(0, "No.", (100, 30, 150, 45)),
+        token(1, "Code", (160, 30, 220, 45)),
+        token(2, "Service Name", (400, 30, 650, 45)),
+        token(3, "Amount", (850, 30, 950, 45)),
+        token(4, "1.A", (100, 70, 150, 85)),
+        token(5, "Room Rent", (400, 70, 600, 85)),
+        token(6, "16,000.00", (850, 70, 950, 85)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 20, 980, 110),
+    )
+
+    assert result.rows[0].candidate.service_code is None
+    table = result.source_tables[0]
+    cells = {cell.column_id: cell for cell in table.rows[0].cells}
+    no_column = next(column for column in table.columns if column.label == "No.")
+    code_column = next(column for column in table.columns if column.label == "Code")
+    assert cells[no_column.id].raw_value == "1.A"
+    assert cells[code_column.id].raw_value is None
+
+
+def test_structured_field_selects_valid_token_inside_its_printed_lane() -> None:
+    tokens = (
+        token(0, "No.", (100, 30, 150, 45)),
+        token(1, "Code", (190, 30, 250, 45)),
+        token(2, "Service Name", (400, 30, 650, 45)),
+        token(3, "Amount", (850, 30, 950, 45)),
+        token(4, "1.A", (150, 70, 190, 85)),
+        token(5, "AB123", (260, 70, 300, 85)),
+        token(6, "Room Rent", (400, 70, 600, 85)),
+        token(7, "16,000.00", (850, 70, 950, 85)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 20, 980, 110),
+    )
+
+    assert result.rows[0].candidate.service_code == "AB123"
+    table = result.source_tables[0]
+    cells = {cell.column_id: cell for cell in table.rows[0].cells}
+    no_column = next(column for column in table.columns if column.label == "No.")
+    code_column = next(column for column in table.columns if column.label == "Code")
+    assert cells[no_column.id].raw_value == "1.A"
+    assert cells[code_column.id].raw_value == "AB123"
+
+
+def test_structured_field_accepts_stacked_fragments_in_same_printed_lane() -> None:
+    tokens = (
+        token(0, "Service", (100, 20, 180, 35)),
+        token(1, "Particular", (400, 20, 650, 35)),
+        token(2, "Amount", (850, 45, 950, 60)),
+        token(3, "Date", (105, 45, 165, 60)),
+        token(4, "15/07/2026", (100, 90, 200, 105)),
+        token(5, "Procedure", (400, 90, 600, 105)),
+        token(6, "4,500.00", (850, 90, 950, 105)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 10, 980, 130),
+    )
+
+    assert result.diagnostics["header_found"] is True
+    assert result.rows[0].candidate.service_date == "15/07/2026"
+
+
 def test_repeated_header_ignores_numeric_section_preamble() -> None:
     tokens = (
         token(0, "Date", (195, 20, 269, 40)),

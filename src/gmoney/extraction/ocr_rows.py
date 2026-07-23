@@ -466,6 +466,15 @@ def _contains_total_value(line: OcrLine) -> bool:
     )
 
 
+def _header_lines_are_adjacent(previous: OcrLine, current: OcrLine) -> bool:
+    previous_bottom = max(_bounds(token)[3] for token in previous.tokens)
+    current_top = min(_bounds(token)[1] for token in current.tokens)
+    typical_height = median(
+        _height(token) for line in (previous, current) for token in line.tokens
+    )
+    return current_top - previous_bottom <= max(8.0, typical_height * 1.5)
+
+
 def _merge_header_roles(
     current: dict[str, OcrToken], incoming: dict[str, OcrToken]
 ) -> dict[str, OcrToken]:
@@ -518,6 +527,10 @@ def _header_blocks(lines: tuple[OcrLine, ...]) -> tuple[HeaderBlock, ...]:
         if not _header_roles(lines[start]) and not (start_words and start_words <= fragment_words):
             continue
         for end in range(start, min(len(lines), start + 3)):
+            if end > start and not _header_lines_are_adjacent(
+                lines[end - 1], lines[end]
+            ):
+                break
             if _contains_total_value(lines[end]):
                 break
             roles = _merge_header_roles(roles, _header_roles(lines[end]))
@@ -1685,6 +1698,7 @@ def _closest_field_token(
     width: float,
     *,
     role: str,
+    printed_centers: tuple[float, ...] = (),
 ) -> OcrToken | None:
     if target is None:
         return None
@@ -1694,16 +1708,44 @@ def _closest_field_token(
             role, token.text
         )
 
-    candidates = [token for token in line.tokens if valid(token)]
+    center_cluster_tolerance = 0.025
+    left_neighbor = max(
+        (
+            center
+            for center in printed_centers
+            if center < target - center_cluster_tolerance
+        ),
+        default=None,
+    )
+    right_neighbor = min(
+        (
+            center
+            for center in printed_centers
+            if center > target + center_cluster_tolerance
+        ),
+        default=None,
+    )
+    minimum = (
+        (left_neighbor + target) / 2 if left_neighbor is not None else 0.0
+    )
+    maximum = (
+        (target + right_neighbor) / 2 if right_neighbor is not None else 1.0
+    )
+    candidates = [
+        token
+        for token in line.tokens
+        if valid(token)
+        and minimum <= (_center_x(token) - left) / width < maximum
+    ]
     if not candidates:
         return None
-    selected = min(candidates, key=lambda token: abs(((_center_x(token) - left) / width) - target))
-    tolerance = 0.12 if role == "service_date" else 0.08
-    return (
-        selected
-        if abs(((_center_x(selected) - left) / width) - target) <= tolerance
-        else None
+    selected = min(
+        candidates,
+        key=lambda token: abs(((_center_x(token) - left) / width) - target),
     )
+    selected_center = (_center_x(selected) - left) / width
+    tolerance = 0.12 if role == "service_date" else 0.08
+    return selected if abs(selected_center - target) <= tolerance else None
 
 
 def _structured_field_value_is_valid(role: str, value: str) -> bool:
@@ -1730,6 +1772,7 @@ def _structured_text_fields(
     column_centers: dict[str, float],
     left: float,
     width: float,
+    printed_centers: tuple[float, ...] = (),
 ) -> tuple[dict[str, str], dict[str, tuple[str, ...]]]:
     values: dict[str, str] = {}
     evidence: dict[str, tuple[str, ...]] = {}
@@ -1740,6 +1783,7 @@ def _structured_text_fields(
             left,
             width,
             role=role,
+            printed_centers=printed_centers,
         )
         if token is None:
             continue
@@ -2100,6 +2144,7 @@ def reconstruct_ocr_rows(
             column_centers,
             left,
             width,
+            description_header_centers,
         )
         if pending_service_date:
             current_date = structured_values.get("service_date")
