@@ -73,6 +73,44 @@ HEADER_TERMS: dict[str, tuple[str, ...]] = {
     ),
 }
 
+RAW_HEADER_TERMS = frozenset(
+    {
+        "amount",
+        "amt",
+        "balance",
+        "bill",
+        "charge",
+        "code",
+        "company",
+        "copay",
+        "date",
+        "description",
+        "discount",
+        "expiry",
+        "gross",
+        "hospital",
+        "invoice",
+        "issue",
+        "kind",
+        "name",
+        "net",
+        "no",
+        "part",
+        "pay",
+        "price",
+        "quantity",
+        "rate",
+        "reference",
+        "round",
+        "serial",
+        "service",
+        "sr",
+        "total",
+        "type",
+        "value",
+    }
+)
+
 DATE_VALUE = (
     r"\d{1,2}(?:[/.-]\d{1,2}[/.-]\d{2,4}"
     r"|[-\s](?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
@@ -1068,8 +1106,13 @@ def _build_source_tables(
     return tuple(output)
 
 
-def _raw_source_header(lines: tuple[OcrLine, ...], width: float) -> HeaderBlock | None:
-    """Find a non-canonical header from its geometry and following numeric rows."""
+def _raw_source_headers(
+    lines: tuple[OcrLine, ...],
+    width: float,
+) -> tuple[HeaderBlock, ...]:
+    """Find arbitrary header segments from geometry and following numeric rows."""
+    output: list[HeaderBlock] = []
+    primary_signature: tuple[str, ...] = ()
     for index, line in enumerate(lines[:-1]):
         header_tokens = tuple(token for token in line.tokens if token.text.strip())
         if len(header_tokens) < 2 or any(
@@ -1092,9 +1135,40 @@ def _raw_source_header(lines: tuple[OcrLine, ...], width: float) -> HeaderBlock 
             )
             for candidate in candidates
         )
-        if aligned >= 2:
-            return HeaderBlock(start=index, end=index, roles={})
-    return None
+        normalized_words = set(_normalize(line.text).split())
+        signature = tuple(
+            re.sub(r"\s+", " ", token.text.casefold()).strip()
+            for token in header_tokens
+        )
+        is_repeated_signature = bool(
+            primary_signature
+            and all(primary_signature)
+            and all(signature)
+            and len(signature) == len(primary_signature)
+            and sum(
+                SequenceMatcher(None, current, primary).ratio() >= 0.8
+                for current, primary in zip(
+                    signature,
+                    primary_signature,
+                    strict=True,
+                )
+            )
+            >= max(2, len(signature) - 1)
+        )
+        is_dense_explicit_restart = (
+            not any(character.isdigit() for character in line.text)
+            and len(header_tokens) >= 4
+            and len(normalized_words & RAW_HEADER_TERMS) >= 5
+        )
+        if aligned >= 2 and (
+            not output
+            or is_repeated_signature
+            or is_dense_explicit_restart
+        ):
+            output.append(HeaderBlock(start=index, end=index, roles={}))
+            if not primary_signature:
+                primary_signature = signature
+    return tuple(output)
 
 
 def _synthetic_source_table(
@@ -2783,12 +2857,23 @@ def reconstruct_ocr_rows(
             raw_description=description_text,
         )
 
-    source_header = primary_header if header_valid else _raw_source_header(lines, width)
+    raw_source_headers = (
+        () if header_valid else _raw_source_headers(lines, width)
+    )
+    source_header = (
+        primary_header
+        if header_valid
+        else (raw_source_headers[0] if raw_source_headers else None)
+    )
     source_tables = (
         _build_source_tables(
             lines,
             primary=source_header,
-            repeated=repeated_header_blocks if header_valid else (),
+            repeated=(
+                repeated_header_blocks
+                if header_valid
+                else raw_source_headers[1:]
+            ),
             original_by_id=original_by_id,
             page_number=page_number,
             table_id=table_id,

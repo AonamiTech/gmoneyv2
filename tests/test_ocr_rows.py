@@ -802,6 +802,180 @@ def test_source_table_keeps_fully_unknown_grounded_headers() -> None:
     ]
 
 
+def test_source_tables_restart_at_arbitrary_header_after_preamble() -> None:
+    tokens = (
+        token(0, "From Date", (80, 10, 170, 25)),
+        token(1, ":06-07-2026", (190, 10, 300, 25)),
+        token(2, "To Date", (380, 10, 450, 25)),
+        token(3, ":08-07-2026", (470, 10, 580, 25)),
+        token(4, "Sales", (80, 35, 140, 50)),
+        token(5, "SR. ISSUE NO", (80, 60, 190, 75)),
+        token(6, "ISSUE DATE", (240, 60, 340, 75)),
+        token(7, "DISCOUNT", (430, 60, 510, 75)),
+        token(8, "ROUND OFF", (550, 60, 640, 75)),
+        token(9, "NET AMT BILL TYPE", (700, 60, 850, 75)),
+        token(10, "HOSPITAL", (900, 60, 980, 75)),
+        token(11, "1 S.19201", (80, 95, 180, 110)),
+        token(12, "06-07-2026", (240, 95, 340, 110)),
+        token(13, "0.00", (450, 95, 500, 110)),
+        token(14, "0.00", (570, 95, 620, 110)),
+        token(15, "8292.77 CREDIT", (700, 95, 850, 110)),
+        token(16, "Y", (925, 95, 940, 110)),
+        token(17, "2 S.19273", (80, 130, 180, 145)),
+        token(18, "07-07-2026", (240, 130, 340, 145)),
+        token(19, "0.00", (450, 130, 500, 145)),
+        token(20, "0.00", (570, 130, 620, 145)),
+        token(21, "631.89 CREDIT", (700, 130, 850, 145)),
+        token(22, "Y", (925, 130, 940, 145)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(60, 0, 1000, 160),
+    )
+
+    assert len(result.source_tables) == 2
+    ledger = result.source_tables[1]
+    assert [column.label for column in ledger.columns] == [
+        "SR. ISSUE NO",
+        "ISSUE DATE",
+        "DISCOUNT",
+        "ROUND OFF",
+        "NET AMT BILL TYPE",
+        "HOSPITAL",
+    ]
+    assert [cell.raw_value for cell in ledger.rows[0].cells] == [
+        "1 S.19201",
+        "06-07-2026",
+        "0.00",
+        "0.00",
+        "8292.77 CREDIT",
+        "Y",
+    ]
+
+
+def test_arbitrary_data_rows_are_not_promoted_to_repeated_headers() -> None:
+    tokens = (
+        token(0, "REFERENCE", (80, 20, 200, 35)),
+        token(1, "KIND", (420, 20, 500, 35)),
+        token(2, "VALUE", (740, 20, 850, 35)),
+        token(3, "S.19201", (80, 60, 200, 75)),
+        token(4, "CREDIT", (420, 60, 500, 75)),
+        token(5, "8292.77 CREDIT", (740, 60, 880, 75)),
+        token(6, "CURRENT", (80, 90, 200, 105)),
+        token(7, "SALES", (420, 90, 500, 105)),
+        token(8, "CREDIT", (740, 90, 850, 105)),
+        token(9, "S.19202", (80, 120, 200, 135)),
+        token(10, "CREDIT", (420, 120, 500, 135)),
+        token(11, "631.89", (740, 120, 850, 135)),
+        token(12, "S.19203", (80, 150, 200, 165)),
+        token(13, "CREDIT", (420, 150, 500, 165)),
+        token(14, "500.00", (740, 150, 850, 165)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(60, 0, 900, 180),
+    )
+
+    assert len(result.source_tables) == 1
+    table = result.source_tables[0]
+    assert [column.label for column in table.columns] == [
+        "REFERENCE",
+        "KIND",
+        "VALUE",
+    ]
+    assert [
+        [cell.raw_value for cell in source_row.cells]
+        for source_row in table.rows
+    ] == [
+        ["S.19201", "CREDIT", "8292.77 CREDIT"],
+        ["CURRENT", "SALES", "CREDIT"],
+        ["S.19202", "CREDIT", "631.89"],
+        ["S.19203", "CREDIT", "500.00"],
+    ]
+
+
+def test_headerish_nil_data_row_is_not_promoted_to_repeated_header() -> None:
+    tokens = (
+        token(0, "REFERENCE", (80, 20, 200, 35)),
+        token(1, "KIND", (420, 20, 500, 35)),
+        token(2, "VALUE", (740, 20, 850, 35)),
+        token(3, "S.1", (80, 60, 200, 75)),
+        token(4, "CREDIT", (420, 60, 500, 75)),
+        token(5, "100.00", (740, 60, 850, 75)),
+        token(6, "SERVICE", (80, 90, 200, 105)),
+        token(7, "CREDIT", (420, 90, 500, 105)),
+        token(8, "NIL", (740, 90, 850, 105)),
+        token(9, "S.2", (80, 120, 200, 135)),
+        token(10, "CREDIT", (420, 120, 500, 135)),
+        token(11, "631.89", (740, 120, 850, 135)),
+        token(12, "S.3", (80, 150, 200, 165)),
+        token(13, "CREDIT", (420, 150, 500, 165)),
+        token(14, "500.00", (740, 150, 850, 165)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(60, 0, 900, 180),
+    )
+
+    assert len(result.source_tables) == 1
+    assert [
+        [cell.raw_value for cell in source_row.cells]
+        for source_row in result.source_tables[0].rows
+    ] == [
+        ["S.1", "CREDIT", "100.00"],
+        ["SERVICE", "CREDIT", "NIL"],
+        ["S.2", "CREDIT", "631.89"],
+        ["S.3", "CREDIT", "500.00"],
+    ]
+
+
+def test_unicode_nil_data_row_is_not_promoted_to_repeated_header() -> None:
+    tokens = (
+        token(0, "विवरण", (80, 20, 200, 35)),
+        token(1, "प्रकार", (420, 20, 500, 35)),
+        token(2, "राशि", (740, 20, 850, 35)),
+        token(3, "सेवा", (80, 60, 200, 75)),
+        token(4, "उधार", (420, 60, 500, 75)),
+        token(5, "100.00", (740, 60, 850, 75)),
+        token(6, "दवा", (80, 90, 200, 105)),
+        token(7, "नकद", (420, 90, 500, 105)),
+        token(8, "शून्य", (740, 90, 850, 105)),
+        token(9, "जाँच", (80, 120, 200, 135)),
+        token(10, "उधार", (420, 120, 500, 135)),
+        token(11, "631.89", (740, 120, 850, 135)),
+        token(12, "कमरा", (80, 150, 200, 165)),
+        token(13, "उधार", (420, 150, 500, 165)),
+        token(14, "500.00", (740, 150, 850, 165)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(60, 0, 900, 180),
+    )
+
+    assert len(result.source_tables) == 1
+    assert [
+        [cell.raw_value for cell in source_row.cells]
+        for source_row in result.source_tables[0].rows
+    ] == [
+        ["सेवा", "उधार", "100.00"],
+        ["दवा", "नकद", "शून्य"],
+        ["जाँच", "उधार", "631.89"],
+        ["कमरा", "उधार", "500.00"],
+    ]
+
+
 def test_source_table_row_links_to_its_grounded_canonical_row() -> None:
     tokens = (
         token(0, "Particular", (100, 30, 360, 45)),
