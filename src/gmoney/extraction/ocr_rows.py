@@ -189,6 +189,13 @@ class OcrLine:
 
 
 @dataclass(frozen=True)
+class NumericValue:
+    token: OcrToken
+    value: Decimal
+    token_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class TableSchemaState:
     source_page: int
     source_table: str
@@ -330,7 +337,7 @@ def _normalize_orientation(
             pair = _closest_numeric(_numeric_tokens(line), amount_center, 0, width, set())
             if pair is None:
                 continue
-            token, _ = pair
+            token = pair.token
             relative_x = _center_x(token) / width
             if abs(relative_x - amount_center) <= 0.06 and re.search(
                 r"\d[\d,]*\.\d{2}\b", token.text
@@ -680,8 +687,8 @@ def _missing_numeric_column_centers(
     tolerance = max(4.0, width * 0.025)
     clusters: list[list[tuple[int, float]]] = []
     for line_index, values in numeric_lines:
-        for token, _ in values:
-            center = _center_x(token)
+        for value in values:
+            center = _center_x(value.token)
             candidate = next(
                 (
                     cluster
@@ -1207,12 +1214,95 @@ def _description_cell_boundaries(
     )
 
 
-def _numeric_tokens(line: OcrLine) -> list[tuple[OcrToken, Decimal]]:
-    output: list[tuple[OcrToken, Decimal]] = []
+def _merge_vertical_decimal_suffixes(
+    values: list[NumericValue],
+) -> list[NumericValue]:
+    consumed: set[int] = set()
+    merged: list[NumericValue] = []
+    for first_index, first in enumerate(values):
+        if first_index in consumed or not re.fullmatch(
+            r"[+-]?\d[\d,]*\.\d",
+            first.token.text.strip(),
+        ):
+            continue
+        first_left, first_top, first_right, first_bottom = _bounds(first.token)
+        first_width = max(1.0, first_right - first_left)
+        candidates: list[tuple[float, int, NumericValue]] = []
+        for second_index, second in enumerate(values):
+            if (
+                second_index == first_index
+                or second_index in consumed
+                or first.token.token_id == second.token.token_id
+                or not re.fullmatch(r"\d", second.token.text.strip())
+            ):
+                continue
+            second_left, second_top, second_right, second_bottom = _bounds(second.token)
+            vertical_gap = second_top - first_bottom
+            if (
+                _center_y(second.token) <= _center_y(first.token)
+                or vertical_gap < -2.0
+                or vertical_gap
+                > max(10.0, median((_height(first.token), _height(second.token))) * 0.35)
+                or abs(second_right - first_right) > max(8.0, first_width * 0.12)
+                or second_left < first_right - max(36.0, first_width * 0.32)
+                or second_left > first_right + max(8.0, first_width * 0.08)
+            ):
+                continue
+            combined_text = f"{first.token.text.strip()}{second.token.text.strip()}"
+            combined_value = parse_decimal(combined_text)
+            if combined_value is None:
+                continue
+            candidates.append(
+                (
+                    abs(second_right - first_right) + max(0.0, vertical_gap),
+                    second_index,
+                    NumericValue(
+                        token=first.token.model_copy(
+                            update={
+                                "text": combined_text,
+                                "polygon": Polygon(
+                                    points=(
+                                        Point(x=min(first_left, second_left), y=first_top),
+                                        Point(x=max(first_right, second_right), y=first_top),
+                                        Point(
+                                            x=max(first_right, second_right),
+                                            y=second_bottom,
+                                        ),
+                                        Point(
+                                            x=min(first_left, second_left),
+                                            y=second_bottom,
+                                        ),
+                                    )
+                                ),
+                            }
+                        ),
+                        value=combined_value,
+                        token_ids=tuple(
+                            dict.fromkeys((*first.token_ids, *second.token_ids))
+                        ),
+                    ),
+                )
+            )
+        if not candidates:
+            continue
+        _, second_index, combined = min(candidates, key=lambda item: item[0])
+        consumed.update((first_index, second_index))
+        merged.append(combined)
+    return sorted(
+        (
+            *(value for index, value in enumerate(values) if index not in consumed),
+            *merged,
+        ),
+        key=lambda value: _center_x(value.token),
+    )
+
+
+def _numeric_tokens(line: OcrLine) -> list[NumericValue]:
+    output: list[NumericValue] = []
     for token in line.tokens:
         value = parse_decimal(token.text)
         if value is not None:
-            output.append((token, value))
+            output.append(NumericValue(token, value, (token.token_id,)))
             continue
         expiry_quantity = re.search(
             r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)/\d{4}\s*"
@@ -1224,7 +1314,7 @@ def _numeric_tokens(line: OcrLine) -> list[tuple[OcrToken, Decimal]]:
             parsed = parse_decimal(expiry_quantity.group("quantity"))
             if parsed is not None:
                 output.append(
-                    (
+                    NumericValue(
                         _virtual_horizontal_token(
                             token,
                             expiry_quantity.start("quantity"),
@@ -1232,6 +1322,7 @@ def _numeric_tokens(line: OcrLine) -> list[tuple[OcrToken, Decimal]]:
                             len(token.text),
                         ),
                         parsed,
+                        (token.token_id,),
                     )
                 )
                 continue
@@ -1240,7 +1331,7 @@ def _numeric_tokens(line: OcrLine) -> list[tuple[OcrToken, Decimal]]:
             parsed = parse_decimal(duration_quantity.group("quantity"))
             if parsed is not None:
                 output.append(
-                    (
+                    NumericValue(
                         _virtual_horizontal_token(
                             token,
                             duration_quantity.start("quantity"),
@@ -1248,6 +1339,7 @@ def _numeric_tokens(line: OcrLine) -> list[tuple[OcrToken, Decimal]]:
                             len(token.text),
                         ),
                         parsed,
+                        (token.token_id,),
                     )
                 )
                 continue
@@ -1314,8 +1406,8 @@ def _numeric_tokens(line: OcrLine) -> list[tuple[OcrToken, Decimal]]:
                     )
                 }
             )
-            output.append((virtual, parsed))
-    return output
+            output.append(NumericValue(virtual, parsed, (token.token_id,)))
+    return _merge_vertical_decimal_suffixes(output)
 
 
 def _stable_numeric_centers(
@@ -1323,7 +1415,10 @@ def _stable_numeric_centers(
 ) -> tuple[float, ...]:
     centers: list[float] = []
     for line in lines:
-        centers.extend((_center_x(token) - left) / width for token, _ in _numeric_tokens(line))
+        centers.extend(
+            (_center_x(value.token) - left) / width
+            for value in _numeric_tokens(line)
+        )
     clusters: list[list[float]] = []
     for center in sorted(centers):
         matching = next(
@@ -1816,20 +1911,25 @@ def _structured_text_fields(
 
 
 def _closest_numeric(
-    numeric: list[tuple[OcrToken, Decimal]],
+    numeric: list[NumericValue],
     target: float | None,
     left: float,
     width: float,
     used: set[tuple[str, float, Decimal]],
-) -> tuple[OcrToken, Decimal] | None:
+) -> NumericValue | None:
     available = [
-        (token, value) for token, value in numeric if _numeric_identity(token, value) not in used
+        value
+        for value in numeric
+        if _numeric_identity(value.token, value.value) not in used
     ]
     if not available:
         return None
     if target is None:
-        return max(available, key=lambda item: _center_x(item[0]))
-    return min(available, key=lambda item: abs(((_center_x(item[0]) - left) / width) - target))
+        return max(available, key=lambda item: _center_x(item.token))
+    return min(
+        available,
+        key=lambda item: abs(((_center_x(item.token) - left) / width) - target),
+    )
 
 
 def _numeric_identity(token: OcrToken, value: Decimal) -> tuple[str, float, Decimal]:
@@ -1935,8 +2035,9 @@ def reconstruct_ocr_rows(
     summary_lines = [values for line in data_lines if len(values := _numeric_tokens(line)) >= 3]
     zero_tail_summary = bool(
         len(summary_lines) >= 5
-        and sum(values[-1][1] == 0 for values in summary_lines) / len(summary_lines) >= 0.7
-        and sum(any(value != 0 for _, value in values[:-1]) for values in summary_lines)
+        and sum(values[-1].value == 0 for values in summary_lines) / len(summary_lines)
+        >= 0.7
+        and sum(any(value.value != 0 for value in values[:-1]) for values in summary_lines)
         / len(summary_lines)
         >= 0.7
     )
@@ -2146,8 +2247,8 @@ def reconstruct_ocr_rows(
             continue
         numeric = _numeric_tokens(line)
         amount_pair = _closest_numeric(numeric, amount_center, left, width, set())
-        amount_token = amount_pair[0] if amount_pair else None
-        amount = amount_pair[1] if amount_pair else None
+        amount_token = amount_pair.token if amount_pair else None
+        amount = amount_pair.value if amount_pair else None
         amount_in_lane = bool(
             amount_token is not None
             and (
@@ -2354,7 +2455,7 @@ def reconstruct_ocr_rows(
         used = {_numeric_identity(amount_token, amount)}
         field_tokens: dict[str, tuple[str, ...]] = {
             "description": tuple(token.token_id for token in description_tokens),
-            "amount": (amount_token.token_id,),
+            "amount": amount_pair.token_ids,
             **structured_evidence,
         }
         if service_date and "service_date" not in field_tokens:
@@ -2386,11 +2487,11 @@ def reconstruct_ocr_rows(
             pair = _closest_numeric(numeric, target, left, width, used)
             if pair is None:
                 continue
-            token, value = pair
+            token, value = pair.token, pair.value
             if abs(((_center_x(token) - left) / width) - target) > 0.06:
                 continue
             used.add(_numeric_identity(token, value))
-            field_tokens[role] = (token.token_id,)
+            field_tokens[role] = pair.token_ids
             values[role] = value
 
         normalized_description = _normalize(description)

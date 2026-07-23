@@ -1029,6 +1029,45 @@ def test_quantity_with_printed_days_unit_is_canonical_numeric_quantity() -> None
     assert quantity_cell.raw_value == "2 Days"
 
 
+def test_vertically_split_decimal_suffix_stays_in_one_numeric_cell() -> None:
+    tokens = (
+        token(0, "Date", (195, 1183, 269, 1220)),
+        token(1, "Code", (351, 1180, 438, 1222)),
+        token(2, "Service Name (Notes)", (578, 1184, 910, 1224)),
+        token(3, "Rate", (1492, 1186, 1568, 1224)),
+        token(4, "Qty.", (1669, 1186, 1733, 1230)),
+        token(5, "Amount", (1841, 1189, 1962, 1225)),
+        token(6, "Disc", (2068, 1187, 2138, 1225)),
+        token(7, "Net Amt", (2184, 1190, 2311, 1222)),
+        token(8, "19720.9", (1436, 3140, 1558, 3176)),
+        token(9, "08-07-2026", (122, 3156, 293, 3194)),
+        token(10, "MEDICINE CHARGES", (574, 3158, 915, 3195)),
+        token(11, "1", (1708, 3160, 1731, 3196)),
+        token(12, "19720.96", (1811, 3159, 1951, 3197)),
+        token(13, "0", (2103, 3161, 2128, 3196)),
+        token(14, "19720.96", (2211, 3159, 2353, 3197)),
+        token(15, "6", (1533, 3179, 1561, 3216)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(100, 1100, 2380, 3250),
+    )
+
+    row = next(
+        row
+        for row in result.rows
+        if row.candidate.description == "MEDICINE CHARGES"
+    )
+    assert row.candidate.rate == Decimal("19720.96")
+    assert row.candidate.quantity == Decimal("1")
+    assert row.candidate.amount == Decimal("19720.96")
+    assert "line_arithmetic_mismatch" not in row.candidate.validation_flags
+    assert set(row.field_token_ids["rate"]) == {"token-8", "token-15"}
+
+
 def test_category_total_with_header_words_does_not_reset_quantity_and_rate() -> None:
     tokens = (
         token(0, "Description", (100, 30, 300, 45)),
