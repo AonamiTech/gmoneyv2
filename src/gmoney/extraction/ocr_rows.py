@@ -455,6 +455,17 @@ def _valid_header_line(line: OcrLine, roles: dict[str, OcrToken]) -> bool:
     )
 
 
+def _contains_total_value(line: OcrLine) -> bool:
+    return bool(
+        re.search(
+            r"\b(?:grand\s+total|sub\s*total|total)"
+            r"(?:\s+rs\.?|\s*₹)?\s*[:.-]?\s*\d",
+            line.text,
+            re.IGNORECASE,
+        )
+    )
+
+
 def _merge_header_roles(
     current: dict[str, OcrToken], incoming: dict[str, OcrToken]
 ) -> dict[str, OcrToken]:
@@ -507,6 +518,8 @@ def _header_blocks(lines: tuple[OcrLine, ...]) -> tuple[HeaderBlock, ...]:
         if not _header_roles(lines[start]) and not (start_words and start_words <= fragment_words):
             continue
         for end in range(start, min(len(lines), start + 3)):
+            if _contains_total_value(lines[end]):
+                break
             roles = _merge_header_roles(roles, _header_roles(lines[end]))
             if not _valid_header(roles):
                 continue

@@ -757,6 +757,109 @@ def test_repeated_shifted_headers_reassign_rate_and_quantity_lanes() -> None:
     ]
 
 
+def test_wrapped_header_allows_numeric_label_beside_named_columns() -> None:
+    tokens = (
+        token(0, "Item Name", (100, 20, 300, 35)),
+        token(1, "Tax", (500, 20, 580, 35)),
+        token(2, "1", (650, 20, 670, 35)),
+        token(3, "Net", (850, 20, 900, 35)),
+        token(4, "Amount", (850, 45, 950, 60)),
+        token(5, "Procedure", (100, 90, 300, 105)),
+        token(6, "10", (520, 90, 560, 105)),
+        token(7, "1", (650, 90, 670, 105)),
+        token(8, "4,500.00", (860, 90, 940, 105)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 10, 980, 130),
+    )
+
+    assert result.diagnostics["header_found"] is True
+    assert [column.label for column in result.source_tables[0].columns] == [
+        "Item Name",
+        "Tax",
+        "Net",
+        "Amount",
+    ]
+
+
+def test_repeated_header_ignores_numeric_section_preamble() -> None:
+    tokens = (
+        token(0, "Date", (195, 20, 269, 40)),
+        token(1, "Code", (351, 20, 438, 40)),
+        token(2, "Service Name (Notes)", (578, 20, 910, 40)),
+        token(3, "Rate", (1492, 20, 1568, 40)),
+        token(4, "Qty.", (1669, 20, 1733, 40)),
+        token(5, "Amount", (1841, 20, 1962, 40)),
+        token(6, "Disc", (2068, 20, 2138, 40)),
+        token(7, "Net Amt", (2184, 20, 2311, 40)),
+        token(8, "06-07-2026", (127, 60, 299, 80)),
+        token(9, "Room Rent", (577, 60, 900, 80)),
+        token(10, "8000", (1483, 60, 1565, 80)),
+        token(11, "2", (1712, 60, 1737, 80)),
+        token(12, "16000.00", (1833, 60, 1955, 80)),
+        token(13, "0", (2108, 60, 2133, 80)),
+        token(14, "16000.00", (2234, 60, 2357, 80)),
+        token(15, "ACCOMMODATION CHARGES", (127, 100, 604, 120)),
+        token(16, "Total Rs. 16000.00/-", (2055, 100, 2356, 120)),
+        token(17, "1.A", (127, 135, 182, 155)),
+        token(
+            18,
+            "Room Rent (06-07-2026 to 08-07-2026 MICU)",
+            (431, 135, 1120, 155),
+        ),
+        token(19, "8000", (1484, 135, 1566, 155)),
+        token(20, "2 Days", (1626, 135, 1738, 155)),
+        token(21, "16000.00", (1817, 135, 1957, 155)),
+        token(22, "0", (2107, 135, 2135, 155)),
+        token(23, "16000.00", (2218, 135, 2357, 155)),
+        token(24, "Date", (195, 175, 269, 195)),
+        token(25, "Code", (351, 175, 438, 195)),
+        token(26, "Service Name (Notes)", (578, 175, 910, 195)),
+        token(27, "Rate", (1492, 175, 1568, 195)),
+        token(28, "Qty.", (1669, 175, 1733, 195)),
+        token(29, "Amount", (1841, 175, 1962, 195)),
+        token(30, "Disc", (2068, 175, 2138, 195)),
+        token(31, "Net Amt", (2184, 175, 2311, 195)),
+        token(32, "CONSULTATION CHARGES", (128, 215, 560, 235)),
+        token(33, "Total Rs. 7500.00/-", (2067, 215, 2351, 235)),
+        token(34, "06-07-2026", (127, 255, 299, 275)),
+        token(
+            35,
+            "IP VISIT CHARGE(ICU) (Dr. SWAPNIL JAISWAL)",
+            (577, 255, 1327, 275),
+        ),
+        token(36, "2500", (1483, 255, 1565, 275)),
+        token(37, "3", (1712, 255, 1737, 275)),
+        token(38, "7500.00", (1833, 255, 1955, 275)),
+        token(39, "0", (2108, 255, 2133, 275)),
+        token(40, "7500.00", (2234, 255, 2357, 275)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(100, 0, 2380, 300),
+    )
+
+    assert result.diagnostics["header_segments"] == 2
+    repeated = result.source_tables[1]
+    description_column = next(
+        column
+        for column in repeated.columns
+        if column.canonical_field == "description"
+    )
+    cells = {cell.column_id: cell for cell in repeated.rows[-1].cells}
+    assert description_column.label == "Service Name (Notes)"
+    assert cells[description_column.id].raw_value == (
+        "IP VISIT CHARGE(ICU) (Dr. SWAPNIL JAISWAL)"
+    )
+
+
 def test_category_total_with_header_words_does_not_reset_quantity_and_rate() -> None:
     tokens = (
         token(0, "Description", (100, 30, 300, 45)),
