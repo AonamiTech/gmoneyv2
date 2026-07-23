@@ -49,6 +49,7 @@ from gmoney.extraction.ocr_rows import (
     DATE_PREFIX,
     ReconstructionResult,
     TableSchemaState,
+    _clean_description,
     _structured_field_value_is_valid,
     fuse_provider_descriptions,
     reconstruct_ocr_rows,
@@ -866,13 +867,29 @@ def _split_grounded_date_from_description(
     cells_by_id = {cell.column_id: cell for cell in cells}
     date_cell = cells_by_id[date_column.id]
     description_cell = cells_by_id[description_column.id]
-    if date_cell.raw_value or not description_cell.raw_value:
+    date_match = DATE_PREFIX.match(date_cell.raw_value or "")
+    date_remainder = (
+        date_cell.raw_value[date_match.end() :].strip()
+        if date_cell.raw_value and date_match is not None
+        else ""
+    )
+    split_from_date_cell = bool(date_match is not None and date_remainder)
+    if split_from_date_cell:
+        merged_cell = date_cell
+    elif not date_cell.raw_value and description_cell.raw_value:
+        merged_cell = description_cell
+    else:
         return cells
-    match = DATE_PREFIX.match(description_cell.raw_value)
+    assert merged_cell.raw_value is not None
+    match = DATE_PREFIX.match(merged_cell.raw_value)
     if match is None:
         return cells
-    printed_date = description_cell.raw_value[: match.end()].strip(" -:")
-    remaining_description = description_cell.raw_value[match.end() :].strip()
+    printed_date = merged_cell.raw_value[: match.end()].strip(" -:")
+    remaining_description = merged_cell.raw_value[match.end() :].strip()
+    if split_from_date_cell and description_cell.raw_value:
+        remaining_description = " ".join(
+            (remaining_description, description_cell.raw_value)
+        )
     if (
         not remaining_description
         or parse_service_date(printed_date) != canonical.service_date_iso
@@ -883,20 +900,72 @@ def _split_grounded_date_from_description(
         for evidence in canonical.field_evidence.get("service_date", ())
         for token_id in evidence.token_ids
     }
-    description_token_ids = {
+    merged_token_ids = {
         token_id
-        for evidence in description_cell.evidence
+        for evidence in merged_cell.evidence
         for token_id in evidence.token_ids
     }
-    if not date_token_ids or not date_token_ids.issubset(description_token_ids):
+    if not date_token_ids or not date_token_ids.issubset(merged_token_ids):
         return cells
     date_evidence = tuple(
         evidence
-        for evidence in description_cell.evidence
+        for evidence in merged_cell.evidence
         if date_token_ids.intersection(evidence.token_ids)
     )
     if not date_evidence:
         return cells
+    description_evidence = description_cell.evidence
+    if split_from_date_cell:
+        date_description, _, printed_request = _clean_description(
+            merged_cell.raw_value
+        )
+        existing_description, _, _ = _clean_description(
+            description_cell.raw_value or ""
+        )
+        comparable_description = " ".join(
+            value
+            for value in (date_description, existing_description)
+            if value
+        )
+        if printed_request and printed_request != canonical.request_no:
+            return cells
+        normalized_remaining = re.sub(
+            r"[^a-z0-9]+",
+            " ",
+            comparable_description.casefold(),
+        ).strip()
+        normalized_canonical = re.sub(
+            r"[^a-z0-9]+",
+            " ",
+            canonical.description.casefold(),
+        ).strip()
+        description_token_ids = {
+            token_id
+            for evidence in canonical.field_evidence.get("description", ())
+            for token_id in evidence.token_ids
+        }
+        description_source_evidence = (
+            *merged_cell.evidence,
+            *description_cell.evidence,
+        )
+        description_source_token_ids = {
+            token_id
+            for evidence in description_source_evidence
+            for token_id in evidence.token_ids
+        }
+        if (
+            not description_token_ids
+            or not description_token_ids.issubset(description_source_token_ids)
+            or normalized_remaining != normalized_canonical
+        ):
+            return cells
+        description_evidence = tuple(
+            evidence
+            for evidence in description_source_evidence
+            if description_token_ids.intersection(evidence.token_ids)
+        )
+        if not description_evidence:
+            return cells
     split_flag = "split_from_merged_ocr_token"
     cells_by_id[date_column.id] = date_cell.model_copy(
         update={
@@ -919,8 +988,18 @@ def _split_grounded_date_from_description(
     cells_by_id[description_column.id] = description_cell.model_copy(
         update={
             "raw_value": remaining_description,
+            "evidence": description_evidence,
             "validation_flags": tuple(
-                dict.fromkeys((*description_cell.validation_flags, split_flag))
+                dict.fromkeys(
+                    (
+                        *(
+                            flag
+                            for flag in description_cell.validation_flags
+                            if flag != "empty_cell"
+                        ),
+                        split_flag,
+                    )
+                )
             ),
         }
     )

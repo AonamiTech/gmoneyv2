@@ -1002,6 +1002,334 @@ def test_source_table_row_links_to_its_grounded_canonical_row() -> None:
     assert linked[0].rows[0].canonical_row_id == str(canonical[0].id)
 
 
+def test_merged_date_and_description_in_date_lane_is_grounded_and_split() -> None:
+    tokens = (
+        token(0, "Date", (80, 20, 160, 35)),
+        token(1, "Particulars", (350, 20, 520, 35)),
+        token(2, "Units", (600, 20, 660, 35)),
+        token(3, "Service Amt", (700, 20, 790, 35)),
+        token(4, "Disc Amt", (800, 20, 870, 35)),
+        token(5, "Net Amount", (900, 20, 970, 35)),
+        token(6, "14/07/2026 NORMAL DELIVERY", (80, 60, 330, 75)),
+        token(7, "1.00", (610, 60, 650, 75)),
+        token(8, "95000.00", (700, 60, 790, 75)),
+        token(9, "0.00", (810, 60, 860, 75)),
+        token(10, "95000.00", (900, 60, 970, 75)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(60, 0, 990, 100),
+    )
+
+    assert len(result.rows) == 1
+    assert result.rows[0].candidate.description == "NORMAL DELIVERY"
+    assert result.rows[0].candidate.service_date == "14/07/2026"
+    assert result.rows[0].candidate.amount == Decimal("95000.00")
+    assert result.rows[0].field_token_ids["description"] == ("token-6",)
+    assert result.rows[0].field_token_ids["service_date"] == ("token-6",)
+
+    canonical = canonicalize_rows(
+        "d" * 64,
+        1,
+        "p1-t1",
+        "a" * 64,
+        result.rows,
+    )
+    linked = _link_source_tables(result.source_tables, canonical)
+    table = linked[0]
+    assert table.rows[0].canonical_row_id == str(canonical[0].id)
+    cells_by_field = {
+        column.canonical_field: next(
+            cell
+            for cell in table.rows[0].cells
+            if cell.column_id == column.id
+        )
+        for column in table.columns
+        if column.canonical_field is not None
+    }
+    assert cells_by_field["service_date_raw"].raw_value == "14/07/2026"
+    assert cells_by_field["description"].raw_value == "NORMAL DELIVERY"
+    assert (
+        cells_by_field["service_date_raw"].validation_flags
+        == ("split_from_merged_ocr_token",)
+    )
+    assert (
+        cells_by_field["description"].validation_flags
+        == ("split_from_merged_ocr_token",)
+    )
+    assert cells_by_field["service_date_raw"].evidence
+    assert cells_by_field["description"].evidence
+
+
+def test_partial_description_in_date_lane_is_grounded_and_merged() -> None:
+    tokens = (
+        token(0, "Date", (80, 20, 160, 35)),
+        token(1, "Particulars", (350, 20, 520, 35)),
+        token(2, "Net Amount", (900, 20, 970, 35)),
+        token(3, "14/07/2026 NORMAL", (80, 60, 330, 75)),
+        token(4, "DELIVERY", (350, 60, 520, 75)),
+        token(5, "95000.00", (900, 60, 970, 75)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(60, 0, 990, 100),
+    )
+
+    assert len(result.rows) == 1
+    assert result.rows[0].candidate.description == "NORMAL DELIVERY"
+    assert result.rows[0].field_token_ids["description"] == (
+        "token-3",
+        "token-4",
+    )
+    canonical = canonicalize_rows(
+        "d" * 64,
+        1,
+        "p1-t1",
+        "a" * 64,
+        result.rows,
+    )
+    linked = _link_source_tables(result.source_tables, canonical)
+    table = linked[0]
+    assert table.rows[0].canonical_row_id == str(canonical[0].id)
+    cells_by_field = {
+        column.canonical_field: next(
+            cell
+            for cell in table.rows[0].cells
+            if cell.column_id == column.id
+        )
+        for column in table.columns
+        if column.canonical_field is not None
+    }
+    assert cells_by_field["service_date_raw"].raw_value == "14/07/2026"
+    assert cells_by_field["description"].raw_value == "NORMAL DELIVERY"
+    assert {
+        token_id
+        for evidence in cells_by_field["description"].evidence
+        for token_id in evidence.token_ids
+    } == {"token-3", "token-4"}
+
+
+@pytest.mark.parametrize(
+    ("date_cell_text", "description_cell_text", "description_token_ids"),
+    (
+        (
+            "14/07/2026 MNEIPI/123 NORMAL DELIVERY",
+            None,
+            ("token-3",),
+        ),
+        (
+            "14/07/2026 MNEIPI/123 NORMAL",
+            "DELIVERY",
+            ("token-3", "token-4"),
+        ),
+    ),
+)
+def test_request_prefix_in_date_lane_is_preserved_while_description_is_split(
+    date_cell_text: str,
+    description_cell_text: str | None,
+    description_token_ids: tuple[str, ...],
+) -> None:
+    tokens = (
+        token(0, "Date", (80, 20, 160, 35)),
+        token(1, "Particulars", (350, 20, 520, 35)),
+        token(2, "Net Amount", (900, 20, 970, 35)),
+        token(3, date_cell_text, (80, 60, 330, 75)),
+        *(
+            (token(4, description_cell_text, (350, 60, 520, 75)),)
+            if description_cell_text
+            else ()
+        ),
+        token(5, "95000.00", (900, 60, 970, 75)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(60, 0, 990, 100),
+    )
+
+    assert len(result.rows) == 1
+    assert result.rows[0].candidate.description == "NORMAL DELIVERY"
+    assert result.rows[0].candidate.request_no == "MNEIPI/123"
+    assert result.rows[0].field_token_ids["description"] == description_token_ids
+    canonical = canonicalize_rows(
+        "d" * 64,
+        1,
+        "p1-t1",
+        "a" * 64,
+        result.rows,
+    )
+    linked = _link_source_tables(result.source_tables, canonical)
+    table = linked[0]
+    assert table.rows[0].canonical_row_id == str(canonical[0].id)
+    cells_by_field = {
+        column.canonical_field: next(
+            cell
+            for cell in table.rows[0].cells
+            if cell.column_id == column.id
+        )
+        for column in table.columns
+        if column.canonical_field is not None
+    }
+    assert cells_by_field["service_date_raw"].raw_value == "14/07/2026"
+    assert (
+        cells_by_field["description"].raw_value
+        == "MNEIPI/123 NORMAL DELIVERY"
+    )
+    assert {
+        token_id
+        for evidence in cells_by_field["description"].evidence
+        for token_id in evidence.token_ids
+    } == set(description_token_ids)
+
+
+@pytest.mark.parametrize(
+    ("date_cell_text", "description_cell_text", "printed_description"),
+    (
+        (
+            "14/07/2026 NORMAL DELIVERY Batch: X",
+            None,
+            "NORMAL DELIVERY Batch: X",
+        ),
+        (
+            "14/07/2026 NORMAL Batch: X",
+            "DELIVERY",
+            "NORMAL Batch: X DELIVERY",
+        ),
+    ),
+)
+def test_batch_suffix_in_date_lane_is_preserved_while_description_is_cleaned(
+    date_cell_text: str,
+    description_cell_text: str | None,
+    printed_description: str,
+) -> None:
+    tokens = (
+        token(0, "Date", (80, 20, 160, 35)),
+        token(1, "Particulars", (350, 20, 520, 35)),
+        token(2, "Net Amount", (900, 20, 970, 35)),
+        token(3, date_cell_text, (80, 60, 330, 75)),
+        *(
+            (token(4, description_cell_text, (350, 60, 520, 75)),)
+            if description_cell_text
+            else ()
+        ),
+        token(5, "95000.00", (900, 60, 970, 75)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(60, 0, 990, 100),
+    )
+
+    assert len(result.rows) == 1
+    assert result.rows[0].candidate.description == "NORMAL DELIVERY"
+    canonical = canonicalize_rows(
+        "d" * 64,
+        1,
+        "p1-t1",
+        "a" * 64,
+        result.rows,
+    )
+    linked = _link_source_tables(result.source_tables, canonical)
+    table = linked[0]
+    assert table.rows[0].canonical_row_id == str(canonical[0].id)
+    cells_by_field = {
+        column.canonical_field: next(
+            cell
+            for cell in table.rows[0].cells
+            if cell.column_id == column.id
+        )
+        for column in table.columns
+        if column.canonical_field is not None
+    }
+    assert cells_by_field["service_date_raw"].raw_value == "14/07/2026"
+    assert cells_by_field["description"].raw_value == printed_description
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    (
+        "1.00",
+        "HSN1234",
+        "HSN 1234",
+        "HSN: 1234",
+        "SAC 9983",
+        "Service Code AB123",
+        "Request No ABC123",
+        "Request No: ABC123",
+        "Reference No ABC123",
+        "Ref No ABC123",
+        "CASHLESS",
+    ),
+)
+def test_merged_date_metadata_is_not_promoted_to_description(suffix: str) -> None:
+    tokens = (
+        token(0, "Date", (80, 20, 160, 35)),
+        token(1, "Particulars", (350, 20, 520, 35)),
+        token(2, "Net Amount", (900, 20, 970, 35)),
+        token(3, f"14/07/2026 {suffix}", (80, 60, 330, 75)),
+        token(4, "95000.00", (900, 60, 970, 75)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(60, 0, 990, 100),
+    )
+
+    assert result.rows == ()
+    assert [
+        [cell.raw_value for cell in row.cells]
+        for row in result.source_tables[0].rows
+    ] == [[f"14/07/2026 {suffix}", None, "95000.00"]]
+
+
+@pytest.mark.parametrize(
+    "description",
+    (
+        "DIALYSIS",
+        "DELIVERY",
+        "XRAY",
+        "MRI",
+        "ROOM",
+        "COVID-19",
+        "COVID19",
+        "H1N1",
+        "B12",
+    ),
+)
+def test_merged_date_single_word_charge_is_preserved(description: str) -> None:
+    tokens = (
+        token(0, "Date", (80, 20, 160, 35)),
+        token(1, "Particulars", (350, 20, 520, 35)),
+        token(2, "Net Amount", (900, 20, 970, 35)),
+        token(3, f"14/07/2026 {description}", (80, 60, 330, 75)),
+        token(4, "95000.00", (900, 60, 970, 75)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(60, 0, 990, 100),
+    )
+
+    assert len(result.rows) == 1
+    assert result.rows[0].candidate.description == description
+    assert result.rows[0].candidate.service_date == "14/07/2026"
+    assert result.rows[0].candidate.amount == Decimal("95000.00")
+
+
 def test_source_table_synthesizes_grounded_columns_without_a_header() -> None:
     tokens = (
         token(0, "Procedure", (100, 30, 300, 45)),

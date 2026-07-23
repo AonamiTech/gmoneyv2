@@ -1814,6 +1814,41 @@ def _is_metadata_description(description: str) -> bool:
     )
 
 
+def _is_admissible_merged_date_description(description: str) -> bool:
+    normalized = _normalize(description)
+    has_explicit_code_marker = bool(
+        re.match(
+            r"^\s*(?:hsn|sac|service\s+code\b|request\s+no\b|ref(?:erence)?\s+no\b)",
+            description,
+            re.IGNORECASE,
+        )
+    )
+    if (
+        not normalized
+        or parse_decimal(description) is not None
+        or all(character.isdigit() for character in normalized.replace(" ", ""))
+        or _is_metadata_description(description)
+        or _is_total_description(normalized)
+        or _is_payment_footer_description(description)
+        or normalized
+        in {
+            "cash",
+            "cashless",
+            "corporate",
+            "credit",
+            "insurance",
+            "patient",
+            "payer",
+            "scheme",
+            "self",
+            "sponsor",
+            "tpa",
+        }
+    ):
+        return False
+    return not has_explicit_code_marker
+
+
 def _is_total_description(normalized: str) -> bool:
     return (
         normalized in {"total", "totals", "tota", "sub total", "subtotal"}
@@ -2143,6 +2178,8 @@ def _structured_text_fields(
             if request_match := REQUEST_PREFIX.match(remainder):
                 values["request_no"] = request_match.group(0).strip()
                 evidence["request_no"] = (token.token_id,)
+                raw = date_match.group("date").strip()
+            elif remainder and DATE_SPAN.search(remainder) is None:
                 raw = date_match.group("date").strip()
         values[role] = raw
         evidence[role] = (token.token_id,)
@@ -2535,6 +2572,31 @@ def reconstruct_ocr_rows(
             reserved_ids.add(amount_token.token_id)
 
         line_description_tokens: list[OcrToken] = []
+        service_date_ids = set(structured_evidence.get("service_date", ()))
+        for token in line.tokens:
+            if token.token_id not in service_date_ids:
+                continue
+            merged_description, embedded_date, _ = _clean_description(token.text)
+            token_left, _, token_right, _ = _bounds(token)
+            relative_left = (token_left - left) / width
+            relative_right = (token_right - left) / width
+            overlaps_description_cell = bool(
+                description_cell_min is not None
+                and relative_right > description_cell_min
+                and (
+                    description_cell_max is None
+                    or relative_left < description_cell_max
+                )
+            )
+            if (
+                merged_description
+                and embedded_date
+                and overlaps_description_cell
+                and _is_admissible_merged_date_description(merged_description)
+            ):
+                line_description_tokens.append(
+                    token.model_copy(update={"text": merged_description})
+                )
         for token in line.tokens:
             if token.token_id in reserved_ids:
                 continue
