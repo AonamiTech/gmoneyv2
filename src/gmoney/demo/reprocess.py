@@ -22,7 +22,7 @@ from gmoney.demo.review import structural_issues
 from gmoney.demo.store import JobStore, is_gpu_device, utc_now
 from gmoney.evaluation.corpus import sha256_file
 from gmoney.extraction.offline import OfflineExtractor
-from gmoney.extraction.typed_values import parse_decimal
+from gmoney.extraction.typed_values import parse_decimal, parse_service_date
 
 app = typer.Typer(add_completion=False, invoke_without_command=True)
 _gpu_inference_locks: dict[Path, TextIO] = {}
@@ -658,13 +658,21 @@ def _validate_result(
                             f"{field} value does not match its mapped source cell "
                             f"for canonical row {source_row.canonical_row_id}"
                         )
-                elif field != "description" and _normalized(
-                    cell.raw_value
-                ) != _normalized(canonical_value):
-                    raise ValueError(
-                        f"{field} value does not match its mapped source cell "
-                        f"for canonical row {source_row.canonical_row_id}"
+                elif field != "description":
+                    value_matches = _normalized(cell.raw_value) == _normalized(
+                        canonical_value
                     )
+                    if field == "service_date_raw":
+                        value_matches = value_matches or bool(
+                            canonical.get("service_date_iso")
+                            and parse_service_date(cell.raw_value)
+                            == canonical.get("service_date_iso")
+                        )
+                    if not value_matches:
+                        raise ValueError(
+                            f"{field} value does not match its mapped source cell "
+                            f"for canonical row {source_row.canonical_row_id}"
+                        )
     for row_id, row_payload in canonical_rows.items():
         if (
             "ocr_spatial_graph" in (row_payload.get("source_routes") or [])

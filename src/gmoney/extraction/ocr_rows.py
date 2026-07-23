@@ -636,11 +636,78 @@ def _source_evidence(
     )
 
 
+def _missing_numeric_column_centers(
+    lines: tuple[OcrLine, ...],
+    *,
+    start: int,
+    end: int,
+    existing_centers: tuple[float, ...],
+    width: float,
+) -> tuple[float, ...]:
+    numeric_lines = tuple(
+        (line_index, _numeric_tokens(line))
+        for line_index, line in enumerate(lines[start:end], start=start)
+        if len(_numeric_tokens(line)) >= 2
+    )
+    if len(numeric_lines) < 2 or len(existing_centers) < 2:
+        return ()
+    tolerance = max(4.0, width * 0.025)
+    clusters: list[list[tuple[int, float]]] = []
+    for line_index, values in numeric_lines:
+        for token, _ in values:
+            center = _center_x(token)
+            candidate = next(
+                (
+                    cluster
+                    for cluster in clusters
+                    if abs(median(item[1] for item in cluster) - center) <= tolerance
+                    and all(item[0] != line_index for item in cluster)
+                ),
+                None,
+            )
+            if candidate is None:
+                clusters.append([(line_index, center)])
+            else:
+                candidate.append((line_index, center))
+
+    support_required = max(2, (len(numeric_lines) + 1) // 2)
+    ordered_existing = tuple(sorted(existing_centers))
+    missing: list[float] = []
+    for cluster in clusters:
+        if len(cluster) < support_required:
+            continue
+        center = median(item[1] for item in cluster)
+        neighbors = next(
+            (
+                (left, right)
+                for left, right in zip(
+                    ordered_existing,
+                    ordered_existing[1:],
+                    strict=False,
+                )
+                if left < center < right
+            ),
+            None,
+        )
+        if (
+            neighbors is None
+            or center - neighbors[0] <= width * 0.04
+            or neighbors[1] - center <= width * 0.04
+        ):
+            continue
+        missing.append(center)
+    return tuple(sorted(missing))
+
+
 def _source_columns(
     lines: tuple[OcrLine, ...],
     block: HeaderBlock,
     original_by_id: dict[str, OcrToken],
     table_id: str,
+    *,
+    data_start: int,
+    data_end: int,
+    width: float,
 ) -> tuple[tuple[SourceColumn, ...], tuple[float, ...]]:
     header_tokens = tuple(
         token
@@ -652,7 +719,7 @@ def _source_columns(
     for token in block.roles.values():
         role_token_counts[token.token_id] = role_token_counts.get(token.token_id, 0) + 1
 
-    entries: list[tuple[float, str, str | None, OcrToken]] = []
+    entries: list[tuple[float, str | None, str | None, OcrToken | None]] = []
     recognized_ids: set[str] = set()
     for role, token in block.roles.items():
         recognized_ids.add(token.token_id)
@@ -672,18 +739,34 @@ def _source_columns(
             ):
                 continue
             entries.append((_center_x(token), token.text.strip(), None, token))
+    entries.extend(
+        (center, None, None, None)
+        for center in _missing_numeric_column_centers(
+            lines,
+            start=data_start,
+            end=data_end,
+            existing_centers=tuple(entry[0] for entry in entries),
+            width=width,
+        )
+    )
     entries.sort(key=lambda entry: entry[0])
 
     columns: list[SourceColumn] = []
     centers: list[float] = []
     for order, (center, label, canonical_field, token) in enumerate(entries):
+        synthetic = token is None
         columns.append(
             SourceColumn(
                 id=f"c{order + 1}",
-                label=label,
+                label=label or f"Column {order + 1}",
                 order=order,
                 canonical_field=canonical_field,
-                evidence=_source_evidence((token,), original_by_id, table_id),
+                evidence=(
+                    ()
+                    if token is None
+                    else _source_evidence((token,), original_by_id, table_id)
+                ),
+                validation_flags=("synthetic_header",) if synthetic else (),
             )
         )
         centers.append(center)
@@ -853,8 +936,16 @@ def _build_source_tables(
     output: list[SourceTable] = []
     for segment, block in enumerate(blocks, start=1):
         source_table_id = f"{table_id}-s{segment}"
-        columns, centers = _source_columns(lines, block, original_by_id, table_id)
         next_start = blocks[segment].start if segment < len(blocks) else len(lines)
+        columns, centers = _source_columns(
+            lines,
+            block,
+            original_by_id,
+            table_id,
+            data_start=block.end + 1,
+            data_end=next_start,
+            width=width,
+        )
         rows = _source_rows(
             lines,
             start=block.end + 1,

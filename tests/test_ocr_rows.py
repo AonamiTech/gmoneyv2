@@ -1344,6 +1344,102 @@ def test_invalid_stamp_text_is_not_published_as_a_missing_service_code() -> None
     assert "excluded_oversized_overlay" in code_cell.validation_flags
 
 
+def test_linked_source_row_splits_grounded_date_from_cross_column_ocr_token() -> None:
+    tokens = (
+        token(0, "Date", (100, 30, 170, 45)),
+        token(1, "Particulars", (300, 30, 500, 45)),
+        token(2, "Rate", (650, 30, 710, 45)),
+        token(3, "Qty", (760, 30, 800, 45)),
+        token(4, "Amount", (880, 30, 970, 45)),
+        token(
+            5,
+            "15/07/2026 11:31:00 - MNEIPI/265586 BED BATH ADULT WIPES GINNI",
+            (100, 70, 600, 85),
+        ),
+        token(6, "570.00", (650, 70, 710, 85)),
+        token(7, "1.00", (760, 70, 800, 85)),
+        token(8, "570.00", (880, 70, 970, 85)),
+    )
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 20, 980, 110),
+    )
+    canonical = canonicalize_rows(
+        "d" * 64,
+        1,
+        "p1-t1",
+        "a" * 64,
+        result.rows,
+    )
+
+    linked = _link_source_tables(result.source_tables, canonical)
+
+    assert len(canonical) == 1
+    assert canonical[0].service_date_raw == "15/07/2026"
+    assert canonical[0].request_no == "MNEIPI/265586"
+    columns = {column.canonical_field: column for column in linked[0].columns}
+    cells = {cell.column_id: cell for cell in linked[0].rows[0].cells}
+    date_cell = cells[columns["service_date_raw"].id]
+    description_cell = cells[columns["description"].id]
+    assert date_cell.raw_value == "15/07/2026 11:31:00"
+    assert date_cell.evidence
+    assert "split_from_merged_ocr_token" in date_cell.validation_flags
+    assert description_cell.raw_value == "MNEIPI/265586 BED BATH ADULT WIPES GINNI"
+    assert description_cell.evidence
+    assert "split_from_merged_ocr_token" in description_cell.validation_flags
+
+
+def test_printed_table_synthesizes_repeated_unlabeled_numeric_column() -> None:
+    tokens = (
+        token(0, "Date", (100, 30, 170, 45)),
+        token(1, "Particulars", (300, 30, 500, 45)),
+        token(2, "Rate", (650, 30, 710, 45)),
+        token(3, "Qty", (760, 30, 800, 45)),
+        token(4, "Amount", (880, 30, 970, 45)),
+        *tuple(
+            value
+            for row, top in enumerate((70, 100, 130), start=1)
+            for value in (
+                token(
+                    row * 10,
+                    f"15/07/2026 11:31:00 - MNEIPI/{265585 + row} Item {row}",
+                    (100, top, 600, top + 15),
+                ),
+                token(row * 10 + 1, "570.00", (650, top, 710, top + 15)),
+                token(row * 10 + 2, "1.00", (760, top, 800, top + 15)),
+                token(row * 10 + 3, "0.00", (820, top, 860, top + 15)),
+                token(row * 10 + 4, "570.00", (880, top, 970, top + 15)),
+            )
+        ),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 20, 980, 170),
+    )
+
+    table = result.source_tables[0]
+    assert [column.canonical_field for column in table.columns] == [
+        "service_date_raw",
+        "description",
+        "unit_price",
+        "quantity",
+        None,
+        "net_amount",
+    ]
+    assert table.columns[4].label == "Column 5"
+    assert table.columns[4].validation_flags == ("synthetic_header",)
+    for row in table.rows:
+        cells = {cell.column_id: cell for cell in row.cells}
+        assert cells[table.columns[3].id].raw_value == "1.00"
+        assert cells[table.columns[4].id].raw_value == "0.00"
+        assert cells[table.columns[5].id].raw_value == "570.00"
+
+
 @pytest.mark.parametrize(
     ("printed_code", "code_box", "rotated"),
     (

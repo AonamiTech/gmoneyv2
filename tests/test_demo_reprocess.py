@@ -536,6 +536,69 @@ def test_reprocess_validation_requires_all_description_tokens_in_printed_cell(
         )
 
 
+@pytest.mark.parametrize(
+    ("printed_date", "accepted"),
+    (("15/07/2026 11:31:00", True), ("16/07/2026 11:31:00", False)),
+)
+def test_reprocess_validation_compares_grounded_printed_time_by_canonical_date(
+    tmp_path: Path,
+    printed_date: str,
+    accepted: bool,
+) -> None:
+    store, job_id, old_result = setup_job(tmp_path)
+    page_sha = old_result["page_assets"][0]["artifact_sha256"]
+    new_rows = [row("new-row", page_sha)]
+    new_rows[0]["service_date_raw"] = "15/07/2026"
+    new_rows[0]["service_date_iso"] = "2026-07-15"
+    new_rows[0]["field_evidence"]["service_date"] = [
+        evidence(page_sha, "service-date-token")
+    ]
+    printed = source_tables(new_rows, page_sha)
+    printed[0]["columns"].insert(
+        0,
+        {
+            "id": "service-date",
+            "label": "Date",
+            "order": 0,
+            "canonical_field": "service_date_raw",
+            "evidence": [evidence(page_sha, "header-service-date")],
+            "validation_flags": [],
+        },
+    )
+    for order, column in enumerate(printed[0]["columns"]):
+        column["order"] = order
+    printed[0]["rows"][0]["cells"].insert(
+        0,
+        {
+            "column_id": "service-date",
+            "raw_value": printed_date,
+            "evidence": [evidence(page_sha, "service-date-token")],
+            "validation_flags": ["split_from_merged_ocr_token"],
+        },
+    )
+    new_result = {
+        **old_result,
+        "rows": new_rows,
+        "source_tables": printed,
+    }
+
+    if accepted:
+        _validate_result(
+            store.job_dir(job_id) / "source.pdf",
+            old_result,
+            new_result,
+            store.job_dir(job_id) / "artifacts",
+        )
+    else:
+        with pytest.raises(ValueError, match="service_date_raw.*source cell"):
+            _validate_result(
+                store.job_dir(job_id) / "source.pdf",
+                old_result,
+                new_result,
+                store.job_dir(job_id) / "artifacts",
+            )
+
+
 def test_reprocess_validation_rejects_printed_value_missing_from_canonical_row(
     tmp_path: Path,
 ) -> None:

@@ -45,6 +45,7 @@ from gmoney.extraction.document_total import (
 )
 from gmoney.extraction.hospital import detect_hospital
 from gmoney.extraction.ocr_rows import (
+    DATE_PREFIX,
     ReconstructionResult,
     TableSchemaState,
     _structured_field_value_is_valid,
@@ -67,6 +68,7 @@ from gmoney.extraction.recovery import (
 )
 from gmoney.extraction.rows import extract_candidate_rows
 from gmoney.extraction.spatial import align_candidate_rows
+from gmoney.extraction.typed_values import parse_service_date
 from gmoney.geometry.crop import clahe_variant, crop_region, render_pdf_region
 from gmoney.geometry.render import render_pdf
 from gmoney.inference.contracts import InferenceRequest, InferenceResponse
@@ -355,6 +357,89 @@ def _contains_service_code_fragment(value: str) -> bool:
     )
 
 
+def _split_grounded_date_from_description(
+    cells: tuple[SourceCell, ...],
+    columns: tuple[SourceColumn, ...],
+    canonical: CanonicalRow,
+) -> tuple[SourceCell, ...]:
+    columns_by_field = {
+        column.canonical_field: column
+        for column in columns
+        if column.canonical_field is not None
+    }
+    date_column = columns_by_field.get("service_date_raw")
+    description_column = columns_by_field.get("description")
+    if (
+        date_column is None
+        or description_column is None
+        or date_column.order >= description_column.order
+        or not canonical.service_date_iso
+    ):
+        return cells
+    cells_by_id = {cell.column_id: cell for cell in cells}
+    date_cell = cells_by_id[date_column.id]
+    description_cell = cells_by_id[description_column.id]
+    if date_cell.raw_value or not description_cell.raw_value:
+        return cells
+    match = DATE_PREFIX.match(description_cell.raw_value)
+    if match is None:
+        return cells
+    printed_date = description_cell.raw_value[: match.end()].strip(" -:")
+    remaining_description = description_cell.raw_value[match.end() :].strip()
+    if (
+        not remaining_description
+        or parse_service_date(printed_date) != canonical.service_date_iso
+    ):
+        return cells
+    date_token_ids = {
+        token_id
+        for evidence in canonical.field_evidence.get("service_date", ())
+        for token_id in evidence.token_ids
+    }
+    description_token_ids = {
+        token_id
+        for evidence in description_cell.evidence
+        for token_id in evidence.token_ids
+    }
+    if not date_token_ids or not date_token_ids.issubset(description_token_ids):
+        return cells
+    date_evidence = tuple(
+        evidence
+        for evidence in description_cell.evidence
+        if date_token_ids.intersection(evidence.token_ids)
+    )
+    if not date_evidence:
+        return cells
+    split_flag = "split_from_merged_ocr_token"
+    cells_by_id[date_column.id] = date_cell.model_copy(
+        update={
+            "raw_value": printed_date,
+            "evidence": date_evidence,
+            "validation_flags": tuple(
+                dict.fromkeys(
+                    (
+                        *(
+                            flag
+                            for flag in date_cell.validation_flags
+                            if flag != "empty_cell"
+                        ),
+                        split_flag,
+                    )
+                )
+            ),
+        }
+    )
+    cells_by_id[description_column.id] = description_cell.model_copy(
+        update={
+            "raw_value": remaining_description,
+            "validation_flags": tuple(
+                dict.fromkeys((*description_cell.validation_flags, split_flag))
+            ),
+        }
+    )
+    return tuple(cells_by_id[cell.column_id] for cell in cells)
+
+
 def _link_source_tables(
     tables: tuple[SourceTable, ...] | list[SourceTable],
     canonical_rows: tuple[CanonicalRow, ...] | list[CanonicalRow],
@@ -429,8 +514,13 @@ def _link_source_tables(
             if scored and (len(scored) == 1 or scored[0][0] != scored[1][0]):
                 matched = scored[0][1]
                 canonical_row_id = str(matched.id)
+                columns_by_id = {column.id: column for column in table.columns}
+                linked_cells = _split_grounded_date_from_description(
+                    linked_cells,
+                    table.columns,
+                    matched,
+                )
                 if matched.service_code is None:
-                    columns_by_id = {column.id: column for column in table.columns}
                     linked_cells = tuple(
                         cell.model_copy(
                             update={
@@ -458,11 +548,11 @@ def _link_source_tables(
                                 cell,
                                 columns_by_id[cell.column_id],
                                 table.columns,
-                                source_row.cells,
+                                linked_cells,
                             )
                         )
                         else cell
-                        for cell in source_row.cells
+                        for cell in linked_cells
                     )
             elif scored:
                 flags = tuple(dict.fromkeys((*flags, "canonical_link_ambiguous")))
