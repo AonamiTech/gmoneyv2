@@ -911,6 +911,91 @@ def test_reprocess_validation_accepts_only_matching_section_subtotal(
             )
 
 
+@pytest.mark.parametrize(
+    ("subtotal", "accepted"),
+    (("100.00", True), ("99.00", False)),
+)
+def test_labeled_subtotal_matches_grounded_section_heading(
+    tmp_path: Path,
+    subtotal: str,
+    accepted: bool,
+) -> None:
+    store, job_id, old_result = setup_job(tmp_path)
+    page_sha = old_result["page_assets"][0]["artifact_sha256"]
+    new_rows = [row("pharmacy-row", page_sha)]
+    new_rows[0]["description"] = "Pharmacy sales bill"
+    new_rows[0]["section"] = "pharmacy"
+    printed = source_tables(new_rows, page_sha)
+    printed[0]["rows"].insert(
+        0,
+        {
+            "id": "p1-t1-s1-r1",
+            "order": 0,
+            "canonical_row_id": None,
+            "cells": [
+                {
+                    "column_id": "description",
+                    "raw_value": "Medicines & Consumables",
+                    "evidence": [evidence(page_sha, "section-heading")],
+                    "validation_flags": [],
+                },
+                {
+                    "column_id": "amount",
+                    "raw_value": None,
+                    "evidence": [],
+                    "validation_flags": ["empty_cell"],
+                },
+            ],
+            "validation_flags": [],
+        },
+    )
+    printed[0]["rows"][1]["id"] = "p1-t1-s1-r2"
+    printed[0]["rows"][1]["order"] = 1
+    printed[0]["rows"].append(
+        {
+            "id": "p1-t1-s1-r3",
+            "order": 2,
+            "canonical_row_id": None,
+            "cells": [
+                {
+                    "column_id": "description",
+                    "raw_value": "Sub Total : Medicines & Consumables",
+                    "evidence": [evidence(page_sha, "subtotal-description")],
+                    "validation_flags": [],
+                },
+                {
+                    "column_id": "amount",
+                    "raw_value": subtotal,
+                    "evidence": [evidence(page_sha, "subtotal-amount")],
+                    "validation_flags": [],
+                },
+            ],
+            "validation_flags": [],
+        },
+    )
+    new_result = {
+        **old_result,
+        "rows": new_rows,
+        "source_tables": printed,
+    }
+
+    if accepted:
+        _validate_result(
+            store.job_dir(job_id) / "source.pdf",
+            old_result,
+            new_result,
+            store.job_dir(job_id) / "artifacts",
+        )
+    else:
+        with pytest.raises(ValueError, match="unlinked source row.*financial"):
+            _validate_result(
+                store.job_dir(job_id) / "source.pdf",
+                old_result,
+                new_result,
+                store.job_dir(job_id) / "artifacts",
+            )
+
+
 @pytest.mark.parametrize(("bill_total", "accepted"), (("100.00", True), ("99.00", False)))
 def test_reprocess_validation_accepts_only_matching_internal_bill_total(
     tmp_path: Path,

@@ -621,6 +621,7 @@ def _unlinked_financial_row_is_explained(
 
     if is_section_subtotal_label(normalized_label):
         section_rows: list[dict[str, Any]] = []
+        section_heading_words: set[str] = set()
         table_index = next(
             index
             for index, candidate in enumerate(source_tables)
@@ -688,13 +689,19 @@ def _unlinked_financial_row_is_explained(
                 preceding_index,
                 previous_is_continuation=previous_was_continuation,
             )
-            if preceding_is_financial_boundary or (
+            if preceding_is_financial_boundary:
+                section_rows.clear()
+                section_heading_words.clear()
+            elif (
                 preceding_label
                 and preceding_has_section_text
                 and not preceding_has_financial_value
                 and not preceding_is_continuation
             ):
                 section_rows.clear()
+                section_heading_words = _meaningful_summary_words(
+                    preceding_label
+                )
             previous_was_continuation = preceding_is_continuation
         subtotal_scope = re.sub(
             r"^(?:sub\s+total|subtotal)\s*",
@@ -717,6 +724,7 @@ def _unlinked_financial_row_is_explained(
                 for row in section_rows
             ),
         )
+        section_words.update(section_heading_words)
         if (
             section_rows
             and (not scope_words or scope_words.issubset(section_words))
