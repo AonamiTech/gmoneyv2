@@ -2615,6 +2615,119 @@ def test_reprocess_preserves_job_and_review_with_backup(tmp_path: Path) -> None:
     assert not (store.job_dir(job_id) / ".cutover.json").exists()
 
 
+def test_review_migration_preserves_weaker_colliding_fragment_override() -> None:
+    page_sha = "a" * 64
+    main = row("old-main", page_sha)
+    main["description"] = "Mupimet Ointment"
+    main["field_evidence"]["description"] = [
+        evidence(page_sha, "main-description")
+    ]
+    main["field_evidence"]["amount"] = [evidence(page_sha, "main-amount")]
+    fragment = row("old-fragment", page_sha)
+    fragment["description"] = "5Gm"
+    fragment["field_evidence"]["description"] = [
+        evidence(page_sha, "fragment-description")
+    ]
+    fragment["field_evidence"]["amount"] = [
+        evidence(page_sha, "fragment-total")
+    ]
+    combined = row("new-combined", page_sha)
+    combined["description"] = "Mupimet Ointment 5Gm"
+    combined["field_evidence"]["description"] = [
+        evidence(page_sha, "main-description"),
+        evidence(page_sha, "fragment-description"),
+    ]
+    combined["field_evidence"]["amount"] = [evidence(page_sha, "main-amount")]
+    old_result = {"rows": [fragment, main]}
+    new_result = {"rows": [combined]}
+    review = {
+        "revision": 4,
+        "row_overrides": {
+            "old-fragment": {
+                "changes": {"review_disposition": "rejected"},
+                "reason": "duplicate fragment",
+            },
+            "old-main": {
+                "changes": {
+                    "quantity_raw": "1",
+                    "quantity": "1",
+                    "review_disposition": "accepted",
+                },
+                "reason": "verified charge",
+            },
+        },
+        "added_rows": {},
+        "issue_overrides": {},
+        "events": [],
+    }
+
+    migrated = reprocess_module._migrate_review(
+        "job-id",
+        old_result,
+        new_result,
+        review,
+    )
+
+    assert migrated["row_overrides"] == {
+        "new-combined": {
+            **review["row_overrides"]["old-main"],
+            "changes": {
+                "quantity_raw": "1",
+                "quantity": "1",
+            },
+        }
+    }
+    assert len(migrated["added_rows"]) == 1
+    preserved = next(iter(migrated["added_rows"].values()))
+    assert preserved["description"] == "5Gm"
+    assert preserved["review_disposition"] == "rejected"
+    assert "reviewer_preserved" in preserved["validation_flags"]
+    assert migrated["events"][-1]["changes"][
+        "preserved_unmapped_row_overrides"
+    ] == ["old-fragment"]
+
+
+def test_review_migration_does_not_reapply_unchanged_machine_fields() -> None:
+    page_sha = "a" * 64
+    old = row("old-row", page_sha)
+    old["description"] = "07/2026 PI123 Truncated Product"
+    upgraded = row("new-row", page_sha)
+    upgraded["description"] = "Complete Product Name"
+    upgraded["field_evidence"] = deepcopy(old["field_evidence"])
+    review = {
+        "revision": 1,
+        "row_overrides": {
+            "old-row": {
+                "changes": {
+                    "description": old["description"],
+                    "net_amount_raw": old["net_amount_raw"],
+                    "net_amount": old["net_amount"],
+                    "quantity_raw": "2",
+                    "quantity": "2",
+                    "review_disposition": old["review_disposition"],
+                    "role": old["role"],
+                },
+                "reason": "Quantity corrected",
+            }
+        },
+        "added_rows": {},
+        "issue_overrides": {},
+        "events": [],
+    }
+
+    migrated = reprocess_module._migrate_review(
+        "job-id",
+        {"rows": [old]},
+        {"rows": [upgraded]},
+        review,
+    )
+
+    assert migrated["row_overrides"]["new-row"]["changes"] == {
+        "quantity_raw": "2",
+        "quantity": "2",
+    }
+
+
 def test_manual_rollback_rejects_review_created_after_deployment(tmp_path: Path) -> None:
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]

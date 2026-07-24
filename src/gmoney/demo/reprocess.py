@@ -781,38 +781,58 @@ def _field_token_ids(row: dict[str, Any], field: str | None = None) -> set[str]:
     }
 
 
+def _review_mapping_score(
+    old_row: dict[str, Any],
+    candidate: dict[str, Any],
+) -> tuple[int, int, float] | None:
+    if int(candidate.get("page_number") or 0) != int(
+        old_row.get("page_number") or 0
+    ):
+        return None
+    old_description_ids = _field_token_ids(old_row, "description")
+    old_all_ids = _field_token_ids(old_row)
+    description_overlap = len(
+        old_description_ids & _field_token_ids(candidate, "description")
+    )
+    all_overlap = len(old_all_ids & _field_token_ids(candidate))
+    if not description_overlap and not all_overlap:
+        return None
+    similarity = SequenceMatcher(
+        None,
+        _normalized(old_row.get("description")),
+        _normalized(candidate.get("description")),
+    ).ratio()
+    return (description_overlap, all_overlap, similarity)
+
+
 def _map_reviewed_row(
     old_row: dict[str, Any], new_rows: list[dict[str, Any]]
 ) -> str | None:
-    old_description_ids = _field_token_ids(old_row, "description")
-    old_all_ids = _field_token_ids(old_row)
-    old_description = _normalized(old_row.get("description"))
     scored: list[tuple[tuple[int, int, float], str]] = []
     for candidate in new_rows:
-        if int(candidate.get("page_number") or 0) != int(old_row.get("page_number") or 0):
+        score = _review_mapping_score(old_row, candidate)
+        if score is None:
             continue
-        description_overlap = len(
-            old_description_ids & _field_token_ids(candidate, "description")
-        )
-        all_overlap = len(old_all_ids & _field_token_ids(candidate))
-        similarity = SequenceMatcher(
-            None,
-            old_description,
-            _normalized(candidate.get("description")),
-        ).ratio()
-        if description_overlap or all_overlap:
-            scored.append(
-                (
-                    (description_overlap, all_overlap, similarity),
-                    str(candidate["id"]),
-                )
-            )
+        scored.append((score, str(candidate["id"])))
     if not scored:
         return None
     scored.sort(reverse=True)
     if len(scored) > 1 and scored[0][0] == scored[1][0]:
         return None
     return scored[0][1]
+
+
+def _rebase_review_override(
+    old_row: dict[str, Any],
+    override: dict[str, Any],
+) -> dict[str, Any]:
+    rebased = json.loads(json.dumps(override))
+    rebased["changes"] = {
+        field: value
+        for field, value in (override.get("changes") or {}).items()
+        if field not in old_row or old_row[field] != value
+    }
+    return rebased
 
 
 def _migrate_review(
@@ -823,43 +843,81 @@ def _migrate_review(
 ) -> dict[str, Any]:
     old_rows = {str(row["id"]): row for row in old_result.get("rows", [])}
     new_rows = list(new_result.get("rows", []))
+    new_rows_by_id = {str(row["id"]): row for row in new_rows}
     new_ids = {str(row["id"]) for row in new_rows}
     migrated_overrides: dict[str, Any] = {}
+    migrated_override_sources: dict[str, str] = {}
     migrated_added = json.loads(json.dumps(review.get("added_rows", {})))
     preserved_unmapped: list[str] = []
+
+    def preserve_override(old_id: str, override: dict[str, Any]) -> None:
+        preserved = json.loads(json.dumps(old_rows[old_id]))
+        preserved.update(override.get("changes", {}))
+        preserved_id = f"reprocessed-{old_id}"
+        suffix = 1
+        while preserved_id in migrated_added or preserved_id in new_ids:
+            suffix += 1
+            preserved_id = f"reprocessed-{old_id}-{suffix}"
+        preserved["id"] = preserved_id
+        preserved["contract_version"] = "canonical_row_reviewer_v1"
+        preserved["source_routes"] = sorted(
+            {
+                *preserved.get("source_routes", []),
+                "reviewer",
+                "reprocess_preserved",
+            }
+        )
+        preserved["validation_flags"] = sorted(
+            {
+                *preserved.get("validation_flags", []),
+                "reviewer_preserved",
+            }
+        )
+        preserved["review_reason"] = override.get("reason") or (
+            "Reviewer correction preserved because the upgraded machine row "
+            "could not be mapped uniquely"
+        )
+        migrated_added[preserved_id] = preserved
+        preserved_unmapped.append(old_id)
+
+    def mapping_priority(old_id: str, target_id: str) -> tuple[Any, ...]:
+        score = _review_mapping_score(
+            old_rows[old_id],
+            new_rows_by_id[target_id],
+        )
+        return (
+            old_id == target_id,
+            *(score or (0, 0, 0.0)),
+        )
+
     for old_id, override in review.get("row_overrides", {}).items():
+        old_row = old_rows.get(old_id)
+        if old_row is None:
+            raise ValueError(
+                f"reviewed row is absent from the old result: {old_id}"
+            )
         target_id = old_id if old_id in new_ids else None
+        rebased_override = _rebase_review_override(old_row, override)
         if target_id is None:
-            old_row = old_rows.get(old_id)
-            if old_row is None:
-                raise ValueError(f"reviewed row is absent from the old result: {old_id}")
             target_id = _map_reviewed_row(old_row, new_rows)
         if target_id is None:
-            preserved = json.loads(json.dumps(old_rows[old_id]))
-            preserved.update(override.get("changes", {}))
-            preserved_id = f"reprocessed-{old_id}"
-            suffix = 1
-            while preserved_id in migrated_added or preserved_id in new_ids:
-                suffix += 1
-                preserved_id = f"reprocessed-{old_id}-{suffix}"
-            preserved["id"] = preserved_id
-            preserved["contract_version"] = "canonical_row_reviewer_v1"
-            preserved["source_routes"] = sorted(
-                {*preserved.get("source_routes", []), "reviewer", "reprocess_preserved"}
-            )
-            preserved["validation_flags"] = sorted(
-                {*preserved.get("validation_flags", []), "reviewer_preserved"}
-            )
-            preserved["review_reason"] = override.get("reason") or (
-                "Reviewer correction preserved because the upgraded machine row "
-                "could not be mapped uniquely"
-            )
-            migrated_added[preserved_id] = preserved
-            preserved_unmapped.append(old_id)
+            preserve_override(old_id, override)
             continue
         if target_id in migrated_overrides:
-            raise ValueError(f"multiple reviewed rows map to {target_id}")
-        migrated_overrides[target_id] = override
+            incumbent_id = migrated_override_sources[target_id]
+            if mapping_priority(old_id, target_id) > mapping_priority(
+                incumbent_id,
+                target_id,
+            ):
+                preserve_override(
+                    incumbent_id,
+                    review["row_overrides"][incumbent_id],
+                )
+            else:
+                preserve_override(old_id, override)
+                continue
+        migrated_overrides[target_id] = rebased_override
+        migrated_override_sources[target_id] = old_id
 
     issue_probe = {**review, "issue_overrides": {}}
     new_issue_ids = {
