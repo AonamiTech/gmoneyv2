@@ -613,6 +613,44 @@ def test_slanted_serial_descriptions_start_distinct_financial_rows() -> None:
     )
 
 
+def test_added_to_bill_footer_does_not_extend_last_description() -> None:
+    tokens = (
+        token(0, "#", (50, 30, 70, 45)),
+        token(1, "Particulars", (100, 30, 420, 45)),
+        token(2, "Rate", (650, 30, 700, 45)),
+        token(3, "Qty", (760, 30, 800, 45)),
+        token(4, "Amount", (880, 30, 960, 45)),
+        token(5, "22 DECMAX 4MG TABLET", (50, 70, 420, 85)),
+        token(6, "5.00", (650, 70, 700, 85)),
+        token(7, "6", (760, 70, 780, 85)),
+        token(8, "30.00", (880, 70, 950, 85)),
+        token(9, "(Added to Bill)", (100, 100, 420, 115)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(40, 20, 980, 130),
+    )
+
+    assert [item.candidate.description for item in result.rows] == [
+        "22 DECMAX 4MG TABLET"
+    ]
+    assert len(result.source_tables[0].rows) == 1
+    description_column = next(
+        column
+        for column in result.source_tables[0].columns
+        if column.canonical_field == "description"
+    )
+    description_cell = next(
+        cell
+        for cell in result.source_tables[0].rows[0].cells
+        if cell.column_id == description_column.id
+    )
+    assert description_cell.raw_value == "22 DECMAX 4MG TABLET"
+
+
 def test_source_table_excludes_distant_text_beyond_final_column_boundary() -> None:
     tokens = (
         token(0, "Sr.N", (50, 30, 90, 45)),

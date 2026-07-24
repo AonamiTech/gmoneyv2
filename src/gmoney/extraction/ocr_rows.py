@@ -1185,7 +1185,10 @@ def _is_printed_table_footer(line: OcrLine) -> bool:
     normalized = _normalize(line.text)
     if re.search(r"\bpage \d+(?: of)? \d+\b", normalized):
         return True
-    return "this bill was created using" in normalized
+    return (
+        "this bill was created using" in normalized
+        or "added to bill" in normalized
+    )
 
 
 def _source_rows(
