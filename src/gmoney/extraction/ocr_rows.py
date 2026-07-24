@@ -2802,6 +2802,10 @@ def reconstruct_ocr_rows(
         has_ledger_header=header_valid,
         zero_tail_summary=zero_tail_summary,
     )
+    is_pharmacy_table = (
+        table_type is TableType.PHARMACY
+        or "pharmacy" in _normalize(table_text).split()
+    )
     has_tax_columns = bool(re.search(r"\b(?:gst|tax)\b", _normalize(table_text)))
     header_ids = tuple(
         token.token_id
@@ -2846,6 +2850,7 @@ def reconstruct_ocr_rows(
     pending_service_date: str | None = None
     pending_service_date_ids: tuple[str, ...] = ()
     current_section: str | None = None
+    in_return_section = False
 
     def pending_description_is_proven_continuation(
         continuation_tokens: list[OcrToken],
@@ -3021,6 +3026,23 @@ def reconstruct_ocr_rows(
             )
             continue
         numeric = _numeric_tokens(line)
+        normalized_line = _normalize(line.text)
+        line_words = set(normalized_line.split())
+        if (
+            is_pharmacy_table
+            and not numeric
+            and {"return", "returns"}.intersection(line_words)
+            and not {"detail", "details"}.intersection(line_words)
+        ):
+            in_return_section = True
+        elif (
+            in_return_section
+            and not numeric
+            and "pharmacy" in line_words
+            and {"detail", "details"}.intersection(line_words)
+            and not {"return", "returns"}.intersection(line_words)
+        ):
+            in_return_section = False
         amount_pair = _closest_numeric(numeric, amount_center, left, width, set())
         amount_token = amount_pair.token if amount_pair else None
         amount = amount_pair.value if amount_pair else None
@@ -3472,6 +3494,8 @@ def reconstruct_ocr_rows(
         if amount < 0 and role is RowRole.DETAIL:
             role = RowRole.REFUND
         validation_flags: list[str] = []
+        if in_return_section and amount > 0 and role is RowRole.DETAIL:
+            validation_flags.append("positive_amount_in_return_section")
         if missing_printed_description:
             validation_flags.append("missing_printed_description")
         if "quantity" in column_centers and values["quantity"] is None:
@@ -3482,13 +3506,23 @@ def reconstruct_ocr_rows(
             expected_amount = values["quantity"] * values["rate"]
             if values["discount"] is not None:
                 expected_amount -= values["discount"]
-            if abs(expected_amount - amount) > Decimal("0.01"):
+            compared_amount = (
+                abs(amount)
+                if role is RowRole.REFUND and amount < 0 <= expected_amount
+                else amount
+            )
+            if abs(expected_amount - compared_amount) > Decimal("0.01"):
                 validation_flags.append("line_arithmetic_mismatch")
         elif values["gross_amount"] is not None and not has_tax_columns:
             expected_amount = values["gross_amount"]
             if values["discount"] is not None:
                 expected_amount -= values["discount"]
-            if abs(expected_amount - amount) > Decimal("0.01"):
+            compared_amount = (
+                abs(amount)
+                if role is RowRole.REFUND and amount < 0 <= expected_amount
+                else amount
+            )
+            if abs(expected_amount - compared_amount) > Decimal("0.01"):
                 validation_flags.append("line_arithmetic_mismatch")
         candidate = CandidateLedgerRow(
             source_row=source_row,

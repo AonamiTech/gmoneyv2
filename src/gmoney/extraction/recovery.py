@@ -28,6 +28,7 @@ FIELD_QUALITY_FLAGS = frozenset(
         "missing_labeled_quantity",
         "missing_labeled_unit_price",
         "line_arithmetic_mismatch",
+        "positive_amount_in_return_section",
     }
 )
 MAPPED_CANONICAL_FIELDS = frozenset(
@@ -50,6 +51,12 @@ MAPPED_CANONICAL_FIELDS = frozenset(
 class GroundingResult:
     rows: tuple[AlignedLedgerRow, ...]
     rejected_reasons: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ReturnSignRecoveryTarget:
+    region: tuple[int, int, int, int]
+    expected_absolute_amount: Decimal
 
 
 def is_implausibly_low_yield(reconstruction: ReconstructionResult) -> bool:
@@ -85,7 +92,13 @@ def _field_quality_defects(reconstruction: ReconstructionResult) -> tuple[int, i
         for flag in row.candidate.validation_flags
     )
     return (
-        flags.count("line_arithmetic_mismatch"),
+        sum(
+            flags.count(flag)
+            for flag in (
+                "line_arithmetic_mismatch",
+                "positive_amount_in_return_section",
+            )
+        ),
         sum(
             flags.count(flag)
             for flag in ("missing_labeled_quantity", "missing_labeled_unit_price")
@@ -304,6 +317,28 @@ def _preserves_grounded_fields(
             ).strip().casefold()
         return left == right
 
+    def is_grounded_refund_sign_correction(
+        baseline: AlignedLedgerRow,
+        candidate: AlignedLedgerRow,
+        field: str,
+        baseline_value: object,
+        candidate_value: object,
+    ) -> bool:
+        return (
+            field == "amount"
+            and "positive_amount_in_return_section"
+            in baseline.candidate.validation_flags
+            and baseline.candidate.role is RowRole.DETAIL
+            and candidate.candidate.role is RowRole.REFUND
+            and bool(candidate.field_token_ids.get(field))
+            and isinstance(baseline_value, Decimal)
+            and isinstance(candidate_value, Decimal)
+            and baseline_value > 0
+            and candidate_value == -baseline_value
+            and "positive_amount_in_return_section"
+            not in candidate.candidate.validation_flags
+        )
+
     for baseline, candidate in matches:
         for field in MAPPED_CANONICAL_FIELDS:
             baseline_value = getattr(baseline.candidate, field, None)
@@ -317,6 +352,14 @@ def _preserves_grounded_fields(
                     or not equivalent(baseline_value, candidate_value)
                 )
             ):
+                if is_grounded_refund_sign_correction(
+                    baseline,
+                    candidate,
+                    field,
+                    baseline_value,
+                    candidate_value,
+                ):
+                    continue
                 return False
     return True
 
@@ -468,6 +511,72 @@ def _row_evidence_bounds(row: object) -> tuple[float, float, float, float] | Non
     )
 
 
+def return_sign_recovery_targets(
+    reconstruction: ReconstructionResult,
+    *,
+    table_box: tuple[int, int, int, int],
+) -> tuple[ReturnSignRecoveryTarget, ...]:
+    """Locate grounded amount cells whose minus sign needs a focused OCR retry."""
+    table_left, table_top, table_right, table_bottom = table_box
+    targets: list[ReturnSignRecoveryTarget] = []
+    for aligned_row in reconstruction.rows:
+        if (
+            "positive_amount_in_return_section"
+            not in aligned_row.candidate.validation_flags
+            or aligned_row.candidate.amount is None
+            or aligned_row.candidate.amount <= 0
+        ):
+            continue
+        amount_token_ids = {
+            token_id.strip()
+            for token_id in aligned_row.field_token_ids.get("amount", ())
+            if token_id.strip()
+        }
+        if not amount_token_ids:
+            continue
+        amount_cell = next(
+            (
+                cell
+                for table in reconstruction.source_tables
+                for row in table.rows
+                for cell in row.cells
+                if parse_decimal(getattr(cell, "raw_value", None))
+                == aligned_row.candidate.amount
+                and any(
+                    amount_token_ids.intersection(
+                        token_id.strip()
+                        for token_id in getattr(evidence, "token_ids", ())
+                        if token_id.strip()
+                    )
+                    for evidence in getattr(cell, "evidence", ())
+                )
+            ),
+            None,
+        )
+        if amount_cell is None:
+            continue
+        bounds = _evidence_bounds(amount_cell.evidence)
+        if bounds is None:
+            continue
+        left, top, right, bottom = bounds
+        height = max(1.0, bottom - top)
+        region = (
+            max(table_left, round(left - 2 * height)),
+            max(table_top, round(top - height / 2)),
+            min(table_right, round(right + height / 2)),
+            min(table_bottom, round(bottom + height / 2)),
+        )
+        if region[2] <= region[0] or region[3] <= region[1]:
+            continue
+        target = ReturnSignRecoveryTarget(
+            region=region,
+            expected_absolute_amount=aligned_row.candidate.amount,
+        )
+        if target not in targets:
+            targets.append(target)
+    return tuple(targets)
+
+
 def _cell_by_canonical_field(
     table: object,
     row: object,
@@ -495,7 +604,6 @@ def _cell_by_canonical_field(
 
 def _has_missing_grounded_detail_description(table: object, row: object) -> bool:
     description = _cell_by_canonical_field(table, row, "description")
-    quantity = _cell_by_canonical_field(table, row, "quantity")
     unit_price = _cell_by_canonical_field(table, row, "unit_price")
     financial = next(
         (
@@ -509,8 +617,6 @@ def _has_missing_grounded_detail_description(table: object, row: object) -> bool
     return (
         description is not None
         and not str(getattr(description, "raw_value", "") or "").strip()
-        and quantity is not None
-        and parse_decimal(getattr(quantity, "raw_value", None)) is not None
         and unit_price is not None
         and parse_decimal(getattr(unit_price, "raw_value", None)) is not None
         and financial is not None

@@ -4128,6 +4128,81 @@ def test_pharmacy_description_continuation_in_same_lane_is_grounded() -> None:
     assert linked[0].rows[0].canonical_row_id == str(canonical[0].id)
 
 
+@pytest.mark.parametrize(
+    ("printed_amount", "expected_role", "expected_flags"),
+    (
+        (
+            "23.93",
+            RowRole.DETAIL,
+            ("positive_amount_in_return_section",),
+        ),
+        ("-23.93", RowRole.REFUND, ()),
+    ),
+)
+def test_pharmacy_return_section_marks_missing_sign_and_valid_refund_arithmetic(
+    printed_amount: str,
+    expected_role: RowRole,
+    expected_flags: tuple[str, ...],
+) -> None:
+    tokens = (
+        token(0, "ProductName", (300, 25, 450, 40)),
+        token(1, "Qty", (700, 25, 750, 40)),
+        token(2, "Rate", (800, 25, 850, 40)),
+        token(3, "Total", (900, 25, 960, 40)),
+        token(4, "IP Pharmacy Returns", (300, 65, 500, 80)),
+        token(5, "Metronidazole IV 100ML", (300, 105, 500, 120)),
+        token(6, "1", (710, 105, 730, 120)),
+        token(7, "23.93", (800, 105, 850, 120)),
+        token(8, printed_amount, (900, 105, 960, 120)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=6,
+        table_id="p6-t1",
+        box=(280, 15, 980, 140),
+    )
+
+    assert len(result.rows) == 1
+    candidate = result.rows[0].candidate
+    assert candidate.description == "Metronidazole IV 100ML"
+    assert candidate.amount == Decimal(printed_amount)
+    assert candidate.role is expected_role
+    assert candidate.validation_flags == expected_flags
+
+
+def test_pharmacy_return_section_ends_at_the_next_explicit_pharmacy_section() -> None:
+    tokens = (
+        token(0, "ProductName", (300, 25, 450, 40)),
+        token(1, "Qty", (700, 25, 750, 40)),
+        token(2, "Rate", (800, 25, 850, 40)),
+        token(3, "Total", (900, 25, 960, 40)),
+        token(4, "IP Pharmacy Returns", (300, 65, 500, 80)),
+        token(5, "Returned item", (300, 105, 500, 120)),
+        token(6, "1", (710, 105, 730, 120)),
+        token(7, "10.00", (800, 105, 850, 120)),
+        token(8, "-10.00", (900, 105, 960, 120)),
+        token(9, "IP Pharmacy Details", (300, 145, 500, 160)),
+        token(10, "Issued item", (300, 185, 500, 200)),
+        token(11, "1", (710, 185, 730, 200)),
+        token(12, "20.00", (800, 185, 850, 200)),
+        token(13, "20.00", (900, 185, 960, 200)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=6,
+        table_id="p6-t1",
+        box=(280, 15, 980, 220),
+    )
+
+    assert tuple(row.candidate.amount for row in result.rows) == (
+        Decimal("-10.00"),
+        Decimal("20.00"),
+    )
+    assert tuple(row.candidate.validation_flags for row in result.rows) == ((), ())
+
+
 def test_pharmacy_description_wrap_inside_numeric_row_envelope_is_grounded() -> None:
     tokens = (
         token(99, "IP Pharmacy", (300, 0, 430, 15)),

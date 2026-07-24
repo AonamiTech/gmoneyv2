@@ -37,10 +37,12 @@ from gmoney.extraction.recovery import (
     needs_field_quality_recovery,
     reconstruction_quality,
     replace_tokens_in_regions,
+    return_sign_recovery_targets,
     safely_improves_reconstruction,
 )
 from gmoney.extraction.rows import CandidateLedgerRow
 from gmoney.extraction.spatial import AlignedLedgerRow
+from gmoney.extraction.typed_values import parse_decimal
 
 
 def _schema(table_type: TableType = TableType.ITEM_LEDGER) -> TableSchemaState:
@@ -318,6 +320,43 @@ def _description_recovery_source_table() -> SourceTable:
     )
 
 
+def _return_sign_recovery_baseline() -> ReconstructionResult:
+    table = _description_recovery_source_table()
+    first_cells = list(table.rows[0].cells)
+    first_cells[-1] = first_cells[-1].model_copy(
+        update={
+            "raw_value": "23.93",
+            "evidence": _evidence_at(
+                "token-0-amount",
+                710,
+                140,
+                735,
+                160,
+            ),
+        }
+    )
+    table = table.model_copy(
+        update={
+            "rows": (
+                table.rows[0].model_copy(update={"cells": tuple(first_cells)}),
+            )
+        }
+    )
+    return ReconstructionResult(
+        rows=(
+            _aligned_row(
+                0,
+                amount=Decimal("23.93"),
+                flags=("positive_amount_in_return_section",),
+                table_type=TableType.PHARMACY,
+            ),
+        ),
+        schema=_schema(TableType.PHARMACY),
+        diagnostics={"table_type": TableType.PHARMACY.value},
+        source_tables=(table,),
+    )
+
+
 def test_description_lane_recovery_targets_only_consecutive_grounded_detail_rows() -> None:
     reconstruction = ReconstructionResult(
         rows=(),
@@ -330,6 +369,17 @@ def test_description_lane_recovery_targets_only_consecutive_grounded_detail_rows
         reconstruction,
         table_box=(50, 80, 800, 300),
     ) == ((100, 165, 400, 255),)
+
+
+def test_return_sign_recovery_targets_only_the_flagged_grounded_amount_cell() -> None:
+    targets = return_sign_recovery_targets(
+        _return_sign_recovery_baseline(),
+        table_box=(50, 80, 800, 300),
+    )
+
+    assert len(targets) == 1
+    assert targets[0].expected_absolute_amount == Decimal("23.93")
+    assert targets[0].region == (670, 130, 745, 170)
 
 
 def test_description_recovery_boundary_ignores_rotated_overlay_only_row() -> None:
@@ -451,6 +501,36 @@ def test_description_recovery_uses_parseable_gross_when_net_cell_is_blank() -> N
                     "rows": (target_row,),
                 }
             ),
+        ),
+    )
+
+    assert description_lane_recovery_regions(
+        reconstruction,
+        table_box=(50, 80, 800, 300),
+    ) == ((100, 160, 400, 200),)
+
+
+def test_description_recovery_does_not_require_a_printed_quantity() -> None:
+    table = _description_recovery_source_table()
+    target_cells = tuple(
+        cell.model_copy(
+            update={
+                "raw_value": None,
+                "evidence": (),
+                "validation_flags": ("empty_cell",),
+            }
+        )
+        if cell.column_id == "quantity"
+        else cell
+        for cell in table.rows[1].cells
+    )
+    target_row = table.rows[1].model_copy(update={"cells": target_cells})
+    reconstruction = ReconstructionResult(
+        rows=(),
+        schema=_schema(TableType.PHARMACY),
+        diagnostics={"table_type": TableType.PHARMACY.value},
+        source_tables=(
+            table.model_copy(update={"rows": (target_row,)}),
         ),
     )
 
@@ -649,6 +729,7 @@ def test_empty_metadata_region_is_terminal_without_recovery() -> None:
         "missing_labeled_quantity",
         "missing_labeled_unit_price",
         "line_arithmetic_mismatch",
+        "positive_amount_in_return_section",
     ),
 )
 def test_grounded_field_defects_route_to_local_validation_recovery(flag: str) -> None:
@@ -975,6 +1056,62 @@ def test_recovery_cannot_change_an_existing_grounded_financial_value() -> None:
     )
 
     assert not safely_improves_reconstruction(baseline, candidate)
+
+
+def test_recovery_can_correct_only_a_grounded_missing_refund_sign() -> None:
+    baseline = _reconstruction(
+        (
+            _aligned_row(
+                0,
+                description="Metronidazole IV 100ML",
+                amount=Decimal("23.93"),
+                flags=("positive_amount_in_return_section",),
+                role=RowRole.DETAIL,
+                table_type=TableType.PHARMACY,
+            ),
+        ),
+        table_type=TableType.PHARMACY,
+    )
+    corrected = _reconstruction(
+        (
+            _aligned_row(
+                0,
+                description="Metronidazole IV 100ML",
+                amount=Decimal("-23.93"),
+                role=RowRole.REFUND,
+                table_type=TableType.PHARMACY,
+            ),
+        ),
+        table_type=TableType.PHARMACY,
+    )
+    wrong_amount = replace(
+        corrected,
+        rows=(
+            _aligned_row(
+                0,
+                description="Metronidazole IV 100ML",
+                amount=Decimal("-24"),
+                role=RowRole.REFUND,
+                table_type=TableType.PHARMACY,
+            ),
+        ),
+    )
+    unflagged = replace(
+        baseline,
+        rows=(
+            replace(
+                baseline.rows[0],
+                candidate=replace(
+                    baseline.rows[0].candidate,
+                    validation_flags=(),
+                ),
+            ),
+        ),
+    )
+
+    assert safely_improves_reconstruction(baseline, corrected)
+    assert not safely_improves_reconstruction(baseline, wrong_amount)
+    assert not safely_improves_reconstruction(unflagged, corrected)
 
 
 @pytest.mark.parametrize(
@@ -1314,8 +1451,143 @@ def test_crop_recovery_uses_targeted_description_lane_for_grounded_financial_row
     assert "page-baseline-amount" in {
         token.token_id for token in targeted_batch
     }
+    assert not any(
+        "full-description" in token.token_id
+        for token in targeted_batch
+    )
     assert any(
         attempt.status == "recovered"
         and attempt.reason == "input_variant:high_resolution+description_lane"
+        for attempt in attempts
+    )
+
+
+def test_crop_recovery_uses_800dpi_clahe_only_for_a_grounded_refund_sign(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page_artifact_sha256 = "a" * 64
+    baseline = _return_sign_recovery_baseline()
+    render_calls: list[tuple[tuple[int, int, int, int], int]] = []
+    observed_variants: list[str] = []
+    reconstructed_batches: list[tuple[OcrToken, ...]] = []
+
+    def fake_render(source, output, page_number, box, **kwargs):
+        output_dpi = int(kwargs.get("output_dpi", 400))
+        render_calls.append((box, output_dpi))
+        return SimpleNamespace(
+            output_path=tmp_path / f"render-{output_dpi}.png",
+            artifact_sha256=("b" if output_dpi == 400 else "c") * 64,
+        )
+
+    monkeypatch.setattr(offline_module, "render_pdf_region", fake_render)
+    monkeypatch.setattr(
+        offline_module,
+        "clahe_variant",
+        lambda source, output: SimpleNamespace(
+            output_path=(
+                tmp_path / "sign-clahe.png"
+                if "800" in str(source)
+                else tmp_path / "high-clahe.png"
+            ),
+            artifact_sha256=("d" if "800" in str(source) else "e") * 64,
+        ),
+    )
+
+    def fake_prediction(path, request, adapter):
+        variant = str(request.options["input_variant"])
+        observed_variants.append(variant)
+        return SimpleNamespace(output={"variant": variant}, latency_ms=1), False
+
+    monkeypatch.setattr(offline_module, "_cached_prediction", fake_prediction)
+    monkeypatch.setattr(
+        offline_module,
+        "paddle_ocr_tokens",
+        lambda output, page_number, artifact_sha256: (
+            _ocr_token(
+                (
+                    "-23.93"
+                    if output["variant"] == "return_sign_800dpi_clahe"
+                    else "23.93"
+                ),
+                artifact_sha256,
+                "local-amount",
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        offline_module.cv2,
+        "imread",
+        lambda path, mode: SimpleNamespace(shape=(100, 100, 3)),
+    )
+
+    def fake_reconstruct(tokens, **kwargs):
+        reconstructed_batches.append(tokens)
+        if any(parse_decimal(token.text) == Decimal("-23.93") for token in tokens):
+            return replace(
+                baseline,
+                rows=(
+                    _aligned_row(
+                        0,
+                        amount=Decimal("-23.93"),
+                        role=RowRole.REFUND,
+                        table_type=TableType.PHARMACY,
+                    ),
+                ),
+            )
+        return baseline
+
+    monkeypatch.setattr(offline_module, "reconstruct_ocr_rows", fake_reconstruct)
+    extractor = object.__new__(OfflineExtractor)
+    extractor.ocr = object()
+    work = TableWork(
+        table_id="table-1",
+        page_number=1,
+        page_artifact_sha256=page_artifact_sha256,
+        crop_path=tmp_path / "primary.png",
+        crop_sha256="f" * 64,
+        box=(50, 80, 800, 300),
+    )
+    baseline_amount_token = _ocr_token(
+        "23.93",
+        page_artifact_sha256,
+        "token-0-amount",
+    ).model_copy(
+        update={
+            "polygon": Polygon(
+                points=(
+                    Point(x=710, y=140),
+                    Point(x=735, y=140),
+                    Point(x=735, y=160),
+                    Point(x=710, y=160),
+                )
+            )
+        }
+    )
+
+    recovered, attempts = extractor._recover_crop_ocr(
+        source=tmp_path / "bill.pdf",
+        artifact_root=tmp_path,
+        work=work,
+        prior_schemas=(),
+        page_artifact_sha256=page_artifact_sha256,
+        baseline=baseline,
+        baseline_tokens=(baseline_amount_token,),
+    )
+
+    assert recovered is not None
+    assert recovered.rows[0].candidate.amount == Decimal("-23.93")
+    assert recovered.rows[0].candidate.role is RowRole.REFUND
+    assert ((670, 130, 745, 170), 800) in render_calls
+    assert "return_sign_800dpi_clahe" in observed_variants
+    sign_batch = next(
+        tokens
+        for tokens in reconstructed_batches
+        if any(token.text == "-23.93" for token in tokens)
+    )
+    assert not any(token.text == "23.93" for token in sign_batch)
+    assert any(
+        attempt.status == "recovered"
+        and "return_sign" in str(attempt.reason)
         for attempt in attempts
     )

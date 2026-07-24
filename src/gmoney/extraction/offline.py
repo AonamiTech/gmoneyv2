@@ -72,6 +72,8 @@ from gmoney.extraction.recovery import (
     merge_recovery_tokens,
     needs_field_quality_recovery,
     reconstruction_quality,
+    replace_tokens_in_regions,
+    return_sign_recovery_targets,
     safely_improves_reconstruction,
 )
 from gmoney.extraction.rows import extract_candidate_rows
@@ -2098,7 +2100,7 @@ class OfflineExtractor:
                         _,
                         _,
                         _,
-                        mapped_tokens,
+                        _,
                         _,
                     ) = item
                     recovered_tokens: list[OcrToken] = []
@@ -2200,7 +2202,7 @@ class OfflineExtractor:
                         continue
                     combined_tokens = merge_recovery_tokens(
                         baseline_tokens,
-                        mapped_tokens,
+                        (),
                         tuple(recovered_tokens),
                         regions=regions,
                     )
@@ -2231,6 +2233,173 @@ class OfflineExtractor:
                             overlay_suppressed.artifact_sha256,
                             all(target_cache_hits),
                             target_latency_ms,
+                            combined_tokens,
+                            reconstruction,
+                        )
+                    )
+        sign_targets = return_sign_recovery_targets(
+            baseline,
+            table_box=work.box,
+        )
+        if sign_targets:
+            recovered_sign_tokens: list[OcrToken] = []
+            recovered_sign_regions: list[tuple[int, int, int, int]] = []
+            sign_cache_hits: list[bool] = []
+            sign_latency_ms = 0
+            sign_artifact_sha256 = page_artifact_sha256
+            for target_index, target in enumerate(sign_targets, start=1):
+                region = target.region
+                region_slug = "-".join(str(value) for value in region)
+                try:
+                    high_resolution_sign = render_pdf_region(
+                        source,
+                        artifact_root
+                        / "crops"
+                        / f"{work.table_id}-800dpi-return-sign-{region_slug}.png",
+                        work.page_number,
+                        region,
+                        output_dpi=800,
+                    )
+                    enhanced_sign = clahe_variant(
+                        high_resolution_sign.output_path,
+                        artifact_root
+                        / "crops"
+                        / (
+                            f"{work.table_id}-800dpi-return-sign-"
+                            f"{region_slug}-clahe.png"
+                        ),
+                    )
+                    sign_request = InferenceRequest(
+                        request_id=str(uuid4()),
+                        artifact_sha256=enhanced_sign.artifact_sha256,
+                        image_path=str(enhanced_sign.output_path.resolve()),
+                        page_number=work.page_number,
+                        options={
+                            "recovery_stage": RecoveryStage.CROP_OCR.value,
+                            "input_variant": "return_sign_800dpi_clahe",
+                            "source_crop_sha256": work.crop_sha256,
+                        },
+                    )
+                    sign_response, sign_cache_hit = _cached_prediction(
+                        artifact_root
+                        / "inference"
+                        / (
+                            f"{work.table_id}.800dpi-return-sign-"
+                            f"{region_slug}.ocr.json"
+                        ),
+                        sign_request,
+                        self.ocr,
+                    )
+                    local_sign_tokens = paddle_ocr_tokens(
+                        sign_response.output,
+                        work.page_number,
+                        enhanced_sign.artifact_sha256,
+                    )
+                    matching_sign_tokens = tuple(
+                        token
+                        for token in local_sign_tokens
+                        if parse_decimal(token.text)
+                        == -target.expected_absolute_amount
+                    )
+                    if len(matching_sign_tokens) != 1:
+                        raise ValueError("exact negative amount not uniquely recovered")
+                    sign_image = cv2.imread(
+                        str(enhanced_sign.output_path),
+                        cv2.IMREAD_COLOR,
+                    )
+                    if sign_image is None:
+                        raise ValueError(
+                            f"cannot read return sign crop: "
+                            f"{enhanced_sign.output_path}"
+                        )
+                    prefixed_sign_tokens = tuple(
+                        token.model_copy(
+                            update={
+                                "token_id": (
+                                    f"return-sign:{target_index}:"
+                                    f"{token.token_id}"
+                                )
+                            }
+                        )
+                        for token in matching_sign_tokens
+                    )
+                    recovered_sign_tokens.extend(
+                        map_crop_tokens_to_page(
+                            prefixed_sign_tokens,
+                            region,
+                            sign_image.shape[1],
+                            sign_image.shape[0],
+                            page_artifact_sha256,
+                        )
+                    )
+                    recovered_sign_regions.append(region)
+                    sign_cache_hits.append(sign_cache_hit)
+                    sign_latency_ms += sign_response.latency_ms
+                    sign_artifact_sha256 = enhanced_sign.artifact_sha256
+                except Exception as error:
+                    attempts.append(
+                        RecoveryAttempt(
+                            stage=RecoveryStage.CROP_OCR,
+                            status="failed",
+                            reason=(
+                                "return_sign_800dpi_clahe:"
+                                f"{type(error).__name__}"
+                            ),
+                        )
+                    )
+            if recovered_sign_tokens:
+                sign_bases = (
+                    (
+                        "baseline",
+                        page_artifact_sha256,
+                        True,
+                        0,
+                        baseline_tokens,
+                        baseline,
+                    ),
+                    *tuple(reconstructed),
+                )
+                for item in sign_bases:
+                    (
+                        variant,
+                        _,
+                        cache_hit,
+                        latency_ms,
+                        candidate_tokens,
+                        _,
+                    ) = item
+                    combined_tokens = replace_tokens_in_regions(
+                        candidate_tokens,
+                        tuple(recovered_sign_tokens),
+                        regions=tuple(recovered_sign_regions),
+                    )
+                    try:
+                        reconstruction = reconstruct_ocr_rows(
+                            combined_tokens,
+                            page_number=work.page_number,
+                            table_id=work.table_id,
+                            box=work.box,
+                            prior_schemas=prior_schemas,
+                        )
+                    except Exception as error:
+                        attempts.append(
+                            RecoveryAttempt(
+                                stage=RecoveryStage.CROP_OCR,
+                                artifact_sha256=sign_artifact_sha256,
+                                status="failed",
+                                reason=(
+                                    "return_sign_800dpi_clahe:"
+                                    f"reconstruction_error:{type(error).__name__}"
+                                ),
+                            )
+                        )
+                        continue
+                    reconstructed.append(
+                        (
+                            f"{variant}+return_sign_800dpi_clahe",
+                            sign_artifact_sha256,
+                            cache_hit and all(sign_cache_hits),
+                            latency_ms + sign_latency_ms,
                             combined_tokens,
                             reconstruction,
                         )

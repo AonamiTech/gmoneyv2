@@ -226,6 +226,7 @@ def _meaningful_summary_words(value: object) -> set[str]:
 def _unlinked_financial_row_is_explained(
     *,
     table: SourceTable,
+    source_tables: tuple[SourceTable, ...],
     source_row: Any,
     cells: dict[str, Any],
     financial_values: tuple[tuple[str, Any], ...],
@@ -433,16 +434,56 @@ def _unlinked_financial_row_is_explained(
     ):
         return True
 
+    summary_words = set(normalized_label.split())
+    pharmacy_summary_sign = (
+        -1
+        if "return" in summary_words or "returns" in summary_words
+        else (
+            1
+            if {"total", "amount"}.issubset(summary_words)
+            else 0
+        )
+    )
+    source_row_seen = False
+    linked_row_follows = False
+    for candidate in table.rows:
+        if candidate.id == source_row.id:
+            source_row_seen = True
+            continue
+        if source_row_seen and candidate.canonical_row_id is not None:
+            linked_row_follows = True
+            break
+    if (
+        table.table_type.value == "pharmacy"
+        and pharmacy_summary_sign
+        and not linked_row_follows
+    ):
+        pharmacy_rows = tuple(
+            row
+            for row in canonical_rows.values()
+            if row.get("table_type") == "pharmacy"
+            and row.get("role") in {"detail", "refund", "category_rollup"}
+        )
+        if pharmacy_rows and all(
+            sum(
+                (
+                    parsed
+                    for row in pharmacy_rows
+                    if (parsed := parse_decimal(str(row.get(field)))) is not None
+                    and (
+                        parsed > 0
+                        if pharmacy_summary_sign > 0
+                        else parsed < 0
+                    )
+                ),
+                Decimal("0"),
+            )
+            == value
+            for field, value in financial_values
+        ):
+            return True
+
     if normalized_label in {"bill total", "total", "totals"}:
-        source_row_seen = False
-        linked_row_follows = False
-        for candidate in table.rows:
-            if candidate.id == source_row.id:
-                source_row_seen = True
-                continue
-            if source_row_seen and candidate.canonical_row_id is not None:
-                linked_row_follows = True
-                break
         physical_table_rows = [
             row
             for row in canonical_rows.values()
@@ -470,10 +511,40 @@ def _unlinked_financial_row_is_explained(
 
     if normalized_label in {"bill total", "sub total", "subtotal"}:
         section_rows: list[dict[str, Any]] = []
+        signature = (
+            table.table_type,
+            tuple(
+                (column.id, column.canonical_field)
+                for column in table.columns
+            ),
+        )
+        table_index = next(
+            index
+            for index, candidate in enumerate(source_tables)
+            if candidate is table
+        )
+        section_start = table_index
+        while section_start > 0:
+            previous = source_tables[section_start - 1]
+            following = source_tables[section_start]
+            previous_signature = (
+                previous.table_type,
+                tuple(
+                    (column.id, column.canonical_field)
+                    for column in previous.columns
+                ),
+            )
+            if (
+                previous.page_number + 1 != following.page_number
+                or previous_signature != signature
+            ):
+                break
+            section_start -= 1
         preceding_rows = tuple(
             preceding
-            for preceding in table.rows
-            if preceding.order < source_row.order
+            for candidate in source_tables[section_start : table_index + 1]
+            for preceding in candidate.rows
+            if candidate is not table or preceding.order < source_row.order
         )
         previous_was_continuation = False
         for preceding_index, preceding in enumerate(preceding_rows):
@@ -518,6 +589,7 @@ def _unlinked_financial_row_is_explained(
             )
             if preceding_is_financial_boundary or (
                 preceding_label
+                and re.search(r"[a-z]", preceding_label)
                 and not preceding_has_financial_value
                 and not preceding_is_continuation
             ):
@@ -793,9 +865,9 @@ def _validate_result(
     if new_result.get("rows") and not source_payload:
         raise ValueError("canonical rows require validated source tables")
     try:
-        source_tables = [
+        source_tables = tuple(
             SourceTable.model_validate(table) for table in source_payload or []
-        ]
+        )
     except ValidationError as error:
         raise ValueError(f"source tables failed grounding validation: {error}") from error
 
@@ -836,6 +908,7 @@ def _validate_result(
                 )
                 if financial_values and not _unlinked_financial_row_is_explained(
                     table=table,
+                    source_tables=source_tables,
                     source_row=source_row,
                     cells=cells,
                     financial_values=financial_values,

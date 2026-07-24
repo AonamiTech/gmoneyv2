@@ -1016,6 +1016,199 @@ def test_reprocess_validation_accepts_only_matching_internal_bill_total(
     ("bill_total", "accepted"),
     (("150.00", True), ("149.00", False)),
 )
+def test_internal_bill_total_can_continue_across_compatible_page_tables(
+    tmp_path: Path,
+    bill_total: str,
+    accepted: bool,
+) -> None:
+    store, job_id, old_result = setup_job(tmp_path)
+    first_page_sha = old_result["page_assets"][0]["artifact_sha256"]
+    second_page = b"Second PNG fixture"
+    second_page_path = (
+        store.job_dir(job_id) / "artifacts" / "pages" / "page-2.png"
+    )
+    second_page_path.write_bytes(second_page)
+    second_page_sha = digest(second_page)
+    old_result["pages"] = 2
+    old_result["page_assets"].append(
+        {
+            "page_number": 2,
+            "artifact_sha256": second_page_sha,
+            "width": 100,
+            "height": 200,
+            "relative_path": "pages/page-2.png",
+        }
+    )
+
+    preceding_rows = [
+        row("preceding-first", first_page_sha, amount="40.00"),
+        row("preceding-second", first_page_sha, amount="60.00"),
+    ]
+    current_rows = [
+        row("current-first", second_page_sha, amount="50.00"),
+        row("following-row", second_page_sha, amount="25.00"),
+    ]
+    for canonical in current_rows:
+        canonical["page_number"] = 2
+        canonical["table_id"] = "p2-t1"
+        for evidence_items in canonical["field_evidence"].values():
+            for item in evidence_items:
+                item["page_number"] = 2
+                item["table_id"] = "p2-t1"
+        for item in canonical["evidence"]:
+            item["page_number"] = 2
+            item["table_id"] = "p2-t1"
+
+    first_table = source_tables(preceding_rows, first_page_sha)[0]
+    second_table = source_tables(current_rows, second_page_sha)[0]
+    second_table["id"] = "p2-t1-s1"
+    second_table["page_number"] = 2
+    second_table["table_id"] = "p2-t1"
+    for column in second_table["columns"]:
+        for item in column["evidence"]:
+            item["page_number"] = 2
+            item["table_id"] = "p2-t1"
+    for source_row in second_table["rows"]:
+        for cell in source_row["cells"]:
+            for item in cell["evidence"]:
+                item["page_number"] = 2
+                item["table_id"] = "p2-t1"
+    subtotal_description = evidence(
+        second_page_sha,
+        "cross-page-bill-total-description",
+    )
+    subtotal_amount = evidence(
+        second_page_sha,
+        "cross-page-bill-total-amount",
+    )
+    for item in (subtotal_description, subtotal_amount):
+        item["page_number"] = 2
+        item["table_id"] = "p2-t1"
+    second_table["rows"].insert(
+        1,
+        {
+            "id": "p2-t1-s1-r2",
+            "order": 1,
+            "canonical_row_id": None,
+            "cells": [
+                {
+                    "column_id": "description",
+                    "raw_value": "BILL TOTAL",
+                    "evidence": [subtotal_description],
+                    "validation_flags": [],
+                },
+                {
+                    "column_id": "amount",
+                    "raw_value": bill_total,
+                    "evidence": [subtotal_amount],
+                    "validation_flags": [],
+                },
+            ],
+            "validation_flags": [],
+        },
+    )
+    second_table["rows"][2]["id"] = "p2-t1-s1-r3"
+    second_table["rows"][2]["order"] = 2
+    new_result = {
+        **old_result,
+        "rows": [*preceding_rows, *current_rows],
+        "source_tables": [first_table, second_table],
+    }
+
+    if accepted:
+        _validate_result(
+            store.job_dir(job_id) / "source.pdf",
+            old_result,
+            new_result,
+            store.job_dir(job_id) / "artifacts",
+        )
+    else:
+        with pytest.raises(ValueError, match="unlinked source row.*financial"):
+            _validate_result(
+                store.job_dir(job_id) / "source.pdf",
+                old_result,
+                new_result,
+                store.job_dir(job_id) / "artifacts",
+            )
+
+
+@pytest.mark.parametrize(
+    ("label", "summary_amount", "accepted"),
+    (
+        ("Total Amount", "300.00", True),
+        ("Total Amount", "299.00", False),
+        ("IP Pharmacy Return", "-50.00", True),
+        ("IP Pharmacy Return", "-49.00", False),
+    ),
+)
+def test_pharmacy_summary_requires_exact_positive_or_return_arithmetic(
+    tmp_path: Path,
+    label: str,
+    summary_amount: str,
+    accepted: bool,
+) -> None:
+    store, job_id, old_result = setup_job(tmp_path)
+    page_sha = old_result["page_assets"][0]["artifact_sha256"]
+    new_rows = [
+        row("first-charge", page_sha, amount="100.00"),
+        row("second-charge", page_sha, amount="200.00"),
+        row("returned-charge", page_sha, amount="-50.00"),
+    ]
+    for order, canonical in enumerate(new_rows):
+        canonical["row_order"] = order
+        canonical["table_type"] = "pharmacy"
+        canonical["role"] = "refund" if canonical["net_amount"].startswith("-") else "detail"
+    printed = source_tables(new_rows, page_sha)
+    printed[0]["table_type"] = "pharmacy"
+    printed[0]["rows"].append(
+        {
+            "id": "p1-t1-s1-r4",
+            "order": 3,
+            "canonical_row_id": None,
+            "cells": [
+                {
+                    "column_id": "description",
+                    "raw_value": label,
+                    "evidence": [evidence(page_sha, "pharmacy-summary-label")],
+                    "validation_flags": [],
+                },
+                {
+                    "column_id": "amount",
+                    "raw_value": summary_amount,
+                    "evidence": [evidence(page_sha, "pharmacy-summary-amount")],
+                    "validation_flags": [],
+                },
+            ],
+            "validation_flags": [],
+        },
+    )
+    new_result = {
+        **old_result,
+        "rows": new_rows,
+        "source_tables": printed,
+    }
+
+    if accepted:
+        _validate_result(
+            store.job_dir(job_id) / "source.pdf",
+            old_result,
+            new_result,
+            store.job_dir(job_id) / "artifacts",
+        )
+    else:
+        with pytest.raises(ValueError, match="unlinked source row.*financial"):
+            _validate_result(
+                store.job_dir(job_id) / "source.pdf",
+                old_result,
+                new_result,
+                store.job_dir(job_id) / "artifacts",
+            )
+
+
+@pytest.mark.parametrize(
+    ("bill_total", "accepted"),
+    (("150.00", True), ("149.00", False)),
+)
 def test_internal_bill_total_spans_intervening_text_within_prior_row_envelope(
     tmp_path: Path,
     bill_total: str,
@@ -1132,11 +1325,17 @@ def test_internal_bill_total_spans_intervening_text_within_prior_row_envelope(
 
 
 @pytest.mark.parametrize(
-    ("bill_total", "accepted"),
-    (("50.00", True), ("150.00", False)),
+    ("heading", "bill_total", "accepted"),
+    (
+        ("NEXT SECTION", "50.00", True),
+        ("NEXT SECTION", "150.00", False),
+        ("7.57.5", "150.00", True),
+        ("7.57.5", "50.00", False),
+    ),
 )
 def test_internal_bill_total_does_not_cross_an_unlinked_section_heading(
     tmp_path: Path,
+    heading: str,
     bill_total: str,
     accepted: bool,
 ) -> None:
@@ -1178,7 +1377,7 @@ def test_internal_bill_total_does_not_cross_an_unlinked_section_heading(
             "cells": [
                 {
                     "column_id": "description",
-                    "raw_value": "NEXT SECTION",
+                    "raw_value": heading,
                     "evidence": [
                         evidence(
                             page_sha,
