@@ -45,6 +45,48 @@ def test_clean_description_collapses_an_exact_ocr_phrase_echo() -> None:
     assert request_no is None
 
 
+@pytest.mark.parametrize(
+    ("printed_description", "expected"),
+    (
+        (
+            "Becosules Cap 20S 25230730 Becosules Cap",
+            "Becosules Cap 20S 25230730",
+        ),
+        ("Neo | Care Pad Neo I Care Pad", "Neo | Care Pad"),
+    ),
+)
+def test_clean_description_collapses_a_grounded_ocr_suffix_echo(
+    printed_description: str,
+    expected: str,
+) -> None:
+    description, service_date, request_no = _clean_description(
+        printed_description
+    )
+
+    assert description == expected
+    assert service_date is None
+    assert request_no is None
+
+
+@pytest.mark.parametrize(
+    "printed_description",
+    (
+        "Vitamin C and D Vitamin C",
+        "Type I Type II",
+    ),
+)
+def test_clean_description_preserves_legitimate_repeated_phrases(
+    printed_description: str,
+) -> None:
+    description, service_date, request_no = _clean_description(
+        printed_description
+    )
+
+    assert description == printed_description
+    assert service_date is None
+    assert request_no is None
+
+
 def skewed_token(
     index: int,
     text: str,

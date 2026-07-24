@@ -2037,6 +2037,67 @@ def row_category(description: str, table_type: TableType) -> str | None:
     )
 
 
+def _collapse_description_phrase_echo(raw: str) -> str:
+    words = raw.split()
+    midpoint = len(words) // 2
+    if len(words) >= 4 and len(words) % 2 == 0:
+        left = " ".join(words[:midpoint])
+        right = " ".join(words[midpoint:])
+        normalized_left = _normalize(left)
+        normalized_right = _normalize(right)
+        confusable_separator = any(
+            (
+                not _normalize(left_word)
+                and _normalize(right_word) in {"1", "i", "l"}
+            )
+            or (
+                not _normalize(right_word)
+                and _normalize(left_word) in {"1", "i", "l"}
+            )
+            for left_word, right_word in zip(
+                words[:midpoint],
+                words[midpoint:],
+                strict=True,
+            )
+        )
+        if normalized_left == normalized_right or (
+            confusable_separator
+            and SequenceMatcher(
+                None,
+                normalized_left,
+                normalized_right,
+            ).ratio()
+            >= 0.9
+        ):
+            return left
+
+    normalized_word_matches = tuple(
+        match
+        for match in re.finditer(r"[A-Za-z0-9#]+", raw)
+        if _normalize(match.group())
+    )
+    normalized_words = tuple(
+        _normalize(match.group()) for match in normalized_word_matches
+    )
+    for echo_length in range(len(normalized_words) // 2, 1, -1):
+        intervening_matches = normalized_word_matches[
+            echo_length:-echo_length
+        ]
+        if (
+            len(normalized_words) > echo_length * 2
+            and normalized_words[:echo_length]
+            == normalized_words[-echo_length:]
+            and any(
+                any(character.isdigit() for character in match.group())
+                for match in intervening_matches
+            )
+        ):
+            return raw[: normalized_word_matches[-echo_length].start()].rstrip(
+                " -:[]"
+            )
+    return raw
+
+
 def _clean_description(text: str) -> tuple[str, str | None, str | None]:
     raw = re.sub(r"\s+", " ", text).strip(" -:")
     date_match = DATE_PREFIX.match(raw)
@@ -2051,15 +2112,7 @@ def _clean_description(text: str) -> tuple[str, str | None, str | None]:
     raw = BATCH_SUFFIX.sub("", raw)
     raw = DATE_RANGE_SUFFIX.sub("", raw)
     raw = re.sub(r"\s+", " ", raw).strip(" -:[]")
-    words = raw.split()
-    midpoint = len(words) // 2
-    if (
-        len(words) >= 4
-        and len(words) % 2 == 0
-        and _normalize(" ".join(words[:midpoint]))
-        == _normalize(" ".join(words[midpoint:]))
-    ):
-        raw = " ".join(words[:midpoint])
+    raw = _collapse_description_phrase_echo(raw)
     return raw, service_date, request_no
 
 
