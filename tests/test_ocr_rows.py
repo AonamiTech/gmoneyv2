@@ -961,6 +961,9 @@ def test_source_tables_restart_at_arbitrary_header_after_valid_ledger() -> None:
         "0.00",
         "5000.00",
     ]
+    assert [
+        aligned.candidate.description for aligned in result.rows
+    ] == ["Suction Catheter"]
 
 
 def test_arbitrary_data_rows_are_not_promoted_to_repeated_headers() -> None:

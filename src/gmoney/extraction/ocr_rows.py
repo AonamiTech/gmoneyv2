@@ -2819,10 +2819,32 @@ def reconstruct_ocr_rows(
             for index, roles in header_candidates
             if index > header_index and _valid_header_line(lines[index], roles)
         )
+    raw_source_headers = _raw_source_headers(lines, width)
+    recognized_source_headers = (
+        (primary_header, *repeated_header_blocks)
+        if header_valid
+        else ()
+    )
+    arbitrary_source_headers = tuple(
+        block
+        for block in raw_source_headers
+        if header_valid
+        and block.start > header_index
+        and not any(
+            block.start <= recognized.end
+            and block.end >= recognized.start
+            for recognized in recognized_source_headers
+        )
+    )
     repeated_header_indexes = tuple(block.start for block in repeated_header_blocks)
     repeated_header_by_line = {
         index: block
         for block in repeated_header_blocks
+        for index in range(block.start, block.end + 1)
+    }
+    arbitrary_header_by_line = {
+        index: block
+        for block in arbitrary_source_headers
         for index in range(block.start, block.end + 1)
     }
     first_segment_end = repeated_header_indexes[0] if repeated_header_indexes else len(lines)
@@ -3142,14 +3164,22 @@ def reconstruct_ocr_rows(
         )
         aligned_description_raw.append(raw_description)
 
+    in_unmapped_source_segment = False
     for source_row, line in enumerate(data_lines, start=(header_index + 1 if header_valid else 0)):
         if _is_printed_table_footer(line):
             pending_description_tokens = []
             pending_service_date = None
             pending_service_date_ids = ()
             break
+        if source_row in arbitrary_header_by_line:
+            in_unmapped_source_segment = True
+            pending_description_tokens = []
+            pending_service_date = None
+            pending_service_date_ids = ()
+            continue
         repeated_block = repeated_header_by_line.get(source_row)
         if repeated_block is not None:
+            in_unmapped_source_segment = False
             if source_row != repeated_block.end:
                 continue
             repeated_roles = repeated_block.roles
@@ -3199,6 +3229,8 @@ def reconstruct_ocr_rows(
                 column_centers,
                 description_header_centers,
             )
+            continue
+        if in_unmapped_source_segment:
             continue
         numeric = _numeric_tokens(line)
         in_return_section = updated_return_section_state(
@@ -3754,30 +3786,15 @@ def reconstruct_ocr_rows(
             raw_description=description_text,
         )
 
-    raw_source_headers = _raw_source_headers(lines, width)
     source_header = (
         primary_header
         if header_valid
         else (raw_source_headers[0] if raw_source_headers else None)
     )
     if header_valid:
-        recognized_source_headers = (
-            primary_header,
-            *repeated_header_blocks,
-        )
-        arbitrary_restarts = tuple(
-            block
-            for block in raw_source_headers
-            if block.start > header_index
-            and not any(
-                block.start <= recognized.end
-                and block.end >= recognized.start
-                for recognized in recognized_source_headers
-            )
-        )
         source_repeated_headers = tuple(
             sorted(
-                (*repeated_header_blocks, *arbitrary_restarts),
+                (*repeated_header_blocks, *arbitrary_source_headers),
                 key=lambda block: block.start,
             )
         )
