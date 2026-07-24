@@ -585,7 +585,7 @@ def test_slanted_serial_descriptions_start_distinct_financial_rows() -> None:
         token(8, "1 ZEPOXIN INJ", (50, 55, 300, 95)),
         token(9, "2 ONDET 2ML", (50, 80, 280, 120)),
         token(10, "12.72", (650, 90, 700, 130)),
-        token(11, "2", (760, 90, 780, 130)),
+        token(11, "2.", (760, 90, 780, 130)),
         token(12, "25.44", (880, 90, 950, 130)),
     )
 

@@ -63,9 +63,13 @@ def parse_decimal(value: object) -> Decimal | None:
 
 
 def parse_quantity(value: object) -> Decimal | None:
-    text = str(value or "")
+    text = str(value or "").strip()
     duration = DAY_QUANTITY.fullmatch(text)
-    return parse_decimal(duration.group("quantity") if duration is not None else text)
+    if duration is not None:
+        text = duration.group("quantity")
+    elif re.fullmatch(r"[+-]?\d+\.", text):
+        text = text[:-1]
+    return parse_decimal(text)
 
 
 def parse_service_date(value: object) -> str | None:

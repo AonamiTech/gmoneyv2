@@ -18,7 +18,11 @@ from gmoney.contracts.extraction import (
 )
 from gmoney.extraction.rows import CandidateLedgerRow
 from gmoney.extraction.spatial import AlignedLedgerRow
-from gmoney.extraction.typed_values import DAY_QUANTITY, parse_decimal
+from gmoney.extraction.typed_values import (
+    DAY_QUANTITY,
+    parse_decimal,
+    parse_quantity,
+)
 
 HEADER_TERMS: dict[str, tuple[str, ...]] = {
     "serial": ("sr no", "sr n", "s no", "serial no", "#"),
@@ -3827,6 +3831,45 @@ def reconstruct_ocr_rows(
             used.add(_numeric_identity(token, value))
             field_tokens[role] = pair.token_ids
             values[role] = value
+
+        if (
+            "quantity" in column_centers
+            and values["quantity"] is None
+            and values["rate"] is not None
+        ):
+            quantity_target = column_centers["quantity"]
+            assigned_token_ids = {
+                token_id
+                for token_ids in field_tokens.values()
+                for token_id in token_ids
+            }
+            punctuated_quantities = tuple(
+                (token, parsed)
+                for token in line.tokens
+                if token.token_id not in assigned_token_ids
+                and parse_decimal(token.text) is None
+                and (parsed := parse_quantity(token.text)) is not None
+                and abs(
+                    ((_center_x(token) - left) / width)
+                    - quantity_target
+                )
+                <= 0.06
+            )
+            if len(punctuated_quantities) == 1:
+                quantity_token, quantity_value = punctuated_quantities[0]
+                expected_amount = quantity_value * values["rate"]
+                if values["discount"] is not None:
+                    expected_amount -= values["discount"]
+                compared_amount = (
+                    abs(amount)
+                    if amount < 0 <= expected_amount
+                    else amount
+                )
+                if abs(expected_amount - compared_amount) <= Decimal("0.01"):
+                    values["quantity"] = quantity_value
+                    field_tokens["quantity"] = (
+                        quantity_token.token_id,
+                    )
 
         normalized_description = _normalize(description)
         if _is_metadata_description(description):
