@@ -283,15 +283,77 @@ class HeaderBlock:
 def _lines(tokens: tuple[OcrToken, ...]) -> tuple[OcrLine, ...]:
     if not tokens:
         return ()
-    tolerance = max(5.0, median(_height(token) for token in tokens) * 0.65)
+
+    def is_vertical_decimal_suffix_pair(
+        first: OcrToken,
+        second: OcrToken,
+    ) -> bool:
+        for decimal_token, suffix_token in (
+            (first, second),
+            (second, first),
+        ):
+            if not (
+                re.fullmatch(
+                    r"[+-]?\d[\d,]*\.\d",
+                    decimal_token.text.strip(),
+                )
+                and re.fullmatch(r"\d", suffix_token.text.strip())
+            ):
+                continue
+            _, _, decimal_right, decimal_bottom = _bounds(decimal_token)
+            suffix_left, suffix_top, suffix_right, _ = _bounds(suffix_token)
+            decimal_width = max(
+                1.0,
+                _bounds(decimal_token)[2] - _bounds(decimal_token)[0],
+            )
+            if (
+                suffix_top >= decimal_bottom - 2.0
+                and abs(suffix_right - decimal_right)
+                <= max(8.0, decimal_width * 0.12)
+                and suffix_left
+                >= decimal_right - max(36.0, decimal_width * 0.32)
+            ):
+                return True
+        return False
+
+    typical_height = median(_height(token) for token in tokens)
+    tolerance = max(5.0, typical_height * 0.65)
+    slanted_numeric_tolerance = max(tolerance, typical_height * 0.85)
     grouped: list[list[OcrToken]] = []
     for token in sorted(tokens, key=lambda item: (_center_y(item), _center_x(item))):
         if not grouped:
             grouped.append([token])
             continue
-        current_y = median(_center_y(item) for item in grouped[-1])
-        if abs(_center_y(token) - current_y) <= tolerance:
-            grouped[-1].append(token)
+        current = grouped[-1]
+        current_y = median(_center_y(item) for item in current)
+        effective_tolerance = (
+            slanted_numeric_tolerance
+            if any(parse_decimal(item.text) is not None for item in current)
+            else tolerance
+        )
+        token_left, _, token_right, _ = _bounds(token)
+        same_lane_conflict = any(
+            parse_decimal(token.text) is not None
+            and parse_decimal(existing.text) is not None
+            and not is_vertical_decimal_suffix_pair(existing, token)
+            and
+            min(token_right, existing_right)
+            - max(token_left, existing_left)
+            >= min(
+                max(1.0, token_right - token_left),
+                max(1.0, existing_right - existing_left),
+            )
+            * 0.5
+            and abs(_center_y(token) - _center_y(existing))
+            > max(4.0, min(_height(token), _height(existing)) * 0.3)
+            for existing in current
+            for existing_left, _, existing_right, _ in (_bounds(existing),)
+        )
+        if (
+            abs(_center_y(token) - current_y) <= effective_tolerance
+            and not same_lane_conflict
+        ):
+            current.append(token)
         else:
             grouped.append([token])
     return tuple(OcrLine(tuple(sorted(group, key=_center_x))) for group in grouped)

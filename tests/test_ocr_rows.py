@@ -1174,6 +1174,55 @@ def test_merged_date_and_description_in_date_lane_is_grounded_and_split() -> Non
     assert cells_by_field["description"].evidence
 
 
+def test_slanted_rows_do_not_shift_total_amount_into_prior_charge() -> None:
+    tokens = (
+        token(0, "Service Name", (100, 10, 300, 30)),
+        token(1, "Qty / Days", (600, 10, 680, 30)),
+        token(2, "Amount", (730, 10, 810, 30)),
+        token(3, "Total Amount", (900, 10, 990, 30)),
+        token(4, "Diagnostics", (100, 50, 260, 90)),
+        token(5, "500.00", (900, 80, 980, 120)),
+        token(6, "500.00", (730, 95, 810, 135)),
+        token(7, "1.00", (610, 105, 670, 145)),
+        token(8, "COMPLETE BLOOD COUNT(CBC)", (100, 110, 430, 150)),
+        token(9, "1,000.00", (900, 120, 980, 160)),
+        token(10, "1,000.00", (730, 135, 810, 175)),
+        token(11, "1.00", (610, 145, 670, 185)),
+        token(12, "RENAL FUNCTION TEST(RFT)", (100, 150, 410, 190)),
+        token(13, "1,500.00", (900, 160, 980, 200)),
+        token(14, "Sub Total : Diagnostics", (100, 190, 390, 230)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(60, 0, 1000, 240),
+    )
+
+    assert [
+        (aligned.candidate.description, aligned.candidate.amount)
+        for aligned in result.rows
+    ] == [
+        ("COMPLETE BLOOD COUNT(CBC)", Decimal("500.00")),
+        ("RENAL FUNCTION TEST(RFT)", Decimal("1000.00")),
+    ]
+    amount_column = next(
+        column
+        for column in result.source_tables[0].columns
+        if column.canonical_field == "net_amount"
+    )
+    assert [
+        cell.raw_value
+        for source_row in result.source_tables[0].rows
+        if (cell := next(
+            item
+            for item in source_row.cells
+            if item.column_id == amount_column.id
+        )).raw_value
+    ] == ["500.00", "1,000.00", "1,500.00"]
+
+
 def test_separate_description_token_shifted_into_wide_date_lane_is_split() -> None:
     tokens = (
         token(0, "Date", (80, 20, 160, 35)),
