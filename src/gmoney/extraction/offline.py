@@ -119,6 +119,23 @@ class TableWork:
     box: tuple[int, int, int, int]
 
 
+def _recovery_prior_schemas(
+    schemas: tuple[TableSchemaState, ...] | list[TableSchemaState],
+    *,
+    page_number: int,
+    table_id: str,
+) -> tuple[TableSchemaState, ...]:
+    """Exclude a table's final state from retries that start at its beginning."""
+    return tuple(
+        schema
+        for schema in schemas
+        if (
+            schema.source_page != page_number
+            or schema.source_table != table_id
+        )
+    )
+
+
 @dataclass(frozen=True)
 class VlAsset:
     path: Path
@@ -2890,7 +2907,11 @@ class OfflineExtractor:
                         source=source,
                         artifact_root=artifact_root,
                         work=work,
-                        prior_schemas=tuple(schema_states),
+                        prior_schemas=_recovery_prior_schemas(
+                            schema_states,
+                            page_number=work.page_number,
+                            table_id=work.table_id,
+                        ),
                         page_artifact_sha256=work.page_artifact_sha256,
                         baseline=reconstruction,
                         baseline_tokens=tokens_in_box(tokens, work.box),

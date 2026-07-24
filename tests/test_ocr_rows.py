@@ -10,7 +10,10 @@ from gmoney.extraction.ocr_rows import (
     fuse_provider_descriptions,
     reconstruct_ocr_rows,
 )
-from gmoney.extraction.offline import _link_source_tables
+from gmoney.extraction.offline import (
+    _link_source_tables,
+    _recovery_prior_schemas,
+)
 from gmoney.extraction.rows import CandidateLedgerRow
 
 
@@ -4616,6 +4619,55 @@ def test_pharmacy_return_section_continues_to_the_next_page_table() -> None:
         "positive_amount_in_return_section",
     )
     assert normal_page.rows[0].candidate.validation_flags == ()
+
+
+def test_recovery_does_not_inherit_its_own_table_end_state() -> None:
+    tokens = (
+        token(0, "ProductName", (300, 25, 450, 40)),
+        token(1, "Qty", (700, 25, 750, 40)),
+        token(2, "Rate", (800, 25, 850, 40)),
+        token(3, "Total", (900, 25, 960, 40)),
+        token(4, "Issued item", (300, 65, 500, 80)),
+        token(5, "1", (710, 65, 730, 80)),
+        token(6, "20.00", (800, 65, 850, 80)),
+        token(7, "20.00", (900, 65, 960, 80)),
+        token(8, "IP Pharmacy Returns", (300, 105, 500, 120)),
+        token(9, "Returned item", (300, 145, 500, 160)),
+        token(10, "1", (710, 145, 730, 160)),
+        token(11, "10.00", (800, 145, 850, 160)),
+        token(12, "-10.00", (900, 145, 960, 160)),
+    )
+    baseline = reconstruct_ocr_rows(
+        tokens,
+        page_number=6,
+        table_id="p6-t1",
+        box=(280, 15, 980, 180),
+    )
+    assert baseline.schema is not None
+    assert baseline.schema.in_return_section
+
+    recovery_schemas = _recovery_prior_schemas(
+        (baseline.schema,),
+        page_number=6,
+        table_id="p6-t1",
+    )
+    recovered = reconstruct_ocr_rows(
+        tokens,
+        page_number=6,
+        table_id="p6-t1",
+        box=(280, 15, 980, 180),
+        prior_schemas=recovery_schemas,
+    )
+
+    assert recovery_schemas == ()
+    assert tuple(row.candidate.validation_flags for row in recovered.rows) == (
+        (),
+        (),
+    )
+    assert tuple(row.candidate.role for row in recovered.rows) == (
+        RowRole.DETAIL,
+        RowRole.REFUND,
+    )
 
 
 def test_pharmacy_description_wrap_inside_numeric_row_envelope_is_grounded() -> None:
