@@ -6,7 +6,11 @@ import numpy as np
 import pytest
 
 from gmoney.evaluation.corpus import sha256_file
-from gmoney.geometry.crop import crop_region, render_pdf_region
+from gmoney.geometry.crop import (
+    color_overlay_suppressed_variant,
+    crop_region,
+    render_pdf_region,
+)
 from gmoney.geometry.normalize import normalize_page
 from gmoney.geometry.quality import estimate_skew
 from gmoney.geometry.render import render_pdf
@@ -91,6 +95,30 @@ def test_crop_retains_inverse_page_mapping(tmp_path: Path) -> None:
     assert crop_points[0] == (0.0, 0.0)
     restored = apply_matrix(result.transform.inverse_matrix, crop_points)
     assert restored == page_points
+
+
+def test_color_overlay_suppression_fades_colored_marks_and_preserves_dark_text(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "colored.png"
+    image = np.asarray(
+        (
+            ((10, 10, 10), (120, 50, 200)),
+            ((255, 255, 255), (40, 180, 80)),
+        ),
+        dtype=np.uint8,
+    )
+    assert cv2.imwrite(str(source), image)
+
+    result = color_overlay_suppressed_variant(
+        source,
+        tmp_path / "overlay-suppressed.png",
+    )
+
+    recovered = cv2.imread(str(result.output_path), cv2.IMREAD_GRAYSCALE)
+    assert recovered is not None
+    assert recovered.tolist() == [[10, 200], [255, 180]]
+    assert result.artifact_sha256 == sha256_file(result.output_path)
 
 
 def test_400_dpi_region_rerender_round_trips_to_300_dpi_page(tmp_path: Path) -> None:

@@ -203,16 +203,24 @@ def digest(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
-def evidence(artifact_sha256: str, token_id: str) -> dict[str, Any]:
+def evidence(
+    artifact_sha256: str,
+    token_id: str,
+    *,
+    left: int = 1,
+    top: int = 1,
+    right: int = 10,
+    bottom: int = 10,
+) -> dict[str, Any]:
     return {
         "page_number": 1,
         "table_id": "p1-t1",
         "polygon": {
             "points": [
-                {"x": 1, "y": 1},
-                {"x": 10, "y": 1},
-                {"x": 10, "y": 10},
-                {"x": 1, "y": 10},
+                {"x": left, "y": top},
+                {"x": right, "y": top},
+                {"x": right, "y": bottom},
+                {"x": left, "y": bottom},
             ]
         },
         "artifact_sha256": artifact_sha256,
@@ -903,6 +911,16 @@ def test_reprocess_validation_accepts_only_matching_internal_bill_total(
         row("first-row", page_sha, amount="100.00"),
         row("following-row", page_sha, amount="50.00"),
     ]
+    first_description_evidence = evidence(
+        page_sha,
+        "description-token",
+        left=100,
+        top=100,
+        right=220,
+        bottom=120,
+    )
+    new_rows[0]["field_evidence"]["description"] = [first_description_evidence]
+    new_rows[0]["evidence"] = [first_description_evidence]
     new_rows[1]["row_order"] = 1
     printed = source_tables(new_rows, page_sha)
     printed[0]["rows"].insert(
@@ -910,6 +928,38 @@ def test_reprocess_validation_accepts_only_matching_internal_bill_total(
         {
             "id": "p1-t1-s1-r2",
             "order": 1,
+            "canonical_row_id": None,
+            "cells": [
+                {
+                    "column_id": "description",
+                    "raw_value": "Syringe",
+                    "evidence": [
+                        evidence(
+                            page_sha,
+                            "continuation-description",
+                            left=100,
+                            top=125,
+                            right=180,
+                            bottom=145,
+                        )
+                    ],
+                    "validation_flags": [],
+                },
+                {
+                    "column_id": "amount",
+                    "raw_value": None,
+                    "evidence": [],
+                    "validation_flags": ["empty_cell"],
+                },
+            ],
+            "validation_flags": [],
+        },
+    )
+    printed[0]["rows"].insert(
+        2,
+        {
+            "id": "p1-t1-s1-r3",
+            "order": 2,
             "canonical_row_id": None,
             "cells": [
                 {
@@ -928,8 +978,216 @@ def test_reprocess_validation_accepts_only_matching_internal_bill_total(
             "validation_flags": [],
         },
     )
-    printed[0]["rows"][2]["id"] = "p1-t1-s1-r3"
-    printed[0]["rows"][2]["order"] = 2
+    printed[0]["rows"][3]["id"] = "p1-t1-s1-r4"
+    printed[0]["rows"][3]["order"] = 3
+    new_result = {
+        **old_result,
+        "rows": new_rows,
+        "source_tables": printed,
+    }
+
+    if accepted:
+        _validate_result(
+            store.job_dir(job_id) / "source.pdf",
+            old_result,
+            new_result,
+            store.job_dir(job_id) / "artifacts",
+        )
+    else:
+        with pytest.raises(ValueError, match="unlinked source row.*financial"):
+            _validate_result(
+                store.job_dir(job_id) / "source.pdf",
+                old_result,
+                new_result,
+                store.job_dir(job_id) / "artifacts",
+            )
+
+
+@pytest.mark.parametrize("bill_total", ("150.00", "149.00"))
+def test_internal_bill_total_rejects_ambiguous_intervening_aligned_text(
+    tmp_path: Path,
+    bill_total: str,
+) -> None:
+    store, job_id, old_result = setup_job(tmp_path)
+    page_sha = old_result["page_assets"][0]["artifact_sha256"]
+    new_rows = [
+        row("first-row", page_sha, amount="100.00"),
+        row("second-row", page_sha, amount="50.00"),
+        row("following-row", page_sha, amount="25.00"),
+    ]
+    first_description_evidence = evidence(
+        page_sha,
+        "description-token",
+        left=100,
+        top=100,
+        right=220,
+        bottom=120,
+    )
+    new_rows[0]["field_evidence"]["description"] = [first_description_evidence]
+    new_rows[0]["evidence"] = [first_description_evidence]
+    for order, canonical in enumerate(new_rows):
+        canonical["row_order"] = order
+    printed = source_tables(new_rows, page_sha)
+    printed[0]["rows"].insert(
+        1,
+        {
+            "id": "intervening-continuation",
+            "order": 1,
+            "canonical_row_id": None,
+            "cells": [
+                {
+                    "column_id": "description",
+                    "raw_value": "Syringe",
+                    "evidence": [
+                        evidence(
+                            page_sha,
+                            "intervening-continuation",
+                            left=100,
+                            top=125,
+                            right=180,
+                            bottom=145,
+                        )
+                    ],
+                    "validation_flags": [],
+                },
+                {
+                    "column_id": "amount",
+                    "raw_value": None,
+                    "evidence": [],
+                    "validation_flags": ["empty_cell"],
+                },
+            ],
+            "validation_flags": [],
+        },
+    )
+    printed[0]["rows"].insert(
+        3,
+        {
+            "id": "intervening-bill-total",
+            "order": 3,
+            "canonical_row_id": None,
+            "cells": [
+                {
+                    "column_id": "description",
+                    "raw_value": "BILL TOTAL",
+                    "evidence": [evidence(page_sha, "intervening-bill-total-label")],
+                    "validation_flags": [],
+                },
+                {
+                    "column_id": "amount",
+                    "raw_value": bill_total,
+                    "evidence": [evidence(page_sha, "intervening-bill-total-amount")],
+                    "validation_flags": [],
+                },
+            ],
+            "validation_flags": [],
+        },
+    )
+    for order, source_row in enumerate(printed[0]["rows"]):
+        source_row["id"] = f"p1-t1-s1-r{order + 1}"
+        source_row["order"] = order
+    new_result = {
+        **old_result,
+        "rows": new_rows,
+        "source_tables": printed,
+    }
+
+    with pytest.raises(ValueError, match="unlinked source row.*financial"):
+        _validate_result(
+            store.job_dir(job_id) / "source.pdf",
+            old_result,
+            new_result,
+            store.job_dir(job_id) / "artifacts",
+        )
+
+
+@pytest.mark.parametrize(
+    ("bill_total", "accepted"),
+    (("50.00", True), ("150.00", False)),
+)
+def test_internal_bill_total_does_not_cross_an_unlinked_section_heading(
+    tmp_path: Path,
+    bill_total: str,
+    accepted: bool,
+) -> None:
+    store, job_id, old_result = setup_job(tmp_path)
+    page_sha = old_result["page_assets"][0]["artifact_sha256"]
+    new_rows = [
+        row("first-section-row", page_sha, amount="100.00"),
+        row("second-section-row", page_sha, amount="50.00"),
+        row("following-row", page_sha, amount="25.00"),
+    ]
+    first_description_evidence = evidence(
+        page_sha,
+        "description-token",
+        left=100,
+        top=100,
+        right=220,
+        bottom=120,
+    )
+    new_rows[0]["field_evidence"]["description"] = [first_description_evidence]
+    new_rows[0]["evidence"] = [first_description_evidence]
+    for order, canonical in enumerate(new_rows):
+        canonical["row_order"] = order
+    printed = source_tables(new_rows, page_sha)
+    printed[0]["rows"].insert(
+        1,
+        {
+            "id": "section-heading",
+            "order": 1,
+            "canonical_row_id": None,
+            "cells": [
+                {
+                    "column_id": "description",
+                    "raw_value": "NEXT SECTION",
+                    "evidence": [
+                        evidence(
+                            page_sha,
+                            "section-heading",
+                            left=100,
+                            top=125,
+                            right=220,
+                            bottom=145,
+                        )
+                    ],
+                    "validation_flags": [],
+                },
+                {
+                    "column_id": "amount",
+                    "raw_value": None,
+                    "evidence": [],
+                    "validation_flags": ["empty_cell"],
+                },
+            ],
+            "validation_flags": [],
+        },
+    )
+    printed[0]["rows"].insert(
+        3,
+        {
+            "id": "section-bill-total",
+            "order": 3,
+            "canonical_row_id": None,
+            "cells": [
+                {
+                    "column_id": "description",
+                    "raw_value": "BILL TOTAL",
+                    "evidence": [evidence(page_sha, "section-bill-total-label")],
+                    "validation_flags": [],
+                },
+                {
+                    "column_id": "amount",
+                    "raw_value": bill_total,
+                    "evidence": [evidence(page_sha, "section-bill-total-amount")],
+                    "validation_flags": [],
+                },
+            ],
+            "validation_flags": [],
+        },
+    )
+    for order, source_row in enumerate(printed[0]["rows"]):
+        source_row["id"] = f"p1-t1-s1-r{order + 1}"
+        source_row["order"] = order
     new_result = {
         **old_result,
         "rows": new_rows,

@@ -123,3 +123,20 @@ def clahe_variant(source: Path, output: Path) -> PhotometricVariant:
         raise RuntimeError(f"failed to write CLAHE crop: {temporary}")
     temporary.replace(output)
     return PhotometricVariant(output, sha256_file(output))
+
+
+def color_overlay_suppressed_variant(
+    source: Path,
+    output: Path,
+) -> PhotometricVariant:
+    """Fade chromatic overlays while retaining neutral dark printed text."""
+    image = cv2.imread(str(source), cv2.IMREAD_COLOR)
+    if image is None:
+        raise ValueError(f"cannot read crop: {source}")
+    suppressed = image.max(axis=2)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_name(f".{output.stem}.tmp{output.suffix}")
+    if not cv2.imwrite(str(temporary), suppressed):
+        raise RuntimeError(f"failed to write color-suppressed crop: {temporary}")
+    temporary.replace(output)
+    return PhotometricVariant(output, sha256_file(output))

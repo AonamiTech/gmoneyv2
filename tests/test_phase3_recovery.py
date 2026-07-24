@@ -6,7 +6,15 @@ from types import SimpleNamespace
 import pytest
 
 from gmoney.contracts.evidence import OcrToken, Point, Polygon
-from gmoney.contracts.extraction import RowRole, TableType
+from gmoney.contracts.extraction import (
+    EvidenceRef,
+    RowRole,
+    SourceCell,
+    SourceColumn,
+    SourceRow,
+    SourceTable,
+    TableType,
+)
 from gmoney.contracts.phase3 import (
     GeminiMode,
     ProfileMatch,
@@ -21,10 +29,14 @@ from gmoney.extraction.ocr_rows import (
 from gmoney.extraction.offline import OfflineExtractor, TableWork
 from gmoney.extraction.recovery import (
     decide_recovery,
+    description_lane_recovery_regions,
     is_implausibly_low_yield,
     map_crop_tokens_to_page,
+    map_page_box_to_crop_pixels,
+    merge_recovery_tokens,
     needs_field_quality_recovery,
     reconstruction_quality,
+    replace_tokens_in_regions,
     safely_improves_reconstruction,
 )
 from gmoney.extraction.rows import CandidateLedgerRow
@@ -54,6 +66,7 @@ def _aligned_row(
     service_date: str | None = None,
     quantity: Decimal | None = None,
     rate: Decimal | None = Decimal("100"),
+    amount: Decimal = Decimal("100"),
     flags: tuple[str, ...] = (),
     mapped_fields: tuple[str, ...] = ("description", "rate", "amount"),
     role: RowRole = RowRole.DETAIL,
@@ -66,12 +79,12 @@ def _aligned_row(
         candidate=CandidateLedgerRow(
             source_row=source_row,
             role=role,
-            cells=(description, str(quantity or ""), str(rate or ""), "100"),
+            cells=(description, str(quantity or ""), str(rate or ""), str(amount)),
             description=description,
             service_date=service_date,
             quantity=quantity,
             rate=rate,
-            amount=Decimal("100"),
+            amount=amount,
             table_type=table_type,
             source_route="ocr_spatial_graph",
             validation_flags=flags,
@@ -184,6 +197,380 @@ def test_crop_tokens_map_back_to_original_page() -> None:
     assert mapped.token_id == "recovery:1"
     assert mapped.polygon.points[0] == Point(x=200, y=300)
     assert mapped.polygon.points[2] == Point(x=300, y=350)
+
+
+def _evidence_at(
+    token_id: str,
+    left: float,
+    top: float,
+    right: float,
+    bottom: float,
+) -> tuple[EvidenceRef, ...]:
+    return (
+        EvidenceRef(
+            page_number=1,
+            table_id="table-1",
+            polygon=Polygon(
+                points=(
+                    Point(x=left, y=top),
+                    Point(x=right, y=top),
+                    Point(x=right, y=bottom),
+                    Point(x=left, y=bottom),
+                )
+            ),
+            artifact_sha256="a" * 64,
+            token_ids=(token_id,),
+        ),
+    )
+
+
+def _description_recovery_source_table() -> SourceTable:
+    columns = (
+        SourceColumn(
+            id="description",
+            label="ProductName",
+            order=0,
+            canonical_field="description",
+            evidence=_evidence_at("h-description", 100, 100, 220, 120),
+        ),
+        SourceColumn(
+            id="batch",
+            label="Batch No",
+            order=1,
+            evidence=_evidence_at("h-batch", 400, 100, 470, 120),
+        ),
+        SourceColumn(
+            id="quantity",
+            label="Qty",
+            order=2,
+            canonical_field="quantity",
+            evidence=_evidence_at("h-quantity", 500, 100, 540, 120),
+        ),
+        SourceColumn(
+            id="rate",
+            label="Rate",
+            order=3,
+            canonical_field="unit_price",
+            evidence=_evidence_at("h-rate", 600, 100, 640, 120),
+        ),
+        SourceColumn(
+            id="total",
+            label="Total",
+            order=4,
+            canonical_field="net_amount",
+            evidence=_evidence_at("h-total", 700, 100, 750, 120),
+        ),
+    )
+
+    def cell(
+        column_id: str,
+        value: str | None,
+        row: int,
+    ) -> SourceCell:
+        x_by_column = {
+            "description": 110,
+            "batch": 410,
+            "quantity": 510,
+            "rate": 610,
+            "total": 710,
+        }
+        return SourceCell(
+            column_id=column_id,
+            raw_value=value,
+            evidence=(
+                _evidence_at(
+                    f"r{row}-{column_id}",
+                    x_by_column[column_id],
+                    140 + row * 30,
+                    x_by_column[column_id] + 25,
+                    160 + row * 30,
+                )
+                if value
+                else ()
+            ),
+        )
+
+    values = (
+        ("Emeset", "A1", "1", "25.44", "25.44"),
+        (None, "B2", "3", "37.23", "111.69"),
+        ("RoadSterile Water", "C3", "5", "3.04", "15.20"),
+        (None, "D4", "4", "153.80", "615.20"),
+        (None, None, "BILL TOTAL", None, "767.53"),
+    )
+    rows = tuple(
+        SourceRow(
+            id=f"row-{order}",
+            order=order,
+            cells=tuple(
+                cell(column.id, value, order)
+                for column, value in zip(columns, row_values, strict=True)
+            ),
+        )
+        for order, row_values in enumerate(values)
+    )
+    return SourceTable(
+        id="table-1-s1",
+        page_number=1,
+        table_id="table-1",
+        table_type=TableType.PHARMACY,
+        columns=columns,
+        rows=rows,
+    )
+
+
+def test_description_lane_recovery_targets_only_consecutive_grounded_detail_rows() -> None:
+    reconstruction = ReconstructionResult(
+        rows=(),
+        schema=_schema(TableType.PHARMACY),
+        diagnostics={"table_type": TableType.PHARMACY.value},
+        source_tables=(_description_recovery_source_table(),),
+    )
+
+    assert description_lane_recovery_regions(
+        reconstruction,
+        table_box=(50, 80, 800, 300),
+    ) == ((100, 165, 400, 255),)
+
+
+def test_first_description_recovery_band_stays_below_grounded_headers() -> None:
+    table = _description_recovery_source_table()
+    first_cells = list(table.rows[0].cells)
+    first_cells[0] = first_cells[0].model_copy(
+        update={"raw_value": None, "evidence": ()}
+    )
+    first_cells[1] = first_cells[1].model_copy(
+        update={
+            "evidence": _evidence_at(
+                "r0-tall-batch-overlay",
+                410,
+                80,
+                470,
+                180,
+            )
+        }
+    )
+    first_row = table.rows[0].model_copy(update={"cells": tuple(first_cells)})
+    reconstruction = ReconstructionResult(
+        rows=(),
+        schema=_schema(TableType.PHARMACY),
+        diagnostics={"table_type": TableType.PHARMACY.value},
+        source_tables=(
+            table.model_copy(
+                update={"rows": (first_row, *table.rows[1:])}
+            ),
+        ),
+    )
+
+    assert description_lane_recovery_regions(
+        reconstruction,
+        table_box=(50, 80, 800, 300),
+    ) == ((100, 120, 400, 255),)
+
+
+def test_description_recovery_uses_parseable_gross_when_net_cell_is_blank() -> None:
+    table = _description_recovery_source_table()
+    gross_column = SourceColumn(
+        id="gross",
+        label="Gross",
+        order=len(table.columns),
+        canonical_field="gross_amount",
+        evidence=_evidence_at("h-gross", 760, 100, 790, 120),
+    )
+    target_row = table.rows[1]
+    target_cells = [
+        cell.model_copy(
+            update={"raw_value": None, "evidence": ()}
+        )
+        if cell.column_id == "total"
+        else cell
+        for cell in target_row.cells
+    ]
+    target_cells.append(
+        SourceCell(
+            column_id="gross",
+            raw_value="111.69",
+            evidence=_evidence_at("r1-gross", 760, 170, 790, 190),
+        )
+    )
+    target_row = target_row.model_copy(update={"cells": tuple(target_cells)})
+    reconstruction = ReconstructionResult(
+        rows=(),
+        schema=_schema(TableType.PHARMACY),
+        diagnostics={"table_type": TableType.PHARMACY.value},
+        source_tables=(
+            table.model_copy(
+                update={
+                    "columns": (*table.columns, gross_column),
+                    "rows": (target_row,),
+                }
+            ),
+        ),
+    )
+
+    assert description_lane_recovery_regions(
+        reconstruction,
+        table_box=(50, 80, 800, 300),
+    ) == ((100, 160, 400, 200),)
+
+
+def test_normal_yield_with_missing_grounded_descriptions_enters_crop_recovery() -> None:
+    reconstruction = ReconstructionResult(
+        rows=(_aligned_row(0, description="Emeset"),),
+        schema=_schema(TableType.PHARMACY),
+        diagnostics={"table_type": TableType.PHARMACY.value},
+        source_tables=(_description_recovery_source_table(),),
+    )
+
+    assert offline_module._should_attempt_crop_recovery(
+        reconstruction,
+        parsed_rows=(object(),),
+        table_box=(50, 80, 800, 300),
+    )
+
+
+def test_page_region_maps_to_high_resolution_crop_pixels() -> None:
+    assert map_page_box_to_crop_pixels(
+        (100, 200, 400, 500),
+        parent_page_box=(50, 100, 650, 700),
+        crop_width=1200,
+        crop_height=900,
+    ) == (100, 150, 700, 600)
+
+
+def test_targeted_tokens_replace_only_ocr_inside_recovery_regions() -> None:
+    original = (
+        _ocr_token("keep-left", "a" * 64, "keep-left").model_copy(
+            update={
+                "polygon": Polygon(
+                    points=(
+                        Point(x=10, y=200),
+                        Point(x=40, y=200),
+                        Point(x=40, y=220),
+                        Point(x=10, y=220),
+                    )
+                )
+            }
+        ),
+        _ocr_token("RoadSterile Water", "a" * 64, "replace").model_copy(
+            update={
+                "polygon": Polygon(
+                    points=(
+                        Point(x=120, y=200),
+                        Point(x=350, y=200),
+                        Point(x=350, y=220),
+                        Point(x=120, y=220),
+                    )
+                )
+            }
+        ),
+        _ocr_token("keep-right", "a" * 64, "keep-right").model_copy(
+            update={
+                "polygon": Polygon(
+                    points=(
+                        Point(x=500, y=200),
+                        Point(x=550, y=200),
+                        Point(x=550, y=220),
+                        Point(x=500, y=220),
+                    )
+                )
+            }
+        ),
+    )
+    recovered = (_ocr_token("Sterile Water 10ML", "a" * 64, "recovered"),)
+
+    merged = replace_tokens_in_regions(
+        original,
+        recovered,
+        regions=((100, 185, 400, 245),),
+    )
+
+    assert tuple(token.token_id for token in merged) == (
+        "keep-left",
+        "keep-right",
+        "recovered",
+    )
+
+
+def test_targeted_merge_preserves_baseline_evidence_and_adds_only_missing_geometry() -> None:
+    baseline = (
+        _ocr_token("RoadSterile Water", "a" * 64, "baseline-target").model_copy(
+            update={
+                "polygon": Polygon(
+                    points=(
+                        Point(x=120, y=200),
+                        Point(x=350, y=200),
+                        Point(x=350, y=220),
+                        Point(x=120, y=220),
+                    )
+                )
+            }
+        ),
+        _ocr_token("25.44", "a" * 64, "baseline-amount").model_copy(
+            update={
+                "polygon": Polygon(
+                    points=(
+                        Point(x=500, y=200),
+                        Point(x=550, y=200),
+                        Point(x=550, y=220),
+                        Point(x=500, y=220),
+                    )
+                )
+            }
+        ),
+    )
+    high_resolution = (
+        _ocr_token("25,44", "a" * 64, "high-amount").model_copy(
+            update={
+                "polygon": Polygon(
+                    points=(
+                        Point(x=502, y=201),
+                        Point(x=552, y=201),
+                        Point(x=552, y=221),
+                        Point(x=502, y=221),
+                    )
+                )
+            }
+        ),
+        _ocr_token("4", "a" * 64, "high-missing-quantity").model_copy(
+            update={
+                "polygon": Polygon(
+                    points=(
+                        Point(x=600, y=200),
+                        Point(x=620, y=200),
+                        Point(x=620, y=220),
+                        Point(x=600, y=220),
+                    )
+                )
+            }
+        ),
+    )
+    targeted = (
+        _ocr_token("Sterile Water 10ML", "a" * 64, "target-description").model_copy(
+            update={
+                "polygon": Polygon(
+                    points=(
+                        Point(x=120, y=200),
+                        Point(x=350, y=200),
+                        Point(x=350, y=220),
+                        Point(x=120, y=220),
+                    )
+                )
+            }
+        ),
+    )
+
+    merged = merge_recovery_tokens(
+        baseline,
+        high_resolution,
+        targeted,
+        regions=((100, 185, 400, 245),),
+    )
+
+    assert tuple(token.token_id for token in merged) == (
+        "baseline-amount",
+        "high-missing-quantity",
+        "target-description",
+    )
 
 
 def test_implausibly_low_yield_is_escalated() -> None:
@@ -519,6 +906,30 @@ def test_source_cell_regression_does_not_veto_better_grounded_field_quality() ->
     assert safely_improves_reconstruction(baseline, candidate)
 
 
+def test_recovery_cannot_change_an_existing_grounded_financial_value() -> None:
+    baseline = _reconstruction(
+        (
+            _aligned_row(
+                0,
+                flags=("missing_labeled_quantity",),
+                mapped_fields=("description", "amount"),
+            ),
+        )
+    )
+    candidate = _reconstruction(
+        (
+            _aligned_row(
+                0,
+                quantity=Decimal("1"),
+                amount=Decimal("999"),
+                mapped_fields=("description", "quantity", "rate", "amount"),
+            ),
+        )
+    )
+
+    assert not safely_improves_reconstruction(baseline, candidate)
+
+
 @pytest.mark.parametrize(
     "bad_first_variant",
     (False, True),
@@ -667,6 +1078,7 @@ def test_crop_recovery_isolates_and_ranks_grounded_variants(
         prior_schemas=(),
         page_artifact_sha256=page_artifact_sha256,
         baseline=baseline,
+        baseline_tokens=(),
     )
 
     assert recovered is not None
@@ -692,3 +1104,171 @@ def test_crop_recovery_isolates_and_ranks_grounded_variants(
         else ["no_improvement", "recovered"]
     )
     assert [attempt.accepted_rows for attempt in crop_attempts] == [0, 1]
+
+
+def test_crop_recovery_uses_targeted_description_lane_for_grounded_financial_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page_artifact_sha256 = "a" * 64
+    high_artifact_sha256 = "b" * 64
+    overlay_artifact_sha256 = "c" * 64
+    target_artifact_sha256 = "d" * 64
+    baseline = _reconstruction(
+        (_aligned_row(0, description="Emeset 2ML"),),
+        table_type=TableType.PHARMACY,
+    )
+    source_table = _description_recovery_source_table()
+    observed_variants: list[str] = []
+    reconstructed_token_batches: list[tuple[OcrToken, ...]] = []
+
+    monkeypatch.setattr(
+        offline_module,
+        "render_pdf_region",
+        lambda *args, **kwargs: SimpleNamespace(
+            output_path=tmp_path / "high.png",
+            artifact_sha256=high_artifact_sha256,
+        ),
+    )
+    monkeypatch.setattr(
+        offline_module,
+        "clahe_variant",
+        lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("skip CLAHE")),
+    )
+    monkeypatch.setattr(
+        offline_module,
+        "color_overlay_suppressed_variant",
+        lambda *args, **kwargs: SimpleNamespace(
+            output_path=tmp_path / "overlay.png",
+            artifact_sha256=overlay_artifact_sha256,
+        ),
+    )
+    monkeypatch.setattr(
+        offline_module,
+        "crop_region",
+        lambda *args, **kwargs: SimpleNamespace(
+            output_path=tmp_path / "description-lane.png",
+            artifact_sha256=target_artifact_sha256,
+        ),
+    )
+
+    def fake_prediction(path, request, adapter):
+        variant = str(request.options["input_variant"])
+        observed_variants.append(variant)
+        return (
+            SimpleNamespace(
+                output={"variant": variant},
+                latency_ms=1,
+            ),
+            False,
+        )
+
+    monkeypatch.setattr(offline_module, "_cached_prediction", fake_prediction)
+    monkeypatch.setattr(
+        offline_module,
+        "paddle_ocr_tokens",
+        lambda output, page_number, artifact_sha256: (
+            _ocr_token(
+                (
+                    "Ns 500ML"
+                    if output["variant"] == "description_lane"
+                    else "Emeset 2ML"
+                ),
+                artifact_sha256,
+                (
+                    "target-description"
+                    if output["variant"] == "description_lane"
+                    else "full-description"
+                ),
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        offline_module.cv2,
+        "imread",
+        lambda path, mode: SimpleNamespace(
+            shape=(
+                (60, 300, 3)
+                if str(path).endswith("description-lane.png")
+                else (220, 800, 3)
+            )
+        ),
+    )
+
+    def fake_reconstruct(tokens, **kwargs):
+        reconstructed_token_batches.append(tokens)
+        if any("target-description" in token.token_id for token in tokens):
+            return ReconstructionResult(
+                rows=(
+                    _aligned_row(0, description="Emeset 2ML"),
+                    _aligned_row(1, description="Ns 500ML"),
+                ),
+                schema=_schema(TableType.PHARMACY),
+                diagnostics={"table_type": TableType.PHARMACY.value},
+                source_tables=(source_table,),
+            )
+        return ReconstructionResult(
+            rows=(_aligned_row(0, description="Emeset 2ML"),),
+            schema=_schema(TableType.PHARMACY),
+            diagnostics={"table_type": TableType.PHARMACY.value},
+            source_tables=(source_table,),
+        )
+
+    monkeypatch.setattr(offline_module, "reconstruct_ocr_rows", fake_reconstruct)
+    extractor = object.__new__(OfflineExtractor)
+    extractor.ocr = object()
+    work = TableWork(
+        table_id="table-1",
+        page_number=1,
+        page_artifact_sha256=page_artifact_sha256,
+        crop_path=tmp_path / "primary.png",
+        crop_sha256="e" * 64,
+        box=(50, 80, 800, 300),
+    )
+
+    recovered, attempts = extractor._recover_crop_ocr(
+        source=tmp_path / "bill.pdf",
+        artifact_root=tmp_path,
+        work=work,
+        prior_schemas=(),
+        page_artifact_sha256=page_artifact_sha256,
+        baseline=baseline,
+        baseline_tokens=(
+            _ocr_token(
+                "25.44",
+                page_artifact_sha256,
+                "page-baseline-amount",
+            ).model_copy(
+                update={
+                    "polygon": Polygon(
+                        points=(
+                            Point(x=500, y=200),
+                            Point(x=550, y=200),
+                            Point(x=550, y=220),
+                            Point(x=500, y=220),
+                        )
+                    )
+                }
+            ),
+        ),
+    )
+
+    assert recovered is not None
+    assert tuple(row.candidate.description for row in recovered.rows) == (
+        "Emeset 2ML",
+        "Ns 500ML",
+    )
+    assert observed_variants == ["high_resolution", "description_lane"]
+    targeted_batch = next(
+        batch
+        for batch in reconstructed_token_batches
+        if any("target-description" in token.token_id for token in batch)
+    )
+    assert "page-baseline-amount" in {
+        token.token_id for token in targeted_batch
+    }
+    assert any(
+        attempt.status == "recovered"
+        and attempt.reason == "input_variant:high_resolution+description_lane"
+        for attempt in attempts
+    )

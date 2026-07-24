@@ -315,6 +315,77 @@ def _unlinked_financial_row_is_explained(
         adjacent = row_cells[table.columns[financial_index - 1].id].raw_value
         return bool(adjacent and is_settlement_label(adjacent))
 
+    def cell_bounds(cell: Any) -> tuple[float, float, float, float] | None:
+        points = tuple(
+            point
+            for item in cell.evidence
+            if item.token_ids
+            for point in item.polygon.points
+        )
+        if not points:
+            return None
+        return (
+            min(point.x for point in points),
+            min(point.y for point in points),
+            max(point.x for point in points),
+            max(point.y for point in points),
+        )
+
+    description_column = next(
+        (
+            column
+            for column in table.columns
+            if column.canonical_field == "description"
+        ),
+        None,
+    )
+
+    def is_grounded_description_continuation(
+        preceding_rows: tuple[Any, ...],
+        row_index: int,
+        *,
+        previous_is_continuation: bool,
+    ) -> bool:
+        if description_column is None or row_index == 0:
+            return False
+        current = preceding_rows[row_index]
+        previous = preceding_rows[row_index - 1]
+        if (
+            previous.canonical_row_id is None
+            and not previous_is_continuation
+        ):
+            return False
+        current_cells = {cell.column_id: cell for cell in current.cells}
+        previous_cells = {cell.column_id: cell for cell in previous.cells}
+        populated_current = tuple(
+            cell
+            for cell in current.cells
+            if cell.raw_value and cell.raw_value.strip()
+        )
+        current_description = current_cells[description_column.id]
+        previous_description = previous_cells[description_column.id]
+        if (
+            len(populated_current) != 1
+            or populated_current[0].column_id != description_column.id
+            or not current_description.raw_value
+            or not previous_description.raw_value
+        ):
+            return False
+        current_bounds = cell_bounds(current_description)
+        previous_bounds = cell_bounds(previous_description)
+        if current_bounds is None or previous_bounds is None:
+            return False
+        current_height = max(1.0, current_bounds[3] - current_bounds[1])
+        previous_height = max(1.0, previous_bounds[3] - previous_bounds[1])
+        line_height = max(current_height, previous_height)
+        vertical_gap = current_bounds[1] - previous_bounds[3]
+        return (
+            current_bounds[1] > previous_bounds[1]
+            and -line_height * 0.25 <= vertical_gap <= line_height * 1.5
+            and abs(current_bounds[0] - previous_bounds[0])
+            <= max(4.0, line_height * 0.25)
+        )
+
     if is_structurally_grounded_settlement(cells):
         return True
 
@@ -385,9 +456,13 @@ def _unlinked_financial_row_is_explained(
 
     if normalized_label in {"bill total", "sub total", "subtotal"}:
         section_rows: list[dict[str, Any]] = []
-        for preceding in table.rows:
-            if preceding.id == source_row.id:
-                break
+        preceding_rows = tuple(
+            preceding
+            for preceding in table.rows
+            if preceding.order < source_row.order
+        )
+        previous_was_continuation = False
+        for preceding_index, preceding in enumerate(preceding_rows):
             preceding_cells = {
                 cell.column_id: cell for cell in preceding.cells
             }
@@ -399,6 +474,7 @@ def _unlinked_financial_row_is_explained(
                     "category_rollup",
                 }:
                     section_rows.append(canonical)
+                previous_was_continuation = False
                 continue
             preceding_label = _normalized(
                 " ".join(
@@ -421,10 +497,22 @@ def _unlinked_financial_row_is_explained(
                 or preceding_label.startswith(total_prefixes)
                 or is_structurally_grounded_settlement(preceding_cells)
             )
+            linked_row_follows_before_total = any(
+                candidate.canonical_row_id is not None
+                for candidate in preceding_rows[preceding_index + 1 :]
+            )
+            preceding_is_continuation = is_grounded_description_continuation(
+                preceding_rows,
+                preceding_index,
+                previous_is_continuation=previous_was_continuation,
+            ) and not linked_row_follows_before_total
             if preceding_is_financial_boundary or (
-                preceding_label and not preceding_has_financial_value
+                preceding_label
+                and not preceding_has_financial_value
+                and not preceding_is_continuation
             ):
                 section_rows.clear()
+            previous_was_continuation = preceding_is_continuation
         if section_rows and all(
             sum(
                 (

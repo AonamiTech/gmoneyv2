@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from difflib import SequenceMatcher
 from functools import lru_cache
+from math import ceil
 
 from gmoney.contracts.evidence import OcrToken, Point, Polygon
 from gmoney.contracts.extraction import RowRole, TableType
@@ -294,14 +295,26 @@ def _match_publishable_rows(
 def _preserves_grounded_fields(
     matches: tuple[tuple[AlignedLedgerRow, AlignedLedgerRow], ...],
 ) -> bool:
+    def equivalent(left: object, right: object) -> bool:
+        if isinstance(left, str) and isinstance(right, str):
+            return re.sub(r"\s+", " ", left).strip().casefold() == re.sub(
+                r"\s+",
+                " ",
+                right,
+            ).strip().casefold()
+        return left == right
+
     for baseline, candidate in matches:
         for field in MAPPED_CANONICAL_FIELDS:
+            baseline_value = getattr(baseline.candidate, field, None)
+            candidate_value = getattr(candidate.candidate, field, None)
             if (
                 baseline.field_token_ids.get(field)
-                and _is_populated(getattr(baseline.candidate, field, None))
+                and _is_populated(baseline_value)
                 and (
                     not candidate.field_token_ids.get(field)
-                    or not _is_populated(getattr(candidate.candidate, field, None))
+                    or not _is_populated(candidate_value)
+                    or not equivalent(baseline_value, candidate_value)
                 )
             ):
                 return False
@@ -416,6 +429,281 @@ def map_crop_tokens_to_page(
         )
         for token in tokens
     )
+
+
+def _evidence_bounds(
+    evidence: tuple[object, ...],
+) -> tuple[float, float, float, float] | None:
+    polygons = tuple(
+        item.polygon
+        for item in evidence
+        if getattr(item, "token_ids", ()) and getattr(item, "polygon", None) is not None
+    )
+    if not polygons:
+        return None
+    bounds = tuple(_polygon_bounds(polygon) for polygon in polygons)
+    return (
+        min(item[0] for item in bounds),
+        min(item[1] for item in bounds),
+        max(item[2] for item in bounds),
+        max(item[3] for item in bounds),
+    )
+
+
+def _row_evidence_bounds(row: object) -> tuple[float, float, float, float] | None:
+    bounds = tuple(
+        bound
+        for cell in getattr(row, "cells", ())
+        if (bound := _evidence_bounds(getattr(cell, "evidence", ()))) is not None
+    )
+    if not bounds:
+        return None
+    return (
+        min(item[0] for item in bounds),
+        min(item[1] for item in bounds),
+        max(item[2] for item in bounds),
+        max(item[3] for item in bounds),
+    )
+
+
+def _cell_by_canonical_field(
+    table: object,
+    row: object,
+    canonical_field: str,
+) -> object | None:
+    column = next(
+        (
+            item
+            for item in getattr(table, "columns", ())
+            if getattr(item, "canonical_field", None) == canonical_field
+        ),
+        None,
+    )
+    if column is None:
+        return None
+    return next(
+        (
+            cell
+            for cell in getattr(row, "cells", ())
+            if getattr(cell, "column_id", None) == column.id
+        ),
+        None,
+    )
+
+
+def _has_missing_grounded_detail_description(table: object, row: object) -> bool:
+    description = _cell_by_canonical_field(table, row, "description")
+    quantity = _cell_by_canonical_field(table, row, "quantity")
+    unit_price = _cell_by_canonical_field(table, row, "unit_price")
+    financial = next(
+        (
+            cell
+            for field in ("net_amount", "gross_amount")
+            if (cell := _cell_by_canonical_field(table, row, field)) is not None
+            and parse_decimal(getattr(cell, "raw_value", None)) is not None
+        ),
+        None,
+    )
+    return (
+        description is not None
+        and not str(getattr(description, "raw_value", "") or "").strip()
+        and quantity is not None
+        and parse_decimal(getattr(quantity, "raw_value", None)) is not None
+        and unit_price is not None
+        and parse_decimal(getattr(unit_price, "raw_value", None)) is not None
+        and financial is not None
+    )
+
+
+def description_lane_recovery_regions(
+    reconstruction: ReconstructionResult,
+    *,
+    table_box: tuple[int, int, int, int],
+) -> tuple[tuple[int, int, int, int], ...]:
+    """Find grounded detail rows whose description lane needs targeted OCR."""
+    table_left, table_top, table_right, table_bottom = table_box
+    regions: list[tuple[int, int, int, int]] = []
+    for table in reconstruction.source_tables:
+        columns = table.columns
+        description_index = next(
+            (
+                index
+                for index, column in enumerate(columns)
+                if column.canonical_field == "description"
+            ),
+            None,
+        )
+        if description_index is None or description_index + 1 >= len(columns):
+            continue
+        description_bounds = _evidence_bounds(columns[description_index].evidence)
+        next_bounds = _evidence_bounds(columns[description_index + 1].evidence)
+        if description_bounds is None or next_bounds is None:
+            continue
+        grounded_header_bounds = tuple(
+            bounds
+            for column in columns
+            if (bounds := _evidence_bounds(column.evidence)) is not None
+        )
+        if not grounded_header_bounds:
+            continue
+        data_top = max(
+            table_top,
+            ceil(max(bounds[3] for bounds in grounded_header_bounds)),
+        )
+        left = max(table_left, round(description_bounds[0]))
+        right = min(table_right, round(next_bounds[0]))
+        if right <= left:
+            continue
+
+        row_bounds = tuple(_row_evidence_bounds(row) for row in table.rows)
+        target_indexes = tuple(
+            index
+            for index, row in enumerate(table.rows)
+            if row_bounds[index] is not None
+            and _has_missing_grounded_detail_description(table, row)
+        )
+        target_groups: list[list[int]] = []
+        for target_index in target_indexes:
+            if (
+                not target_groups
+                or target_index - target_groups[-1][-1] > 2
+            ):
+                target_groups.append([target_index])
+            else:
+                target_groups[-1].append(target_index)
+        for indexes in target_groups:
+            first_index, last_index = indexes[0], indexes[-1]
+            first_bounds = row_bounds[first_index]
+            last_bounds = row_bounds[last_index]
+            if first_bounds is None or last_bounds is None:
+                continue
+            previous_bounds = next(
+                (
+                    row_bounds[index]
+                    for index in range(first_index - 1, -1, -1)
+                    if row_bounds[index] is not None
+                ),
+                None,
+            )
+            next_row_bounds = next(
+                (
+                    row_bounds[index]
+                    for index in range(last_index + 1, len(row_bounds))
+                    if row_bounds[index] is not None
+                ),
+                None,
+            )
+            first_height = max(1.0, first_bounds[3] - first_bounds[1])
+            last_height = max(1.0, last_bounds[3] - last_bounds[1])
+            top = (
+                round((previous_bounds[3] + first_bounds[1]) / 2)
+                if previous_bounds is not None
+                else round(first_bounds[1] - first_height / 2)
+            )
+            bottom = (
+                round((last_bounds[3] + next_row_bounds[1]) / 2)
+                if next_row_bounds is not None
+                else round(last_bounds[3] + last_height / 2)
+            )
+            top = max(data_top, top)
+            bottom = min(table_bottom, bottom)
+            if bottom > top:
+                regions.append((left, top, right, bottom))
+    return tuple(regions)
+
+
+def map_page_box_to_crop_pixels(
+    page_box: tuple[int, int, int, int],
+    *,
+    parent_page_box: tuple[int, int, int, int],
+    crop_width: int,
+    crop_height: int,
+) -> tuple[int, int, int, int]:
+    parent_left, parent_top, parent_right, parent_bottom = parent_page_box
+    left, top, right, bottom = page_box
+    parent_width = max(1, parent_right - parent_left)
+    parent_height = max(1, parent_bottom - parent_top)
+    return (
+        max(0, min(crop_width, round((left - parent_left) * crop_width / parent_width))),
+        max(0, min(crop_height, round((top - parent_top) * crop_height / parent_height))),
+        max(0, min(crop_width, round((right - parent_left) * crop_width / parent_width))),
+        max(
+            0,
+            min(crop_height, round((bottom - parent_top) * crop_height / parent_height)),
+        ),
+    )
+
+
+def replace_tokens_in_regions(
+    original: tuple[OcrToken, ...],
+    replacements: tuple[OcrToken, ...],
+    *,
+    regions: tuple[tuple[int, int, int, int], ...],
+) -> tuple[OcrToken, ...]:
+    def inside_region(token: OcrToken) -> bool:
+        left, top, right, bottom = _bounds(token)
+        center_x = (left + right) / 2
+        center_y = (top + bottom) / 2
+        return any(
+            region_left <= center_x <= region_right
+            and region_top <= center_y <= region_bottom
+            for region_left, region_top, region_right, region_bottom in regions
+        )
+
+    return (
+        *(token for token in original if not inside_region(token)),
+        *replacements,
+    )
+
+
+def merge_recovery_tokens(
+    baseline: tuple[OcrToken, ...],
+    recovered: tuple[OcrToken, ...],
+    targeted: tuple[OcrToken, ...],
+    *,
+    regions: tuple[tuple[int, int, int, int], ...],
+) -> tuple[OcrToken, ...]:
+    """Preserve page OCR, supplement missing geometry, then replace target lanes."""
+
+    def inside_region(token: OcrToken) -> bool:
+        left, top, right, bottom = _bounds(token)
+        center_x = (left + right) / 2
+        center_y = (top + bottom) / 2
+        return any(
+            region_left <= center_x <= region_right
+            and region_top <= center_y <= region_bottom
+            for region_left, region_top, region_right, region_bottom in regions
+        )
+
+    preserved = tuple(token for token in baseline if not inside_region(token))
+
+    def substantially_overlaps_preserved(token: OcrToken) -> bool:
+        left, top, right, bottom = _bounds(token)
+        area = max(1.0, (right - left) * (bottom - top))
+        for existing in preserved:
+            other_left, other_top, other_right, other_bottom = _bounds(existing)
+            intersection = max(
+                0.0,
+                min(right, other_right) - max(left, other_left),
+            ) * max(
+                0.0,
+                min(bottom, other_bottom) - max(top, other_top),
+            )
+            other_area = max(
+                1.0,
+                (other_right - other_left) * (other_bottom - other_top),
+            )
+            if intersection / min(area, other_area) >= 0.5:
+                return True
+        return False
+
+    supplements = tuple(
+        token
+        for token in recovered
+        if not inside_region(token)
+        and not substantially_overlaps_preserved(token)
+    )
+    return (*preserved, *supplements, *targeted)
 
 
 def _bounds(token: OcrToken) -> tuple[float, float, float, float]:

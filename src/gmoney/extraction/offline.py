@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import asdict, dataclass, replace
 from decimal import Decimal
 from pathlib import Path
@@ -14,6 +14,7 @@ from uuid import uuid4
 import cv2
 import typer
 
+from gmoney.contracts.evidence import OcrToken
 from gmoney.contracts.extraction import (
     CanonicalRow,
     DocumentTotal,
@@ -62,10 +63,13 @@ from gmoney.extraction.ocr_tokens import paddle_ocr_tokens
 from gmoney.extraction.otsl import parse_otsl, split_otsl_tables
 from gmoney.extraction.recovery import (
     decide_recovery,
+    description_lane_recovery_regions,
     ground_adjudication,
     is_implausibly_low_yield,
     is_terminal_non_ledger,
     map_crop_tokens_to_page,
+    map_page_box_to_crop_pixels,
+    merge_recovery_tokens,
     needs_field_quality_recovery,
     reconstruction_quality,
     safely_improves_reconstruction,
@@ -73,7 +77,12 @@ from gmoney.extraction.recovery import (
 from gmoney.extraction.rows import extract_candidate_rows
 from gmoney.extraction.spatial import align_candidate_rows
 from gmoney.extraction.typed_values import parse_decimal, parse_service_date
-from gmoney.geometry.crop import clahe_variant, crop_region, render_pdf_region
+from gmoney.geometry.crop import (
+    clahe_variant,
+    color_overlay_suppressed_variant,
+    crop_region,
+    render_pdf_region,
+)
 from gmoney.geometry.render import render_pdf
 from gmoney.inference.contracts import InferenceRequest, InferenceResponse
 from gmoney.inference.gemini import (
@@ -112,6 +121,25 @@ class VlAsset:
     path: Path
     artifact_sha256: str
     identity: str
+
+
+def _should_attempt_crop_recovery(
+    reconstruction: ReconstructionResult,
+    *,
+    parsed_rows: Collection[object],
+    table_box: tuple[int, int, int, int],
+) -> bool:
+    return not is_terminal_non_ledger(reconstruction) and (
+        not parsed_rows
+        or is_implausibly_low_yield(reconstruction)
+        or needs_field_quality_recovery(reconstruction)
+        or bool(
+            description_lane_recovery_regions(
+                reconstruction,
+                table_box=table_box,
+            )
+        )
+    )
 
 
 def _page_type(table_type: TableType) -> PageType:
@@ -1835,6 +1863,7 @@ class OfflineExtractor:
         prior_schemas: tuple[TableSchemaState, ...],
         page_artifact_sha256: str,
         baseline: ReconstructionResult,
+        baseline_tokens: tuple[OcrToken, ...],
     ) -> tuple[ReconstructionResult | None, tuple[RecoveryAttempt, ...]]:
         attempts: list[RecoveryAttempt] = []
         try:
@@ -1897,7 +1926,16 @@ class OfflineExtractor:
                     f"{work.table_id}.400dpi-clahe.ocr.json",
                 )
             )
-        reconstructed: list[tuple[str, str, bool, int, ReconstructionResult]] = []
+        reconstructed: list[
+            tuple[
+                str,
+                str,
+                bool,
+                int,
+                tuple[OcrToken, ...],
+                ReconstructionResult,
+            ]
+        ] = []
         for variant, image_path, artifact_sha256, cache_name in assets:
             request = InferenceRequest(
                 request_id=str(uuid4()),
@@ -1970,9 +2008,208 @@ class OfflineExtractor:
                     artifact_sha256,
                     cache_hit,
                     response.latency_ms,
+                    mapped_tokens,
                     reconstruction,
                 )
             )
+        targeted_inputs = tuple(
+            (
+                item,
+                tuple(
+                    dict.fromkeys(
+                        description_lane_recovery_regions(
+                            item[-1],
+                            table_box=work.box,
+                        )
+                    )
+                ),
+            )
+            for item in reconstructed
+            if description_lane_recovery_regions(
+                item[-1],
+                table_box=work.box,
+            )
+        )
+        if targeted_inputs:
+            try:
+                overlay_suppressed = color_overlay_suppressed_variant(
+                    high_resolution.output_path,
+                    artifact_root
+                    / "crops"
+                    / f"{work.table_id}-400dpi-color-suppressed.png",
+                )
+                overlay_image = cv2.imread(
+                    str(overlay_suppressed.output_path),
+                    cv2.IMREAD_COLOR,
+                )
+                if overlay_image is None:
+                    raise ValueError(
+                        f"cannot read color-suppressed crop: "
+                        f"{overlay_suppressed.output_path}"
+                    )
+            except Exception as error:
+                attempts.append(
+                    RecoveryAttempt(
+                        stage=RecoveryStage.PHOTOMETRIC,
+                        status="failed",
+                        reason=(
+                            "description_lane_variant_error:"
+                            f"{type(error).__name__}"
+                        ),
+                    )
+                )
+            else:
+                attempts.append(
+                    RecoveryAttempt(
+                        stage=RecoveryStage.PHOTOMETRIC,
+                        artifact_sha256=overlay_suppressed.artifact_sha256,
+                        status="prepared",
+                        reason="description_lane_color_suppression",
+                    )
+                )
+                for item, regions in targeted_inputs:
+                    (
+                        variant,
+                        _,
+                        _,
+                        _,
+                        mapped_tokens,
+                        _,
+                    ) = item
+                    recovered_tokens: list[OcrToken] = []
+                    target_cache_hits: list[bool] = []
+                    target_latency_ms = 0
+                    for region_index, region in enumerate(regions, start=1):
+                        pixel_box = map_page_box_to_crop_pixels(
+                            region,
+                            parent_page_box=work.box,
+                            crop_width=overlay_image.shape[1],
+                            crop_height=overlay_image.shape[0],
+                        )
+                        if (
+                            pixel_box[2] <= pixel_box[0]
+                            or pixel_box[3] <= pixel_box[1]
+                        ):
+                            continue
+                        region_slug = "-".join(str(value) for value in region)
+                        try:
+                            targeted_crop = crop_region(
+                                overlay_suppressed.output_path,
+                                artifact_root
+                                / "crops"
+                                / (
+                                    f"{work.table_id}-400dpi-description-"
+                                    f"{region_slug}.png"
+                                ),
+                                work.page_number,
+                                pixel_box,
+                            )
+                            target_request = InferenceRequest(
+                                request_id=str(uuid4()),
+                                artifact_sha256=targeted_crop.artifact_sha256,
+                                image_path=str(targeted_crop.output_path.resolve()),
+                                page_number=work.page_number,
+                                options={
+                                    "recovery_stage": RecoveryStage.CROP_OCR.value,
+                                    "input_variant": "description_lane",
+                                    "source_crop_sha256": work.crop_sha256,
+                                },
+                            )
+                            target_response, target_cache_hit = _cached_prediction(
+                                artifact_root
+                                / "inference"
+                                / (
+                                    f"{work.table_id}.400dpi-description-"
+                                    f"{region_slug}.ocr.json"
+                                ),
+                                target_request,
+                                self.ocr,
+                            )
+                            local_target_tokens = tuple(
+                                token.model_copy(
+                                    update={
+                                        "token_id": (
+                                            f"description:{region_index}:"
+                                            f"{token.token_id}"
+                                        )
+                                    }
+                                )
+                                for token in paddle_ocr_tokens(
+                                    target_response.output,
+                                    work.page_number,
+                                    targeted_crop.artifact_sha256,
+                                )
+                            )
+                            target_image = cv2.imread(
+                                str(targeted_crop.output_path),
+                                cv2.IMREAD_COLOR,
+                            )
+                            if target_image is None:
+                                raise ValueError(
+                                    f"cannot read description crop: "
+                                    f"{targeted_crop.output_path}"
+                                )
+                            recovered_tokens.extend(
+                                map_crop_tokens_to_page(
+                                    local_target_tokens,
+                                    region,
+                                    target_image.shape[1],
+                                    target_image.shape[0],
+                                    page_artifact_sha256,
+                                )
+                            )
+                            target_cache_hits.append(target_cache_hit)
+                            target_latency_ms += target_response.latency_ms
+                        except Exception as error:
+                            attempts.append(
+                                RecoveryAttempt(
+                                    stage=RecoveryStage.CROP_OCR,
+                                    status="failed",
+                                    reason=(
+                                        "description_lane:"
+                                        f"{type(error).__name__}"
+                                    ),
+                                )
+                            )
+                    if not recovered_tokens:
+                        continue
+                    combined_tokens = merge_recovery_tokens(
+                        baseline_tokens,
+                        mapped_tokens,
+                        tuple(recovered_tokens),
+                        regions=regions,
+                    )
+                    try:
+                        reconstruction = reconstruct_ocr_rows(
+                            combined_tokens,
+                            page_number=work.page_number,
+                            table_id=work.table_id,
+                            box=work.box,
+                            prior_schemas=prior_schemas,
+                        )
+                    except Exception as error:
+                        attempts.append(
+                            RecoveryAttempt(
+                                stage=RecoveryStage.CROP_OCR,
+                                artifact_sha256=overlay_suppressed.artifact_sha256,
+                                status="failed",
+                                reason=(
+                                    "description_lane:reconstruction_error:"
+                                    f"{type(error).__name__}"
+                                ),
+                            )
+                        )
+                        continue
+                    reconstructed.append(
+                        (
+                            f"{variant}+description_lane",
+                            overlay_suppressed.artifact_sha256,
+                            all(target_cache_hits),
+                            target_latency_ms,
+                            combined_tokens,
+                            reconstruction,
+                        )
+                    )
         safe_candidates = [
             item
             for item in reconstructed
@@ -1984,7 +2221,14 @@ class OfflineExtractor:
             default=None,
         )
         for item in reconstructed:
-            variant, artifact_sha256, cache_hit, latency_ms, reconstruction = item
+            (
+                variant,
+                artifact_sha256,
+                cache_hit,
+                latency_ms,
+                _,
+                reconstruction,
+            ) = item
             selected = item is selected_item
             attempts.append(
                 RecoveryAttempt(
@@ -2207,10 +2451,10 @@ class OfflineExtractor:
                     )
                 )
                 recovery_attempts: list[RecoveryAttempt] = []
-                if not is_terminal_non_ledger(reconstruction) and (
-                    not parsed_rows
-                    or is_implausibly_low_yield(reconstruction)
-                    or needs_field_quality_recovery(reconstruction)
+                if _should_attempt_crop_recovery(
+                    reconstruction,
+                    parsed_rows=parsed_rows,
+                    table_box=work.box,
                 ):
                     recovered, attempts = self._recover_crop_ocr(
                         source=source,
@@ -2219,6 +2463,7 @@ class OfflineExtractor:
                         prior_schemas=tuple(schema_states),
                         page_artifact_sha256=work.page_artifact_sha256,
                         baseline=reconstruction,
+                        baseline_tokens=tokens_in_box(tokens, work.box),
                     )
                     recovery_attempts.extend(attempts)
                     if recovered is not None:
