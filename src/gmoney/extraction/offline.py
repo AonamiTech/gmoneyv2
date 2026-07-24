@@ -1070,7 +1070,7 @@ def _split_grounded_date_request_description(
     printed_date = merged_cell.raw_value[: date_match.end()].strip(" -:")
     remainder = merged_cell.raw_value[date_match.end() :].strip()
     printed_request = request_match.group(0).strip()
-    merged_tail = remainder[request_match.end() :].strip(" -:")
+    merged_tail = remainder[request_match.end() :].strip(" -:.;,")
     canonical_description_prefix = re.match(
         re.escape(canonical.description),
         merged_tail,
@@ -1630,6 +1630,138 @@ def _split_grounded_date_from_description(
     return tuple(cells_by_id[cell.column_id] for cell in cells)
 
 
+def _consolidate_grounded_adjacent_descriptions(
+    table: SourceTable,
+    canonical_rows: tuple[CanonicalRow, ...],
+) -> SourceTable:
+    description_column = next(
+        (
+            column
+            for column in table.columns
+            if column.canonical_field == "description"
+        ),
+        None,
+    )
+    if description_column is None:
+        return table
+    canonical_by_id = {str(row.id): row for row in canonical_rows}
+    rows = list(table.rows)
+
+    def normalized(value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", value.casefold()).strip()
+
+    for linked_index, linked_row in enumerate(tuple(rows)):
+        if linked_row.canonical_row_id is None:
+            continue
+        canonical = canonical_by_id.get(linked_row.canonical_row_id)
+        if canonical is None or not canonical.description:
+            continue
+        linked_cells = {
+            cell.column_id: cell for cell in rows[linked_index].cells
+        }
+        target = linked_cells[description_column.id]
+        if target.raw_value and target.raw_value.strip():
+            continue
+        description_ids = {
+            token_id
+            for evidence in canonical.field_evidence.get("description", ())
+            for token_id in evidence.token_ids
+        }
+        if not description_ids:
+            continue
+        donors: list[tuple[int, SourceCell, tuple[EvidenceRef, ...]]] = []
+        for donor_index in range(
+            max(0, linked_index - 1),
+            min(len(rows), linked_index + 2),
+        ):
+            if donor_index == linked_index:
+                continue
+            donor_row = rows[donor_index]
+            if donor_row.canonical_row_id is not None:
+                continue
+            donor = next(
+                cell
+                for cell in donor_row.cells
+                if cell.column_id == description_column.id
+            )
+            if (
+                not donor.raw_value
+                or normalized(donor.raw_value)
+                != normalized(canonical.description)
+            ):
+                continue
+            donor_ids = {
+                token_id
+                for evidence in donor.evidence
+                for token_id in evidence.token_ids
+            }
+            if not description_ids.issubset(donor_ids):
+                continue
+            grounded = _filter_evidence_token_ids(
+                donor.evidence,
+                description_ids,
+            )
+            if grounded:
+                donors.append((donor_index, donor, grounded))
+        if len(donors) != 1:
+            continue
+
+        donor_index, donor, grounded = donors[0]
+        linked_cells[description_column.id] = target.model_copy(
+            update={
+                "raw_value": donor.raw_value,
+                "evidence": grounded,
+                "validation_flags": tuple(
+                    dict.fromkeys(
+                        (
+                            *(
+                                flag
+                                for flag in target.validation_flags
+                                if flag != "empty_cell"
+                            ),
+                            "redistributed_from_adjacent_source_row",
+                        )
+                    )
+                ),
+            }
+        )
+        rows[linked_index] = rows[linked_index].model_copy(
+            update={
+                "cells": tuple(
+                    linked_cells[cell.column_id]
+                    for cell in rows[linked_index].cells
+                )
+            }
+        )
+        donor_cells = {
+            cell.column_id: cell for cell in rows[donor_index].cells
+        }
+        donor_cells[description_column.id] = donor.model_copy(
+            update={
+                "raw_value": None,
+                "evidence": (),
+                "validation_flags": tuple(
+                    dict.fromkeys(
+                        (
+                            *donor.validation_flags,
+                            "empty_cell",
+                            "redistributed_to_linked_source_row",
+                        )
+                    )
+                ),
+            }
+        )
+        rows[donor_index] = rows[donor_index].model_copy(
+            update={
+                "cells": tuple(
+                    donor_cells[cell.column_id]
+                    for cell in rows[donor_index].cells
+                )
+            }
+        )
+    return table.model_copy(update={"rows": tuple(rows)})
+
+
 def _link_source_tables(
     tables: tuple[SourceTable, ...] | list[SourceTable],
     canonical_rows: tuple[CanonicalRow, ...] | list[CanonicalRow],
@@ -1761,7 +1893,13 @@ def _link_source_tables(
                     }
                 )
             )
-        linked_tables.append(table.model_copy(update={"rows": tuple(linked_rows)}))
+        linked_table = table.model_copy(update={"rows": tuple(linked_rows)})
+        linked_tables.append(
+            _consolidate_grounded_adjacent_descriptions(
+                linked_table,
+                candidates,
+            )
+        )
     return tuple(linked_tables)
 
 

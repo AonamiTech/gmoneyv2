@@ -4132,10 +4132,12 @@ def test_client_pharmacy_aliases_keep_date_product_gross_and_net_in_their_lanes(
 @pytest.mark.parametrize("merged_right", (440, 650, 850))
 @pytest.mark.parametrize("timestamp_separator", (" ", ", ", "; ", " - ", ".", ". "))
 @pytest.mark.parametrize("request_prefix", ("PI", "P|"))
+@pytest.mark.parametrize("request_suffix", ("", "."))
 def test_pharmacy_expiry_date_does_not_replace_left_transaction_date(
     merged_right: int,
     timestamp_separator: str,
     request_prefix: str,
+    request_suffix: str,
 ) -> None:
     tokens = (
         token(0, "Date/ Time", (80, 25, 170, 40)),
@@ -4150,7 +4152,7 @@ def test_pharmacy_expiry_date_does_not_replace_left_transaction_date(
         token(
             9,
             f"10/07/2026{timestamp_separator}02:48 am "
-            f"{request_prefix}261015227 Patient Coat",
+            f"{request_prefix}261015227{request_suffix} Patient Coat",
             (80, 70, merged_right, 85),
         ),
         token(10, "Patient Coat", (320, 70, 430, 85)),
@@ -4160,7 +4162,8 @@ def test_pharmacy_expiry_date_does_not_replace_left_transaction_date(
         token(15, "250", (930, 70, 965, 85)),
         token(
             16,
-            f"10/07/2026{timestamp_separator}02:49 am {request_prefix}261015228",
+            f"10/07/2026{timestamp_separator}02:49 am "
+            f"{request_prefix}261015228{request_suffix}",
             (80, 100, 290, 115),
         ),
         token(18, "Betadine Scrub 50 ML", (320, 100, 465, 115)),
@@ -4289,6 +4292,140 @@ def test_pharmacy_expiry_date_does_not_replace_left_transaction_date(
     )
     assert second_cells["request_no"].raw_value == f"{request_prefix}261015228"
     assert second_cells["description"].raw_value == "Betadine Scrub 50 ML"
+
+
+def test_linked_pharmacy_row_consolidates_grounded_adjacent_description() -> None:
+    tokens = (
+        token(0, "Date/ Time", (80, 10, 170, 25)),
+        token(1, "Bill Number", (200, 10, 290, 25)),
+        token(2, "ProductName", (320, 10, 450, 25)),
+        token(3, "Batch No", (500, 10, 570, 25)),
+        token(4, "Expiry Date", (620, 10, 730, 25)),
+        token(5, "Qty", (770, 10, 805, 25)),
+        token(6, "Rate", (840, 10, 885, 25)),
+        token(7, "Total", (920, 10, 970, 25)),
+        token(8, "tals & Fertility Centre", (200, 50, 300, 105)),
+        token(9, "Easyadlide Skin", (320, 70, 450, 85)),
+        token(
+            10,
+            "12/07/2026,06:00 pm PI262015226.",
+            (80, 85, 290, 105),
+        ),
+        token(11, "OD260403", (500, 87, 570, 103)),
+        token(12, "31/03/2031", (620, 87, 730, 103)),
+        token(13, "36.5", (840, 87, 885, 103)),
+        token(14, "-73", (920, 87, 970, 103)),
+    )
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(60, 0, 980, 120),
+    )
+    canonical = canonicalize_rows(
+        "d" * 64,
+        1,
+        "p1-t1",
+        "a" * 64,
+        result.rows,
+    )
+
+    linked = _link_source_tables(result.source_tables, canonical)
+
+    assert len(canonical) == 1
+    linked_row = next(
+        row for row in linked[0].rows if row.canonical_row_id is not None
+    )
+    donor_row = linked[0].rows[0]
+    columns = {
+        column.canonical_field: column
+        for column in linked[0].columns
+        if column.canonical_field is not None
+    }
+    linked_cells = {cell.column_id: cell for cell in linked_row.cells}
+    donor_cells = {cell.column_id: cell for cell in donor_row.cells}
+    description = linked_cells[columns["description"].id]
+    donor_description = donor_cells[columns["description"].id]
+
+    assert linked_cells[columns["service_date_raw"].id].raw_value == (
+        "12/07/2026,06:00 pm"
+    )
+    assert linked_cells[columns["request_no"].id].raw_value == "PI262015226"
+    assert description.raw_value == "Easyadlide Skin"
+    assert {
+        token_id
+        for item in description.evidence
+        for token_id in item.token_ids
+    } == {"token-9"}
+    assert "redistributed_from_adjacent_source_row" in (
+        description.validation_flags
+    )
+    assert donor_description.raw_value is None
+    assert not donor_description.evidence
+    assert "redistributed_to_linked_source_row" in (
+        donor_description.validation_flags
+    )
+
+
+def test_linked_row_does_not_guess_between_adjacent_description_donors() -> None:
+    tokens = (
+        token(0, "ProductName", (320, 10, 450, 25)),
+        token(1, "Rate", (840, 10, 885, 25)),
+        token(2, "Total", (920, 10, 970, 25)),
+        token(3, "Grounded Item", (320, 50, 450, 65)),
+        token(4, "25", (840, 75, 885, 90)),
+        token(5, "25", (920, 75, 970, 90)),
+    )
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(300, 0, 980, 110),
+    )
+    canonical = canonicalize_rows(
+        "d" * 64,
+        1,
+        "p1-t1",
+        "a" * 64,
+        result.rows,
+    )
+    source_table = result.source_tables[0]
+    donor, financial = source_table.rows
+    duplicate_donor = donor.model_copy(
+        update={
+            "id": f"{donor.id}-duplicate",
+            "order": 2,
+        }
+    )
+    ambiguous_table = source_table.model_copy(
+        update={"rows": (donor, financial, duplicate_donor)}
+    )
+
+    linked = _link_source_tables((ambiguous_table,), canonical)
+
+    linked_row = next(
+        row for row in linked[0].rows if row.canonical_row_id is not None
+    )
+    description_column = next(
+        column
+        for column in linked[0].columns
+        if column.canonical_field == "description"
+    )
+    description = next(
+        cell
+        for cell in linked_row.cells
+        if cell.column_id == description_column.id
+    )
+    assert description.raw_value is None
+    assert all(
+        next(
+            cell
+            for cell in source_row.cells
+            if cell.column_id == description_column.id
+        ).raw_value
+        == "Grounded Item"
+        for source_row in (linked[0].rows[0], linked[0].rows[2])
+    )
 
 
 def test_pharmacy_description_continuation_in_same_lane_is_grounded() -> None:

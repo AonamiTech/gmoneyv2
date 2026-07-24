@@ -2079,6 +2079,21 @@ def _collapse_description_phrase_echo(raw: str) -> str:
     normalized_words = tuple(
         _normalize(match.group()) for match in normalized_word_matches
     )
+    normalized_midpoint = len(normalized_words) // 2
+    if (
+        len(normalized_words) >= 4
+        and len(normalized_words) % 2 == 0
+        and normalized_words[:normalized_midpoint]
+        == normalized_words[normalized_midpoint:]
+    ):
+        separator = raw[
+            normalized_word_matches[normalized_midpoint - 1].end() :
+            normalized_word_matches[normalized_midpoint].start()
+        ]
+        if separator and not re.search(r"[A-Za-z0-9#]", separator):
+            return raw[
+                : normalized_word_matches[normalized_midpoint - 1].end()
+            ].rstrip(" -:.;,[]")
     for echo_length in range(len(normalized_words) // 2, 1, -1):
         intervening_matches = normalized_word_matches[
             echo_length:-echo_length
@@ -2099,7 +2114,7 @@ def _collapse_description_phrase_echo(raw: str) -> str:
 
 
 def _clean_description(text: str) -> tuple[str, str | None, str | None]:
-    raw = re.sub(r"\s+", " ", text).strip(" -:")
+    raw = re.sub(r"\s+", " ", text).strip(" -:.;,")
     date_match = DATE_PREFIX.match(raw)
     service_date = date_match.group("date").strip(" -:") if date_match else None
     if date_match:
@@ -2111,7 +2126,7 @@ def _clean_description(text: str) -> tuple[str, str | None, str | None]:
     raw = LEADING_BATCH_FRAGMENT.sub("", raw)
     raw = BATCH_SUFFIX.sub("", raw)
     raw = DATE_RANGE_SUFFIX.sub("", raw)
-    raw = re.sub(r"\s+", " ", raw).strip(" -:[]")
+    raw = re.sub(r"\s+", " ", raw).strip(" -:.;,[]")
     raw = _collapse_description_phrase_echo(raw)
     return raw, service_date, request_no
 
