@@ -1120,6 +1120,95 @@ def test_merged_date_and_description_in_date_lane_is_grounded_and_split() -> Non
     assert cells_by_field["description"].evidence
 
 
+def test_separate_description_token_shifted_into_wide_date_lane_is_split() -> None:
+    tokens = (
+        token(0, "Date", (80, 20, 160, 35)),
+        token(1, "Particulars", (550, 20, 720, 35)),
+        token(2, "Units", (740, 20, 790, 35)),
+        token(3, "Service Amt", (805, 20, 875, 35)),
+        token(4, "Disc Amt", (890, 20, 945, 35)),
+        token(5, "Net Amount", (960, 20, 1030, 35)),
+        token(6, "27/06/2026", (80, 60, 160, 75)),
+        token(7, "PT INR - PROTHROMBIN TIME", (180, 60, 430, 75)),
+        token(8, "1.00", (745, 60, 785, 75)),
+        token(9, "450.00", (810, 60, 870, 75)),
+        token(10, "0.00", (895, 60, 940, 75)),
+        token(11, "450.00", (965, 60, 1025, 75)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(60, 0, 1040, 100),
+    )
+
+    assert len(result.rows) == 1
+    assert result.rows[0].candidate.description == "PT INR - PROTHROMBIN TIME"
+    assert result.rows[0].candidate.service_date == "27/06/2026"
+    assert result.rows[0].field_token_ids["description"] == ("token-7",)
+    assert result.rows[0].field_token_ids["service_date"] == ("token-6",)
+
+    canonical = canonicalize_rows(
+        "d" * 64,
+        1,
+        "p1-t1",
+        "a" * 64,
+        result.rows,
+    )
+    linked = _link_source_tables(result.source_tables, canonical)
+    columns = {
+        column.canonical_field: column
+        for column in linked[0].columns
+        if column.canonical_field is not None
+    }
+    cells = {
+        cell.column_id: cell for cell in linked[0].rows[0].cells
+    }
+    assert linked[0].rows[0].canonical_row_id == str(canonical[0].id)
+    assert cells[columns["service_date_raw"].id].raw_value == "27/06/2026"
+    assert (
+        cells[columns["description"].id].raw_value
+        == "PT INR - PROTHROMBIN TIME"
+    )
+    assert "split_from_merged_ocr_token" in (
+        cells[columns["service_date_raw"].id].validation_flags
+    )
+    assert "split_from_merged_ocr_token" in (
+        cells[columns["description"].id].validation_flags
+    )
+
+
+@pytest.mark.parametrize(
+    "shifted_text",
+    (
+        "9:05AM",
+        "MNEIPI/123",
+        "Service Code AB123",
+    ),
+)
+def test_shifted_date_lane_metadata_is_not_promoted_to_description(
+    shifted_text: str,
+) -> None:
+    tokens = (
+        token(0, "Date", (80, 20, 160, 35)),
+        token(1, "Particulars", (550, 20, 720, 35)),
+        token(2, "Net Amount", (960, 20, 1030, 35)),
+        token(3, "27/06/2026", (80, 60, 160, 75)),
+        token(4, shifted_text, (180, 60, 430, 75)),
+        token(5, "450.00", (965, 60, 1025, 75)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(60, 0, 1040, 100),
+    )
+
+    assert result.rows == ()
+
+
 def test_partial_description_in_date_lane_is_grounded_and_merged() -> None:
     tokens = (
         token(0, "Date", (80, 20, 160, 35)),

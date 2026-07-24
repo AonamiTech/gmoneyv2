@@ -2233,6 +2233,8 @@ def _is_admissible_merged_date_description(description: str) -> bool:
     if (
         not normalized
         or parse_decimal(description) is not None
+        or DATE_SPAN.fullmatch(description.strip()) is not None
+        or re.fullmatch(TIME_VALUE, description.strip(), re.IGNORECASE) is not None
         or all(character.isdigit() for character in normalized.replace(" ", ""))
         or _is_metadata_description(description)
         or _is_total_description(normalized)
@@ -3260,6 +3262,44 @@ def reconstruct_ocr_rows(
                 line_description_tokens.append(
                     token.model_copy(update={"text": merged_description})
                 )
+        if structured_values.get("service_date") and service_date_ids:
+            grounded_date_tokens = tuple(
+                token
+                for token in line.tokens
+                if token.token_id in service_date_ids
+            )
+            grounded_date_right = max(
+                (_bounds(token)[2] - left) / width
+                for token in grounded_date_tokens
+            )
+            for token in line.tokens:
+                if (
+                    token.token_id in reserved_ids
+                    or _is_header_token(token)
+                ):
+                    continue
+                token_left, _, _, _ = _bounds(token)
+                relative_left = (token_left - left) / width
+                relative_center = (_center_x(token) - left) / width
+                if (
+                    description_cell_min is None
+                    or relative_center >= description_cell_min
+                    or relative_left < grounded_date_right - 0.01
+                    or relative_left - grounded_date_right > 0.12
+                ):
+                    continue
+                shifted_description, embedded_date, _ = _clean_description(
+                    token.text
+                )
+                if (
+                    embedded_date is None
+                    and _is_admissible_merged_date_description(
+                        shifted_description
+                    )
+                ):
+                    line_description_tokens.append(
+                        token.model_copy(update={"text": shifted_description})
+                    )
         for token in line.tokens:
             if token.token_id in reserved_ids:
                 continue
