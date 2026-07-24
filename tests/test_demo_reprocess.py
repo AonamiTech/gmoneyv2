@@ -1532,6 +1532,132 @@ def test_internal_bill_total_does_not_cross_an_unlinked_section_heading(
             )
 
 
+@pytest.mark.parametrize(
+    ("bill_total", "accepted"),
+    (("150.00", True), ("50.00", False)),
+)
+def test_internal_bill_total_ignores_rotated_structured_overlay_fragments(
+    tmp_path: Path,
+    bill_total: str,
+    accepted: bool,
+) -> None:
+    store, job_id, old_result = setup_job(tmp_path)
+    page_sha = old_result["page_assets"][0]["artifact_sha256"]
+    new_rows = [
+        row("first-row", page_sha, amount="100.00"),
+        row("second-row", page_sha, amount="50.00"),
+        row("following-row", page_sha, amount="25.00"),
+    ]
+    for order, canonical in enumerate(new_rows):
+        canonical["row_order"] = order
+    printed = source_tables(new_rows, page_sha)
+    printed[0]["columns"].insert(
+        1,
+        {
+            "id": "request-number",
+            "label": "Bill Number",
+            "order": 1,
+            "canonical_field": "request_no",
+            "evidence": [evidence(page_sha, "request-number-header")],
+            "validation_flags": [],
+        },
+    )
+    for order, column in enumerate(printed[0]["columns"]):
+        column["order"] = order
+    for source_row in printed[0]["rows"]:
+        source_row["cells"].insert(
+            1,
+            {
+                "column_id": "request-number",
+                "raw_value": None,
+                "evidence": [],
+                "validation_flags": ["empty_cell"],
+            },
+        )
+    printed[0]["rows"].insert(
+        1,
+        {
+            "id": "rotated-overlay",
+            "order": 1,
+            "canonical_row_id": None,
+            "cells": [
+                {
+                    "column_id": "description",
+                    "raw_value": "7.57.5",
+                    "evidence": [evidence(page_sha, "numeric-overlay-fragment")],
+                    "validation_flags": [],
+                },
+                {
+                    "column_id": "request-number",
+                    "raw_value": "VL. Ltd.",
+                    "evidence": [evidence(page_sha, "rotated-overlay-fragment")],
+                    "validation_flags": ["all_text_rotated"],
+                },
+                {
+                    "column_id": "amount",
+                    "raw_value": None,
+                    "evidence": [],
+                    "validation_flags": ["empty_cell"],
+                },
+            ],
+            "validation_flags": [],
+        },
+    )
+    printed[0]["rows"].insert(
+        3,
+        {
+            "id": "section-bill-total",
+            "order": 3,
+            "canonical_row_id": None,
+            "cells": [
+                {
+                    "column_id": "description",
+                    "raw_value": "BILL TOTAL",
+                    "evidence": [evidence(page_sha, "section-bill-total-label")],
+                    "validation_flags": [],
+                },
+                {
+                    "column_id": "request-number",
+                    "raw_value": None,
+                    "evidence": [],
+                    "validation_flags": ["empty_cell"],
+                },
+                {
+                    "column_id": "amount",
+                    "raw_value": bill_total,
+                    "evidence": [evidence(page_sha, "section-bill-total-amount")],
+                    "validation_flags": [],
+                },
+            ],
+            "validation_flags": [],
+        },
+    )
+    for order, source_row in enumerate(printed[0]["rows"]):
+        source_row["id"] = f"p1-t1-s1-r{order + 1}"
+        source_row["order"] = order
+    new_result = {
+        **old_result,
+        "rows": new_rows,
+        "source_tables": printed,
+    }
+
+    if accepted:
+        _validate_result(
+            store.job_dir(job_id) / "source.pdf",
+            old_result,
+            new_result,
+            store.job_dir(job_id) / "artifacts",
+        )
+    else:
+        with pytest.raises(ValueError, match="unlinked source row.*financial"):
+            _validate_result(
+                store.job_dir(job_id) / "source.pdf",
+                old_result,
+                new_result,
+                store.job_dir(job_id) / "artifacts",
+            )
+
+
 def test_reprocess_validation_accepts_matching_total_across_header_segments(
     tmp_path: Path,
 ) -> None:

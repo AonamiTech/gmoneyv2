@@ -2349,15 +2349,23 @@ def test_invalid_stamp_text_is_not_published_as_a_missing_service_code() -> None
 
 
 @pytest.mark.parametrize(
-    ("overlay_text", "overlay_box"),
+    ("overlay_text", "overlay_box", "supporting_overlay_tokens"),
     (
-        ("No: 10&10/1, Radhkrishnan", (300, 120, 650, 155)),
-        ("Road,", (530, 120, 610, 135)),
+        ("No: 10&10/1, Radhkrishnan", (300, 120, 650, 155), ()),
+        (
+            "Road,",
+            (530, 120, 610, 135),
+            (
+                rotated_token(11, "VL. Ltd.", (530, 100, 610, 115), 19),
+                rotated_token(12, "600 087.", (530, 160, 610, 175), 19),
+            ),
+        ),
     ),
 )
 def test_invalid_stamp_text_is_not_published_as_a_missing_request_number(
     overlay_text: str,
     overlay_box: tuple[float, float, float, float],
+    supporting_overlay_tokens: tuple[OcrToken, ...],
 ) -> None:
     tokens = (
         token(0, "Service Name", (100, 30, 300, 45)),
@@ -2376,6 +2384,7 @@ def test_invalid_stamp_text_is_not_published_as_a_missing_request_number(
             19,
         ),
         token(10, "20/01/2026 09:44:58", (700, 130, 850, 145)),
+        *supporting_overlay_tokens,
     )
     result = reconstruct_ocr_rows(
         tokens,
@@ -2413,6 +2422,58 @@ def test_invalid_stamp_text_is_not_published_as_a_missing_request_number(
     assert request_cell.raw_value is None
     assert request_cell.evidence == ()
     assert "excluded_oversized_overlay" in request_cell.validation_flags
+
+
+def test_plausible_slanted_request_number_remains_for_strict_validation() -> None:
+    tokens = (
+        token(0, "Service Name", (100, 30, 300, 45)),
+        token(1, "Bill Number", (520, 30, 620, 45)),
+        token(2, "Date", (700, 30, 760, 45)),
+        token(3, "Net Amount", (870, 30, 970, 45)),
+        token(4, "Package Name : Coronary Angiography", (100, 70, 430, 85)),
+        token(5, "20/01/2026 - 21/01/2026", (700, 70, 850, 85)),
+        token(6, "11457.00", (880, 70, 960, 85)),
+        token(7, "Pharmacy", (100, 100, 230, 115)),
+        token(8, "Gloves Sterile 7", (100, 130, 300, 145)),
+        rotated_token(9, "REQ 12345", (530, 120, 610, 135), 19),
+        token(10, "20/01/2026 09:44:58", (700, 130, 850, 145)),
+    )
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 20, 980, 180),
+    )
+    canonical = canonicalize_rows(
+        "d" * 64,
+        1,
+        "p1-t1",
+        "a" * 64,
+        result.rows,
+    )
+
+    linked = _link_source_tables(result.source_tables, canonical)
+
+    gloves = next(row for row in canonical if row.description == "Gloves Sterile 7")
+    assert gloves.request_no is None
+    request_column = next(
+        column
+        for column in linked[0].columns
+        if column.canonical_field == "request_no"
+    )
+    gloves_source_row = next(
+        row
+        for row in linked[0].rows
+        if row.canonical_row_id == str(gloves.id)
+    )
+    request_cell = next(
+        cell
+        for cell in gloves_source_row.cells
+        if cell.column_id == request_column.id
+    )
+    assert request_cell.raw_value == "REQ 12345"
+    assert request_cell.evidence
+    assert "excluded_oversized_overlay" not in request_cell.validation_flags
 
 
 def test_linked_source_row_splits_grounded_date_from_cross_column_ocr_token() -> None:

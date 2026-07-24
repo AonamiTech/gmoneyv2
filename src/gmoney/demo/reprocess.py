@@ -638,6 +638,25 @@ def _unlinked_financial_row_is_explained(
                     and parse_decimal(cell.raw_value) is None
                 )
             )
+            preceding_has_section_text = any(
+                cell.raw_value
+                and re.search(r"[a-z]", _normalized(cell.raw_value))
+                and not (
+                    next(
+                        column.canonical_field
+                        for column in table.columns
+                        if column.id == cell.column_id
+                    )
+                    in {
+                        "service_date_raw",
+                        "request_no",
+                        "service_code",
+                        "hsn_code",
+                    }
+                    and "all_text_rotated" in cell.validation_flags
+                )
+                for cell in preceding.cells
+            )
             preceding_has_financial_value = any(
                 column.canonical_field in {"net_amount", "gross_amount"}
                 and preceding_cells[column.id].raw_value
@@ -657,7 +676,7 @@ def _unlinked_financial_row_is_explained(
             )
             if preceding_is_financial_boundary or (
                 preceding_label
-                and re.search(r"[a-z]", preceding_label)
+                and preceding_has_section_text
                 and not preceding_has_financial_value
                 and not preceding_is_continuation
             ):
