@@ -678,6 +678,7 @@ def _header_blocks(lines: tuple[OcrLine, ...]) -> tuple[HeaderBlock, ...]:
     candidates: list[HeaderBlock] = []
     for start in range(len(lines)):
         roles: dict[str, OcrToken] = {}
+        block_start = start
         start_words = set(re.findall(r"[a-z]+", _normalize(lines[start].text)))
         if not _header_roles(lines[start]) and not (start_words and start_words <= fragment_words):
             continue
@@ -688,13 +689,28 @@ def _header_blocks(lines: tuple[OcrLine, ...]) -> tuple[HeaderBlock, ...]:
                 break
             if _contains_total_value(lines[end]):
                 break
-            roles = _merge_header_roles(roles, _header_roles(lines[end]))
+            incoming_roles = _header_roles(lines[end])
+            if (
+                end > start
+                and _valid_header_line(lines[end], incoming_roles)
+                and set(roles).issubset(incoming_roles)
+            ):
+                roles = incoming_roles
+                block_start = end
+            else:
+                roles = _merge_header_roles(roles, incoming_roles)
             if not _valid_header(roles):
                 continue
-            normalized = _normalize(" ".join(line.text for line in lines[start : end + 1]))
+            normalized = _normalize(
+                " ".join(
+                    line.text for line in lines[block_start : end + 1]
+                )
+            )
             if normalized.startswith(("total for", "sub total", "subtotal", "grand total")):
                 continue
-            candidates.append(HeaderBlock(start=start, end=end, roles=dict(roles)))
+            candidates.append(
+                HeaderBlock(start=block_start, end=end, roles=dict(roles))
+            )
             break
     selected: list[HeaderBlock] = []
     for candidate in candidates:

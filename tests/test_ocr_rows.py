@@ -1641,6 +1641,56 @@ def test_header_does_not_absorb_distant_metadata_line() -> None:
     ]
 
 
+def test_header_does_not_absorb_redundant_adjacent_bill_date_metadata() -> None:
+    tokens = (
+        token(0, "Bill Date", (800, 5, 900, 20)),
+        token(1, "Date", (80, 30, 160, 45)),
+        token(2, "Particulars", (300, 30, 550, 45)),
+        token(3, "Units", (600, 30, 660, 45)),
+        token(4, "Service Amt", (700, 30, 790, 45)),
+        token(5, "Disc Amt", (800, 30, 870, 45)),
+        token(6, "Net Amt", (900, 30, 970, 45)),
+        token(7, "27/06/2026", (80, 70, 160, 85)),
+        token(8, "Suction Catheter", (300, 70, 520, 85)),
+        token(9, "1.00", (610, 70, 650, 85)),
+        token(10, "91.00", (710, 70, 780, 85)),
+        token(11, "0.00", (810, 70, 860, 85)),
+        token(12, "91.00", (910, 70, 960, 85)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(60, 0, 990, 110),
+    )
+
+    assert [column.label for column in result.source_tables[0].columns] == [
+        "Date",
+        "Particulars",
+        "Units",
+        "Service Amt",
+        "Disc Amt",
+        "Net Amt",
+    ]
+    assert result.source_tables[0].columns[0].canonical_field == (
+        "service_date_raw"
+    )
+    canonical = canonicalize_rows(
+        "d" * 64,
+        1,
+        "p1-t1",
+        "a" * 64,
+        result.rows,
+    )
+    linked = _link_source_tables(result.source_tables, canonical)
+    cells = {
+        cell.column_id: cell for cell in linked[0].rows[0].cells
+    }
+    assert cells[linked[0].columns[0].id].raw_value == "27/06/2026"
+    assert linked[0].rows[0].canonical_row_id == str(canonical[0].id)
+
+
 def test_structured_field_does_not_borrow_from_adjacent_printed_column() -> None:
     tokens = (
         token(0, "No.", (100, 30, 150, 45)),
