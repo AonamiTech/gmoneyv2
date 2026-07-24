@@ -325,6 +325,12 @@ def _unlinked_financial_row_is_explained(
             return True
         return _normalized(cell.raw_value or "") in total_labels
 
+    def is_section_subtotal_label(value: str) -> bool:
+        return (
+            value in {"bill total", "sub total", "subtotal"}
+            or value.startswith(("sub total ", "subtotal "))
+        )
+
     label_values = tuple(
         cell.raw_value.strip()
         for cell in source_row.cells
@@ -613,7 +619,7 @@ def _unlinked_financial_row_is_explained(
         ):
             return True
 
-    if normalized_label in {"bill total", "sub total", "subtotal"}:
+    if is_section_subtotal_label(normalized_label):
         section_rows: list[dict[str, Any]] = []
         table_index = next(
             index
@@ -674,6 +680,7 @@ def _unlinked_financial_row_is_explained(
             preceding_is_financial_boundary = (
                 preceding_label in total_labels
                 or preceding_label.startswith(total_prefixes)
+                or is_section_subtotal_label(preceding_label)
                 or is_structurally_grounded_settlement(preceding_cells)
             )
             preceding_is_continuation = is_grounded_description_continuation(
@@ -689,7 +696,31 @@ def _unlinked_financial_row_is_explained(
             ):
                 section_rows.clear()
             previous_was_continuation = preceding_is_continuation
-        if section_rows and all(
+        subtotal_scope = re.sub(
+            r"^(?:sub\s+total|subtotal)\s*",
+            "",
+            normalized_label,
+        ).strip()
+        scope_words = _meaningful_summary_words(subtotal_scope)
+        section_words = set().union(
+            *(
+                _meaningful_summary_words(
+                    " ".join(
+                        str(value)
+                        for value in (
+                            row.get("section"),
+                            row.get("description"),
+                        )
+                        if value
+                    )
+                )
+                for row in section_rows
+            ),
+        )
+        if (
+            section_rows
+            and (not scope_words or scope_words.issubset(section_words))
+            and all(
             sum(
                 (
                     parsed
@@ -700,6 +731,7 @@ def _unlinked_financial_row_is_explained(
             )
             == value
             for field, value in financial_values
+            )
         ):
             return True
 

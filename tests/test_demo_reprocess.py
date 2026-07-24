@@ -843,15 +843,27 @@ def test_reprocess_validation_rejects_unlinked_printed_financial_total(
         )
 
 
-@pytest.mark.parametrize(("subtotal", "accepted"), (("100.00", True), ("99.00", False)))
+@pytest.mark.parametrize(
+    ("label", "subtotal", "accepted"),
+    (
+        ("Sub Total", "100.00", True),
+        ("Sub Total", "99.00", False),
+        ("Sub Total : Registration", "100.00", True),
+        ("Sub Total : Registration", "99.00", False),
+        ("Sub Total : Pharmacy", "100.00", False),
+    ),
+)
 def test_reprocess_validation_accepts_only_matching_section_subtotal(
     tmp_path: Path,
+    label: str,
     subtotal: str,
     accepted: bool,
 ) -> None:
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
     new_rows = [row("new-row", page_sha, role="category_rollup")]
+    new_rows[0]["description"] = "Registration"
+    new_rows[0]["section"] = "registration"
     printed = source_tables(new_rows, page_sha)
     printed[0]["table_type"] = "category_summary"
     printed[0]["rows"].append(
@@ -862,7 +874,7 @@ def test_reprocess_validation_accepts_only_matching_section_subtotal(
             "cells": [
                 {
                     "column_id": "description",
-                    "raw_value": "Sub Total",
+                    "raw_value": label,
                     "evidence": [evidence(page_sha, "subtotal-description")],
                     "validation_flags": [],
                 },
