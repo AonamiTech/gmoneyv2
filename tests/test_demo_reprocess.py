@@ -1536,10 +1536,15 @@ def test_internal_bill_total_does_not_cross_an_unlinked_section_heading(
     ("bill_total", "accepted"),
     (("150.00", True), ("50.00", False)),
 )
-def test_internal_bill_total_ignores_rotated_structured_overlay_fragments(
+@pytest.mark.parametrize(
+    "preceding_overlay_flags",
+    ([], ["all_text_rotated"]),
+)
+def test_internal_bill_total_ignores_non_section_structured_overlay_fragments(
     tmp_path: Path,
     bill_total: str,
     accepted: bool,
+    preceding_overlay_flags: list[str],
 ) -> None:
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
@@ -1589,9 +1594,9 @@ def test_internal_bill_total_ignores_rotated_structured_overlay_fragments(
                 },
                 {
                     "column_id": "request-number",
-                    "raw_value": "VL. Ltd.",
+                    "raw_value": "No: 10&10/1,",
                     "evidence": [evidence(page_sha, "rotated-overlay-fragment")],
-                    "validation_flags": ["all_text_rotated"],
+                    "validation_flags": preceding_overlay_flags,
                 },
                 {
                     "column_id": "amount",

@@ -307,18 +307,15 @@ def _unlinked_financial_row_is_explained(
         column.id: column.canonical_field for column in table.columns
     }
 
-    def is_rotated_structured_overlay(cell: Any) -> bool:
-        return (
-            fields_by_column.get(cell.column_id) in structured_fields
-            and "all_text_rotated" in cell.validation_flags
-        )
+    def is_structured_identifier_cell(cell: Any) -> bool:
+        return fields_by_column.get(cell.column_id) in structured_fields
 
     label_values = tuple(
         cell.raw_value.strip()
         for cell in source_row.cells
         if cell.raw_value and cell.raw_value.strip()
         and parse_decimal(cell.raw_value) is None
-        and not is_rotated_structured_overlay(cell)
+        and not is_structured_identifier_cell(cell)
     )
     normalized_label = _normalized(" ".join(label_values))
     discount_labels = {"discount", "discount rs"}
@@ -653,13 +650,13 @@ def _unlinked_financial_row_is_explained(
                     if cell.raw_value
                     and cell.raw_value.strip()
                     and parse_decimal(cell.raw_value) is None
-                    and not is_rotated_structured_overlay(cell)
+                    and not is_structured_identifier_cell(cell)
                 )
             )
             preceding_has_section_text = any(
                 cell.raw_value
                 and re.search(r"[a-z]", _normalized(cell.raw_value))
-                and not is_rotated_structured_overlay(cell)
+                and not is_structured_identifier_cell(cell)
                 for cell in preceding.cells
             )
             preceding_has_financial_value = any(
