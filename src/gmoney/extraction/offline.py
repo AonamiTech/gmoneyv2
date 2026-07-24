@@ -885,6 +885,7 @@ def _source_cell_is_in_rotated_overlay_cluster(
     cell: SourceCell,
     table: SourceTable,
     source_row: SourceRow,
+    role: str,
 ) -> bool:
     row_index = next(
         (
@@ -906,6 +907,7 @@ def _source_cell_is_in_rotated_overlay_cluster(
         if candidate.column_id == cell.column_id
         and candidate.raw_value
         and "all_text_rotated" in candidate.validation_flags
+        and not _structured_field_value_is_valid(role, candidate.raw_value)
     )
     return len(rotated_cells_in_lane) >= 3
 
@@ -941,7 +943,7 @@ def _source_cell_is_invalid_structured_overlay(
         return False
     if _structured_field_value_is_valid(
         role,
-        re.sub(r"\s+", "", cell.raw_value),
+        re.sub(r"[\s:#]+", "", cell.raw_value),
     ):
         return False
     return _source_cell_is_oversized_overlay(
@@ -953,6 +955,7 @@ def _source_cell_is_invalid_structured_overlay(
         cell,
         table,
         source_row,
+        role,
     )
 
 

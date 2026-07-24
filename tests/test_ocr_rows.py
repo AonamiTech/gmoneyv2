@@ -2435,8 +2435,10 @@ def test_plausible_slanted_request_number_remains_for_strict_validation() -> Non
         token(6, "11457.00", (880, 70, 960, 85)),
         token(7, "Pharmacy", (100, 100, 230, 115)),
         token(8, "Gloves Sterile 7", (100, 130, 300, 145)),
-        rotated_token(9, "REQ 12345", (530, 120, 610, 135), 19),
+        rotated_token(9, "No: 12345", (530, 120, 610, 135), 19),
         token(10, "20/01/2026 09:44:58", (700, 130, 850, 145)),
+        rotated_token(11, "REQ100", (530, 100, 610, 115), 19),
+        rotated_token(12, "REQ200", (530, 160, 610, 175), 19),
     )
     result = reconstruct_ocr_rows(
         tokens,
@@ -2471,7 +2473,7 @@ def test_plausible_slanted_request_number_remains_for_strict_validation() -> Non
         for cell in gloves_source_row.cells
         if cell.column_id == request_column.id
     )
-    assert request_cell.raw_value == "REQ 12345"
+    assert request_cell.raw_value == "No: 12345"
     assert request_cell.evidence
     assert "excluded_oversized_overlay" not in request_cell.validation_flags
 
