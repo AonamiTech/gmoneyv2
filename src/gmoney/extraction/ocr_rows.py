@@ -332,10 +332,15 @@ def _lines(tokens: tuple[OcrToken, ...]) -> tuple[OcrLine, ...]:
             else tolerance
         )
         token_left, _, token_right, _ = _bounds(token)
+        token_starts_printed_row = bool(
+            re.match(r"^\s*\d+[.)]?\s+\S", token.text)
+            and re.search(r"[A-Za-z]", token.text)
+        )
+        current_has_numeric = any(
+            parse_decimal(item.text) is not None for item in current
+        )
         same_lane_conflict = any(
-            parse_decimal(token.text) is not None
-            and parse_decimal(existing.text) is not None
-            and not is_vertical_decimal_suffix_pair(existing, token)
+            not is_vertical_decimal_suffix_pair(existing, token)
             and
             min(token_right, existing_right)
             - max(token_left, existing_left)
@@ -346,6 +351,18 @@ def _lines(tokens: tuple[OcrToken, ...]) -> tuple[OcrLine, ...]:
             * 0.5
             and abs(_center_y(token) - _center_y(existing))
             > max(4.0, min(_height(token), _height(existing)) * 0.3)
+            and (
+                (
+                    parse_decimal(token.text) is not None
+                    and parse_decimal(existing.text) is not None
+                )
+                or (
+                    token_starts_printed_row
+                    and current_has_numeric
+                    and parse_decimal(existing.text) is None
+                    and re.search(r"[A-Za-z]", existing.text)
+                )
+            )
             for existing in current
             for existing_left, _, existing_right, _ in (_bounds(existing),)
         )

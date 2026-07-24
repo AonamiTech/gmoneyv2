@@ -572,6 +572,44 @@ def test_financial_row_splits_merged_serial_and_description_across_boundary() ->
     } == {"token-7"}
 
 
+def test_slanted_serial_descriptions_start_distinct_financial_rows() -> None:
+    tokens = (
+        token(0, "#", (50, 10, 70, 50)),
+        token(1, "Particulars", (100, 10, 300, 50)),
+        token(2, "Rate", (650, 10, 700, 50)),
+        token(3, "Qty", (760, 10, 800, 50)),
+        token(4, "Amount", (880, 10, 960, 50)),
+        token(5, "53.30", (650, 50, 700, 90)),
+        token(6, "1", (760, 50, 780, 90)),
+        token(7, "53.30", (880, 50, 950, 90)),
+        token(8, "1 ZEPOXIN INJ", (50, 55, 300, 95)),
+        token(9, "2 ONDET 2ML", (50, 80, 280, 120)),
+        token(10, "12.72", (650, 90, 700, 130)),
+        token(11, "2", (760, 90, 780, 130)),
+        token(12, "25.44", (880, 90, 950, 130)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(40, 0, 980, 140),
+    )
+
+    assert [
+        (
+            item.candidate.description,
+            item.candidate.rate,
+            item.candidate.quantity,
+            item.candidate.amount,
+        )
+        for item in result.rows
+    ] == [
+        ("1 ZEPOXIN INJ", Decimal("53.30"), Decimal("1"), Decimal("53.30")),
+        ("2 ONDET 2ML", Decimal("12.72"), Decimal("2"), Decimal("25.44")),
+    ]
+
+
 def test_source_table_excludes_distant_text_beyond_final_column_boundary() -> None:
     tokens = (
         token(0, "Sr.N", (50, 30, 90, 45)),
