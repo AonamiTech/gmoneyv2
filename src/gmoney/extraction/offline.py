@@ -875,6 +875,40 @@ def _contains_service_code_fragment(value: str) -> bool:
     )
 
 
+def _source_cell_is_invalid_structured_overlay(
+    cell: SourceCell,
+    column: SourceColumn,
+    columns: tuple[SourceColumn, ...],
+    row_cells: tuple[SourceCell, ...],
+    canonical: CanonicalRow,
+) -> bool:
+    roles = {
+        "service_date_raw": "service_date",
+        "request_no": "request_no",
+        "service_code": "service_code",
+        "hsn_code": "hsn_code",
+    }
+    field = column.canonical_field
+    role = roles.get(field or "")
+    if (
+        field is None
+        or role is None
+        or getattr(canonical, field) is not None
+        or not cell.raw_value
+        or _structured_field_value_is_valid(role, cell.raw_value)
+        or "all_text_rotated" not in cell.validation_flags
+    ):
+        return False
+    if role == "service_code" and _contains_service_code_fragment(cell.raw_value):
+        return False
+    return _source_cell_is_oversized_overlay(
+        cell,
+        column,
+        columns,
+        row_cells,
+    )
+
+
 def _filter_evidence_token_ids(
     evidence_refs: tuple[EvidenceRef, ...],
     token_ids: set[str],
@@ -1591,40 +1625,31 @@ def _link_source_tables(
                     table.columns,
                     matched,
                 )
-                if matched.service_code is None:
-                    linked_cells = tuple(
-                        cell.model_copy(
-                            update={
-                                "raw_value": None,
-                                "evidence": (),
-                                "validation_flags": tuple(
-                                    dict.fromkeys(
-                                        (
-                                            *cell.validation_flags,
-                                            "excluded_oversized_overlay",
-                                        )
+                linked_cells = tuple(
+                    cell.model_copy(
+                        update={
+                            "raw_value": None,
+                            "evidence": (),
+                            "validation_flags": tuple(
+                                dict.fromkeys(
+                                    (
+                                        *cell.validation_flags,
+                                        "excluded_oversized_overlay",
                                     )
-                                ),
-                            }
-                        )
-                        if (
-                            columns_by_id[cell.column_id].canonical_field == "service_code"
-                            and cell.raw_value
-                            and not _structured_field_value_is_valid(
-                                "service_code", cell.raw_value
-                            )
-                            and not _contains_service_code_fragment(cell.raw_value)
-                            and "all_text_rotated" in cell.validation_flags
-                            and _source_cell_is_oversized_overlay(
-                                cell,
-                                columns_by_id[cell.column_id],
-                                table.columns,
-                                linked_cells,
-                            )
-                        )
-                        else cell
-                        for cell in linked_cells
+                                )
+                            ),
+                        }
                     )
+                    if _source_cell_is_invalid_structured_overlay(
+                        cell,
+                        columns_by_id[cell.column_id],
+                        table.columns,
+                        linked_cells,
+                        matched,
+                    )
+                    else cell
+                    for cell in linked_cells
+                )
             elif scored:
                 flags = tuple(dict.fromkeys((*flags, "canonical_link_ambiguous")))
             linked_rows.append(

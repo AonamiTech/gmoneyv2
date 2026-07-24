@@ -78,7 +78,7 @@ def parse_service_date(value: object) -> str | None:
     remainder = text[matches[0].end() :].strip()
     time_match = (
         re.fullmatch(
-            r"[,;-]?\s*(?P<clock>\d{1,2}:\d{2}(?::\d{2})?)"
+            r"[,;.\-]?\s*(?P<clock>\d{1,2}:\d{2}(?::\d{2})?)"
             r"\s*(?P<meridiem>am|pm)?",
             remainder,
             re.IGNORECASE,

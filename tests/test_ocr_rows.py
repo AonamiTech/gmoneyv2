@@ -2338,6 +2338,63 @@ def test_invalid_stamp_text_is_not_published_as_a_missing_service_code() -> None
     assert "excluded_oversized_overlay" in code_cell.validation_flags
 
 
+def test_invalid_stamp_text_is_not_published_as_a_missing_request_number() -> None:
+    tokens = (
+        token(0, "Service Name", (100, 30, 300, 45)),
+        token(1, "Bill Number", (520, 30, 620, 45)),
+        token(2, "Date", (700, 30, 760, 45)),
+        token(3, "Net Amount", (870, 30, 970, 45)),
+        token(4, "Package Name : Coronary Angiography", (100, 70, 430, 85)),
+        token(5, "20/01/2026 - 21/01/2026", (700, 70, 850, 85)),
+        token(6, "11457.00", (880, 70, 960, 85)),
+        token(7, "Pharmacy", (100, 100, 230, 115)),
+        token(8, "Gloves Sterile 7", (100, 130, 300, 145)),
+        rotated_token(
+            9,
+            "No: 10&10/1, Radhkrishnan",
+            (300, 120, 650, 155),
+            19,
+        ),
+        token(10, "20/01/2026 09:44:58", (700, 130, 850, 145)),
+    )
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 20, 980, 180),
+    )
+    canonical = canonicalize_rows(
+        "d" * 64,
+        1,
+        "p1-t1",
+        "a" * 64,
+        result.rows,
+    )
+
+    linked = _link_source_tables(result.source_tables, canonical)
+
+    gloves = next(row for row in canonical if row.description == "Gloves Sterile 7")
+    assert gloves.request_no is None
+    request_column = next(
+        column
+        for column in linked[0].columns
+        if column.canonical_field == "request_no"
+    )
+    gloves_source_row = next(
+        row
+        for row in linked[0].rows
+        if row.canonical_row_id == str(gloves.id)
+    )
+    request_cell = next(
+        cell
+        for cell in gloves_source_row.cells
+        if cell.column_id == request_column.id
+    )
+    assert request_cell.raw_value is None
+    assert request_cell.evidence == ()
+    assert "excluded_oversized_overlay" in request_cell.validation_flags
+
+
 def test_linked_source_row_splits_grounded_date_from_cross_column_ocr_token() -> None:
     tokens = (
         token(0, "Date", (100, 30, 170, 45)),
@@ -3860,10 +3917,12 @@ def test_client_pharmacy_aliases_keep_date_product_gross_and_net_in_their_lanes(
 
 
 @pytest.mark.parametrize("merged_right", (440, 650, 850))
-@pytest.mark.parametrize("timestamp_separator", (" ", ", ", "; ", " - "))
+@pytest.mark.parametrize("timestamp_separator", (" ", ", ", "; ", " - ", ".", ". "))
+@pytest.mark.parametrize("request_prefix", ("PI", "P|"))
 def test_pharmacy_expiry_date_does_not_replace_left_transaction_date(
     merged_right: int,
     timestamp_separator: str,
+    request_prefix: str,
 ) -> None:
     tokens = (
         token(0, "Date/ Time", (80, 25, 170, 40)),
@@ -3877,7 +3936,8 @@ def test_pharmacy_expiry_date_does_not_replace_left_transaction_date(
         token(8, "Total", (920, 25, 970, 40)),
         token(
             9,
-            f"10/07/2026{timestamp_separator}02:48 am PI261015227 Patient Coat",
+            f"10/07/2026{timestamp_separator}02:48 am "
+            f"{request_prefix}261015227 Patient Coat",
             (80, 70, merged_right, 85),
         ),
         token(12, "62104070", (500, 70, 570, 85)),
@@ -3886,7 +3946,7 @@ def test_pharmacy_expiry_date_does_not_replace_left_transaction_date(
         token(15, "250", (930, 70, 965, 85)),
         token(
             16,
-            f"10/07/2026{timestamp_separator}02:49 am PI261015228",
+            f"10/07/2026{timestamp_separator}02:49 am {request_prefix}261015228",
             (80, 100, 290, 115),
         ),
         token(18, "Betadine Scrub 50 ML", (320, 100, 465, 115)),
@@ -3941,7 +4001,7 @@ def test_pharmacy_expiry_date_does_not_replace_left_transaction_date(
     assert first_cells["service_date_raw"].raw_value == (
         f"10/07/2026{timestamp_separator}02:48 am"
     )
-    assert first_cells["request_no"].raw_value == "PI261015227"
+    assert first_cells["request_no"].raw_value == f"{request_prefix}261015227"
     assert first_cells["description"].raw_value == "Patient Coat"
     assert len(first_cells["description"].evidence) == 1
     assert all(
@@ -4010,7 +4070,7 @@ def test_pharmacy_expiry_date_does_not_replace_left_transaction_date(
     assert second_cells["service_date_raw"].raw_value == (
         f"10/07/2026{timestamp_separator}02:49 am"
     )
-    assert second_cells["request_no"].raw_value == "PI261015228"
+    assert second_cells["request_no"].raw_value == f"{request_prefix}261015228"
     assert second_cells["description"].raw_value == "Betadine Scrub 50 ML"
 
 
@@ -4138,11 +4198,53 @@ def test_pharmacy_description_wrap_inside_numeric_row_envelope_is_grounded() -> 
             token(9, "BILL", (700, 160, 740, 180)),
             token(13, "TOTAL", (745, 160, 790, 180)),
         ),
+        (
+            rotated_token(
+                9,
+                "BILL TOTAL",
+                (700, 160, 790, 180),
+                6,
+            ),
+        ),
+        (
+            token(9, "BILL", (700, 160, 740, 180)),
+            rotated_token(
+                13,
+                "TOTAL",
+                (745, 160, 790, 180),
+                6,
+            ),
+        ),
     ),
-    ids=("merged-label-token", "split-label-tokens"),
+    ids=(
+        "merged-label-token",
+        "split-label-tokens",
+        "rotated-merged-label-token",
+        "rotated-split-total-token",
+    ),
+)
+@pytest.mark.parametrize(
+    ("overlay_tokens", "printed_total_description"),
+    (
+        ((), None),
+        (
+            (
+                rotated_token(
+                    14,
+                    "Hospital address",
+                    (300, 155, 550, 180),
+                    15,
+                ),
+            ),
+            "Hospital address",
+        ),
+    ),
+    ids=("clean-total-line", "rotated-overlay-on-total-line"),
 )
 def test_bill_total_in_quantity_lane_does_not_consume_pending_description(
     bill_total_tokens: tuple[OcrToken, ...],
+    overlay_tokens: tuple[OcrToken, ...],
+    printed_total_description: str | None,
 ) -> None:
     tokens = (
         token(99, "IP Pharmacy", (300, 0, 430, 15)),
@@ -4157,6 +4259,7 @@ def test_bill_total_in_quantity_lane_does_not_consume_pending_description(
         token(6, "10.23", (800, 70, 850, 90)),
         token(7, "20.46", (900, 70, 960, 90)),
         token(8, "Unlinked text", (300, 120, 430, 140)),
+        *overlay_tokens,
         *bill_total_tokens,
         token(10, "20.46", (900, 160, 960, 180)),
     )
@@ -4182,7 +4285,7 @@ def test_bill_total_in_quantity_lane_does_not_consume_pending_description(
             if cell.column_id == description_column.id
         )
         for row in result.source_tables[0].rows
-    ] == ["Dispovan 1ML", "Unlinked text", None]
+    ] == ["Dispovan 1ML", "Unlinked text", printed_total_description]
 
     canonical = canonicalize_rows(
         "d" * 64,

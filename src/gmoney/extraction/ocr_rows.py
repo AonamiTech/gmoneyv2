@@ -122,11 +122,11 @@ TIME_VALUE = (
     r"|\d{1,2}:\d{2}(?::\d{2})?)"
 )
 DATE_PREFIX = re.compile(
-    rf"^\s*(?P<date>{DATE_VALUE})(?:\s*[,;-]?\s*{TIME_VALUE})?\s*[-:]?\s*",
+    rf"^\s*(?P<date>{DATE_VALUE})(?:\s*[,;.\-]?\s*{TIME_VALUE})?\s*[-:]?\s*",
     re.IGNORECASE,
 )
 DATE_SPAN = re.compile(
-    rf"{DATE_VALUE}(?:\s*[,;-]?\s*{TIME_VALUE})?",
+    rf"{DATE_VALUE}(?:\s*[,;.\-]?\s*{TIME_VALUE})?",
     re.IGNORECASE,
 )
 DATE_RANGE_SUFFIX = re.compile(
@@ -138,7 +138,9 @@ REQUEST_PREFIX = re.compile(
     r"^[A-Z][A-Z0-9-]{2,}/[A-Z0-9-]+\s*",
     re.IGNORECASE,
 )
-COMPACT_REQUEST_PREFIX = re.compile(r"^[A-Z]{1,5}\d{5,20}(?=\s|$)\s*")
+COMPACT_REQUEST_PREFIX = re.compile(
+    r"^(?=[A-Z|]*[A-Z])[A-Z|]{1,5}\d{5,20}(?=\s|[.,;:]|$)\s*"
+)
 BATCH_SUFFIX = re.compile(
     r"\s*(?:\[?\s*(?:B\.?\s*No|Batch|Exp(?:iry)?\s*Date)\s*[:.-].*)$",
     re.IGNORECASE,
@@ -2232,7 +2234,39 @@ def _is_total_description(normalized: str) -> bool:
 
 
 def _is_structural_total_line(line: OcrLine) -> bool:
-    normalized = _normalize(line.text)
+    ordered_tokens = tuple(
+        token for token in line.tokens if token.text.strip()
+    )
+    structural_labels = {"bill total", "sub total", "subtotal", "total"}
+    for start in range(len(ordered_tokens)):
+        if any(
+            not _is_rotated_text(token)
+            for token in ordered_tokens[:start]
+        ):
+            continue
+        for stop in range(start + 1, min(len(ordered_tokens), start + 2) + 1):
+            candidate = _normalize(
+                " ".join(token.text for token in ordered_tokens[start:stop])
+            )
+            if candidate not in structural_labels:
+                continue
+            if all(
+                _is_rotated_text(token)
+                or parse_decimal(token.text) is not None
+                for token in ordered_tokens[stop:]
+            ):
+                return True
+    non_rotated_tokens = tuple(
+        token for token in line.tokens if not _is_rotated_text(token)
+    )
+    structural_tokens = non_rotated_tokens or line.tokens
+    normalized = _normalize(
+        " ".join(
+            token.text.strip()
+            for token in structural_tokens
+            if token.text.strip()
+        )
+    )
     if _is_total_description(normalized):
         return True
     for label in ("bill total", "sub total", "subtotal", "total"):

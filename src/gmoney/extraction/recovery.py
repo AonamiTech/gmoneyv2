@@ -454,6 +454,8 @@ def _row_evidence_bounds(row: object) -> tuple[float, float, float, float] | Non
     bounds = tuple(
         bound
         for cell in getattr(row, "cells", ())
+        if "all_text_rotated"
+        not in getattr(cell, "validation_flags", ())
         if (bound := _evidence_bounds(getattr(cell, "evidence", ()))) is not None
     )
     if not bounds:

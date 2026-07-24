@@ -332,6 +332,53 @@ def test_description_lane_recovery_targets_only_consecutive_grounded_detail_rows
     ) == ((100, 165, 400, 255),)
 
 
+def test_description_recovery_boundary_ignores_rotated_overlay_only_row() -> None:
+    table = _description_recovery_source_table()
+    target = table.rows[1]
+    overlay = SourceRow(
+        id="stamp-overlay",
+        order=1,
+        cells=(
+            SourceCell(
+                column_id="description",
+                raw_value="Hospital address",
+                evidence=_evidence_at(
+                    "stamp-overlay",
+                    100,
+                    155,
+                    380,
+                    178,
+                ),
+                validation_flags=("all_text_rotated",),
+            ),
+            *(
+                SourceCell(
+                    column_id=column.id,
+                    raw_value=None,
+                    evidence=(),
+                    validation_flags=("empty_cell",),
+                )
+                for column in table.columns[1:]
+            ),
+        ),
+    )
+    reconstruction = ReconstructionResult(
+        rows=(),
+        schema=_schema(TableType.PHARMACY),
+        diagnostics={"table_type": TableType.PHARMACY.value},
+        source_tables=(
+            table.model_copy(
+                update={"rows": (table.rows[0], overlay, target)}
+            ),
+        ),
+    )
+
+    assert description_lane_recovery_regions(
+        reconstruction,
+        table_box=(50, 80, 800, 300),
+    ) == ((100, 165, 400, 200),)
+
+
 def test_first_description_recovery_band_stays_below_grounded_headers() -> None:
     table = _description_recovery_source_table()
     first_cells = list(table.rows[0].cells)
