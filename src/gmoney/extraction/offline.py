@@ -989,12 +989,19 @@ def _source_cell_is_invalid_structured_overlay(
         and _contains_service_code_fragment(cell.raw_value)
     ):
         return False
-    return _source_cell_is_oversized_overlay(
+    if _source_cell_is_oversized_overlay(
         cell,
         column,
         table.columns,
         source_row.cells,
-    ) or _source_cell_is_in_rotated_overlay_cluster(
+    ):
+        return True
+    if _structured_field_value_is_valid(
+        role,
+        re.sub(r"[\s:#]+", "", cell.raw_value),
+    ):
+        return False
+    return _source_cell_is_in_rotated_overlay_cluster(
         table,
         source_row,
     )

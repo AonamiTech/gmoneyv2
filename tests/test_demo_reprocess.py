@@ -1634,6 +1634,34 @@ def test_internal_bill_total_ignores_rotated_structured_overlay_fragments(
             "validation_flags": [],
         },
     )
+    printed[0]["rows"].append(
+        {
+            "id": "following-bill-total",
+            "order": 5,
+            "canonical_row_id": None,
+            "cells": [
+                {
+                    "column_id": "description",
+                    "raw_value": "BILL TOTAL",
+                    "evidence": [evidence(page_sha, "following-bill-total-label")],
+                    "validation_flags": [],
+                },
+                {
+                    "column_id": "request-number",
+                    "raw_value": None,
+                    "evidence": [],
+                    "validation_flags": ["empty_cell"],
+                },
+                {
+                    "column_id": "amount",
+                    "raw_value": "25.00",
+                    "evidence": [evidence(page_sha, "following-bill-total-amount")],
+                    "validation_flags": [],
+                },
+            ],
+            "validation_flags": [],
+        }
+    )
     for order, source_row in enumerate(printed[0]["rows"]):
         source_row["id"] = f"p1-t1-s1-r{order + 1}"
         source_row["order"] = order

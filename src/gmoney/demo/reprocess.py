@@ -653,6 +653,7 @@ def _unlinked_financial_row_is_explained(
                     if cell.raw_value
                     and cell.raw_value.strip()
                     and parse_decimal(cell.raw_value) is None
+                    and not is_rotated_structured_overlay(cell)
                 )
             )
             preceding_has_section_text = any(
