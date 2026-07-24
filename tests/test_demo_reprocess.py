@@ -919,7 +919,16 @@ def test_reprocess_validation_accepts_only_matching_internal_bill_total(
         right=220,
         bottom=120,
     )
+    first_amount_evidence = evidence(
+        page_sha,
+        "amount-token",
+        left=700,
+        top=100,
+        right=780,
+        bottom=140,
+    )
     new_rows[0]["field_evidence"]["description"] = [first_description_evidence]
+    new_rows[0]["field_evidence"]["amount"] = [first_amount_evidence]
     new_rows[0]["evidence"] = [first_description_evidence]
     new_rows[1]["row_order"] = 1
     printed = source_tables(new_rows, page_sha)
@@ -1003,10 +1012,14 @@ def test_reprocess_validation_accepts_only_matching_internal_bill_total(
             )
 
 
-@pytest.mark.parametrize("bill_total", ("150.00", "149.00"))
-def test_internal_bill_total_rejects_ambiguous_intervening_aligned_text(
+@pytest.mark.parametrize(
+    ("bill_total", "accepted"),
+    (("150.00", True), ("149.00", False)),
+)
+def test_internal_bill_total_spans_intervening_text_within_prior_row_envelope(
     tmp_path: Path,
     bill_total: str,
+    accepted: bool,
 ) -> None:
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
@@ -1023,7 +1036,16 @@ def test_internal_bill_total_rejects_ambiguous_intervening_aligned_text(
         right=220,
         bottom=120,
     )
+    first_amount_evidence = evidence(
+        page_sha,
+        "amount-token",
+        left=700,
+        top=100,
+        right=780,
+        bottom=140,
+    )
     new_rows[0]["field_evidence"]["description"] = [first_description_evidence]
+    new_rows[0]["field_evidence"]["amount"] = [first_amount_evidence]
     new_rows[0]["evidence"] = [first_description_evidence]
     for order, canonical in enumerate(new_rows):
         canonical["row_order"] = order
@@ -1092,13 +1114,21 @@ def test_internal_bill_total_rejects_ambiguous_intervening_aligned_text(
         "source_tables": printed,
     }
 
-    with pytest.raises(ValueError, match="unlinked source row.*financial"):
+    if accepted:
         _validate_result(
             store.job_dir(job_id) / "source.pdf",
             old_result,
             new_result,
             store.job_dir(job_id) / "artifacts",
         )
+    else:
+        with pytest.raises(ValueError, match="unlinked source row.*financial"):
+            _validate_result(
+                store.job_dir(job_id) / "source.pdf",
+                old_result,
+                new_result,
+                store.job_dir(job_id) / "artifacts",
+            )
 
 
 @pytest.mark.parametrize(
@@ -1125,7 +1155,16 @@ def test_internal_bill_total_does_not_cross_an_unlinked_section_heading(
         right=220,
         bottom=120,
     )
+    first_amount_evidence = evidence(
+        page_sha,
+        "amount-token",
+        left=700,
+        top=100,
+        right=780,
+        bottom=120,
+    )
     new_rows[0]["field_evidence"]["description"] = [first_description_evidence]
+    new_rows[0]["field_evidence"]["amount"] = [first_amount_evidence]
     new_rows[0]["evidence"] = [first_description_evidence]
     for order, canonical in enumerate(new_rows):
         canonical["row_order"] = order

@@ -1223,6 +1223,13 @@ def _source_rows(
                 for token_id in evidence.token_ids
                 if token_id in original_by_id
             ]
+            previous_row_tokens = [
+                original_by_id[token_id]
+                for cell in previous_cells
+                for evidence in cell.evidence
+                for token_id in evidence.token_ids
+                if token_id in original_by_id
+            ]
             description_cell_max = (
                 (centers[description_index] + centers[description_index + 1])
                 / (2 * width)
@@ -1238,6 +1245,7 @@ def _source_rows(
                 and _wrapped_description_line_is_proven(
                     previous_description_tokens,
                     list(line.tokens),
+                    previous_row_tokens=previous_row_tokens,
                     description_cell_max=description_cell_max,
                     left=0.0,
                     width=width,
@@ -1253,6 +1261,8 @@ def _source_rows(
                         previous_description.raw_value,
                     )
                     or (
+                        table_type is not TableType.PHARMACY
+                        and
                         any(
                             previous_cells[index].raw_value
                             for index in financial_indexes
@@ -1602,6 +1612,7 @@ def _wrapped_description_line_is_proven(
     previous_tokens: list[OcrToken],
     continuation_tokens: list[OcrToken],
     *,
+    previous_row_tokens: list[OcrToken],
     description_cell_max: float | None,
     left: float,
     width: float,
@@ -1616,14 +1627,15 @@ def _wrapped_description_line_is_proven(
         " ",
         continuation_text.casefold(),
     ).strip()
-    if not re.fullmatch(
-        r"(?:"
-        r"\d+(?:\.\d+)?\s*(?:ml|mg|mcg|g|gm|l|iu|%)"
-        r"|(?:ml|mg|mcg|g|gm|l|iu)"
-        r")",
-        normalized_continuation,
-    ):
-        return False
+    is_unit_suffix = bool(
+        re.fullmatch(
+            r"(?:"
+            r"\d+(?:\.\d+)?\s*(?:ml|mg|mcg|g|gm|l|iu|%)"
+            r"|(?:ml|mg|mcg|g|gm|l|iu)"
+            r")",
+            normalized_continuation,
+        )
+    )
     previous_left = min(
         (_bounds(token)[0] - left) / width for token in previous_tokens
     )
@@ -1633,9 +1645,34 @@ def _wrapped_description_line_is_proven(
     continuation_left = min(
         (_bounds(token)[0] - left) / width for token in continuation_tokens
     )
-    return (
+    if is_unit_suffix and (
         previous_right >= description_cell_max - 0.02
         and abs(continuation_left - previous_left) <= 0.03
+    ):
+        return True
+    previous_description_ids = {token.token_id for token in previous_tokens}
+    other_row_tokens = tuple(
+        token
+        for token in previous_row_tokens
+        if token.token_id not in previous_description_ids
+    )
+    if not other_row_tokens:
+        return False
+    previous_top = min(_bounds(token)[1] for token in previous_tokens)
+    previous_bottom = max(_bounds(token)[3] for token in previous_tokens)
+    continuation_top = min(_bounds(token)[1] for token in continuation_tokens)
+    continuation_bottom = max(_bounds(token)[3] for token in continuation_tokens)
+    line_height = max(
+        1.0,
+        previous_bottom - previous_top,
+        continuation_bottom - continuation_top,
+    )
+    return (
+        abs(continuation_left - previous_left) <= 0.03
+        and continuation_top > previous_top
+        and continuation_top
+        <= max(_bounds(token)[3] for token in other_row_tokens)
+        and continuation_top - previous_bottom <= line_height * 1.5
     )
 
 
@@ -2198,12 +2235,10 @@ def _is_structural_total_line(line: OcrLine) -> bool:
     normalized = _normalize(line.text)
     if _is_total_description(normalized):
         return True
-    if not line.tokens:
-        return False
-    leading = _normalize(line.tokens[0].text)
-    if leading not in {"total", "sub total", "subtotal"}:
-        return False
-    return not any(re.search(r"[a-z]", _normalize(token.text)) for token in line.tokens[1:])
+    for label in ("bill total", "sub total", "subtotal", "total"):
+        if normalized == label or normalized.startswith(f"{label} "):
+            return not re.search(r"[a-z]", normalized[len(label) :])
+    return False
 
 
 def _is_description_continuation(text: str, previous: str) -> bool:
@@ -2809,6 +2844,11 @@ def reconstruct_ocr_rows(
         ]
         if not previous_tokens:
             return False
+        previous_row_tokens = [
+            original_by_id[token_id]
+            for token_id in aligned[-1].evidence_token_ids
+            if token_id in original_by_id
+        ]
         previous_left = min(
             (_bounds(token)[0] - left) / width for token in previous_tokens
         )
@@ -2816,6 +2856,7 @@ def reconstruct_ocr_rows(
             return _wrapped_description_line_is_proven(
                 previous_tokens,
                 continuation_tokens,
+                previous_row_tokens=previous_row_tokens,
                 description_cell_max=description_cell_max,
                 left=left,
                 width=width,

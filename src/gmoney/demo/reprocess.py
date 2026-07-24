@@ -373,7 +373,19 @@ def _unlinked_financial_row_is_explained(
             return False
         current_bounds = cell_bounds(current_description)
         previous_bounds = cell_bounds(previous_description)
-        if current_bounds is None or previous_bounds is None:
+        previous_row_bounds = tuple(
+            bounds
+            for cell in previous.cells
+            if cell.column_id != description_column.id
+            and cell.raw_value
+            and cell.raw_value.strip()
+            and (bounds := cell_bounds(cell)) is not None
+        )
+        if (
+            current_bounds is None
+            or previous_bounds is None
+            or not previous_row_bounds
+        ):
             return False
         current_height = max(1.0, current_bounds[3] - current_bounds[1])
         previous_height = max(1.0, previous_bounds[3] - previous_bounds[1])
@@ -381,6 +393,8 @@ def _unlinked_financial_row_is_explained(
         vertical_gap = current_bounds[1] - previous_bounds[3]
         return (
             current_bounds[1] > previous_bounds[1]
+            and current_bounds[1]
+            <= max(bounds[3] for bounds in previous_row_bounds)
             and -line_height * 0.25 <= vertical_gap <= line_height * 1.5
             and abs(current_bounds[0] - previous_bounds[0])
             <= max(4.0, line_height * 0.25)
@@ -497,15 +511,11 @@ def _unlinked_financial_row_is_explained(
                 or preceding_label.startswith(total_prefixes)
                 or is_structurally_grounded_settlement(preceding_cells)
             )
-            linked_row_follows_before_total = any(
-                candidate.canonical_row_id is not None
-                for candidate in preceding_rows[preceding_index + 1 :]
-            )
             preceding_is_continuation = is_grounded_description_continuation(
                 preceding_rows,
                 preceding_index,
                 previous_is_continuation=previous_was_continuation,
-            ) and not linked_row_follows_before_total
+            )
             if preceding_is_financial_boundary or (
                 preceding_label
                 and not preceding_has_financial_value

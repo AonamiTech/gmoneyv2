@@ -4068,6 +4068,137 @@ def test_pharmacy_description_continuation_in_same_lane_is_grounded() -> None:
     assert linked[0].rows[0].canonical_row_id == str(canonical[0].id)
 
 
+def test_pharmacy_description_wrap_inside_numeric_row_envelope_is_grounded() -> None:
+    tokens = (
+        token(99, "IP Pharmacy", (300, 0, 430, 15)),
+        token(0, "ProductName", (300, 25, 450, 40)),
+        token(1, "Batch No", (500, 25, 570, 40)),
+        token(2, "Qty", (700, 25, 750, 40)),
+        token(3, "Rate", (800, 25, 850, 40)),
+        token(4, "Total", (900, 25, 960, 40)),
+        token(5, "Dispovan 10Ml", (300, 70, 470, 90)),
+        token(6, "621103JP1", (500, 70, 590, 110)),
+        token(7, "5", (710, 70, 730, 110)),
+        token(8, "13.3", (800, 70, 850, 110)),
+        token(9, "66.5", (900, 70, 960, 110)),
+        token(10, "Syringe", (300, 100, 390, 120)),
+        token(11, "Next Product", (300, 140, 450, 160)),
+        token(12, "1", (710, 140, 730, 160)),
+        token(13, "20", (800, 140, 850, 160)),
+        token(14, "20", (900, 140, 960, 160)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=2,
+        table_id="p2-t1",
+        box=(280, -5, 980, 175),
+    )
+
+    assert [row.candidate.description for row in result.rows] == [
+        "Dispovan 10Ml Syringe",
+        "Next Product",
+    ]
+    assert result.rows[0].field_token_ids["description"] == (
+        "token-5",
+        "token-10",
+    )
+    canonical = canonicalize_rows(
+        "d" * 64,
+        2,
+        "p2-t1",
+        "a" * 64,
+        result.rows,
+    )
+    linked = _link_source_tables(result.source_tables, canonical)
+    description_column = next(
+        column
+        for column in linked[0].columns
+        if column.canonical_field == "description"
+    )
+    description_cell = next(
+        cell
+        for cell in linked[0].rows[0].cells
+        if cell.column_id == description_column.id
+    )
+    assert description_cell.raw_value == "Dispovan 10Ml Syringe"
+    assert {
+        token_id
+        for evidence in description_cell.evidence
+        for token_id in evidence.token_ids
+    } == {"token-5", "token-10"}
+    assert linked[0].rows[0].canonical_row_id == str(canonical[0].id)
+
+
+@pytest.mark.parametrize(
+    "bill_total_tokens",
+    (
+        (token(9, "BILL TOTAL", (700, 160, 790, 180)),),
+        (
+            token(9, "BILL", (700, 160, 740, 180)),
+            token(13, "TOTAL", (745, 160, 790, 180)),
+        ),
+    ),
+    ids=("merged-label-token", "split-label-tokens"),
+)
+def test_bill_total_in_quantity_lane_does_not_consume_pending_description(
+    bill_total_tokens: tuple[OcrToken, ...],
+) -> None:
+    tokens = (
+        token(99, "IP Pharmacy", (300, 0, 430, 15)),
+        token(0, "ProductName", (300, 25, 450, 40)),
+        token(11, "Batch No", (500, 25, 570, 40)),
+        token(1, "Qty", (700, 25, 750, 40)),
+        token(2, "Rate", (800, 25, 850, 40)),
+        token(3, "Total", (900, 25, 960, 40)),
+        token(4, "Dispovan 1ML", (300, 70, 470, 90)),
+        token(12, "621103JP1", (500, 70, 590, 90)),
+        token(5, "2", (710, 70, 730, 90)),
+        token(6, "10.23", (800, 70, 850, 90)),
+        token(7, "20.46", (900, 70, 960, 90)),
+        token(8, "Unlinked text", (300, 120, 430, 140)),
+        *bill_total_tokens,
+        token(10, "20.46", (900, 160, 960, 180)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=2,
+        table_id="p2-t1",
+        box=(280, -5, 980, 195),
+    )
+
+    assert [row.candidate.description for row in result.rows] == ["Dispovan 1ML"]
+    assert all(row.candidate.amount == Decimal("20.46") for row in result.rows)
+    description_column = next(
+        column
+        for column in result.source_tables[0].columns
+        if column.canonical_field == "description"
+    )
+    assert [
+        next(
+            cell.raw_value
+            for cell in row.cells
+            if cell.column_id == description_column.id
+        )
+        for row in result.source_tables[0].rows
+    ] == ["Dispovan 1ML", "Unlinked text", None]
+
+    canonical = canonicalize_rows(
+        "d" * 64,
+        2,
+        "p2-t1",
+        "a" * 64,
+        result.rows,
+    )
+    linked = _link_source_tables(result.source_tables, canonical)
+    assert [row.canonical_row_id for row in linked[0].rows] == [
+        str(canonical[0].id),
+        None,
+        None,
+    ]
+
+
 def test_pharmacy_unpriced_full_name_is_not_merged_into_previous_product() -> None:
     tokens = (
         token(0, "ProductName", (300, 25, 450, 40)),
