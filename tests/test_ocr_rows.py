@@ -2358,6 +2358,12 @@ def test_invalid_stamp_text_is_not_published_as_a_missing_service_code() -> None
             (
                 rotated_token(11, "VL. Ltd.", (530, 100, 610, 115), 19),
                 rotated_token(12, "600 087.", (530, 160, 610, 175), 19),
+                rotated_token(
+                    13,
+                    "Valasaravakkam,",
+                    (700, 100, 820, 115),
+                    19,
+                ),
             ),
         ),
         (
@@ -2366,6 +2372,12 @@ def test_invalid_stamp_text_is_not_published_as_a_missing_service_code() -> None
             (
                 rotated_token(11, "Road,", (530, 100, 610, 115), 19),
                 rotated_token(12, "600 087.", (530, 160, 610, 175), 19),
+                rotated_token(
+                    13,
+                    "Valasaravakkam,",
+                    (700, 100, 820, 115),
+                    19,
+                ),
             ),
         ),
     ),
@@ -2432,7 +2444,18 @@ def test_invalid_stamp_text_is_not_published_as_a_missing_request_number(
     assert "excluded_oversized_overlay" in request_cell.validation_flags
 
 
-def test_plausible_slanted_request_number_remains_for_strict_validation() -> None:
+@pytest.mark.parametrize(
+    ("printed_request", "preceding_request", "following_request"),
+    (
+        ("No: 12345", "REQ100", "REQ200"),
+        ("REQ 150.", "REQ 100.", "REQ 200."),
+    ),
+)
+def test_plausible_slanted_request_number_remains_for_strict_validation(
+    printed_request: str,
+    preceding_request: str,
+    following_request: str,
+) -> None:
     tokens = (
         token(0, "Service Name", (100, 30, 300, 45)),
         token(1, "Bill Number", (520, 30, 620, 45)),
@@ -2443,10 +2466,10 @@ def test_plausible_slanted_request_number_remains_for_strict_validation() -> Non
         token(6, "11457.00", (880, 70, 960, 85)),
         token(7, "Pharmacy", (100, 100, 230, 115)),
         token(8, "Gloves Sterile 7", (100, 130, 300, 145)),
-        rotated_token(9, "No: 12345", (530, 120, 610, 135), 19),
+        rotated_token(9, printed_request, (530, 120, 610, 135), 19),
         token(10, "20/01/2026 09:44:58", (700, 130, 850, 145)),
-        rotated_token(11, "REQ100", (530, 100, 610, 115), 19),
-        rotated_token(12, "REQ200", (530, 160, 610, 175), 19),
+        rotated_token(11, preceding_request, (530, 100, 610, 115), 19),
+        rotated_token(12, following_request, (530, 160, 610, 175), 19),
     )
     result = reconstruct_ocr_rows(
         tokens,
@@ -2481,7 +2504,7 @@ def test_plausible_slanted_request_number_remains_for_strict_validation() -> Non
         for cell in gloves_source_row.cells
         if cell.column_id == request_column.id
     )
-    assert request_cell.raw_value == "No: 12345"
+    assert request_cell.raw_value == printed_request
     assert request_cell.evidence
     assert "excluded_oversized_overlay" not in request_cell.validation_flags
 

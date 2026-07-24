@@ -855,7 +855,12 @@ def _source_cell_is_oversized_overlay(
     if not own_heights or len(peer_heights) < 2:
         return False
     peer_height = median(peer_heights)
-    if peer_height <= 0 or max(own_heights) <= peer_height * 2:
+    if peer_height <= 0:
+        return False
+    maximum_height = max(own_heights)
+    if maximum_height > peer_height * 3:
+        return True
+    if maximum_height <= peer_height * 2:
         return False
 
     cell_xs = tuple(
@@ -882,10 +887,8 @@ def _source_cell_is_oversized_overlay(
 
 
 def _source_cell_is_in_rotated_overlay_cluster(
-    cell: SourceCell,
     table: SourceTable,
     source_row: SourceRow,
-    role: str,
 ) -> bool:
     row_index = next(
         (
@@ -900,16 +903,39 @@ def _source_cell_is_in_rotated_overlay_cluster(
     neighboring_rows = table.rows[
         max(0, row_index - 2) : min(len(table.rows), row_index + 3)
     ]
-    rotated_cells_in_lane = tuple(
-        candidate
+    structured_roles = {
+        "service_date_raw": "service_date",
+        "request_no": "request_no",
+        "service_code": "service_code",
+        "hsn_code": "hsn_code",
+    }
+    roles_by_column = {
+        column.id: structured_roles[column.canonical_field]
+        for column in table.columns
+        if column.canonical_field in structured_roles
+    }
+    rotated_structured_cells = tuple(
+        (candidate.column_id, candidate)
         for neighboring_row in neighboring_rows
         for candidate in neighboring_row.cells
-        if candidate.column_id == cell.column_id
+        if candidate.column_id in roles_by_column
         and candidate.raw_value
         and "all_text_rotated" in candidate.validation_flags
-        and not _structured_field_value_is_valid(role, candidate.raw_value)
+        and not _structured_field_value_is_valid(
+            roles_by_column[candidate.column_id],
+            candidate.raw_value,
+        )
     )
-    return len(rotated_cells_in_lane) >= 3
+    return (
+        len(rotated_structured_cells) >= 3
+        and len(
+            {
+                column_id
+                for column_id, _ in rotated_structured_cells
+            }
+        )
+        >= 2
+    )
 
 
 def _source_cell_is_invalid_structured_overlay(
@@ -941,22 +967,14 @@ def _source_cell_is_invalid_structured_overlay(
         and _contains_service_code_fragment(cell.raw_value)
     ):
         return False
-    compacted_value = re.sub(r"[\s:#]+", "", cell.raw_value)
-    if (
-        not cell.raw_value.rstrip().endswith((",", ".", ";"))
-        and _structured_field_value_is_valid(role, compacted_value)
-    ):
-        return False
     return _source_cell_is_oversized_overlay(
         cell,
         column,
         table.columns,
         source_row.cells,
     ) or _source_cell_is_in_rotated_overlay_cluster(
-        cell,
         table,
         source_row,
-        role,
     )
 
 
