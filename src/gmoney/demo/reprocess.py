@@ -306,7 +306,14 @@ def _unlinked_financial_row_is_explained(
     fields_by_column = {
         column.id: column.canonical_field for column in table.columns
     }
-    total_labels = {"bill total", "total", "totals", "sub total", "subtotal"}
+    total_labels = {
+        "bill amount",
+        "bill total",
+        "total",
+        "totals",
+        "sub total",
+        "subtotal",
+    }
     total_prefixes = (
         "grand total",
         "gross bill amount",
