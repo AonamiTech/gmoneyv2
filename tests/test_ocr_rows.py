@@ -6,6 +6,7 @@ from gmoney.contracts.evidence import OcrToken, Point, Polygon
 from gmoney.contracts.extraction import RowRole, TableType
 from gmoney.extraction.canonicalize import canonicalize_rows
 from gmoney.extraction.ocr_rows import (
+    _clean_description,
     fuse_provider_descriptions,
     reconstruct_ocr_rows,
 )
@@ -3856,6 +3857,465 @@ def test_client_pharmacy_aliases_keep_date_product_gross_and_net_in_their_lanes(
     assert candidate.rate == Decimal("125.00")
     assert candidate.gross_amount == Decimal("250.00")
     assert candidate.amount == Decimal("225.00")
+
+
+@pytest.mark.parametrize("merged_right", (440, 650, 850))
+@pytest.mark.parametrize("timestamp_separator", (" ", ", ", "; ", " - "))
+def test_pharmacy_expiry_date_does_not_replace_left_transaction_date(
+    merged_right: int,
+    timestamp_separator: str,
+) -> None:
+    tokens = (
+        token(0, "Date/ Time", (80, 25, 170, 40)),
+        token(1, "Bill Number", (200, 25, 290, 40)),
+        token(2, "ProductName", (320, 25, 450, 40)),
+        token(3, "Batch No", (500, 25, 570, 40)),
+        token(4, "Expiry", (620, 25, 680, 40)),
+        token(5, "Date", (690, 25, 730, 40)),
+        token(6, "Qty", (770, 25, 805, 40)),
+        token(7, "Rate", (840, 25, 885, 40)),
+        token(8, "Total", (920, 25, 970, 40)),
+        token(
+            9,
+            f"10/07/2026{timestamp_separator}02:48 am PI261015227 Patient Coat",
+            (80, 70, merged_right, 85),
+        ),
+        token(12, "62104070", (500, 70, 570, 85)),
+        token(13, "1", (780, 70, 795, 85)),
+        token(14, "250", (845, 70, 880, 85)),
+        token(15, "250", (930, 70, 965, 85)),
+        token(
+            16,
+            f"10/07/2026{timestamp_separator}02:49 am PI261015228",
+            (80, 100, 290, 115),
+        ),
+        token(18, "Betadine Scrub 50 ML", (320, 100, 465, 115)),
+        token(19, "MD06126", (500, 100, 570, 115)),
+        token(20, "30/09/2027", (630, 100, 725, 115)),
+        token(21, "1", (780, 100, 795, 115)),
+        token(22, "107.1", (840, 100, 885, 115)),
+        token(23, "107.1", (920, 100, 970, 115)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=2,
+        table_id="p2-t1",
+        box=(60, 15, 980, 130),
+    )
+
+    assert [row.candidate.description for row in result.rows] == [
+        "Patient Coat",
+        "Betadine Scrub 50 ML",
+    ]
+    assert [row.candidate.service_date for row in result.rows] == [
+        "10/07/2026",
+        "10/07/2026",
+    ]
+    assert [row.candidate.amount for row in result.rows] == [
+        Decimal("250"),
+        Decimal("107.1"),
+    ]
+    assert result.diagnostics["column_centers"]["service_date"] < 0.2
+    canonical = canonicalize_rows(
+        "d" * 64,
+        2,
+        "p2-t1",
+        "a" * 64,
+        result.rows,
+    )
+    linked = _link_source_tables(result.source_tables, canonical)
+    columns_by_field = {
+        column.canonical_field: column
+        for column in linked[0].columns
+        if column.canonical_field is not None
+    }
+    first_cells = {
+        column.canonical_field: next(
+            cell
+            for cell in linked[0].rows[0].cells
+            if cell.column_id == column.id
+        )
+        for column in columns_by_field.values()
+    }
+    assert first_cells["service_date_raw"].raw_value == (
+        f"10/07/2026{timestamp_separator}02:48 am"
+    )
+    assert first_cells["request_no"].raw_value == "PI261015227"
+    assert first_cells["description"].raw_value == "Patient Coat"
+    assert len(first_cells["description"].evidence) == 1
+    assert all(
+        cell.validation_flags == ("split_from_merged_ocr_token",)
+        for cell in (
+            first_cells["service_date_raw"],
+            first_cells["request_no"],
+            first_cells["description"],
+        )
+    )
+    if merged_right == 850:
+        assert all(
+            {
+                token_id
+                for evidence in cell.evidence
+                for token_id in evidence.token_ids
+            }
+            == {"token-9"}
+            for cell in (
+                first_cells["service_date_raw"],
+                first_cells["request_no"],
+                first_cells["description"],
+            )
+        )
+        assert all(
+            min(point.x for point in cell.evidence[0].polygon.points) == 80
+            and max(point.x for point in cell.evidence[0].polygon.points) == 850
+            for cell in (
+                first_cells["service_date_raw"],
+                first_cells["request_no"],
+                first_cells["description"],
+            )
+        )
+        batch_column = next(
+            column for column in linked[0].columns if column.label == "Batch No"
+        )
+        batch_cell = next(
+            cell
+            for cell in linked[0].rows[0].cells
+            if cell.column_id == batch_column.id
+        )
+        assert batch_cell.raw_value == "62104070"
+        assert {
+            token_id
+            for evidence in batch_cell.evidence
+            for token_id in evidence.token_ids
+        } == {"token-12"}
+        assert min(
+            point.x
+            for evidence in batch_cell.evidence
+            for point in evidence.polygon.points
+        ) == 500
+        assert max(
+            point.x
+            for evidence in batch_cell.evidence
+            for point in evidence.polygon.points
+        ) == 570
+    second_cells = {
+        column.canonical_field: next(
+            cell
+            for cell in linked[0].rows[1].cells
+            if cell.column_id == column.id
+        )
+        for column in columns_by_field.values()
+    }
+    assert second_cells["service_date_raw"].raw_value == (
+        f"10/07/2026{timestamp_separator}02:49 am"
+    )
+    assert second_cells["request_no"].raw_value == "PI261015228"
+    assert second_cells["description"].raw_value == "Betadine Scrub 50 ML"
+
+
+def test_pharmacy_description_continuation_in_same_lane_is_grounded() -> None:
+    tokens = (
+        token(9, "IP Pharmacy", (300, 0, 430, 15)),
+        token(0, "ProductName", (300, 25, 450, 40)),
+        token(10, "Batch No", (500, 25, 570, 40)),
+        token(11, "Expiry", (600, 25, 660, 40)),
+        token(1, "Qty", (700, 25, 750, 40)),
+        token(2, "Rate", (800, 25, 850, 40)),
+        token(3, "Total", (900, 25, 960, 40)),
+        token(4, "Betadine Scrub 50", (300, 70, 470, 85)),
+        token(12, "MD06126", (500, 70, 570, 85)),
+        token(5, "1", (710, 70, 730, 85)),
+        token(6, "107.1", (800, 70, 850, 85)),
+        token(7, "107.1", (900, 70, 960, 85)),
+        token(8, "ML", (300, 100, 330, 115)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=2,
+        table_id="p2-t1",
+        box=(280, -5, 980, 130),
+    )
+
+    assert len(result.rows) == 1
+    assert result.rows[0].candidate.description == "Betadine Scrub 50 ML"
+    assert result.rows[0].field_token_ids["description"] == ("token-4", "token-8")
+    canonical = canonicalize_rows(
+        "d" * 64,
+        2,
+        "p2-t1",
+        "a" * 64,
+        result.rows,
+    )
+    linked = _link_source_tables(result.source_tables, canonical)
+    description_column = next(
+        column
+        for column in linked[0].columns
+        if column.canonical_field == "description"
+    )
+    description_cell = next(
+        cell
+        for cell in linked[0].rows[0].cells
+        if cell.column_id == description_column.id
+    )
+    assert description_cell.raw_value == "Betadine Scrub 50 ML"
+    assert {
+        token_id
+        for evidence in description_cell.evidence
+        for token_id in evidence.token_ids
+    } == {"token-4", "token-8"}
+    assert linked[0].rows[0].canonical_row_id == str(canonical[0].id)
+
+
+def test_pharmacy_unpriced_full_name_is_not_merged_into_previous_product() -> None:
+    tokens = (
+        token(0, "ProductName", (300, 25, 450, 40)),
+        token(1, "Batch No", (500, 25, 570, 40)),
+        token(2, "Expiry", (600, 25, 660, 40)),
+        token(3, "Qty", (700, 25, 750, 40)),
+        token(4, "Rate", (800, 25, 850, 40)),
+        token(5, "Total", (900, 25, 960, 40)),
+        token(6, "First Product", (300, 70, 470, 85)),
+        token(7, "1", (710, 70, 730, 85)),
+        token(8, "100", (800, 70, 850, 85)),
+        token(9, "100", (900, 70, 960, 85)),
+        token(10, "Second Product", (300, 100, 420, 115)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=2,
+        table_id="p2-t1",
+        box=(280, 15, 980, 130),
+    )
+
+    assert [row.candidate.description for row in result.rows] == ["First Product"]
+    assert any(
+        "Second Product" in {cell.raw_value for cell in row.cells}
+        for table in result.source_tables
+        for row in table.rows
+    )
+
+
+@pytest.mark.parametrize(
+    "standalone_product",
+    (
+        "Glove",
+        "Gloves",
+        "Injection",
+        "Tablet",
+        "Capsule",
+        "Syringe",
+        "Blade",
+    ),
+)
+def test_pharmacy_standalone_form_is_not_merged_into_previous_product(
+    standalone_product: str,
+) -> None:
+    tokens = (
+        token(0, "ProductName", (300, 25, 450, 40)),
+        token(1, "Batch No", (500, 25, 570, 40)),
+        token(2, "Expiry", (600, 25, 660, 40)),
+        token(3, "Qty", (700, 25, 750, 40)),
+        token(4, "Rate", (800, 25, 850, 40)),
+        token(5, "Total", (900, 25, 960, 40)),
+        token(6, "First Product", (300, 70, 470, 85)),
+        token(7, "1", (710, 70, 730, 85)),
+        token(8, "100", (800, 70, 850, 85)),
+        token(9, "100", (900, 70, 960, 85)),
+        token(10, standalone_product, (300, 100, 420, 115)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=2,
+        table_id="p2-t1",
+        box=(280, 15, 980, 130),
+    )
+
+    assert [row.candidate.description for row in result.rows] == ["First Product"]
+    assert any(
+        standalone_product in {cell.raw_value for cell in row.cells}
+        for table in result.source_tables
+        for row in table.rows
+    )
+
+
+@pytest.mark.parametrize("merged_right", (480, 500, 541, 600, 650, 850))
+def test_fused_product_and_batch_does_not_publish_partial_batch_suffix(
+    merged_right: int,
+) -> None:
+    result = reconstruct_ocr_rows(
+        (
+            token(0, "ProductName", (300, 25, 450, 40)),
+            token(1, "Batch No", (500, 25, 570, 40)),
+            token(2, "Qty", (700, 25, 750, 40)),
+            token(3, "Rate", (800, 25, 850, 40)),
+            token(4, "Total", (900, 25, 960, 40)),
+            token(5, "Solution 100Ml MD06126", (320, 70, merged_right, 85)),
+            token(6, "MD06126", (500, 70, 570, 85)),
+            token(7, "1", (710, 70, 730, 85)),
+            token(8, "100", (800, 70, 850, 85)),
+            token(9, "100", (900, 70, 960, 85)),
+        ),
+        page_number=2,
+        table_id="p2-t1",
+        box=(280, 15, 980, 100),
+    )
+
+    assert len(result.rows) == 1
+    assert result.rows[0].candidate.description == "Solution 100Ml"
+    canonical = canonicalize_rows(
+        "d" * 64,
+        2,
+        "p2-t1",
+        "a" * 64,
+        result.rows,
+    )
+    linked = _link_source_tables(result.source_tables, canonical)
+    columns = {column.label: column for column in linked[0].columns}
+    cells = {cell.column_id: cell for cell in linked[0].rows[0].cells}
+    assert cells[columns["ProductName"].id].raw_value == "Solution 100Ml"
+    assert cells[columns["Batch No"].id].raw_value == "MD06126"
+
+
+@pytest.mark.parametrize("expiry_header", ("Expiry Date", "Exp Date", "Date of Expiry"))
+def test_pharmacy_expiry_header_never_becomes_service_date(
+    expiry_header: str,
+) -> None:
+    result = reconstruct_ocr_rows(
+        (
+            token(0, "ProductName", (300, 25, 450, 40)),
+            token(1, "Batch No", (500, 25, 570, 40)),
+            token(2, expiry_header, (600, 25, 700, 40)),
+            token(3, "Qty", (710, 25, 750, 40)),
+            token(4, "Rate", (800, 25, 850, 40)),
+            token(5, "Total", (900, 25, 960, 40)),
+            token(6, "Betadine Solution", (300, 70, 450, 85)),
+            token(7, "MD06126", (500, 70, 570, 85)),
+            token(8, "30/09/2027", (600, 70, 700, 85)),
+            token(9, "1", (710, 70, 750, 85)),
+            token(10, "100", (800, 70, 850, 85)),
+            token(11, "100", (900, 70, 960, 85)),
+        ),
+        page_number=2,
+        table_id="p2-t1",
+        box=(280, 15, 980, 100),
+    )
+
+    assert len(result.rows) == 1
+    assert result.rows[0].candidate.description == "Betadine Solution"
+    assert result.rows[0].candidate.service_date is None
+
+
+@pytest.mark.parametrize(
+    ("date_fragment", "expiry_fragment"),
+    (("Date", "of Expiry"), ("Date of", "Expiry")),
+)
+def test_split_date_of_expiry_header_never_becomes_service_date(
+    date_fragment: str,
+    expiry_fragment: str,
+) -> None:
+    result = reconstruct_ocr_rows(
+        (
+            token(0, "ProductName", (300, 25, 450, 40)),
+            token(1, "Batch No", (500, 25, 570, 40)),
+            token(2, date_fragment, (600, 25, 630, 40)),
+            token(3, expiry_fragment, (640, 25, 700, 40)),
+            token(4, "Qty", (710, 25, 750, 40)),
+            token(5, "Rate", (800, 25, 850, 40)),
+            token(6, "Total", (900, 25, 960, 40)),
+            token(7, "Betadine Solution", (300, 70, 450, 85)),
+            token(8, "MD06126", (500, 70, 570, 85)),
+            token(9, "30/09/2027", (600, 70, 700, 85)),
+            token(10, "1", (710, 70, 750, 85)),
+            token(11, "100", (800, 70, 850, 85)),
+            token(12, "100", (900, 70, 960, 85)),
+        ),
+        page_number=2,
+        table_id="p2-t1",
+        box=(280, 15, 980, 100),
+    )
+
+    assert len(result.rows) == 1
+    assert result.rows[0].candidate.description == "Betadine Solution"
+    assert result.rows[0].candidate.service_date is None
+
+
+def test_split_expiry_phrase_does_not_hide_separate_transaction_date() -> None:
+    result = reconstruct_ocr_rows(
+        (
+            token(0, "Date/Time", (50, 25, 140, 40)),
+            token(1, "ProductName", (200, 25, 400, 40)),
+            token(2, "Batch No", (500, 25, 570, 40)),
+            token(3, "Date", (600, 25, 630, 40)),
+            token(4, "of Expiry", (640, 25, 700, 40)),
+            token(5, "Qty", (710, 25, 750, 40)),
+            token(6, "Rate", (800, 25, 850, 40)),
+            token(7, "Total", (900, 25, 960, 40)),
+            token(8, "10/07/2026", (50, 70, 140, 85)),
+            token(9, "Betadine Solution", (200, 70, 400, 85)),
+            token(10, "MD06126", (500, 70, 570, 85)),
+            token(11, "30/09/2027", (600, 70, 700, 85)),
+            token(12, "1", (710, 70, 750, 85)),
+            token(13, "100", (800, 70, 850, 85)),
+            token(14, "100", (900, 70, 960, 85)),
+        ),
+        page_number=2,
+        table_id="p2-t1",
+        box=(30, 15, 980, 100),
+    )
+
+    assert len(result.rows) == 1
+    assert result.rows[0].candidate.description == "Betadine Solution"
+    assert result.rows[0].candidate.service_date == "10/07/2026"
+
+
+@pytest.mark.parametrize(
+    "description",
+    (
+        "B12345 Injection",
+        "ITEM12345 Dressing",
+        "CIPLA12345 Tablet",
+        "b12345 Injection",
+    ),
+)
+def test_compact_product_prefix_is_not_a_request_without_request_schema(
+    description: str,
+) -> None:
+    result = reconstruct_ocr_rows(
+        (
+            token(0, "Description", (100, 25, 400, 40)),
+            token(1, "Amount", (850, 25, 950, 40)),
+            token(2, description, (100, 70, 450, 85)),
+            token(3, "500.00", (870, 70, 940, 85)),
+        ),
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 15, 980, 100),
+    )
+
+    assert result.rows[0].candidate.description == description
+    assert result.rows[0].candidate.request_no is None
+
+
+@pytest.mark.parametrize(
+    ("raw", "description"),
+    (
+        ("10/07/2026 02:48 Ambulance", "Ambulance"),
+        ("10/07/2026 02:48 Ampicillin", "Ampicillin"),
+        ("10/07/2026 02:48 PMMA Implant", "PMMA Implant"),
+    ),
+)
+def test_time_parser_does_not_consume_description_prefix(
+    raw: str,
+    description: str,
+) -> None:
+    cleaned, service_date, _ = _clean_description(raw)
+
+    assert cleaned == description
+    assert service_date == "10/07/2026"
 
 
 def test_aadhaar_policy_and_pin_identifiers_are_not_published_as_money_rows() -> None:

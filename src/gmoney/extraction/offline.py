@@ -17,6 +17,7 @@ import typer
 from gmoney.contracts.extraction import (
     CanonicalRow,
     DocumentTotal,
+    EvidenceRef,
     PageType,
     RowRole,
     SourceCell,
@@ -50,6 +51,7 @@ from gmoney.extraction.ocr_rows import (
     ReconstructionResult,
     TableSchemaState,
     _clean_description,
+    _request_prefix_match,
     _structured_field_value_is_valid,
     fuse_provider_descriptions,
     reconstruct_ocr_rows,
@@ -845,6 +847,466 @@ def _contains_service_code_fragment(value: str) -> bool:
     )
 
 
+def _filter_evidence_token_ids(
+    evidence_refs: tuple[EvidenceRef, ...],
+    token_ids: set[str],
+) -> tuple[EvidenceRef, ...]:
+    return tuple(
+        evidence.model_copy(
+            update={
+                "token_ids": tuple(
+                    token_id
+                    for token_id in evidence.token_ids
+                    if token_id in token_ids
+                )
+            }
+        )
+        for evidence in evidence_refs
+        if token_ids.intersection(evidence.token_ids)
+    )
+
+
+def _split_grounded_date_request_description(
+    cells: tuple[SourceCell, ...],
+    columns: tuple[SourceColumn, ...],
+    canonical: CanonicalRow,
+) -> tuple[SourceCell, ...]:
+    columns_by_field = {
+        column.canonical_field: column
+        for column in columns
+        if column.canonical_field is not None
+    }
+    date_column = columns_by_field.get("service_date_raw")
+    request_column = columns_by_field.get("request_no")
+    description_column = columns_by_field.get("description")
+    if (
+        date_column is None
+        or request_column is None
+        or description_column is None
+        or not canonical.service_date_raw
+        or not canonical.request_no
+    ):
+        return cells
+
+    cells_by_id = {cell.column_id: cell for cell in cells}
+    merged: tuple[SourceCell, re.Match[str], re.Match[str]] | None = None
+    for cell in cells:
+        raw_value = cell.raw_value or ""
+        date_match = DATE_PREFIX.match(raw_value)
+        if date_match is None:
+            continue
+        request_match = _request_prefix_match(
+            raw_value[date_match.end() :].strip(),
+            allow_compact=True,
+        )
+        if request_match is not None:
+            merged = (cell, date_match, request_match)
+            break
+    if merged is None:
+        return cells
+
+    merged_cell, date_match, request_match = merged
+    assert merged_cell.raw_value is not None
+    printed_date = merged_cell.raw_value[: date_match.end()].strip(" -:")
+    remainder = merged_cell.raw_value[date_match.end() :].strip()
+    printed_request = request_match.group(0).strip()
+    merged_tail = remainder[request_match.end() :].strip(" -:")
+    canonical_description_prefix = re.match(
+        re.escape(canonical.description),
+        merged_tail,
+        re.IGNORECASE,
+    )
+    if canonical_description_prefix is not None:
+        merged_description = merged_tail[: canonical_description_prefix.end()]
+        merged_residual = merged_tail[canonical_description_prefix.end() :].strip(
+            " -:;/,[]"
+        )
+    else:
+        merged_description = merged_tail
+        merged_residual = ""
+    existing_description = (
+        ""
+        if cells_by_id[description_column.id] is merged_cell
+        else (cells_by_id[description_column.id].raw_value or "")
+    )
+    printed_description = " ".join(
+        value
+        for value in (merged_description, existing_description)
+        if value
+    )
+    def normalize(value: str) -> str:
+        return re.sub(
+            r"[^a-z0-9]+",
+            " ",
+            value.casefold(),
+        ).strip()
+
+    date_matches = bool(
+        (
+            canonical.service_date_iso
+            and parse_service_date(printed_date) == canonical.service_date_iso
+        )
+        or normalize(printed_date) == normalize(canonical.service_date_raw)
+    )
+    if (
+        not date_matches
+        or printed_request.casefold() != canonical.request_no.casefold()
+        or (
+            merged_description
+            and normalize(printed_description) != normalize(canonical.description)
+        )
+    ):
+        return cells
+    if (
+        cells_by_id[date_column.id] is not merged_cell
+        and cells_by_id[date_column.id].raw_value
+    ) or (
+        cells_by_id[request_column.id] is not merged_cell
+        and cells_by_id[request_column.id].raw_value
+    ):
+        return cells
+
+    split_flag = "split_from_merged_ocr_token"
+    merged_token_ids = {
+        token_id
+        for evidence in merged_cell.evidence
+        for token_id in evidence.token_ids
+    }
+
+    def grounded_evidence(field: str, source: tuple[SourceCell, ...]) -> tuple:
+        field_ids = {
+            token_id
+            for evidence in canonical.field_evidence.get(field, ())
+            for token_id in evidence.token_ids
+        }
+        source_evidence = _filter_evidence_token_ids(
+            tuple(
+            evidence
+            for cell in source
+            for evidence in cell.evidence
+            if field_ids.intersection(evidence.token_ids)
+            ),
+            field_ids,
+        )
+        source_ids = {
+            token_id
+            for evidence in source_evidence
+            for token_id in evidence.token_ids
+        }
+        return source_evidence if field_ids and field_ids.issubset(source_ids) else ()
+
+    date_evidence = grounded_evidence("service_date", (merged_cell,))
+    request_evidence = grounded_evidence("request_no", (merged_cell,))
+    description_sources = (
+        (
+            (merged_cell,)
+            if cells_by_id[description_column.id] is merged_cell
+            else (merged_cell, cells_by_id[description_column.id])
+        )
+        if merged_description
+        else (cells_by_id[description_column.id],)
+    )
+    description_evidence = (
+        grounded_evidence("description", description_sources)
+        if merged_description
+        else ()
+    )
+    if (
+        not merged_token_ids
+        or not date_evidence
+        or not request_evidence
+        or (merged_description and not description_evidence)
+    ):
+        return cells
+
+    def split_cell(
+        cell: SourceCell,
+        raw_value: str,
+        evidence: tuple,
+    ) -> SourceCell:
+        return cell.model_copy(
+            update={
+                "raw_value": raw_value,
+                "evidence": evidence,
+                "validation_flags": tuple(
+                    dict.fromkeys(
+                        (
+                            *(
+                                flag
+                                for flag in cell.validation_flags
+                                if flag != "empty_cell"
+                            ),
+                            split_flag,
+                        )
+                    )
+                ),
+            }
+        )
+
+    structured_column_ids = {
+        date_column.id,
+        request_column.id,
+        description_column.id,
+    }
+    if merged_cell.column_id not in structured_column_ids:
+        consumed_ids = {
+            token_id
+            for field in ("service_date", "request_no", "description")
+            for evidence in canonical.field_evidence.get(field, ())
+            for token_id in evidence.token_ids
+        }
+        residual_ids = merged_token_ids - consumed_ids
+        residual_evidence = _filter_evidence_token_ids(
+            merged_cell.evidence,
+            residual_ids,
+        )
+        if merged_residual and not residual_evidence:
+            return cells
+        cells_by_id[merged_cell.column_id] = merged_cell.model_copy(
+            update={
+                "raw_value": merged_residual or None,
+                "evidence": residual_evidence,
+                "validation_flags": tuple(
+                    dict.fromkeys(
+                        (
+                            *(
+                                flag
+                                for flag in merged_cell.validation_flags
+                                if flag != "empty_cell"
+                            ),
+                            "redistributed_merged_ocr_token",
+                        )
+                    )
+                ),
+            }
+        )
+    cells_by_id[date_column.id] = split_cell(
+        cells_by_id[date_column.id],
+        printed_date,
+        date_evidence,
+    )
+    cells_by_id[request_column.id] = split_cell(
+        cells_by_id[request_column.id],
+        printed_request,
+        request_evidence,
+    )
+    if merged_description:
+        cells_by_id[description_column.id] = split_cell(
+            cells_by_id[description_column.id],
+            printed_description,
+            description_evidence,
+        )
+    return tuple(cells_by_id[cell.column_id] for cell in cells)
+
+
+def _redistribute_grounded_description_from_adjacent_cell(
+    cells: tuple[SourceCell, ...],
+    columns: tuple[SourceColumn, ...],
+    canonical: CanonicalRow,
+) -> tuple[SourceCell, ...]:
+    description_column = next(
+        (
+            column
+            for column in columns
+            if column.canonical_field == "description"
+        ),
+        None,
+    )
+    if description_column is None or not canonical.description:
+        return cells
+    adjacent_column = next(
+        (
+            column
+            for column in columns
+            if column.order == description_column.order + 1
+        ),
+        None,
+    )
+    if adjacent_column is None:
+        return cells
+
+    cells_by_id = {cell.column_id: cell for cell in cells}
+    description_cell = cells_by_id[description_column.id]
+    merged_cell = cells_by_id[adjacent_column.id]
+    if description_cell.raw_value or not merged_cell.raw_value:
+        return cells
+    description_match = re.search(
+        re.escape(canonical.description),
+        merged_cell.raw_value,
+        re.IGNORECASE,
+    )
+    if description_match is None:
+        return cells
+    printed_description = merged_cell.raw_value[
+        description_match.start() : description_match.end()
+    ]
+    leading_residual = merged_cell.raw_value[
+        : description_match.start()
+    ].strip(" -:;/,[]")
+    trailing_residual = merged_cell.raw_value[
+        description_match.end() :
+    ].strip(" -:;/,[]")
+    if (
+        leading_residual
+        and trailing_residual
+        and leading_residual.casefold() != trailing_residual.casefold()
+    ):
+        return cells
+    residual = leading_residual or trailing_residual
+    residual_words = residual.split()
+    midpoint = len(residual_words) // 2
+    if (
+        midpoint
+        and len(residual_words) == midpoint * 2
+        and [word.casefold() for word in residual_words[:midpoint]]
+        == [word.casefold() for word in residual_words[midpoint:]]
+    ):
+        residual = " ".join(residual_words[:midpoint])
+
+    canonical_ids = {
+        token_id
+        for evidence in canonical.field_evidence.get("description", ())
+        for token_id in evidence.token_ids
+    }
+    merged_ids = {
+        token_id
+        for evidence in merged_cell.evidence
+        for token_id in evidence.token_ids
+    }
+    residual_ids = merged_ids - canonical_ids
+    description_evidence = _filter_evidence_token_ids(
+        merged_cell.evidence,
+        canonical_ids,
+    )
+    residual_evidence = _filter_evidence_token_ids(
+        merged_cell.evidence,
+        residual_ids,
+    )
+    if (
+        not residual
+        or not description_evidence
+        or not residual_evidence
+    ):
+        return cells
+
+    split_flag = "split_from_merged_ocr_token"
+    cells_by_id[description_column.id] = description_cell.model_copy(
+        update={
+            "raw_value": printed_description,
+            "evidence": description_evidence,
+            "validation_flags": tuple(
+                dict.fromkeys(
+                    (
+                        *(
+                            flag
+                            for flag in description_cell.validation_flags
+                            if flag != "empty_cell"
+                        ),
+                        split_flag,
+                    )
+                )
+            ),
+        }
+    )
+    cells_by_id[adjacent_column.id] = merged_cell.model_copy(
+        update={
+            "raw_value": residual,
+            "evidence": residual_evidence,
+            "validation_flags": tuple(
+                dict.fromkeys(
+                    (
+                        *merged_cell.validation_flags,
+                        split_flag,
+                    )
+                )
+            ),
+        }
+    )
+    return tuple(cells_by_id[cell.column_id] for cell in cells)
+
+
+def _trim_grounded_duplicate_adjacent_description(
+    cells: tuple[SourceCell, ...],
+    columns: tuple[SourceColumn, ...],
+    canonical: CanonicalRow,
+) -> tuple[SourceCell, ...]:
+    description_column = next(
+        (
+            column
+            for column in columns
+            if column.canonical_field == "description"
+        ),
+        None,
+    )
+    if description_column is None or not canonical.description:
+        return cells
+    adjacent_column = next(
+        (
+            column
+            for column in columns
+            if column.order == description_column.order + 1
+        ),
+        None,
+    )
+    if adjacent_column is None:
+        return cells
+
+    cells_by_id = {cell.column_id: cell for cell in cells}
+    description_cell = cells_by_id[description_column.id]
+    adjacent_cell = cells_by_id[adjacent_column.id]
+    description_value = description_cell.raw_value or ""
+    adjacent_value = adjacent_cell.raw_value or ""
+    if (
+        not description_value
+        or not adjacent_value
+        or not adjacent_cell.evidence
+    ):
+        return cells
+    suffix = re.search(
+        rf"(?<![A-Za-z0-9]){re.escape(adjacent_value.strip())}\s*$",
+        description_value,
+        re.IGNORECASE,
+    )
+    if suffix is None:
+        return cells
+    printed_description = description_value[: suffix.start()].rstrip(" -:;/,[]")
+
+    def normalize(value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", value.casefold()).strip()
+
+    canonical_ids = {
+        token_id
+        for evidence in canonical.field_evidence.get("description", ())
+        for token_id in evidence.token_ids
+    }
+    printed_ids = {
+        token_id
+        for evidence in description_cell.evidence
+        for token_id in evidence.token_ids
+    }
+    if (
+        not printed_description
+        or normalize(printed_description) != normalize(canonical.description)
+        or not canonical_ids
+        or not canonical_ids.issubset(printed_ids)
+    ):
+        return cells
+    cells_by_id[description_column.id] = description_cell.model_copy(
+        update={
+            "raw_value": printed_description,
+            "validation_flags": tuple(
+                dict.fromkeys(
+                    (
+                        *description_cell.validation_flags,
+                        "split_duplicate_adjacent_value",
+                    )
+                )
+            ),
+        }
+    )
+    return tuple(cells_by_id[cell.column_id] for cell in cells)
+
+
 def _split_grounded_date_from_description(
     cells: tuple[SourceCell, ...],
     columns: tuple[SourceColumn, ...],
@@ -1081,6 +1543,21 @@ def _link_source_tables(
                 matched = scored[0][1]
                 canonical_row_id = str(matched.id)
                 columns_by_id = {column.id: column for column in table.columns}
+                linked_cells = _split_grounded_date_request_description(
+                    linked_cells,
+                    table.columns,
+                    matched,
+                )
+                linked_cells = _redistribute_grounded_description_from_adjacent_cell(
+                    linked_cells,
+                    table.columns,
+                    matched,
+                )
+                linked_cells = _trim_grounded_duplicate_adjacent_description(
+                    linked_cells,
+                    table.columns,
+                    matched,
+                )
                 linked_cells = _split_grounded_date_from_description(
                     linked_cells,
                     table.columns,

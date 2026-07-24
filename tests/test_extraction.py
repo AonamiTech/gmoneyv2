@@ -150,6 +150,11 @@ def test_service_date_parser_supports_numeric_and_alphabetic_indian_dates() -> N
     assert parse_service_date("2026-02-12") is None
     assert parse_service_date("20/01/2026 10:24:02") == "2026-01-20"
     assert parse_service_date("20/01/202610:24:02") == "2026-01-20"
+    assert parse_service_date("10/07/2026, 02:48 am") == "2026-07-10"
+    assert parse_service_date("10/07/2026 02:48 pm") == "2026-07-10"
+    assert parse_service_date("10/07/2026; 02:48 pm") == "2026-07-10"
+    assert parse_service_date("10/07/2026 - 02:48 pm") == "2026-07-10"
+    assert parse_service_date("10/07/2026, 14:48") == "2026-07-10"
     assert parse_service_date("20/01/2026 99:99:99") is None
     assert parse_service_date("20/01/2026 - 21/01/2026") is None
 

@@ -117,12 +117,16 @@ DATE_VALUE = (
     r"Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
     r"[-\s]\d{2,4})"
 )
+TIME_VALUE = (
+    r"(?:\d{1,2}:\d{2}(?::\d{2})?\s*(?:am|pm)\b"
+    r"|\d{1,2}:\d{2}(?::\d{2})?)"
+)
 DATE_PREFIX = re.compile(
-    rf"^\s*(?P<date>{DATE_VALUE})(?:\s*\d{{1,2}}:\d{{2}}(?::\d{{2}})?)?\s*[-:]?\s*",
+    rf"^\s*(?P<date>{DATE_VALUE})(?:\s*[,;-]?\s*{TIME_VALUE})?\s*[-:]?\s*",
     re.IGNORECASE,
 )
 DATE_SPAN = re.compile(
-    rf"{DATE_VALUE}(?:\s*\d{{1,2}}:\d{{2}}(?::\d{{2}})?)?",
+    rf"{DATE_VALUE}(?:\s*[,;-]?\s*{TIME_VALUE})?",
     re.IGNORECASE,
 )
 DATE_RANGE_SUFFIX = re.compile(
@@ -130,7 +134,11 @@ DATE_RANGE_SUFFIX = re.compile(
     rf"\s+to\s+(?:{DATE_VALUE}|\d{{1,2}})(?:\s+\d{{1,2}}:\d{{2}}(?::\d{{2}})?)?\s*$",
     re.IGNORECASE,
 )
-REQUEST_PREFIX = re.compile(r"^[A-Z][A-Z0-9-]{2,}/[A-Z0-9-]+\s*", re.IGNORECASE)
+REQUEST_PREFIX = re.compile(
+    r"^[A-Z][A-Z0-9-]{2,}/[A-Z0-9-]+\s*",
+    re.IGNORECASE,
+)
+COMPACT_REQUEST_PREFIX = re.compile(r"^[A-Z]{1,5}\d{5,20}(?=\s|$)\s*")
 BATCH_SUFFIX = re.compile(
     r"\s*(?:\[?\s*(?:B\.?\s*No|Batch|Exp(?:iry)?\s*Date)\s*[:.-].*)$",
     re.IGNORECASE,
@@ -143,6 +151,16 @@ LEADING_BATCH_FRAGMENT = re.compile(
 
 def _normalize(value: object) -> str:
     return re.sub(r"[^a-z0-9#]+", " ", str(value or "").casefold()).strip()
+
+
+def _request_prefix_match(
+    value: str,
+    *,
+    allow_compact: bool = False,
+) -> re.Match[str] | None:
+    return REQUEST_PREFIX.match(value) or (
+        COMPACT_REQUEST_PREFIX.match(value) if allow_compact else None
+    )
 
 
 def _bounds(token: OcrToken) -> tuple[float, float, float, float]:
@@ -450,8 +468,78 @@ def _header_roles(line: OcrLine) -> dict[str, OcrToken]:
             role_token = (
                 _virtual_horizontal_token(token, start, end, len(normalized)) if compound else token
             )
-            if role != "amount" or role not in roles or _center_x(token) > _center_x(roles[role]):
+            if role == "amount":
+                if role not in roles or _center_x(role_token) > _center_x(roles[role]):
+                    roles[role] = role_token
+            elif role == "service_date":
+                if role not in roles or _center_x(role_token) < _center_x(roles[role]):
+                    roles[role] = role_token
+            else:
                 roles[role] = role_token
+    expiry = roles.get("expiry")
+    service_date = roles.get("service_date")
+    ordered_header_tokens = tuple(sorted(line.tokens, key=_center_x))
+    split_expiry_phrase = False
+    if (
+        expiry is not None
+        and service_date is not None
+        and expiry.token_id != service_date.token_id
+    ):
+        service_index = next(
+            (
+                index
+                for index, token in enumerate(ordered_header_tokens)
+                if token.token_id == service_date.token_id
+            ),
+            None,
+        )
+        expiry_index = next(
+            (
+                index
+                for index, token in enumerate(ordered_header_tokens)
+                if token.token_id == expiry.token_id
+            ),
+            None,
+        )
+        if (
+            service_index is not None
+            and expiry_index is not None
+            and service_index < expiry_index
+        ):
+            split_expiry_phrase = bool(
+                re.fullmatch(
+                    r"date\s+of\s+(?:expiry|exp)",
+                    _normalize(
+                        " ".join(
+                            token.text
+                            for token in ordered_header_tokens[
+                                service_index : expiry_index + 1
+                            ]
+                        )
+                    ),
+                )
+            )
+    if (
+        expiry is not None
+        and service_date is not None
+        and (
+            split_expiry_phrase
+            or
+            (
+                expiry.token_id == service_date.token_id
+                and (
+                    "expiry" in _normalize(expiry.text)
+                    or re.search(r"\bexp\s+date\b", _normalize(expiry.text))
+                )
+            )
+            or (
+                _center_x(service_date) >= _center_x(expiry)
+                and _normalize(service_date.text)
+                in {"date", "expiry date", "exp date"}
+            )
+        )
+    ):
+        roles.pop("service_date")
     rate = roles.get("rate")
     amount = roles.get("amount")
     if rate is not None and amount is not None and rate.token_id == amount.token_id:
@@ -830,27 +918,18 @@ def _source_evidence(
     )
     if not originals:
         return ()
-    boxes = [_bounds(token) for token in originals]
-    left = min(box[0] for box in boxes)
-    top = min(box[1] for box in boxes)
-    right = max(box[2] for box in boxes)
-    bottom = max(box[3] for box in boxes)
-    first = originals[0]
-    return (
+    unique = tuple(
+        {token.token_id: token for token in originals}.values()
+    )
+    return tuple(
         EvidenceRef(
-            page_number=first.page_number,
+            page_number=token.page_number,
             table_id=table_id,
-            polygon=Polygon(
-                points=(
-                    Point(x=left, y=top),
-                    Point(x=right, y=top),
-                    Point(x=right, y=bottom),
-                    Point(x=left, y=bottom),
-                )
-            ),
-            artifact_sha256=first.artifact_sha256,
-            token_ids=tuple(dict.fromkeys(token.token_id for token in originals)),
-        ),
+            polygon=token.polygon,
+            artifact_sha256=token.artifact_sha256,
+            token_ids=(token.token_id,),
+        )
+        for token in unique
     )
 
 
@@ -1018,6 +1097,7 @@ def _source_rows(
     width: float,
     original_by_id: dict[str, OcrToken],
     table_id: str,
+    table_type: TableType,
 ) -> tuple[SourceRow, ...]:
     if not columns:
         return ()
@@ -1137,6 +1217,32 @@ def _source_rows(
             previous_cells = list(output[-1].cells)
             previous_description = previous_cells[description_index]
             continuation = cells[description_index]
+            previous_description_tokens = [
+                original_by_id[token_id]
+                for evidence in previous_description.evidence
+                for token_id in evidence.token_ids
+                if token_id in original_by_id
+            ]
+            description_cell_max = (
+                (centers[description_index] + centers[description_index + 1])
+                / (2 * width)
+                if description_index + 1 < len(centers)
+                else None
+            )
+            wrapped_pharmacy_description = bool(
+                table_type is TableType.PHARMACY
+                and any(
+                    previous_cells[index].raw_value
+                    for index in financial_indexes
+                )
+                and _wrapped_description_line_is_proven(
+                    previous_description_tokens,
+                    list(line.tokens),
+                    description_cell_max=description_cell_max,
+                    left=0.0,
+                    width=width,
+                )
+            )
             if (
                 previous_description.raw_value
                 and continuation.raw_value
@@ -1156,6 +1262,7 @@ def _source_rows(
                         and min(_bounds(token)[0] for token in line.tokens)
                         <= centers[description_index] + width * 0.08
                     )
+                    or wrapped_pharmacy_description
                 )
             ):
                 previous_cells[description_index] = previous_description.model_copy(
@@ -1216,6 +1323,7 @@ def _build_source_tables(
             width=width,
             original_by_id=original_by_id,
             table_id=table_id,
+            table_type=table_type,
         )
         if not columns or not rows:
             continue
@@ -1381,6 +1489,7 @@ def _synthetic_source_table(
         width=width,
         original_by_id=original_by_id,
         table_id=table_id,
+        table_type=table_type,
     )
     if not rows:
         return ()
@@ -1432,7 +1541,19 @@ def _description_lane(
     description_min = 0.0
     description_max = first_numeric_center
     if table_type is TableType.PHARMACY:
-        description_min = min(stable_centers, default=0.02) + 0.015
+        description_min = (
+            min(stable_centers, default=0.02) + 0.015
+            if description_center is None
+            else max(
+                (
+                    center
+                    for center in stable_centers
+                    if center < description_center - 0.04
+                ),
+                default=-0.015,
+            )
+            + 0.015
+        )
         description_max = min(
             centers.get("company", 1.0) - 0.03,
             centers.get("batch", 1.0) - 0.05,
@@ -1474,6 +1595,47 @@ def _description_cell_boundaries(
             if description_center is not None and next_printed_center is not None
             else None
         ),
+    )
+
+
+def _wrapped_description_line_is_proven(
+    previous_tokens: list[OcrToken],
+    continuation_tokens: list[OcrToken],
+    *,
+    description_cell_max: float | None,
+    left: float,
+    width: float,
+) -> bool:
+    if not previous_tokens or not continuation_tokens or description_cell_max is None:
+        return False
+    continuation_text = " ".join(
+        token.text.strip() for token in continuation_tokens if token.text.strip()
+    )
+    normalized_continuation = re.sub(
+        r"[^a-z0-9.%]+",
+        " ",
+        continuation_text.casefold(),
+    ).strip()
+    if not re.fullmatch(
+        r"(?:"
+        r"\d+(?:\.\d+)?\s*(?:ml|mg|mcg|g|gm|l|iu|%)"
+        r"|(?:ml|mg|mcg|g|gm|l|iu)"
+        r")",
+        normalized_continuation,
+    ):
+        return False
+    previous_left = min(
+        (_bounds(token)[0] - left) / width for token in previous_tokens
+    )
+    previous_right = max(
+        (_bounds(token)[2] - left) / width for token in previous_tokens
+    )
+    continuation_left = min(
+        (_bounds(token)[0] - left) / width for token in continuation_tokens
+    )
+    return (
+        previous_right >= description_cell_max - 0.02
+        and abs(continuation_left - previous_left) <= 0.03
     )
 
 
@@ -1841,7 +2003,7 @@ def _clean_description(text: str) -> tuple[str, str | None, str | None]:
     service_date = date_match.group("date").strip(" -:") if date_match else None
     if date_match:
         raw = raw[date_match.end() :]
-    request_match = REQUEST_PREFIX.match(raw)
+    request_match = _request_prefix_match(raw)
     request_no = request_match.group(0).strip() if request_match else None
     if request_match:
         raw = raw[request_match.end() :].lstrip(" -:")
@@ -2204,6 +2366,67 @@ def _clip_token_to_lane(
     return token.model_copy(update={"text": clipped}) if clipped else None
 
 
+def _clip_description_words_to_lane(
+    token: OcrToken,
+    minimum: float,
+    maximum: float | None,
+    left: float,
+    width: float,
+) -> OcrToken | None:
+    words = tuple(re.finditer(r"\S+", token.text))
+    if len(words) < 2 or maximum is None:
+        return _clip_token_to_lane(token, minimum, maximum, left, width)
+    token_left, _, token_right, _ = _bounds(token)
+    relative_left = (token_left - left) / width
+    relative_right = (token_right - left) / width
+    if relative_left >= minimum and relative_right <= maximum:
+        return token
+    token_width = max(1e-6, token_right - token_left)
+    text_length = max(1, len(token.text))
+    selected = tuple(
+        word
+        for word in words
+        if minimum
+        <= (
+            token_left
+            + token_width * ((word.start() + word.end()) / 2) / text_length
+            - left
+        )
+        / width
+        < maximum
+    )
+    if not selected:
+        return None
+    clipped = token.text[selected[0].start() : selected[-1].end()].strip(" -:[]")
+    return token.model_copy(update={"text": clipped}) if clipped else None
+
+
+def _strip_duplicate_adjacent_suffix(
+    token: OcrToken,
+    adjacent_tokens: tuple[OcrToken, ...],
+) -> OcrToken:
+    text = token.text.strip()
+    for adjacent in sorted(
+        adjacent_tokens,
+        key=lambda item: len(item.text.strip()),
+        reverse=True,
+    ):
+        adjacent_text = adjacent.text.strip()
+        if not adjacent_text:
+            continue
+        match = re.search(
+            rf"(?<![A-Za-z0-9]){re.escape(adjacent_text)}\s*$",
+            text,
+            re.IGNORECASE,
+        )
+        if match is None:
+            continue
+        without_duplicate = text[: match.start()].rstrip(" -:;/,[]")
+        if without_duplicate:
+            return token.model_copy(update={"text": without_duplicate})
+    return token
+
+
 def _closest_field_token(
     line: OcrLine,
     target: float | None,
@@ -2303,7 +2526,11 @@ def _structured_text_fields(
         raw = re.sub(r"\s+", " ", token.text).strip()
         if role == "service_date" and (date_match := DATE_PREFIX.match(raw)):
             remainder = raw[date_match.end() :].strip()
-            if request_match := REQUEST_PREFIX.match(remainder):
+            request_match = _request_prefix_match(
+                remainder,
+                allow_compact="request_no" in column_centers,
+            )
+            if request_match:
                 values["request_no"] = request_match.group(0).strip()
                 evidence["request_no"] = (token.token_id,)
                 raw = date_match.group("date").strip()
@@ -2311,6 +2538,38 @@ def _structured_text_fields(
                 raw = date_match.group("date").strip()
         values[role] = raw
         evidence[role] = (token.token_id,)
+    if "service_date" not in values and (date_center := column_centers.get("service_date")):
+        center_cluster_tolerance = 0.025
+        right_neighbor = min(
+            (
+                center
+                for center in printed_centers
+                if center > date_center + center_cluster_tolerance
+            ),
+            default=1.0,
+        )
+        date_cell_right = (date_center + right_neighbor) / 2
+        merged = next(
+            (
+                (token, match)
+                for token in line.tokens
+                if ((_bounds(token)[0] - left) / width) < date_cell_right
+                and (match := DATE_PREFIX.match(token.text.strip())) is not None
+            ),
+            None,
+        )
+        if merged is not None:
+            token, date_match = merged
+            values["service_date"] = date_match.group("date").strip()
+            evidence["service_date"] = (token.token_id,)
+            remainder = token.text.strip()[date_match.end() :].strip()
+            request_match = _request_prefix_match(
+                remainder,
+                allow_compact="request_no" in column_centers,
+            )
+            if request_match:
+                values["request_no"] = request_match.group(0).strip()
+                evidence["request_no"] = (token.token_id,)
     return values, evidence
 
 
@@ -2553,6 +2812,14 @@ def reconstruct_ocr_rows(
         previous_left = min(
             (_bounds(token)[0] - left) / width for token in previous_tokens
         )
+        if table_type is TableType.PHARMACY:
+            return _wrapped_description_line_is_proven(
+                previous_tokens,
+                continuation_tokens,
+                description_cell_max=description_cell_max,
+                left=left,
+                width=width,
+            )
         return abs(continuation_left - previous_left) <= 0.03
 
     def extend_previous_description(
@@ -2729,6 +2996,16 @@ def reconstruct_ocr_rows(
             if token.token_id not in service_date_ids:
                 continue
             merged_description, embedded_date, _ = _clean_description(token.text)
+            grounded_request = structured_values.get("request_no")
+            if (
+                grounded_request
+                and merged_description.casefold().startswith(
+                    grounded_request.casefold()
+                )
+            ):
+                merged_description = merged_description[
+                    len(grounded_request) :
+                ].lstrip(" -:")
             token_left, _, token_right, _ = _bounds(token)
             relative_left = (token_left - left) / width
             relative_right = (token_right - left) / width
@@ -2757,15 +3034,94 @@ def reconstruct_ocr_rows(
             relative_center = (_center_x(token) - left) / width
             if description_cell_min is not None and relative_center < description_cell_min:
                 continue
-            if description_cell_max is not None and relative_center >= description_cell_max:
+            token_left = (_bounds(token)[0] - left) / width
+            if (
+                description_cell_max is not None
+                and relative_center >= description_cell_max
+                and (
+                    table_type is not TableType.PHARMACY
+                    or token_left >= description_cell_max
+                )
+            ):
                 continue
-            description_token = _clip_token_to_lane(
-                token,
-                description_min,
-                description_max - 0.03 if description_max is not None else None,
-                left,
-                width,
+            description_clip_max = (
+                description_max - 0.03 if description_max is not None else None
             )
+            adjacent_right_tokens: tuple[OcrToken, ...] = ()
+            if table_type is TableType.PHARMACY:
+                if description_cell_max is not None:
+                    description_clip_max = min(
+                        description_clip_max
+                        if description_clip_max is not None
+                        else description_cell_max,
+                        description_cell_max,
+                    )
+                description_center = column_centers.get("description")
+                next_printed_center = min(
+                    (
+                        center
+                        for center in description_header_centers
+                        if description_center is not None
+                        and center > description_center + 0.04
+                    ),
+                    default=None,
+                )
+                following_printed_center = min(
+                    (
+                        center
+                        for center in description_header_centers
+                        if next_printed_center is not None
+                        and center > next_printed_center + 0.025
+                    ),
+                    default=1.0,
+                )
+                adjacent_right_tokens = tuple(
+                    other
+                    for other in line.tokens
+                    if (
+                        other.token_id != token.token_id
+                        and description_cell_max is not None
+                        and next_printed_center is not None
+                        and description_cell_max
+                        <= (_center_x(other) - left) / width
+                        < (next_printed_center + following_printed_center) / 2
+                    )
+                )
+                if adjacent_right_tokens and description_cell_max is not None:
+                    description_clip_max = min(
+                        1.0,
+                        max(
+                            description_clip_max or 0.0,
+                            description_cell_max + 0.02,
+                        ),
+                    )
+                without_duplicate = (
+                    _strip_duplicate_adjacent_suffix(
+                        token,
+                        adjacent_right_tokens,
+                    )
+                    if adjacent_right_tokens
+                    else token
+                )
+                description_token = (
+                    without_duplicate
+                    if without_duplicate.text != token.text
+                    else _clip_description_words_to_lane(
+                        token,
+                        description_min,
+                        description_clip_max,
+                        left,
+                        width,
+                    )
+                )
+            else:
+                description_token = _clip_token_to_lane(
+                    token,
+                    description_min,
+                    description_clip_max,
+                    left,
+                    width,
+                )
             if description_token is None:
                 continue
             normalized = _normalize(description_token.text)
@@ -2893,9 +3249,18 @@ def reconstruct_ocr_rows(
                     aligned
                     and continuation_text
                     and not _is_payment_footer_description(continuation_raw)
-                    and _is_description_continuation(
-                        continuation_raw,
-                        aligned_description_raw[-1],
+                    and (
+                        _is_description_continuation(
+                            continuation_raw,
+                            aligned_description_raw[-1],
+                        )
+                        or (
+                            table_type is TableType.PHARMACY
+                            and pending_description_is_proven_continuation(
+                                line_description_tokens,
+                                continuation_raw,
+                            )
+                        )
                     )
                 ):
                     extend_previous_description(line_description_tokens, continuation_raw)

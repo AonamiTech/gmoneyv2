@@ -76,13 +76,30 @@ def parse_service_date(value: object) -> str | None:
     if len(matches) != 1 or matches[0].start() != 0:
         return None
     remainder = text[matches[0].end() :].strip()
-    if remainder and not re.fullmatch(r"\d{1,2}:\d{2}(?::\d{2})?", remainder):
+    time_match = (
+        re.fullmatch(
+            r"[,;-]?\s*(?P<clock>\d{1,2}:\d{2}(?::\d{2})?)"
+            r"\s*(?P<meridiem>am|pm)?",
+            remainder,
+            re.IGNORECASE,
+        )
+        if remainder
+        else None
+    )
+    if remainder and time_match is None:
         return None
-    if remainder:
+    if time_match is not None:
+        clock = time_match.group("clock")
+        meridiem = time_match.group("meridiem")
+        parsed_time = f"{clock} {meridiem}" if meridiem else clock
         try:
             datetime.strptime(
-                remainder,
-                "%H:%M:%S" if remainder.count(":") == 2 else "%H:%M",
+                parsed_time,
+                (
+                    ("%I:%M:%S %p" if clock.count(":") == 2 else "%I:%M %p")
+                    if meridiem
+                    else ("%H:%M:%S" if clock.count(":") == 2 else "%H:%M")
+                ),
             )
         except ValueError:
             return None
