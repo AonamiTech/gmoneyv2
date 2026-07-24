@@ -585,7 +585,7 @@ def test_slanted_serial_descriptions_start_distinct_financial_rows() -> None:
         token(8, "1 ZEPOXIN INJ", (50, 55, 300, 95)),
         token(9, "2 ONDET 2ML", (50, 80, 280, 120)),
         token(10, "12.72", (650, 90, 700, 130)),
-        token(11, "2.", (760, 90, 780, 130)),
+        token(11, "NNNN", (760, 90, 800, 130)),
         token(12, "25.44", (880, 90, 950, 130)),
     )
 
@@ -608,6 +608,9 @@ def test_slanted_serial_descriptions_start_distinct_financial_rows() -> None:
         ("1 ZEPOXIN INJ", Decimal("53.30"), Decimal("1"), Decimal("53.30")),
         ("2 ONDET 2ML", Decimal("12.72"), Decimal("2"), Decimal("25.44")),
     ]
+    assert "quantity_derived_from_rate_amount" in (
+        result.rows[1].candidate.validation_flags
+    )
 
 
 def test_source_table_excludes_distant_text_beyond_final_column_boundary() -> None:

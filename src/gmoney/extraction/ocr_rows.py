@@ -3818,6 +3818,7 @@ def reconstruct_ocr_rows(
             "gross_amount": None,
             "discount": None,
         }
+        quantity_derived_from_rate_amount = False
         for role in ("rate", "quantity", "gross_amount", "discount"):
             target = column_centers.get(role)
             if target is None:
@@ -3871,6 +3872,51 @@ def reconstruct_ocr_rows(
                         quantity_token.token_id,
                     )
 
+        if (
+            "quantity" in column_centers
+            and values["quantity"] is None
+            and values["rate"] is not None
+            and values["rate"] > 0
+            and not has_tax_columns
+        ):
+            quantity_target = column_centers["quantity"]
+            assigned_token_ids = {
+                token_id
+                for token_ids in field_tokens.values()
+                for token_id in token_ids
+            }
+            unreadable_quantity_tokens = tuple(
+                token
+                for token in line.tokens
+                if token.token_id not in assigned_token_ids
+                and token.text.strip()
+                and not _is_header_token(token)
+                and parse_quantity(token.text) is None
+                and abs(
+                    ((_center_x(token) - left) / width)
+                    - quantity_target
+                )
+                <= 0.06
+            )
+            adjusted_amount = abs(amount)
+            if values["discount"] is not None:
+                adjusted_amount += values["discount"]
+            derived_quantity = adjusted_amount / values["rate"]
+            if (
+                len(unreadable_quantity_tokens) == 1
+                and derived_quantity > 0
+                and derived_quantity <= Decimal("100000")
+                and derived_quantity
+                == derived_quantity.to_integral_value()
+                and values["rate"] * derived_quantity
+                == adjusted_amount
+            ):
+                values["quantity"] = derived_quantity
+                field_tokens["quantity"] = (
+                    unreadable_quantity_tokens[0].token_id,
+                )
+                quantity_derived_from_rate_amount = True
+
         normalized_description = _normalize(description)
         if _is_metadata_description(description):
             role = RowRole.UNRESOLVED
@@ -3907,6 +3953,8 @@ def reconstruct_ocr_rows(
             validation_flags.append("positive_amount_in_return_section")
         if missing_printed_description:
             validation_flags.append("missing_printed_description")
+        if quantity_derived_from_rate_amount:
+            validation_flags.append("quantity_derived_from_rate_amount")
         if "quantity" in column_centers and values["quantity"] is None:
             validation_flags.append("missing_labeled_quantity")
         if "rate" in column_centers and values["rate"] is None:

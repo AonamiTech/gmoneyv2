@@ -1323,6 +1323,33 @@ def _validate_result(
                         else parse_decimal(cell.raw_value or "")
                     )
                     canonical_value = parse_decimal(str(canonical[field]))
+                    canonical_rate = parse_decimal(
+                        str(canonical.get("unit_price"))
+                    )
+                    canonical_amount = parse_decimal(
+                        str(canonical.get("net_amount"))
+                    )
+                    canonical_discount = (
+                        parse_decimal(str(canonical.get("discount")))
+                        or Decimal("0")
+                    )
+                    derived_quantity_is_proven = bool(
+                        field == "quantity"
+                        and printed_value is None
+                        and "quantity_derived_from_rate_amount"
+                        in (canonical.get("validation_flags") or [])
+                        and canonical_value is not None
+                        and canonical_value > 0
+                        and canonical_value
+                        == canonical_value.to_integral_value()
+                        and canonical_rate is not None
+                        and canonical_rate > 0
+                        and canonical_amount is not None
+                        and canonical_value * canonical_rate
+                        == abs(canonical_amount) + canonical_discount
+                    )
+                    if derived_quantity_is_proven:
+                        continue
                     if printed_value is None or printed_value != canonical_value:
                         raise ValueError(
                             f"{field} value does not match its mapped source cell "
