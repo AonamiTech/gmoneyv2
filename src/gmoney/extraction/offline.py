@@ -7,7 +7,6 @@ from collections.abc import Callable, Collection
 from dataclasses import asdict, dataclass, replace
 from decimal import Decimal
 from pathlib import Path
-from statistics import median
 from typing import Annotated, Any
 from uuid import uuid4
 
@@ -823,53 +822,6 @@ def _suppress_repeated_printed_tables(
     )
 
 
-def _source_cell_is_oversized_overlay(
-    cell: SourceCell,
-    column: SourceColumn,
-    columns: tuple[SourceColumn, ...],
-    row_cells: tuple[SourceCell, ...],
-) -> bool:
-    def evidence_heights(item: SourceCell) -> tuple[float, ...]:
-        return tuple(
-            max(point.y for point in evidence.polygon.points)
-            - min(point.y for point in evidence.polygon.points)
-            for evidence in item.evidence
-        )
-
-    own_heights = evidence_heights(cell)
-    peer_heights = tuple(
-        height
-        for peer in row_cells
-        if peer.column_id != cell.column_id
-        for height in evidence_heights(peer)
-        if height > 0
-    )
-    if not own_heights or len(peer_heights) < 2:
-        return False
-    peer_height = median(peer_heights)
-    if peer_height <= 0 or max(own_heights) <= peer_height * 2:
-        return False
-
-    cell_xs = tuple(
-        point.x for evidence in cell.evidence for point in evidence.polygon.points
-    )
-    column_xs = tuple(
-        point.x for evidence in column.evidence for point in evidence.polygon.points
-    )
-    table_xs = tuple(
-        point.x
-        for source_column in columns
-        for evidence in source_column.evidence
-        for point in evidence.polygon.points
-    )
-    if not cell_xs or not column_xs or not table_xs:
-        return False
-    table_width = max(table_xs) - min(table_xs)
-    cell_center = (min(cell_xs) + max(cell_xs)) / 2
-    column_center = (min(column_xs) + max(column_xs)) / 2
-    return table_width > 0 and abs(cell_center - column_center) > table_width * 0.08
-
-
 def _contains_service_code_fragment(value: str) -> bool:
     return any(
         _structured_field_value_is_valid("service_code", fragment)
@@ -880,8 +832,6 @@ def _contains_service_code_fragment(value: str) -> bool:
 def _source_cell_is_invalid_structured_overlay(
     cell: SourceCell,
     column: SourceColumn,
-    columns: tuple[SourceColumn, ...],
-    row_cells: tuple[SourceCell, ...],
     canonical: CanonicalRow,
 ) -> bool:
     roles = {
@@ -901,13 +851,9 @@ def _source_cell_is_invalid_structured_overlay(
         or "all_text_rotated" not in cell.validation_flags
     ):
         return False
-    if role == "service_code" and _contains_service_code_fragment(cell.raw_value):
-        return False
-    return _source_cell_is_oversized_overlay(
-        cell,
-        column,
-        columns,
-        row_cells,
+    return not (
+        role == "service_code"
+        and _contains_service_code_fragment(cell.raw_value)
     )
 
 
@@ -1647,8 +1593,6 @@ def _link_source_tables(
                     if _source_cell_is_invalid_structured_overlay(
                         cell,
                         columns_by_id[cell.column_id],
-                        table.columns,
-                        linked_cells,
                         matched,
                     )
                     else cell

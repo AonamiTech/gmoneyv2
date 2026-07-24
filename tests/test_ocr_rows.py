@@ -2348,7 +2348,17 @@ def test_invalid_stamp_text_is_not_published_as_a_missing_service_code() -> None
     assert "excluded_oversized_overlay" in code_cell.validation_flags
 
 
-def test_invalid_stamp_text_is_not_published_as_a_missing_request_number() -> None:
+@pytest.mark.parametrize(
+    ("overlay_text", "overlay_box"),
+    (
+        ("No: 10&10/1, Radhkrishnan", (300, 120, 650, 155)),
+        ("Road,", (530, 120, 610, 135)),
+    ),
+)
+def test_invalid_stamp_text_is_not_published_as_a_missing_request_number(
+    overlay_text: str,
+    overlay_box: tuple[float, float, float, float],
+) -> None:
     tokens = (
         token(0, "Service Name", (100, 30, 300, 45)),
         token(1, "Bill Number", (520, 30, 620, 45)),
@@ -2361,8 +2371,8 @@ def test_invalid_stamp_text_is_not_published_as_a_missing_request_number() -> No
         token(8, "Gloves Sterile 7", (100, 130, 300, 145)),
         rotated_token(
             9,
-            "No: 10&10/1, Radhkrishnan",
-            (300, 120, 650, 155),
+            overlay_text,
+            overlay_box,
             19,
         ),
         token(10, "20/01/2026 09:44:58", (700, 130, 850, 145)),
