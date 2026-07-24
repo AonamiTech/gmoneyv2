@@ -912,6 +912,57 @@ def test_source_tables_restart_at_arbitrary_header_after_preamble() -> None:
     ]
 
 
+def test_source_tables_restart_at_arbitrary_header_after_valid_ledger() -> None:
+    tokens = (
+        token(0, "Date", (80, 20, 160, 35)),
+        token(1, "Particulars", (300, 20, 520, 35)),
+        token(2, "Units", (600, 20, 660, 35)),
+        token(3, "Service Amt", (700, 20, 790, 35)),
+        token(4, "Disc Amt", (800, 20, 870, 35)),
+        token(5, "Net Amt", (900, 20, 970, 35)),
+        token(6, "27/06/2026", (80, 55, 160, 70)),
+        token(7, "Suction Catheter", (300, 55, 520, 70)),
+        token(8, "1.00", (610, 55, 650, 70)),
+        token(9, "91.00", (710, 55, 780, 70)),
+        token(10, "0.00", (810, 55, 860, 70)),
+        token(11, "91.00", (910, 55, 960, 70)),
+        token(12, "Advance/Receipt detail", (80, 90, 280, 105)),
+        token(13, "Receipt No", (300, 120, 420, 135)),
+        token(14, "Receipt Date", (520, 120, 640, 135)),
+        token(15, "Card Charges", (700, 120, 810, 135)),
+        token(16, "Receipt Amount", (870, 120, 980, 135)),
+        token(17, "OPA1/26/306 (EFT)", (300, 155, 450, 170)),
+        token(18, "23/05/2026 1:02PM", (520, 155, 660, 170)),
+        token(19, "0.00", (730, 155, 780, 170)),
+        token(20, "5000.00", (900, 155, 970, 170)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(60, 0, 1000, 190),
+    )
+
+    assert len(result.source_tables) == 2
+    assert [
+        column.label for column in result.source_tables[1].columns
+    ] == [
+        "Receipt No",
+        "Receipt Date",
+        "Card Charges",
+        "Receipt Amount",
+    ]
+    assert [
+        cell.raw_value for cell in result.source_tables[1].rows[0].cells
+    ] == [
+        "OPA1/26/306 (EFT)",
+        "23/05/2026 1:02PM",
+        "0.00",
+        "5000.00",
+    ]
+
+
 def test_arbitrary_data_rows_are_not_promoted_to_repeated_headers() -> None:
     tokens = (
         token(0, "REFERENCE", (80, 20, 200, 35)),

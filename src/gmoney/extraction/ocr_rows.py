@@ -1431,7 +1431,15 @@ def _raw_source_headers(
         is_dense_explicit_restart = (
             not any(character.isdigit() for character in line.text)
             and len(header_tokens) >= 4
-            and len(normalized_words & RAW_HEADER_TERMS) >= 5
+            and len(
+                {
+                    word
+                    for word in normalized_words
+                    if word in RAW_HEADER_TERMS
+                    or word.removesuffix("s") in RAW_HEADER_TERMS
+                }
+            )
+            >= min(5, len(header_tokens))
         )
         if aligned >= 2 and (
             not output
@@ -3746,23 +3754,40 @@ def reconstruct_ocr_rows(
             raw_description=description_text,
         )
 
-    raw_source_headers = (
-        () if header_valid else _raw_source_headers(lines, width)
-    )
+    raw_source_headers = _raw_source_headers(lines, width)
     source_header = (
         primary_header
         if header_valid
         else (raw_source_headers[0] if raw_source_headers else None)
     )
+    if header_valid:
+        recognized_source_headers = (
+            primary_header,
+            *repeated_header_blocks,
+        )
+        arbitrary_restarts = tuple(
+            block
+            for block in raw_source_headers
+            if block.start > header_index
+            and not any(
+                block.start <= recognized.end
+                and block.end >= recognized.start
+                for recognized in recognized_source_headers
+            )
+        )
+        source_repeated_headers = tuple(
+            sorted(
+                (*repeated_header_blocks, *arbitrary_restarts),
+                key=lambda block: block.start,
+            )
+        )
+    else:
+        source_repeated_headers = raw_source_headers[1:]
     source_tables = (
         _build_source_tables(
             lines,
             primary=source_header,
-            repeated=(
-                repeated_header_blocks
-                if header_valid
-                else raw_source_headers[1:]
-            ),
+            repeated=source_repeated_headers,
             original_by_id=original_by_id,
             page_number=page_number,
             table_id=table_id,
