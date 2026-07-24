@@ -1618,9 +1618,11 @@ def test_internal_bill_total_ignores_rotated_structured_overlay_fragments(
                 },
                 {
                     "column_id": "request-number",
-                    "raw_value": None,
-                    "evidence": [],
-                    "validation_flags": ["empty_cell"],
+                    "raw_value": "P:044-42649097/90052",
+                    "evidence": [
+                        evidence(page_sha, "rotated-phone-overlay-fragment")
+                    ],
+                    "validation_flags": ["all_text_rotated"],
                 },
                 {
                     "column_id": "amount",

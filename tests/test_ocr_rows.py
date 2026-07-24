@@ -2509,6 +2509,69 @@ def test_plausible_slanted_request_number_remains_for_strict_validation(
     assert "excluded_oversized_overlay" not in request_cell.validation_flags
 
 
+def test_normal_ledger_rows_do_not_form_a_cross_column_overlay_cluster() -> None:
+    tokens = (
+        token(0, "Service Name", (100, 30, 300, 45)),
+        token(1, "Bill Number", (430, 30, 520, 45)),
+        token(2, "HSN", (570, 30, 640, 45)),
+        token(3, "Date", (700, 30, 760, 45)),
+        token(4, "Net Amount", (870, 30, 970, 45)),
+        token(5, "Syringe", (100, 90, 300, 105)),
+        rotated_token(6, "REQ 100.", (430, 85, 520, 100), 19),
+        rotated_token(7, "6210 4070", (570, 85, 660, 100), 19),
+        token(8, "20/01/2026 09:40:00", (700, 90, 850, 105)),
+        token(9, "50.00", (880, 90, 960, 105)),
+        token(10, "Gloves Sterile 7", (100, 130, 300, 145)),
+        rotated_token(11, "REQ 150.", (430, 125, 520, 140), 19),
+        rotated_token(12, "6210 4071", (570, 125, 660, 140), 19),
+        token(13, "20/01/2026 09:44:58", (700, 130, 850, 145)),
+        token(14, "100.00", (880, 130, 960, 145)),
+        token(15, "Gauze", (100, 170, 300, 185)),
+        rotated_token(16, "REQ 200.", (430, 165, 520, 180), 19),
+        rotated_token(17, "6210 4072", (570, 165, 660, 180), 19),
+        token(18, "20/01/2026 09:50:00", (700, 170, 850, 185)),
+        token(19, "60.00", (880, 170, 960, 185)),
+    )
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 20, 980, 200),
+    )
+    canonical = canonicalize_rows(
+        "d" * 64,
+        1,
+        "p1-t1",
+        "a" * 64,
+        result.rows,
+    )
+
+    linked = _link_source_tables(result.source_tables, canonical)
+
+    gloves = next(row for row in canonical if row.description == "Gloves Sterile 7")
+    assert gloves.request_no is None
+    assert gloves.hsn_code is None
+    gloves_source_row = next(
+        row
+        for row in linked[0].rows
+        if row.canonical_row_id == str(gloves.id)
+    )
+    columns_by_field = {
+        column.canonical_field: column for column in linked[0].columns
+    }
+    cells_by_column = {
+        cell.column_id: cell for cell in gloves_source_row.cells
+    }
+    request_cell = cells_by_column[columns_by_field["request_no"].id]
+    hsn_cell = cells_by_column[columns_by_field["hsn_code"].id]
+    assert request_cell.raw_value == "REQ 150."
+    assert hsn_cell.raw_value == "6210 4071"
+    assert request_cell.evidence
+    assert hsn_cell.evidence
+    assert "excluded_oversized_overlay" not in request_cell.validation_flags
+    assert "excluded_oversized_overlay" not in hsn_cell.validation_flags
+
+
 def test_linked_source_row_splits_grounded_date_from_cross_column_ocr_token() -> None:
     tokens = (
         token(0, "Date", (100, 30, 170, 45)),

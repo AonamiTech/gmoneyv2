@@ -914,8 +914,22 @@ def _source_cell_is_in_rotated_overlay_cluster(
         for column in table.columns
         if column.canonical_field in structured_roles
     }
+    financial_column_ids = {
+        column.id
+        for column in table.columns
+        if column.canonical_field in {"net_amount", "gross_amount"}
+    }
+
+    def row_has_financial_value(row: SourceRow) -> bool:
+        return any(
+            candidate.column_id in financial_column_ids
+            and candidate.raw_value
+            and parse_decimal(candidate.raw_value) is not None
+            for candidate in row.cells
+        )
+
     rotated_structured_cells = tuple(
-        (candidate.column_id, candidate)
+        (neighboring_row, candidate)
         for neighboring_row in neighboring_rows
         for candidate in neighboring_row.cells
         if candidate.column_id in roles_by_column
@@ -930,8 +944,16 @@ def _source_cell_is_in_rotated_overlay_cluster(
         len(rotated_structured_cells) >= 3
         and len(
             {
-                column_id
-                for column_id, _ in rotated_structured_cells
+                candidate.column_id
+                for _, candidate in rotated_structured_cells
+            }
+        )
+        >= 2
+        and len(
+            {
+                neighboring_row.id
+                for neighboring_row, _ in rotated_structured_cells
+                if not row_has_financial_value(neighboring_row)
             }
         )
         >= 2

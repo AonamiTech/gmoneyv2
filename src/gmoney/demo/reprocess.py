@@ -297,11 +297,28 @@ def _unlinked_financial_row_is_explained(
     result: dict[str, Any],
 ) -> bool:
     """Accept grounded raw aggregates that intentionally are not ledger rows."""
+    structured_fields = {
+        "service_date_raw",
+        "request_no",
+        "service_code",
+        "hsn_code",
+    }
+    fields_by_column = {
+        column.id: column.canonical_field for column in table.columns
+    }
+
+    def is_rotated_structured_overlay(cell: Any) -> bool:
+        return (
+            fields_by_column.get(cell.column_id) in structured_fields
+            and "all_text_rotated" in cell.validation_flags
+        )
+
     label_values = tuple(
         cell.raw_value.strip()
         for cell in source_row.cells
         if cell.raw_value and cell.raw_value.strip()
         and parse_decimal(cell.raw_value) is None
+        and not is_rotated_structured_overlay(cell)
     )
     normalized_label = _normalized(" ".join(label_values))
     discount_labels = {"discount", "discount rs"}
@@ -641,20 +658,7 @@ def _unlinked_financial_row_is_explained(
             preceding_has_section_text = any(
                 cell.raw_value
                 and re.search(r"[a-z]", _normalized(cell.raw_value))
-                and not (
-                    next(
-                        column.canonical_field
-                        for column in table.columns
-                        if column.id == cell.column_id
-                    )
-                    in {
-                        "service_date_raw",
-                        "request_no",
-                        "service_code",
-                        "hsn_code",
-                    }
-                    and "all_text_rotated" in cell.validation_flags
-                )
+                and not is_rotated_structured_overlay(cell)
                 for cell in preceding.cells
             )
             preceding_has_financial_value = any(
