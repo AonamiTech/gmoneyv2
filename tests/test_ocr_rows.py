@@ -2360,6 +2360,14 @@ def test_invalid_stamp_text_is_not_published_as_a_missing_service_code() -> None
                 rotated_token(12, "600 087.", (530, 160, 610, 175), 19),
             ),
         ),
+        (
+            "J032 51250.",
+            (530, 120, 610, 135),
+            (
+                rotated_token(11, "Road,", (530, 100, 610, 115), 19),
+                rotated_token(12, "600 087.", (530, 160, 610, 175), 19),
+            ),
+        ),
     ),
 )
 def test_invalid_stamp_text_is_not_published_as_a_missing_request_number(

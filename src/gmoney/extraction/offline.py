@@ -941,9 +941,10 @@ def _source_cell_is_invalid_structured_overlay(
         and _contains_service_code_fragment(cell.raw_value)
     ):
         return False
-    if _structured_field_value_is_valid(
-        role,
-        re.sub(r"[\s:#]+", "", cell.raw_value),
+    compacted_value = re.sub(r"[\s:#]+", "", cell.raw_value)
+    if (
+        not cell.raw_value.rstrip().endswith((",", ".", ";"))
+        and _structured_field_value_is_valid(role, compacted_value)
     ):
         return False
     return _source_cell_is_oversized_overlay(
