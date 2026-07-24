@@ -3950,6 +3950,7 @@ def test_pharmacy_expiry_date_does_not_replace_left_transaction_date(
             f"{request_prefix}261015227 Patient Coat",
             (80, 70, merged_right, 85),
         ),
+        token(10, "Patient Coat", (320, 70, 430, 85)),
         token(12, "62104070", (500, 70, 570, 85)),
         token(13, "1", (780, 70, 795, 85)),
         token(14, "250", (845, 70, 880, 85)),
@@ -4013,7 +4014,11 @@ def test_pharmacy_expiry_date_does_not_replace_left_transaction_date(
     )
     assert first_cells["request_no"].raw_value == f"{request_prefix}261015227"
     assert first_cells["description"].raw_value == "Patient Coat"
-    assert len(first_cells["description"].evidence) == 1
+    assert {
+        token_id
+        for evidence in first_cells["description"].evidence
+        for token_id in evidence.token_ids
+    } == {"token-9", "token-10"}
     assert all(
         cell.validation_flags == ("split_from_merged_ocr_token",)
         for cell in (
@@ -4033,7 +4038,6 @@ def test_pharmacy_expiry_date_does_not_replace_left_transaction_date(
             for cell in (
                 first_cells["service_date_raw"],
                 first_cells["request_no"],
-                first_cells["description"],
             )
         )
         assert all(
@@ -4248,11 +4252,30 @@ def test_pharmacy_return_section_continues_to_the_next_page_table() -> None:
         box=(280, 15, 980, 100),
         prior_schemas=(first_page.schema,),
     )
+    assert second_page.schema is not None
+    normal_page = reconstruct_ocr_rows(
+        (
+            token(40, "IP Pharmacy Details", (300, 0, 500, 15)),
+            token(41, "ProductName", (300, 25, 450, 40)),
+            token(42, "Qty", (700, 25, 750, 40)),
+            token(43, "Rate", (800, 25, 850, 40)),
+            token(44, "Total", (900, 25, 960, 40)),
+            token(45, "Issued item", (300, 65, 500, 80)),
+            token(46, "1", (710, 65, 730, 80)),
+            token(47, "30.00", (800, 65, 850, 80)),
+            token(48, "30.00", (900, 65, 960, 80)),
+        ),
+        page_number=3,
+        table_id="p3-t1",
+        box=(280, 0, 980, 100),
+        prior_schemas=(first_page.schema, second_page.schema),
+    )
 
     assert first_page.schema.in_return_section
     assert second_page.rows[0].candidate.validation_flags == (
         "positive_amount_in_return_section",
     )
+    assert normal_page.rows[0].candidate.validation_flags == ()
 
 
 def test_pharmacy_description_wrap_inside_numeric_row_envelope_is_grounded() -> None:

@@ -993,10 +993,12 @@ def _split_grounded_date_request_description(
         if cells_by_id[description_column.id] is merged_cell
         else (cells_by_id[description_column.id].raw_value or "")
     )
-    printed_description = " ".join(
-        value
-        for value in (merged_description, existing_description)
-        if value
+    printed_description, _, _ = _clean_description(
+        " ".join(
+            value
+            for value in (merged_description, existing_description)
+            if value
+        )
     )
     def normalize(value: str) -> str:
         return re.sub(

@@ -385,13 +385,8 @@ def safely_improves_reconstruction(
         baseline_flags = baseline_row.candidate.validation_flags
         candidate_flags = candidate_row.candidate.validation_flags
         baseline_defects = (
-            sum(
-                baseline_flags.count(flag)
-                for flag in (
-                    "line_arithmetic_mismatch",
-                    "positive_amount_in_return_section",
-                )
-            ),
+            baseline_flags.count("line_arithmetic_mismatch"),
+            baseline_flags.count("positive_amount_in_return_section"),
             sum(
                 baseline_flags.count(flag)
                 for flag in (
@@ -401,13 +396,8 @@ def safely_improves_reconstruction(
             ),
         )
         candidate_defects = (
-            sum(
-                candidate_flags.count(flag)
-                for flag in (
-                    "line_arithmetic_mismatch",
-                    "positive_amount_in_return_section",
-                )
-            ),
+            candidate_flags.count("line_arithmetic_mismatch"),
+            candidate_flags.count("positive_amount_in_return_section"),
             sum(
                 candidate_flags.count(flag)
                 for flag in (

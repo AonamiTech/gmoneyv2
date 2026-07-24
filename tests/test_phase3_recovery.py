@@ -1065,7 +1065,10 @@ def test_recovery_can_correct_only_a_grounded_missing_refund_sign() -> None:
                 0,
                 description="Metronidazole IV 100ML",
                 amount=Decimal("23.93"),
-                flags=("positive_amount_in_return_section",),
+                flags=(
+                    "positive_amount_in_return_section",
+                    "missing_labeled_quantity",
+                ),
                 role=RowRole.DETAIL,
                 table_type=TableType.PHARMACY,
             ),
@@ -1096,6 +1099,18 @@ def test_recovery_can_correct_only_a_grounded_missing_refund_sign() -> None:
             ),
         ),
     )
+    arithmetically_unsafe = replace(
+        corrected,
+        rows=(
+            replace(
+                corrected.rows[0],
+                candidate=replace(
+                    corrected.rows[0].candidate,
+                    validation_flags=("line_arithmetic_mismatch",),
+                ),
+            ),
+        ),
+    )
     unflagged = replace(
         baseline,
         rows=(
@@ -1111,6 +1126,7 @@ def test_recovery_can_correct_only_a_grounded_missing_refund_sign() -> None:
 
     assert safely_improves_reconstruction(baseline, corrected)
     assert not safely_improves_reconstruction(baseline, wrong_amount)
+    assert not safely_improves_reconstruction(baseline, arithmetically_unsafe)
     assert not safely_improves_reconstruction(unflagged, corrected)
 
 

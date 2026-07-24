@@ -2902,6 +2902,37 @@ def reconstruct_ocr_rows(
         and continuation_schema.in_return_section
     )
 
+    def updated_return_section_state(
+        current: bool,
+        line: OcrLine,
+        numeric: tuple[NumericValue, ...],
+    ) -> bool:
+        normalized_line = _normalize(line.text)
+        line_words = set(normalized_line.split())
+        if (
+            is_pharmacy_table
+            and not numeric
+            and {"return", "returns"}.intersection(line_words)
+            and not {"detail", "details"}.intersection(line_words)
+        ):
+            return True
+        if (
+            current
+            and not numeric
+            and "pharmacy" in line_words
+            and {"detail", "details"}.intersection(line_words)
+            and not {"return", "returns"}.intersection(line_words)
+        ):
+            return False
+        return current
+
+    for preamble_line in lines[:header_start] if header_valid else ():
+        in_return_section = updated_return_section_state(
+            in_return_section,
+            preamble_line,
+            _numeric_tokens(preamble_line),
+        )
+
     def pending_description_is_proven_continuation(
         continuation_tokens: list[OcrToken],
         continuation_raw: str,
@@ -3076,23 +3107,11 @@ def reconstruct_ocr_rows(
             )
             continue
         numeric = _numeric_tokens(line)
-        normalized_line = _normalize(line.text)
-        line_words = set(normalized_line.split())
-        if (
-            is_pharmacy_table
-            and not numeric
-            and {"return", "returns"}.intersection(line_words)
-            and not {"detail", "details"}.intersection(line_words)
-        ):
-            in_return_section = True
-        elif (
-            in_return_section
-            and not numeric
-            and "pharmacy" in line_words
-            and {"detail", "details"}.intersection(line_words)
-            and not {"return", "returns"}.intersection(line_words)
-        ):
-            in_return_section = False
+        in_return_section = updated_return_section_state(
+            in_return_section,
+            line,
+            numeric,
+        )
         amount_pair = _closest_numeric(numeric, amount_center, left, width, set())
         amount_token = amount_pair.token if amount_pair else None
         amount = amount_pair.value if amount_pair else None
