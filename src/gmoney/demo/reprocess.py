@@ -784,7 +784,7 @@ def _field_token_ids(row: dict[str, Any], field: str | None = None) -> set[str]:
 def _review_mapping_score(
     old_row: dict[str, Any],
     candidate: dict[str, Any],
-) -> tuple[int, int, float] | None:
+) -> tuple[int, int, int, int, float, int, int] | None:
     if int(candidate.get("page_number") or 0) != int(
         old_row.get("page_number") or 0
     ):
@@ -795,20 +795,64 @@ def _review_mapping_score(
         old_description_ids & _field_token_ids(candidate, "description")
     )
     all_overlap = len(old_all_ids & _field_token_ids(candidate))
-    if not description_overlap and not all_overlap:
-        return None
     similarity = SequenceMatcher(
         None,
         _normalized(old_row.get("description")),
         _normalized(candidate.get("description")),
     ).ratio()
-    return (description_overlap, all_overlap, similarity)
+    order_distance = abs(
+        int(old_row.get("row_order") or 0)
+        - int(candidate.get("row_order") or 0)
+    )
+    if description_overlap or all_overlap:
+        return (
+            2,
+            description_overlap,
+            all_overlap,
+            0,
+            similarity,
+            0,
+            -order_distance,
+        )
+
+    exact_financial_fields = sum(
+        1
+        for field in ("net_amount", "gross_amount")
+        if (old_value := parse_decimal(str(old_row.get(field)))) is not None
+        and parse_decimal(str(candidate.get(field))) == old_value
+    )
+    if not exact_financial_fields:
+        return None
+    old_quantity = parse_decimal(str(old_row.get("quantity")))
+    candidate_quantity = parse_decimal(str(candidate.get("quantity")))
+    if (
+        old_quantity is not None
+        and candidate_quantity is not None
+        and old_quantity != candidate_quantity
+    ):
+        return None
+    quantity_match = int(
+        old_quantity is not None and candidate_quantity == old_quantity
+    )
+    if similarity < 0.5 and not quantity_match:
+        return None
+    return (
+        1,
+        0,
+        0,
+        exact_financial_fields,
+        similarity,
+        quantity_match,
+        -order_distance,
+    )
 
 
 def _map_reviewed_row(
     old_row: dict[str, Any], new_rows: list[dict[str, Any]]
 ) -> str | None:
-    scored: list[tuple[tuple[int, int, float], str]] = []
+    scored: list[
+        tuple[tuple[int, int, int, int, float, int, int], str]
+    ] = []
     for candidate in new_rows:
         score = _review_mapping_score(old_row, candidate)
         if score is None:
@@ -835,6 +879,31 @@ def _rebase_review_override(
     return rebased
 
 
+def _merge_compatible_review_overrides(
+    preferred: dict[str, Any],
+    other: dict[str, Any],
+    *,
+    target_row: dict[str, Any],
+) -> dict[str, Any] | None:
+    preferred_changes = preferred.get("changes") or {}
+    other_changes = other.get("changes") or {}
+    if any(
+        field in preferred_changes and preferred_changes[field] != value
+        for field, value in other_changes.items()
+    ):
+        return None
+    if (
+        "review_disposition" in other_changes
+        and "review_disposition" not in preferred_changes
+        and other_changes["review_disposition"]
+        != target_row.get("review_disposition")
+    ):
+        return None
+    merged = json.loads(json.dumps(preferred))
+    merged["changes"] = {**other_changes, **preferred_changes}
+    return merged
+
+
 def _migrate_review(
     job_id: str,
     old_result: dict[str, Any],
@@ -847,8 +916,10 @@ def _migrate_review(
     new_ids = {str(row["id"]) for row in new_rows}
     migrated_overrides: dict[str, Any] = {}
     migrated_override_sources: dict[str, str] = {}
+    migrated_override_members: dict[str, list[str]] = {}
     migrated_added = json.loads(json.dumps(review.get("added_rows", {})))
     preserved_unmapped: list[str] = []
+    subsumed_overrides: list[str] = []
 
     def preserve_override(old_id: str, override: dict[str, Any]) -> None:
         preserved = json.loads(json.dumps(old_rows[old_id]))
@@ -881,8 +952,15 @@ def _migrate_review(
         preserved_unmapped.append(old_id)
 
     def mapping_priority(old_id: str, target_id: str) -> tuple[Any, ...]:
+        reviewed_row = {
+            **old_rows[old_id],
+            **(
+                review["row_overrides"][old_id].get("changes")
+                or {}
+            ),
+        }
         score = _review_mapping_score(
-            old_rows[old_id],
+            reviewed_row,
             new_rows_by_id[target_id],
         )
         return (
@@ -899,25 +977,67 @@ def _migrate_review(
         target_id = old_id if old_id in new_ids else None
         rebased_override = _rebase_review_override(old_row, override)
         if target_id is None:
-            target_id = _map_reviewed_row(old_row, new_rows)
+            reviewed_row = {
+                **old_row,
+                **(override.get("changes") or {}),
+            }
+            target_id = _map_reviewed_row(reviewed_row, new_rows)
         if target_id is None:
             preserve_override(old_id, override)
             continue
         if target_id in migrated_overrides:
             incumbent_id = migrated_override_sources[target_id]
-            if mapping_priority(old_id, target_id) > mapping_priority(
+            incoming_wins = mapping_priority(
+                old_id,
+                target_id,
+            ) > mapping_priority(
                 incumbent_id,
                 target_id,
-            ):
-                preserve_override(
-                    incumbent_id,
-                    review["row_overrides"][incumbent_id],
+            )
+            preferred = (
+                rebased_override
+                if incoming_wins
+                else migrated_overrides[target_id]
+            )
+            other = (
+                migrated_overrides[target_id]
+                if incoming_wins
+                else rebased_override
+            )
+            merged = _merge_compatible_review_overrides(
+                preferred,
+                other,
+                target_row=new_rows_by_id[target_id],
+            )
+            if merged is not None:
+                losing_members = (
+                    migrated_override_members[target_id]
+                    if incoming_wins
+                    else [old_id]
                 )
+                subsumed_overrides.extend(losing_members)
+                migrated_overrides[target_id] = merged
+                if incoming_wins:
+                    migrated_override_sources[target_id] = old_id
+                    migrated_override_members[target_id] = [
+                        *migrated_override_members[target_id],
+                        old_id,
+                    ]
+                else:
+                    migrated_override_members[target_id].append(old_id)
+                continue
+            if incoming_wins:
+                for losing_id in migrated_override_members[target_id]:
+                    preserve_override(
+                        losing_id,
+                        review["row_overrides"][losing_id],
+                    )
             else:
                 preserve_override(old_id, override)
                 continue
         migrated_overrides[target_id] = rebased_override
         migrated_override_sources[target_id] = old_id
+        migrated_override_members[target_id] = [old_id]
 
     issue_probe = {**review, "issue_overrides": {}}
     new_issue_ids = {
@@ -955,6 +1075,7 @@ def _migrate_review(
                 "new_rows": len(new_result.get("rows", [])),
                 "mapped_row_overrides": len(migrated_overrides),
                 "preserved_unmapped_row_overrides": preserved_unmapped,
+                "subsumed_row_overrides": sorted(set(subsumed_overrides)),
                 "archived_issue_overrides": sorted(missing_issues),
             },
             "created_at": utc_now(),

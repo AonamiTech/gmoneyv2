@@ -2728,6 +2728,106 @@ def test_review_migration_does_not_reapply_unchanged_machine_fields() -> None:
     }
 
 
+def test_review_migration_maps_unique_grounded_financial_row_when_token_ids_change() -> None:
+    page_sha = "a" * 64
+    old = row("old-row", page_sha, amount="30.69")
+    old["description"] = "Dispovan 5Ml"
+    old["quantity_raw"] = "3"
+    old["quantity"] = "3"
+    upgraded = row("new-row", page_sha, amount="30.69")
+    upgraded["description"] = "Dispovan 5Ml Syringe"
+    upgraded["quantity_raw"] = "3"
+    upgraded["quantity"] = "3"
+    upgraded["field_evidence"] = {
+        "description": [evidence(page_sha, "new-description")],
+        "amount": [evidence(page_sha, "new-amount")],
+    }
+    review = {
+        "revision": 1,
+        "row_overrides": {
+            "old-row": {
+                "changes": {
+                    "quantity_raw": "3",
+                    "quantity": "3",
+                },
+                "reason": "Quantity verified",
+            }
+        },
+        "added_rows": {},
+        "issue_overrides": {},
+        "events": [],
+    }
+
+    migrated = reprocess_module._migrate_review(
+        "job-id",
+        {"rows": [old]},
+        {"rows": [upgraded]},
+        review,
+    )
+
+    assert migrated["row_overrides"] == {
+        "new-row": {
+            **review["row_overrides"]["old-row"],
+            "changes": {},
+        }
+    }
+    assert migrated["added_rows"] == {}
+
+
+def test_review_migration_subsumes_identical_colliding_corrections() -> None:
+    page_sha = "a" * 64
+    main = row("old-main", page_sha, amount="60")
+    main["description"] = "Gauze Swabs"
+    fragment = row("old-fragment", page_sha, amount="60")
+    fragment["description"] = "Bill Number ProductName"
+    fragment["field_evidence"] = {
+        "description": [evidence(page_sha, "fragment-description")],
+        "amount": [evidence(page_sha, "fragment-amount")],
+    }
+    upgraded = row("new-row", page_sha, amount="60")
+    upgraded["description"] = "Gauze Swabs 7.5 x 7.5"
+    upgraded["quantity_raw"] = "1"
+    upgraded["quantity"] = "1"
+    upgraded["field_evidence"] = {
+        "description": [evidence(page_sha, "new-description")],
+        "amount": [evidence(page_sha, "new-amount")],
+    }
+    correction = {
+        "changes": {"quantity_raw": "1", "quantity": "1"},
+        "reason": "Quantity verified",
+    }
+    review = {
+        "revision": 2,
+        "row_overrides": {
+            "old-main": correction,
+            "old-fragment": {
+                **correction,
+                "reason": "Quantity was missing",
+            },
+        },
+        "added_rows": {},
+        "issue_overrides": {},
+        "events": [],
+    }
+
+    migrated = reprocess_module._migrate_review(
+        "job-id",
+        {"rows": [main, fragment]},
+        {"rows": [upgraded]},
+        review,
+    )
+
+    assert migrated["row_overrides"] == {
+        "new-row": {
+            **correction,
+        }
+    }
+    assert migrated["added_rows"] == {}
+    assert migrated["events"][-1]["changes"][
+        "subsumed_row_overrides"
+    ] == ["old-fragment"]
+
+
 def test_manual_rollback_rejects_review_created_after_deployment(tmp_path: Path) -> None:
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
