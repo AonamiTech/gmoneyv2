@@ -1059,7 +1059,12 @@ def test_internal_bill_total_can_continue_across_compatible_page_tables(
             item["page_number"] = 2
             item["table_id"] = "p2-t1"
 
-    first_table = source_tables(preceding_rows, first_page_sha)[0]
+    first_tables = [
+        source_tables([canonical], first_page_sha)[0]
+        for canonical in preceding_rows
+    ]
+    first_tables[1]["id"] = "p1-t1-s2"
+    first_tables[1]["rows"][0]["id"] = "p1-t1-s2-r1"
     second_table = source_tables(current_rows, second_page_sha)[0]
     second_table["id"] = "p2-t1-s1"
     second_table["page_number"] = 2
@@ -1112,7 +1117,7 @@ def test_internal_bill_total_can_continue_across_compatible_page_tables(
     new_result = {
         **old_result,
         "rows": [*preceding_rows, *current_rows],
-        "source_tables": [first_table, second_table],
+        "source_tables": [*first_tables, second_table],
     }
 
     if accepted:
@@ -1203,6 +1208,84 @@ def test_pharmacy_summary_requires_exact_positive_or_return_arithmetic(
                 new_result,
                 store.job_dir(job_id) / "artifacts",
             )
+
+
+def test_separate_pharmacy_tables_validate_their_own_tail_summaries(
+    tmp_path: Path,
+) -> None:
+    store, job_id, old_result = setup_job(tmp_path)
+    page_sha = old_result["page_assets"][0]["artifact_sha256"]
+    new_rows = [
+        row("first-pharmacy-charge", page_sha, amount="100.00"),
+        row("second-pharmacy-charge", page_sha, amount="50.00"),
+    ]
+    for order, canonical in enumerate(new_rows):
+        canonical["row_order"] = order
+        canonical["table_type"] = "pharmacy"
+    new_rows[1]["table_id"] = "p1-t2"
+    for evidence_items in new_rows[1]["field_evidence"].values():
+        for item in evidence_items:
+            item["table_id"] = "p1-t2"
+    for item in new_rows[1]["evidence"]:
+        item["table_id"] = "p1-t2"
+
+    printed = [
+        source_tables([canonical], page_sha)[0]
+        for canonical in new_rows
+    ]
+    printed[1]["id"] = "p1-t2-s1"
+    printed[1]["table_id"] = "p1-t2"
+    for column in printed[1]["columns"]:
+        for item in column["evidence"]:
+            item["table_id"] = "p1-t2"
+    for source_row in printed[1]["rows"]:
+        source_row["id"] = "p1-t2-s1-r1"
+        for cell in source_row["cells"]:
+            for item in cell["evidence"]:
+                item["table_id"] = "p1-t2"
+
+    for table_index, (table, amount) in enumerate(
+        zip(printed, ("100.00", "50.00"), strict=True),
+        start=1,
+    ):
+        table["table_type"] = "pharmacy"
+        summary_label = evidence(page_sha, f"summary-{table_index}-label")
+        summary_amount = evidence(page_sha, f"summary-{table_index}-amount")
+        summary_label["table_id"] = table["table_id"]
+        summary_amount["table_id"] = table["table_id"]
+        table["rows"].append(
+            {
+                "id": f"{table['id']}-r2",
+                "order": 1,
+                "canonical_row_id": None,
+                "cells": [
+                    {
+                        "column_id": "description",
+                        "raw_value": "Total Amount",
+                        "evidence": [summary_label],
+                        "validation_flags": [],
+                    },
+                    {
+                        "column_id": "amount",
+                        "raw_value": amount,
+                        "evidence": [summary_amount],
+                        "validation_flags": [],
+                    },
+                ],
+                "validation_flags": [],
+            }
+        )
+
+    _validate_result(
+        store.job_dir(job_id) / "source.pdf",
+        old_result,
+        {
+            **old_result,
+            "rows": new_rows,
+            "source_tables": printed,
+        },
+        store.job_dir(job_id) / "artifacts",
+    )
 
 
 @pytest.mark.parametrize(

@@ -1114,6 +1114,43 @@ def test_recovery_can_correct_only_a_grounded_missing_refund_sign() -> None:
     assert not safely_improves_reconstruction(unflagged, corrected)
 
 
+def test_recovery_can_add_a_grounded_row_with_only_an_optional_field_missing() -> None:
+    baseline = _reconstruction(
+        (_aligned_row(0, description="Existing item"),),
+        table_type=TableType.PHARMACY,
+    )
+    recovered = _reconstruction(
+        (
+            _aligned_row(0, description="Existing item"),
+            _aligned_row(
+                1,
+                description="Under Pad 10S",
+                rate=Decimal("153.80"),
+                amount=Decimal("615.20"),
+                flags=("missing_labeled_quantity",),
+                table_type=TableType.PHARMACY,
+            ),
+        ),
+        table_type=TableType.PHARMACY,
+    )
+    arithmetically_unsafe = replace(
+        recovered,
+        rows=(
+            recovered.rows[0],
+            replace(
+                recovered.rows[1],
+                candidate=replace(
+                    recovered.rows[1].candidate,
+                    validation_flags=("line_arithmetic_mismatch",),
+                ),
+            ),
+        ),
+    )
+
+    assert safely_improves_reconstruction(baseline, recovered)
+    assert not safely_improves_reconstruction(baseline, arithmetically_unsafe)
+
+
 @pytest.mark.parametrize(
     "bad_first_variant",
     (False, True),

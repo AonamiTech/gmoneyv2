@@ -143,10 +143,10 @@ def reconstruction_quality(reconstruction: ReconstructionResult) -> tuple[int, .
     source_rows = sum(len(table.rows) for table in reconstruction.source_tables)
     return (
         -arithmetic_mismatches,
+        len(publishable_rows),
         -missing_labeled_fields,
         _mapped_field_coverage(reconstruction),
         _populated_source_cells(reconstruction),
-        len(publishable_rows),
         grounded_rows,
         source_rows,
     )
@@ -378,17 +378,65 @@ def safely_improves_reconstruction(
     candidate_publishable = sum(is_publishable_aligned_row(row) for row in candidate.rows)
     if candidate_publishable < baseline_publishable:
         return False
-    if any(
-        candidate_count > baseline_count
-        for candidate_count, baseline_count in zip(
-            _field_quality_defects(candidate),
-            _field_quality_defects(baseline),
-            strict=True,
-        )
-    ):
-        return False
     matched_rows = _match_publishable_rows(baseline, candidate)
     if matched_rows is None or not _preserves_grounded_fields(matched_rows):
+        return False
+    for baseline_row, candidate_row in matched_rows:
+        baseline_flags = baseline_row.candidate.validation_flags
+        candidate_flags = candidate_row.candidate.validation_flags
+        baseline_defects = (
+            sum(
+                baseline_flags.count(flag)
+                for flag in (
+                    "line_arithmetic_mismatch",
+                    "positive_amount_in_return_section",
+                )
+            ),
+            sum(
+                baseline_flags.count(flag)
+                for flag in (
+                    "missing_labeled_quantity",
+                    "missing_labeled_unit_price",
+                )
+            ),
+        )
+        candidate_defects = (
+            sum(
+                candidate_flags.count(flag)
+                for flag in (
+                    "line_arithmetic_mismatch",
+                    "positive_amount_in_return_section",
+                )
+            ),
+            sum(
+                candidate_flags.count(flag)
+                for flag in (
+                    "missing_labeled_quantity",
+                    "missing_labeled_unit_price",
+                )
+            ),
+        )
+        if any(
+            candidate_count > baseline_count
+            for candidate_count, baseline_count in zip(
+                candidate_defects,
+                baseline_defects,
+                strict=True,
+            )
+        ):
+            return False
+    matched_candidate_ids = {
+        id(candidate_row) for _, candidate_row in matched_rows
+    }
+    if any(
+        {
+            "line_arithmetic_mismatch",
+            "positive_amount_in_return_section",
+        }.intersection(row.candidate.validation_flags)
+        for row in candidate.rows
+        if is_publishable_aligned_row(row)
+        and id(row) not in matched_candidate_ids
+    ):
         return False
     if _mapped_field_coverage(candidate) < _mapped_field_coverage(baseline):
         return False

@@ -262,6 +262,7 @@ class TableSchemaState:
     confidence: float
     header_token_ids: tuple[str, ...]
     orientation: str = "upright"
+    in_return_section: bool = False
 
 
 @dataclass(frozen=True)
@@ -2050,6 +2051,15 @@ def _clean_description(text: str) -> tuple[str, str | None, str | None]:
     raw = BATCH_SUFFIX.sub("", raw)
     raw = DATE_RANGE_SUFFIX.sub("", raw)
     raw = re.sub(r"\s+", " ", raw).strip(" -:[]")
+    words = raw.split()
+    midpoint = len(words) // 2
+    if (
+        len(words) >= 4
+        and len(words) % 2 == 0
+        and _normalize(" ".join(words[:midpoint]))
+        == _normalize(" ".join(words[midpoint:]))
+    ):
+        raw = " ".join(words[:midpoint])
     return raw, service_date, request_no
 
 
@@ -2802,9 +2812,46 @@ def reconstruct_ocr_rows(
         has_ledger_header=header_valid,
         zero_tail_summary=zero_tail_summary,
     )
+    current_table_slot = re.search(r"(?:^|-)t(?P<slot>\d+)$", table_id)
+    continuation_schema = next(
+        (
+            candidate
+            for candidate in reversed(prior_schemas)
+            if 0 <= page_number - candidate.source_page <= 1
+            and candidate.orientation == orientation
+            and (
+                candidate.source_page != page_number
+                or candidate.source_table == table_id
+            )
+            and (
+                candidate.source_page == page_number
+                or current_table_slot is None
+                or (
+                    (prior_slot := re.search(
+                        r"(?:^|-)t(?P<slot>\d+)$",
+                        candidate.source_table,
+                    ))
+                    is None
+                )
+                or prior_slot.group("slot") == current_table_slot.group("slot")
+            )
+            and "amount" in candidate.column_centers
+            and "amount" in column_centers
+            and abs(
+                candidate.column_centers["amount"]
+                - column_centers["amount"]
+            )
+            <= 0.05
+        ),
+        None,
+    )
     is_pharmacy_table = (
         table_type is TableType.PHARMACY
         or "pharmacy" in _normalize(table_text).split()
+        or bool(
+            continuation_schema
+            and continuation_schema.in_return_section
+        )
     )
     has_tax_columns = bool(re.search(r"\b(?:gst|tax)\b", _normalize(table_text)))
     header_ids = tuple(
@@ -2850,7 +2897,10 @@ def reconstruct_ocr_rows(
     pending_service_date: str | None = None
     pending_service_date_ids: tuple[str, ...] = ()
     current_section: str | None = None
-    in_return_section = False
+    in_return_section = bool(
+        continuation_schema
+        and continuation_schema.in_return_section
+    )
 
     def pending_description_is_proven_continuation(
         continuation_tokens: list[OcrToken],
@@ -3588,7 +3638,11 @@ def reconstruct_ocr_rows(
     )
     return ReconstructionResult(
         rows=tuple(aligned),
-        schema=schema,
+        schema=(
+            replace(schema, in_return_section=in_return_section)
+            if schema is not None
+            else None
+        ),
         diagnostics={
             "ocr_token_count": len(scoped),
             "ocr_line_count": len(lines),

@@ -35,6 +35,16 @@ def token(index: int, text: str, box: tuple[float, float, float, float]) -> OcrT
     )
 
 
+def test_clean_description_collapses_an_exact_ocr_phrase_echo() -> None:
+    description, service_date, request_no = _clean_description(
+        "Emeset 2 Ml Inj Emeset 2 Ml Inj"
+    )
+
+    assert description == "Emeset 2 Ml Inj"
+    assert service_date is None
+    assert request_no is None
+
+
 def skewed_token(
     index: int,
     text: str,
@@ -4201,6 +4211,48 @@ def test_pharmacy_return_section_ends_at_the_next_explicit_pharmacy_section() ->
         Decimal("20.00"),
     )
     assert tuple(row.candidate.validation_flags for row in result.rows) == ((), ())
+
+
+def test_pharmacy_return_section_continues_to_the_next_page_table() -> None:
+    first_page = reconstruct_ocr_rows(
+        (
+            token(0, "ProductName", (300, 25, 450, 40)),
+            token(1, "Qty", (700, 25, 750, 40)),
+            token(2, "Rate", (800, 25, 850, 40)),
+            token(3, "Total", (900, 25, 960, 40)),
+            token(4, "IP Pharmacy Returns", (300, 65, 500, 80)),
+            token(5, "Returned item", (300, 105, 500, 120)),
+            token(6, "1", (710, 105, 730, 120)),
+            token(7, "10.00", (800, 105, 850, 120)),
+            token(8, "-10.00", (900, 105, 960, 120)),
+        ),
+        page_number=1,
+        table_id="p1-t1",
+        box=(280, 15, 980, 140),
+    )
+    assert first_page.schema is not None
+
+    second_page = reconstruct_ocr_rows(
+        (
+            token(20, "ProductName", (300, 25, 450, 40)),
+            token(21, "Qty", (700, 25, 750, 40)),
+            token(22, "Rate", (800, 25, 850, 40)),
+            token(23, "Total", (900, 25, 960, 40)),
+            token(24, "Continued item", (300, 65, 500, 80)),
+            token(25, "1", (710, 65, 730, 80)),
+            token(26, "20.00", (800, 65, 850, 80)),
+            token(27, "20.00", (900, 65, 960, 80)),
+        ),
+        page_number=2,
+        table_id="p2-t1",
+        box=(280, 15, 980, 100),
+        prior_schemas=(first_page.schema,),
+    )
+
+    assert first_page.schema.in_return_section
+    assert second_page.rows[0].candidate.validation_flags == (
+        "positive_amount_in_return_section",
+    )
 
 
 def test_pharmacy_description_wrap_inside_numeric_row_envelope_is_grounded() -> None:

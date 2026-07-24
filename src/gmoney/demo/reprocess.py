@@ -223,6 +223,69 @@ def _meaningful_summary_words(value: object) -> set[str]:
     }
 
 
+def _source_table_signature(
+    table: SourceTable,
+) -> tuple[Any, tuple[tuple[str, str | None], ...]]:
+    return (
+        table.table_type,
+        tuple(
+            (column.id, column.canonical_field)
+            for column in table.columns
+        ),
+    )
+
+
+def _source_table_slot(table: SourceTable) -> str | None:
+    match = re.search(r"(?:^|-)t(?P<slot>\d+)$", table.table_id)
+    return match.group("slot") if match is not None else None
+
+
+def _source_tables_are_contiguous(
+    previous: SourceTable,
+    following: SourceTable,
+) -> bool:
+    if _source_table_signature(previous) != _source_table_signature(following):
+        return False
+    if previous.page_number == following.page_number:
+        return previous.table_id == following.table_id
+    if previous.page_number + 1 != following.page_number:
+        return False
+    previous_slot = _source_table_slot(previous)
+    following_slot = _source_table_slot(following)
+    return (
+        previous_slot is None
+        or following_slot is None
+        or previous_slot == following_slot
+    )
+
+
+def _has_pharmacy_tail_summary(table: SourceTable) -> bool:
+    for row in table.rows:
+        if row.canonical_row_id is not None:
+            continue
+        label = _normalized(
+            " ".join(
+                cell.raw_value.strip()
+                for cell in row.cells
+                if cell.raw_value
+                and cell.raw_value.strip()
+                and parse_decimal(cell.raw_value) is None
+            )
+        )
+        words = set(label.split())
+        is_summary = (
+            "return" in words
+            or "returns" in words
+            or {"total", "amount"}.issubset(words)
+        )
+        if is_summary and any(
+            parse_decimal(cell.raw_value or "") is not None
+            for cell in row.cells
+        ):
+            return True
+    return False
+
+
 def _unlinked_financial_row_is_explained(
     *,
     table: SourceTable,
@@ -458,9 +521,31 @@ def _unlinked_financial_row_is_explained(
         and pharmacy_summary_sign
         and not linked_row_follows
     ):
+        table_index = next(
+            index
+            for index, candidate in enumerate(source_tables)
+            if candidate is table
+        )
+        pharmacy_start = table_index
+        while pharmacy_start > 0:
+            previous = source_tables[pharmacy_start - 1]
+            following = source_tables[pharmacy_start]
+            if (
+                not _source_tables_are_contiguous(previous, following)
+                or _has_pharmacy_tail_summary(previous)
+            ):
+                break
+            pharmacy_start -= 1
+        pharmacy_row_ids = {
+            row.canonical_row_id
+            for candidate in source_tables[pharmacy_start : table_index + 1]
+            for row in candidate.rows
+            if row.canonical_row_id is not None
+        }
         pharmacy_rows = tuple(
             row
-            for row in canonical_rows.values()
+            for row_id, row in canonical_rows.items()
+            if row_id in pharmacy_row_ids
             if row.get("table_type") == "pharmacy"
             and row.get("role") in {"detail", "refund", "category_rollup"}
         )
@@ -511,13 +596,6 @@ def _unlinked_financial_row_is_explained(
 
     if normalized_label in {"bill total", "sub total", "subtotal"}:
         section_rows: list[dict[str, Any]] = []
-        signature = (
-            table.table_type,
-            tuple(
-                (column.id, column.canonical_field)
-                for column in table.columns
-            ),
-        )
         table_index = next(
             index
             for index, candidate in enumerate(source_tables)
@@ -527,17 +605,7 @@ def _unlinked_financial_row_is_explained(
         while section_start > 0:
             previous = source_tables[section_start - 1]
             following = source_tables[section_start]
-            previous_signature = (
-                previous.table_type,
-                tuple(
-                    (column.id, column.canonical_field)
-                    for column in previous.columns
-                ),
-            )
-            if (
-                previous.page_number + 1 != following.page_number
-                or previous_signature != signature
-            ):
+            if not _source_tables_are_contiguous(previous, following):
                 break
             section_start -= 1
         preceding_rows = tuple(
