@@ -1750,6 +1750,102 @@ def test_reprocess_validation_accepts_matching_total_across_header_segments(
 
 
 @pytest.mark.parametrize(
+    ("label", "total", "accepted"),
+    (
+        ("Total", "68230.96", True),
+        ("Total", "68230.95", False),
+        ("Continued", "68230.96", False),
+    ),
+)
+def test_reprocess_validation_only_accepts_matching_total_in_structured_lane(
+    tmp_path: Path,
+    label: str,
+    total: str,
+    accepted: bool,
+) -> None:
+    store, job_id, old_result = setup_job(tmp_path)
+    page_sha = old_result["page_assets"][0]["artifact_sha256"]
+    new_rows = [
+        row("first-segment-row", page_sha, amount="16000.00"),
+        row("second-segment-row", page_sha, amount="52230.96"),
+    ]
+    new_rows[1]["row_order"] = 1
+    printed = source_tables(new_rows, page_sha)[0]
+    printed["columns"].insert(
+        0,
+        {
+            "id": "service-date",
+            "label": "Date",
+            "order": 0,
+            "canonical_field": "service_date_raw",
+            "evidence": [evidence(page_sha, "date-header")],
+            "validation_flags": [],
+        },
+    )
+    for order, column in enumerate(printed["columns"]):
+        column["order"] = order
+    for source_row in printed["rows"]:
+        source_row["cells"].insert(
+            0,
+            {
+                "column_id": "service-date",
+                "raw_value": None,
+                "evidence": [],
+                "validation_flags": ["empty_cell"],
+            },
+        )
+    printed["rows"].append(
+        {
+            "id": "p1-t1-s1-r3",
+            "order": 2,
+            "canonical_row_id": None,
+            "cells": [
+                {
+                    "column_id": "service-date",
+                    "raw_value": label,
+                    "evidence": [evidence(page_sha, "structured-total-label")],
+                    "validation_flags": [],
+                },
+                {
+                    "column_id": "description",
+                    "raw_value": None,
+                    "evidence": [],
+                    "validation_flags": ["empty_cell"],
+                },
+                {
+                    "column_id": "amount",
+                    "raw_value": total,
+                    "evidence": [evidence(page_sha, "structured-total-amount")],
+                    "validation_flags": [],
+                },
+            ],
+            "validation_flags": [],
+        },
+    )
+    new_result = {
+        **old_result,
+        "rows": new_rows,
+        "source_tables": [printed],
+    }
+
+    if accepted:
+        _validate_result(
+            store.job_dir(job_id) / "source.pdf",
+            old_result,
+            new_result,
+            store.job_dir(job_id) / "artifacts",
+        )
+    else:
+        with pytest.raises(ValueError, match="unlinked source row.*financial"):
+            _validate_result(
+                store.job_dir(job_id) / "source.pdf",
+                old_result,
+                new_result,
+                store.job_dir(job_id) / "artifacts",
+            )
+
+
+@pytest.mark.parametrize(
     ("boundary_label", "boundary_metadata"),
     (
         ("Grand Total", None),
