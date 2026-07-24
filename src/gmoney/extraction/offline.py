@@ -54,6 +54,7 @@ from gmoney.extraction.ocr_rows import (
     TableSchemaState,
     _clean_description,
     _request_prefix_match,
+    _split_merged_serial_description,
     _structured_field_value_is_valid,
     fuse_provider_descriptions,
     reconstruct_ocr_rows,
@@ -1293,29 +1294,28 @@ def _redistribute_grounded_description_from_adjacent_cell(
     )
     if description_column is None or not canonical.description:
         return cells
-    adjacent_column = next(
-        (
-            column
-            for column in columns
-            if column.order == description_column.order + 1
-        ),
-        None,
-    )
-    if adjacent_column is None:
-        return cells
-
     cells_by_id = {cell.column_id: cell for cell in cells}
     description_cell = cells_by_id[description_column.id]
-    merged_cell = cells_by_id[adjacent_column.id]
-    if description_cell.raw_value or not merged_cell.raw_value:
+    if description_cell.raw_value:
         return cells
-    description_match = re.search(
-        re.escape(canonical.description),
-        merged_cell.raw_value,
-        re.IGNORECASE,
+
+    adjacent_matches = tuple(
+        (column, cells_by_id[column.id], description_match)
+        for column in columns
+        if abs(column.order - description_column.order) == 1
+        and (merged_value := cells_by_id[column.id].raw_value)
+        and (
+            description_match := re.search(
+                re.escape(canonical.description),
+                merged_value,
+                re.IGNORECASE,
+            )
+        )
     )
-    if description_match is None:
+    if len(adjacent_matches) != 1:
         return cells
+    adjacent_column, merged_cell, description_match = adjacent_matches[0]
+    assert merged_cell.raw_value is not None
     printed_description = merged_cell.raw_value[
         description_match.start() : description_match.end()
     ]
@@ -1361,6 +1361,30 @@ def _redistribute_grounded_description_from_adjacent_cell(
         merged_cell.evidence,
         residual_ids,
     )
+    merged_serial = _split_merged_serial_description(merged_cell.raw_value)
+    normalized_adjacent_label = re.sub(
+        r"[^a-z0-9#]+",
+        " ",
+        adjacent_column.label.casefold(),
+    ).strip()
+    serial_split_is_grounded = bool(
+        adjacent_column.order == description_column.order - 1
+        and normalized_adjacent_label
+        in {"#", "no", "s no", "serial no", "sr n", "sr no"}
+        and merged_serial is not None
+        and merged_serial[0] == residual
+        and re.sub(r"[^a-z0-9]+", " ", merged_serial[1].casefold()).strip()
+        == re.sub(
+            r"[^a-z0-9]+",
+            " ",
+            canonical.description.casefold(),
+        ).strip()
+        and canonical_ids
+        and canonical_ids == merged_ids
+    )
+    if serial_split_is_grounded:
+        description_evidence = merged_cell.evidence
+        residual_evidence = merged_cell.evidence
     if (
         not residual
         or not description_evidence

@@ -2344,6 +2344,22 @@ def _is_admissible_merged_date_description(description: str) -> bool:
     return not has_explicit_code_marker
 
 
+def _split_merged_serial_description(value: str) -> tuple[str, str] | None:
+    match = re.fullmatch(
+        r"\s*(?P<serial>\d+[.)]?)\s+(?P<description>.+?)\s*",
+        value,
+    )
+    if match is None:
+        return None
+    description = match.group("description").strip()
+    if (
+        not re.search(r"[A-Za-z]", description)
+        or not _is_admissible_merged_date_description(description)
+    ):
+        return None
+    return match.group("serial"), description
+
+
 def _is_total_description(normalized: str) -> bool:
     return (
         normalized in {"total", "totals", "tota", "sub total", "subtotal"}
@@ -3681,6 +3697,39 @@ def reconstruct_ocr_rows(
         missing_printed_description = False
         if not description:
             serial_center = column_centers.get("serial")
+            merged_serial_descriptions = tuple(
+                (token, split)
+                for token in line.tokens
+                if (
+                    split := _split_merged_serial_description(token.text)
+                )
+                and serial_center is not None
+                and description_cell_min is not None
+                and abs(((_bounds(token)[0] - left) / width) - serial_center)
+                <= 0.08
+                and ((_bounds(token)[0] - left) / width)
+                < description_cell_min
+                < ((_bounds(token)[2] - left) / width)
+            )
+            if len(merged_serial_descriptions) == 1:
+                merged_token, (_, printed_description) = (
+                    merged_serial_descriptions[0]
+                )
+                description_tokens = [
+                    merged_token.model_copy(
+                        update={"text": printed_description}
+                    )
+                ]
+                description_text = printed_description
+                description, embedded_date, embedded_request = (
+                    _clean_description(description_text)
+                )
+                service_date = (
+                    structured_values.get("service_date") or embedded_date
+                )
+                request_no = (
+                    structured_values.get("request_no") or embedded_request
+                )
             serial_token = (
                 min(
                     (
@@ -3696,15 +3745,20 @@ def reconstruct_ocr_rows(
                 if serial_center is not None
                 else None
             )
-            if (
-                serial_token is None
-                or abs(((_center_x(serial_token) - left) / width) - serial_center) > 0.06
-            ):
-                continue
-            description_tokens = [serial_token]
-            description_text = serial_token.text.strip()
-            description = description_text
-            missing_printed_description = True
+            if not description:
+                if (
+                    serial_token is None
+                    or abs(
+                        ((_center_x(serial_token) - left) / width)
+                        - serial_center
+                    )
+                    > 0.06
+                ):
+                    continue
+                description_tokens = [serial_token]
+                description_text = serial_token.text.strip()
+                description = description_text
+                missing_printed_description = True
         normalized_description = _normalize(description)
         if (
             not missing_printed_description

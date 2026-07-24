@@ -522,6 +522,56 @@ def test_financial_row_with_blank_particular_uses_grounded_serial_description() 
     assert result.rows[0].field_token_ids["description"] == ("token-4",)
 
 
+def test_financial_row_splits_merged_serial_and_description_across_boundary() -> None:
+    tokens = (
+        token(0, "#", (50, 30, 70, 45)),
+        token(1, "Particulars", (100, 30, 300, 45)),
+        token(2, "Batch", (400, 30, 470, 45)),
+        token(3, "Expiry", (520, 30, 590, 45)),
+        token(4, "Rate", (650, 30, 700, 45)),
+        token(5, "Qty", (760, 30, 800, 45)),
+        token(6, "Amount", (880, 30, 960, 45)),
+        token(7, "5 IV SET", (50, 70, 195, 85)),
+        token(8, "26D041", (400, 70, 470, 85)),
+        token(9, "Mar-2031", (520, 70, 590, 85)),
+        token(10, "340.00", (650, 70, 700, 85)),
+        token(11, "1", (760, 70, 780, 85)),
+        token(12, "340.00", (880, 70, 950, 85)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(40, 20, 980, 110),
+    )
+    canonical = canonicalize_rows(
+        "d" * 64,
+        1,
+        "p1-t1",
+        "a" * 64,
+        result.rows,
+    )
+    linked = _link_source_tables(result.source_tables, canonical)
+
+    assert len(canonical) == 1
+    assert canonical[0].description == "IV SET"
+    assert canonical[0].net_amount == Decimal("340.00")
+    assert canonical[0].field_evidence["description"][0].token_ids == ("token-7",)
+    columns = {column.label: column for column in linked[0].columns}
+    linked_row = linked[0].rows[0]
+    cells = {cell.column_id: cell for cell in linked_row.cells}
+    assert linked_row.canonical_row_id == str(canonical[0].id)
+    assert cells[columns["#"].id].raw_value == "5"
+    assert cells[columns["Particulars"].id].raw_value == "IV SET"
+    assert {
+        token_id
+        for label in ("#", "Particulars")
+        for item in cells[columns[label].id].evidence
+        for token_id in item.token_ids
+    } == {"token-7"}
+
+
 def test_source_table_excludes_distant_text_beyond_final_column_boundary() -> None:
     tokens = (
         token(0, "Sr.N", (50, 30, 90, 45)),
