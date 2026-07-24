@@ -330,7 +330,7 @@ def _unlinked_financial_row_is_explained(
         parse_decimal(str(payload["amount"]))
         for payload in total_payloads
     }
-    total_labels = {"total", "totals", "sub total", "subtotal"}
+    total_labels = {"bill total", "total", "totals", "sub total", "subtotal"}
     total_prefixes = (
         "grand total",
         "gross bill amount",
@@ -348,7 +348,7 @@ def _unlinked_financial_row_is_explained(
     ):
         return True
 
-    if normalized_label in {"total", "totals"}:
+    if normalized_label in {"bill total", "total", "totals"}:
         source_row_seen = False
         linked_row_follows = False
         for candidate in table.rows:
@@ -383,7 +383,7 @@ def _unlinked_financial_row_is_explained(
         ):
             return True
 
-    if normalized_label in {"sub total", "subtotal"}:
+    if normalized_label in {"bill total", "sub total", "subtotal"}:
         section_rows: list[dict[str, Any]] = []
         for preceding in table.rows:
             if preceding.id == source_row.id:

@@ -891,6 +891,68 @@ def test_reprocess_validation_accepts_only_matching_section_subtotal(
             )
 
 
+@pytest.mark.parametrize(("bill_total", "accepted"), (("100.00", True), ("99.00", False)))
+def test_reprocess_validation_accepts_only_matching_internal_bill_total(
+    tmp_path: Path,
+    bill_total: str,
+    accepted: bool,
+) -> None:
+    store, job_id, old_result = setup_job(tmp_path)
+    page_sha = old_result["page_assets"][0]["artifact_sha256"]
+    new_rows = [
+        row("first-row", page_sha, amount="100.00"),
+        row("following-row", page_sha, amount="50.00"),
+    ]
+    new_rows[1]["row_order"] = 1
+    printed = source_tables(new_rows, page_sha)
+    printed[0]["rows"].insert(
+        1,
+        {
+            "id": "p1-t1-s1-r2",
+            "order": 1,
+            "canonical_row_id": None,
+            "cells": [
+                {
+                    "column_id": "description",
+                    "raw_value": "BILL TOTAL",
+                    "evidence": [evidence(page_sha, "bill-total-description")],
+                    "validation_flags": [],
+                },
+                {
+                    "column_id": "amount",
+                    "raw_value": bill_total,
+                    "evidence": [evidence(page_sha, "bill-total-amount")],
+                    "validation_flags": [],
+                },
+            ],
+            "validation_flags": [],
+        },
+    )
+    printed[0]["rows"][2]["id"] = "p1-t1-s1-r3"
+    printed[0]["rows"][2]["order"] = 2
+    new_result = {
+        **old_result,
+        "rows": new_rows,
+        "source_tables": printed,
+    }
+
+    if accepted:
+        _validate_result(
+            store.job_dir(job_id) / "source.pdf",
+            old_result,
+            new_result,
+            store.job_dir(job_id) / "artifacts",
+        )
+    else:
+        with pytest.raises(ValueError, match="unlinked source row.*financial"):
+            _validate_result(
+                store.job_dir(job_id) / "source.pdf",
+                old_result,
+                new_result,
+                store.job_dir(job_id) / "artifacts",
+            )
+
+
 def test_reprocess_validation_accepts_matching_total_across_header_segments(
     tmp_path: Path,
 ) -> None:
