@@ -353,7 +353,33 @@ def _deduplicate(rows: list[CanonicalRow]) -> list[CanonicalRow]:
         )
         if current is None or score > current_score:
             selected[key] = row
-    return sorted(selected.values(), key=lambda row: (row.page_number, row.row_order))
+
+    def grounded_position(row: CanonicalRow) -> tuple[float, float]:
+        points = tuple(
+            point
+            for item in (
+                *row.evidence,
+                *(
+                    evidence
+                    for field_evidence in row.field_evidence.values()
+                    for evidence in field_evidence
+                ),
+            )
+            for point in item.polygon.points
+        )
+        if not points:
+            return float("inf"), float("inf")
+        return min(point.y for point in points), min(point.x for point in points)
+
+    return sorted(
+        selected.values(),
+        key=lambda row: (
+            row.page_number,
+            *grounded_position(row),
+            row.table_id,
+            row.row_order,
+        ),
+    )
 
 
 @dataclass(frozen=True)

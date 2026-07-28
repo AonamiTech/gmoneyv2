@@ -785,3 +785,44 @@ def test_overlapping_table_proposals_keep_the_trustworthy_complete_row() -> None
         }
     )
     assert _deduplicate([partial, complete]) == [complete]
+
+
+def test_rows_from_multiple_page_tables_are_ordered_by_grounded_geometry() -> None:
+    def positioned(
+        order: int,
+        table_id: str,
+        description: str,
+        top: float,
+    ) -> CanonicalRow:
+        grounded = EvidenceRef(
+            page_number=1,
+            table_id=table_id,
+            polygon=Polygon(
+                points=(
+                    Point(x=100, y=top),
+                    Point(x=900, y=top),
+                    Point(x=900, y=top + 20),
+                    Point(x=100, y=top + 20),
+                )
+            ),
+            artifact_sha256="a" * 64,
+            token_ids=(f"{table_id}-{description}",),
+        )
+        return row(order, RowRole.DETAIL, "service", "10").model_copy(
+            update={
+                "table_id": table_id,
+                "description": description,
+                "evidence": (grounded,),
+                "field_evidence": {"description": (grounded,)},
+            }
+        )
+
+    lower_table_first_row = positioned(0, "p1-t2", "Lower first", 400)
+    upper_table_second_row = positioned(1, "p1-t1", "Upper second", 200)
+
+    selected = _deduplicate([lower_table_first_row, upper_table_second_row])
+
+    assert [item.description for item in selected] == [
+        "Upper second",
+        "Lower first",
+    ]
