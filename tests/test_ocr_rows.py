@@ -613,6 +613,36 @@ def test_slanted_serial_descriptions_start_distinct_financial_rows() -> None:
     )
 
 
+def test_blank_quantity_is_derived_only_from_exact_line_arithmetic() -> None:
+    tokens = (
+        token(0, "Particulars", (100, 30, 420, 45)),
+        token(1, "Rate", (650, 30, 700, 45)),
+        token(2, "Qty", (760, 30, 800, 45)),
+        token(3, "Amount", (880, 30, 960, 45)),
+        token(4, "SYRINGE 20ML", (100, 70, 420, 85)),
+        token(5, "28.00", (650, 70, 700, 85)),
+        token(6, "56.00", (880, 70, 950, 85)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(40, 20, 980, 110),
+    )
+
+    assert len(result.rows) == 1
+    candidate = result.rows[0].candidate
+    assert candidate.quantity == Decimal("2")
+    assert "quantity_derived_from_rate_amount" in (
+        candidate.validation_flags
+    )
+    assert set(result.rows[0].field_token_ids["quantity"]) == {
+        "token-5",
+        "token-6",
+    }
+
+
 def test_added_to_bill_footer_does_not_extend_last_description() -> None:
     tokens = (
         token(0, "#", (50, 30, 70, 45)),
@@ -649,6 +679,100 @@ def test_added_to_bill_footer_does_not_extend_last_description() -> None:
         if cell.column_id == description_column.id
     )
     assert description_cell.raw_value == "22 DECMAX 4MG TABLET"
+
+
+def test_pharmacy_quantity_fused_into_amount_is_split_and_grounded() -> None:
+    tokens = (
+        token(0, "#", (50, 30, 70, 45)),
+        token(1, "Particulars", (100, 30, 420, 45)),
+        token(2, "Rate", (650, 30, 700, 45)),
+        token(3, "Qty", (760, 30, 800, 45)),
+        token(4, "Amount", (880, 30, 960, 45)),
+        token(5, "15 FOSAPRINEON INJ", (50, 70, 420, 85)),
+        token(6, "4,585.00", (650, 70, 720, 85)),
+        token(7, "1 4,585.00", (760, 70, 950, 85)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(40, 20, 980, 110),
+    )
+    canonical = canonicalize_rows(
+        "d" * 64,
+        1,
+        "p1-t1",
+        "a" * 64,
+        result.rows,
+    )
+    linked = _link_source_tables(result.source_tables, canonical)
+
+    assert len(canonical) == 1
+    assert canonical[0].quantity == Decimal("1")
+    assert canonical[0].unit_price == Decimal("4585.00")
+    assert canonical[0].net_amount == Decimal("4585.00")
+    columns = {
+        column.canonical_field: column
+        for column in linked[0].columns
+        if column.canonical_field is not None
+    }
+    cells = {cell.column_id: cell for cell in linked[0].rows[0].cells}
+    quantity = cells[columns["quantity"].id]
+    amount = cells[columns["net_amount"].id]
+    assert quantity.raw_value == "1"
+    assert amount.raw_value == "4,585.00"
+    assert {
+        token_id
+        for cell in (quantity, amount)
+        for item in cell.evidence
+        for token_id in item.token_ids
+    } == {"token-7"}
+
+
+def test_expiry_and_rate_merged_token_is_split_and_grounded() -> None:
+    tokens = (
+        token(0, "#", (50, 30, 70, 45)),
+        token(1, "Particulars", (100, 30, 360, 45)),
+        token(2, "Expiry", (480, 30, 560, 45)),
+        token(3, "Rate", (650, 30, 700, 45)),
+        token(4, "Qty", (760, 30, 800, 45)),
+        token(5, "Amount", (880, 30, 960, 45)),
+        token(6, "13 DOXODEL 50", (50, 70, 360, 85)),
+        token(7, "Sep-2027 3,833.00", (480, 70, 700, 85)),
+        token(8, "2", (760, 70, 780, 85)),
+        token(9, "7,666.00", (880, 70, 950, 85)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(40, 20, 980, 110),
+    )
+    canonical = canonicalize_rows(
+        "d" * 64,
+        1,
+        "p1-t1",
+        "a" * 64,
+        result.rows,
+    )
+    linked = _link_source_tables(result.source_tables, canonical)
+
+    assert len(canonical) == 1
+    assert canonical[0].unit_price == Decimal("3833.00")
+    assert canonical[0].quantity == Decimal("2")
+    assert canonical[0].net_amount == Decimal("7666.00")
+    columns = {column.label: column for column in linked[0].columns}
+    cells = {cell.column_id: cell for cell in linked[0].rows[0].cells}
+    assert cells[columns["Expiry"].id].raw_value == "Sep-2027"
+    assert cells[columns["Rate"].id].raw_value == "3,833.00"
+    assert {
+        token_id
+        for label in ("Expiry", "Rate")
+        for item in cells[columns[label].id].evidence
+        for token_id in item.token_ids
+    } == {"token-7"}
 
 
 def test_source_table_excludes_distant_text_beyond_final_column_boundary() -> None:

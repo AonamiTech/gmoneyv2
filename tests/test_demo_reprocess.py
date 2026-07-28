@@ -790,9 +790,11 @@ def test_reprocess_validation_accepts_grounded_day_quantity(
     )
 
 
+@pytest.mark.parametrize("printed_quantity", ("NNNN", None))
 @pytest.mark.parametrize(("amount", "accepted"), (("90.00", True), ("89.00", False)))
 def test_reprocess_validation_accepts_only_proven_derived_quantity(
     tmp_path: Path,
+    printed_quantity: str | None,
     amount: str,
     accepted: bool,
 ) -> None:
@@ -804,9 +806,14 @@ def test_reprocess_validation_accepts_only_proven_derived_quantity(
     canonical["quantity"] = "2"
     canonical["unit_price_raw"] = "45.00"
     canonical["unit_price"] = "45.00"
-    canonical["field_evidence"]["quantity"] = [
-        evidence(page_sha, "unreadable-quantity-token")
-    ]
+    canonical["field_evidence"]["quantity"] = (
+        [evidence(page_sha, "unreadable-quantity-token")]
+        if printed_quantity is not None
+        else [
+            evidence(page_sha, "rate-token"),
+            evidence(page_sha, "amount-token"),
+        ]
+    )
     canonical["field_evidence"]["rate"] = [
         evidence(page_sha, "rate-token")
     ]
@@ -850,11 +857,15 @@ def test_reprocess_validation_accepts_only_proven_derived_quantity(
         2,
         {
             "column_id": "quantity",
-            "raw_value": "NNNN",
-            "evidence": [
-                evidence(page_sha, "unreadable-quantity-token")
-            ],
-            "validation_flags": [],
+            "raw_value": printed_quantity,
+            "evidence": (
+                [evidence(page_sha, "unreadable-quantity-token")]
+                if printed_quantity is not None
+                else []
+            ),
+            "validation_flags": (
+                [] if printed_quantity is not None else ["empty_cell"]
+            ),
         },
     )
     new_result = {
@@ -871,7 +882,10 @@ def test_reprocess_validation_accepts_only_proven_derived_quantity(
             store.job_dir(job_id) / "artifacts",
         )
     else:
-        with pytest.raises(ValueError, match="quantity value.*source cell"):
+        with pytest.raises(
+            ValueError,
+            match="quantity.*(?:source cell|printed value)",
+        ):
             _validate_result(
                 store.job_dir(job_id) / "source.pdf",
                 old_result,

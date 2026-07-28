@@ -928,7 +928,7 @@ export default function Home() {
             <span className="drop-index">PDF × MULTI</span>
             <span className="drop-cross">+</span>
             <strong>{uploading ? "Transferring…" : "Place bills here"}</strong>
-            <small>or click to choose · 25 MiB and 200 pages maximum each</small>
+            <small>or click to choose</small>
           </label>
         </section>
       ) : (

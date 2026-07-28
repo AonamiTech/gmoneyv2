@@ -1268,12 +1268,57 @@ def _validate_result(
                     )
                     for token_id in item.get("token_ids") or []
                 }
+                canonical_numeric_value = (
+                    parse_decimal(str(canonical_value))
+                    if field in numeric_fields and canonical_present
+                    else None
+                )
+                canonical_rate = parse_decimal(
+                    str(canonical.get("unit_price"))
+                )
+                canonical_amount = parse_decimal(
+                    str(canonical.get("net_amount"))
+                )
+                canonical_discount = (
+                    parse_decimal(str(canonical.get("discount")))
+                    or Decimal("0")
+                )
+                derived_quantity_is_proven = bool(
+                    field == "quantity"
+                    and "quantity_derived_from_rate_amount"
+                    in (canonical.get("validation_flags") or [])
+                    and canonical_numeric_value is not None
+                    and canonical_numeric_value > 0
+                    and canonical_numeric_value
+                    == canonical_numeric_value.to_integral_value()
+                    and canonical_rate is not None
+                    and canonical_rate > 0
+                    and canonical_amount is not None
+                    and canonical_numeric_value * canonical_rate
+                    == abs(canonical_amount) + canonical_discount
+                )
                 if printed_present and not canonical_present:
                     raise ValueError(
                         f"{field} has a printed value but is missing canonical value "
                         f"for canonical row {source_row.canonical_row_id}"
                     )
                 if canonical_present and not printed_present:
+                    derived_quantity_has_grounded_operands = bool(
+                        derived_quantity_is_proven
+                        and field_token_ids
+                        and field_token_ids.issubset(
+                            {
+                                token_id
+                                for supporting_column in table.columns
+                                if supporting_column.canonical_field
+                                in {"unit_price", "net_amount"}
+                                for item in cells[supporting_column.id].evidence
+                                for token_id in item.token_ids
+                            }
+                        )
+                    )
+                    if derived_quantity_has_grounded_operands:
+                        continue
                     serial_description_is_grounded = bool(
                         field == "description"
                         and "missing_printed_description"
@@ -1322,35 +1367,12 @@ def _validate_result(
                         if field == "quantity"
                         else parse_decimal(cell.raw_value or "")
                     )
-                    canonical_value = parse_decimal(str(canonical[field]))
-                    canonical_rate = parse_decimal(
-                        str(canonical.get("unit_price"))
-                    )
-                    canonical_amount = parse_decimal(
-                        str(canonical.get("net_amount"))
-                    )
-                    canonical_discount = (
-                        parse_decimal(str(canonical.get("discount")))
-                        or Decimal("0")
-                    )
-                    derived_quantity_is_proven = bool(
-                        field == "quantity"
-                        and printed_value is None
-                        and "quantity_derived_from_rate_amount"
-                        in (canonical.get("validation_flags") or [])
-                        and canonical_value is not None
-                        and canonical_value > 0
-                        and canonical_value
-                        == canonical_value.to_integral_value()
-                        and canonical_rate is not None
-                        and canonical_rate > 0
-                        and canonical_amount is not None
-                        and canonical_value * canonical_rate
-                        == abs(canonical_amount) + canonical_discount
-                    )
-                    if derived_quantity_is_proven:
+                    if derived_quantity_is_proven and printed_value is None:
                         continue
-                    if printed_value is None or printed_value != canonical_value:
+                    if (
+                        printed_value is None
+                        or printed_value != canonical_numeric_value
+                    ):
                         raise ValueError(
                             f"{field} value does not match its mapped source cell "
                             f"for canonical row {source_row.canonical_row_id}"

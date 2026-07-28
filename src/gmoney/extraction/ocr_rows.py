@@ -1875,13 +1875,38 @@ def _merge_vertical_decimal_suffixes(
 def _numeric_tokens(line: OcrLine) -> list[NumericValue]:
     output: list[NumericValue] = []
     for token in line.tokens:
+        merged_quantity_amount = re.fullmatch(
+            r"\s*(?P<quantity>\d+)\s+"
+            r"(?P<amount>\d{1,3}(?:,\d{3})+\.\d{2})\s*",
+            token.text,
+        )
+        if merged_quantity_amount is not None:
+            for group in ("quantity", "amount"):
+                parsed = parse_decimal(
+                    merged_quantity_amount.group(group)
+                )
+                if parsed is None:
+                    continue
+                output.append(
+                    NumericValue(
+                        _virtual_horizontal_token(
+                            token,
+                            merged_quantity_amount.start(group),
+                            merged_quantity_amount.end(group),
+                            len(token.text),
+                        ),
+                        parsed,
+                        (token.token_id,),
+                    )
+                )
+            continue
         value = parse_decimal(token.text)
         if value is not None:
             output.append(NumericValue(token, value, (token.token_id,)))
             continue
         expiry_quantity = re.search(
-            r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)/\d{4}\s*"
-            r"(?P<quantity>[+-]?\d+(?:\.\d{1,4})?)\s*$",
+            r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[/-]\d{4}\s*"
+            r"(?P<quantity>[+-]?\d[\d,]*(?:\.\d{1,4})?)\s*$",
             token.text,
             re.IGNORECASE,
         )
@@ -3906,7 +3931,7 @@ def reconstruct_ocr_rows(
                 adjusted_amount += values["discount"]
             derived_quantity = adjusted_amount / values["rate"]
             if (
-                len(unreadable_quantity_tokens) == 1
+                len(unreadable_quantity_tokens) <= 1
                 and derived_quantity > 0
                 and derived_quantity <= Decimal("100000")
                 and derived_quantity
@@ -3915,8 +3940,17 @@ def reconstruct_ocr_rows(
                 == adjusted_amount
             ):
                 values["quantity"] = derived_quantity
-                field_tokens["quantity"] = (
-                    unreadable_quantity_tokens[0].token_id,
+                field_tokens["quantity"] = tuple(
+                    dict.fromkeys(
+                        (
+                            unreadable_quantity_tokens[0].token_id,
+                        )
+                        if unreadable_quantity_tokens
+                        else (
+                            *field_tokens.get("rate", ()),
+                            *field_tokens.get("amount", ()),
+                        )
+                    )
                 )
                 quantity_derived_from_rate_amount = True
 

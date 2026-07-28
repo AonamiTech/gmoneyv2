@@ -40,7 +40,7 @@ from gmoney.demo.store import (
     utc_text,
 )
 
-MAX_UPLOAD_BYTES = int(os.environ.get("GMONEY_MAX_UPLOAD_BYTES", str(25 * 1024 * 1024)))
+MAX_UPLOAD_BYTES = int(os.environ.get("GMONEY_MAX_UPLOAD_BYTES", "0"))
 MAX_ACTIVE_JOBS = int(os.environ.get("GMONEY_MAX_ACTIVE_JOBS", "20"))
 MAX_PDF_PAGES = int(os.environ.get("GMONEY_MAX_PDF_PAGES", "200"))
 WORKER_CAPACITY = int(os.environ.get("GMONEY_WORKER_CAPACITY", "2"))
@@ -266,7 +266,7 @@ async def create_document(
                 if not signature:
                     signature = chunk[:5]
                 size += len(chunk)
-                if size > MAX_UPLOAD_BYTES:
+                if MAX_UPLOAD_BYTES > 0 and size > MAX_UPLOAD_BYTES:
                     raise HTTPException(
                         status_code=413,
                         detail=f"PDF exceeds the {_byte_limit_label(MAX_UPLOAD_BYTES)} limit",

@@ -1428,6 +1428,167 @@ def _redistribute_grounded_description_from_adjacent_cell(
     return tuple(cells_by_id[cell.column_id] for cell in cells)
 
 
+def _split_grounded_merged_numeric_cells(
+    cells: tuple[SourceCell, ...],
+    columns: tuple[SourceColumn, ...],
+    canonical: CanonicalRow,
+) -> tuple[SourceCell, ...]:
+    columns_by_field = {
+        column.canonical_field: column
+        for column in columns
+        if column.canonical_field is not None
+    }
+    cells_by_id = {cell.column_id: cell for cell in cells}
+    split_flag = "split_from_merged_ocr_token"
+
+    def field_token_ids(field: str) -> set[str]:
+        return {
+            token_id
+            for item in canonical.field_evidence.get(field, ())
+            for token_id in item.token_ids
+        }
+
+    def populated_cell(
+        cell: SourceCell,
+        raw_value: str,
+        evidence: tuple[EvidenceRef, ...],
+    ) -> SourceCell:
+        return cell.model_copy(
+            update={
+                "raw_value": raw_value,
+                "evidence": evidence,
+                "validation_flags": tuple(
+                    dict.fromkeys(
+                        (
+                            *(
+                                flag
+                                for flag in cell.validation_flags
+                                if flag != "empty_cell"
+                            ),
+                            split_flag,
+                        )
+                    )
+                ),
+            }
+        )
+
+    quantity_column = columns_by_field.get("quantity")
+    amount_column = (
+        columns_by_field.get("net_amount")
+        or columns_by_field.get("gross_amount")
+    )
+    if quantity_column is not None and amount_column is not None:
+        quantity_cell = cells_by_id[quantity_column.id]
+        amount_cell = cells_by_id[amount_column.id]
+        merged = (
+            re.fullmatch(
+                r"\s*(?P<quantity>\d+)\s+"
+                r"(?P<amount>\d{1,3}(?:,\d{3})+\.\d{2})\s*",
+                amount_cell.raw_value or "",
+            )
+            if not quantity_cell.raw_value
+            else None
+        )
+        canonical_amount = (
+            canonical.net_amount
+            if amount_column.canonical_field == "net_amount"
+            else canonical.gross_amount
+        )
+        if (
+            merged is not None
+            and canonical.quantity is not None
+            and canonical_amount is not None
+            and parse_decimal(merged.group("quantity"))
+            == canonical.quantity
+            and parse_decimal(merged.group("amount"))
+            == canonical_amount
+        ):
+            merged_ids = {
+                token_id
+                for item in amount_cell.evidence
+                for token_id in item.token_ids
+            }
+            quantity_ids = field_token_ids("quantity")
+            amount_ids = field_token_ids("amount")
+            if (
+                quantity_ids
+                and amount_ids
+                and quantity_ids.issubset(merged_ids)
+                and amount_ids.issubset(merged_ids)
+            ):
+                cells_by_id[quantity_column.id] = populated_cell(
+                    quantity_cell,
+                    merged.group("quantity"),
+                    _filter_evidence_token_ids(
+                        amount_cell.evidence,
+                        quantity_ids,
+                    ),
+                )
+                cells_by_id[amount_column.id] = populated_cell(
+                    amount_cell,
+                    merged.group("amount"),
+                    _filter_evidence_token_ids(
+                        amount_cell.evidence,
+                        amount_ids,
+                    ),
+                )
+
+    rate_column = columns_by_field.get("unit_price")
+    if (
+        rate_column is not None
+        and canonical.unit_price is not None
+        and not cells_by_id[rate_column.id].raw_value
+    ):
+        adjacent_column = next(
+            (
+                column
+                for column in columns
+                if column.order == rate_column.order - 1
+            ),
+            None,
+        )
+        if adjacent_column is not None:
+            adjacent_cell = cells_by_id[adjacent_column.id]
+            merged = re.fullmatch(
+                r"\s*(?P<prefix>.+?)\s+"
+                r"(?P<rate>[+-]?\d[\d,]*\.\d{1,4})\s*",
+                adjacent_cell.raw_value or "",
+            )
+            if (
+                merged is not None
+                and re.search(
+                    r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)"
+                    r"[/-]\d{4}\b",
+                    merged.group("prefix"),
+                    re.IGNORECASE,
+                )
+                and parse_decimal(merged.group("rate"))
+                == canonical.unit_price
+            ):
+                merged_ids = {
+                    token_id
+                    for item in adjacent_cell.evidence
+                    for token_id in item.token_ids
+                }
+                rate_ids = field_token_ids("rate")
+                if rate_ids and rate_ids.issubset(merged_ids):
+                    cells_by_id[adjacent_column.id] = populated_cell(
+                        adjacent_cell,
+                        merged.group("prefix").strip(),
+                        adjacent_cell.evidence,
+                    )
+                    cells_by_id[rate_column.id] = populated_cell(
+                        cells_by_id[rate_column.id],
+                        merged.group("rate"),
+                        _filter_evidence_token_ids(
+                            adjacent_cell.evidence,
+                            rate_ids,
+                        ),
+                    )
+
+    return tuple(cells_by_id[cell.column_id] for cell in cells)
+
+
 def _trim_grounded_duplicate_adjacent_description(
     cells: tuple[SourceCell, ...],
     columns: tuple[SourceColumn, ...],
@@ -1884,6 +2045,11 @@ def _link_source_tables(
                     matched,
                 )
                 linked_cells = _redistribute_grounded_description_from_adjacent_cell(
+                    linked_cells,
+                    table.columns,
+                    matched,
+                )
+                linked_cells = _split_grounded_merged_numeric_cells(
                     linked_cells,
                     table.columns,
                     matched,

@@ -12,5 +12,5 @@ def test_demo_proxy_has_no_request_rate_limit() -> None:
 
 def test_demo_proxy_allows_multipart_overhead_above_gpu_file_limit() -> None:
     config = PROXY_CONFIG.read_text()
-    assert "client_max_body_size 52m;" in config
+    assert "client_max_body_size 0;" in config
     assert "proxy_request_buffering off;" in config
