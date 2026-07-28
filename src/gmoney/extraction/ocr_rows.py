@@ -3451,38 +3451,39 @@ def reconstruct_ocr_rows(
                 for token in line.tokens
                 if token.token_id in service_date_ids
             )
-            grounded_date_right = max(
-                (_bounds(token)[2] - left) / width
-                for token in grounded_date_tokens
-            )
-            for token in line.tokens:
-                if (
-                    token.token_id in reserved_ids
-                    or _is_header_token(token)
-                ):
-                    continue
-                token_left, _, _, _ = _bounds(token)
-                relative_left = (token_left - left) / width
-                relative_center = (_center_x(token) - left) / width
-                if (
-                    description_cell_min is None
-                    or relative_center >= description_cell_min
-                    or relative_left < grounded_date_right - 0.01
-                    or relative_left - grounded_date_right > 0.12
-                ):
-                    continue
-                shifted_description, embedded_date, _ = _clean_description(
-                    token.text
+            if grounded_date_tokens:
+                grounded_date_right = max(
+                    (_bounds(token)[2] - left) / width
+                    for token in grounded_date_tokens
                 )
-                if (
-                    embedded_date is None
-                    and _is_admissible_merged_date_description(
-                        shifted_description
+                for token in line.tokens:
+                    if (
+                        token.token_id in reserved_ids
+                        or _is_header_token(token)
+                    ):
+                        continue
+                    token_left, _, _, _ = _bounds(token)
+                    relative_left = (token_left - left) / width
+                    relative_center = (_center_x(token) - left) / width
+                    if (
+                        description_cell_min is None
+                        or relative_center >= description_cell_min
+                        or relative_left < grounded_date_right - 0.01
+                        or relative_left - grounded_date_right > 0.12
+                    ):
+                        continue
+                    shifted_description, embedded_date, _ = _clean_description(
+                        token.text
                     )
-                ):
-                    line_description_tokens.append(
-                        token.model_copy(update={"text": shifted_description})
-                    )
+                    if (
+                        embedded_date is None
+                        and _is_admissible_merged_date_description(
+                            shifted_description
+                        )
+                    ):
+                        line_description_tokens.append(
+                            token.model_copy(update={"text": shifted_description})
+                        )
         for token in line.tokens:
             if token.token_id in reserved_ids:
                 continue

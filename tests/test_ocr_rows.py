@@ -4522,6 +4522,32 @@ def test_leading_dash_suffixed_date_is_folded_into_linked_source_row() -> None:
     assert canonical_date_ids <= source_date_ids
 
 
+def test_date_only_line_can_ground_following_row_without_current_date_token() -> None:
+    tokens = (
+        token(0, "Service Name", (100, 30, 300, 45)),
+        token(1, "Date", (650, 30, 710, 45)),
+        token(2, "Net Amount", (870, 30, 970, 45)),
+        token(3, "20/01/2026", (650, 70, 750, 85)),
+        token(4, "Package Name: Coronary Angiography", (100, 100, 430, 115)),
+        token(5, "11,457.00", (880, 100, 960, 115)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 20, 980, 130),
+    )
+
+    assert len(result.rows) == 1
+    assert result.rows[0].candidate.description == (
+        "Package Name: Coronary Angiography"
+    )
+    assert result.rows[0].candidate.service_date == "20/01/2026"
+    assert result.rows[0].candidate.amount == Decimal("11457.00")
+    assert set(result.rows[0].field_token_ids["service_date"]) == {"token-3"}
+
+
 def test_headerless_date_only_continuation_keeps_every_printed_row_linkable() -> None:
     header = (
         token(0, "Service Name", (100, 30, 300, 45)),
