@@ -4896,6 +4896,61 @@ def test_pharmacy_expiry_date_does_not_replace_left_transaction_date(
     assert second_cells["description"].raw_value == "Betadine Scrub 50 ML"
 
 
+def test_linked_pharmacy_row_splits_quantity_merged_with_expiry() -> None:
+    tokens = (
+        token(0, "Date", (80, 25, 150, 40)),
+        token(1, "ProductName", (290, 25, 430, 40)),
+        token(2, "Expiry", (620, 25, 680, 40)),
+        token(3, "Quantity", (750, 25, 820, 40)),
+        token(4, "Rate", (840, 25, 885, 40)),
+        token(5, "Amount", (920, 25, 970, 40)),
+        token(6, "06/02/2026", (80, 70, 150, 85)),
+        token(7, "NS 100 ML FLEXIDRIP CLARIS", (290, 70, 540, 85)),
+        token(8, "Aug/2028 1.00", (620, 70, 810, 85)),
+        token(9, "44.93", (840, 70, 885, 85)),
+        token(10, "44.93", (920, 70, 970, 85)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=2,
+        table_id="p2-t1",
+        box=(60, 15, 980, 100),
+    )
+    canonical = canonicalize_rows(
+        "d" * 64,
+        2,
+        "p2-t1",
+        "a" * 64,
+        result.rows,
+    )
+    linked = _link_source_tables(result.source_tables, canonical)
+    columns_by_field = {
+        column.canonical_field: column
+        for column in linked[0].columns
+        if column.canonical_field is not None
+    }
+    linked_cells = {
+        cell.column_id: cell
+        for cell in linked[0].rows[0].cells
+    }
+    expiry_column = next(
+        column for column in linked[0].columns if column.label == "Expiry"
+    )
+    quantity_cell = linked_cells[columns_by_field["quantity"].id]
+    expiry_cell = linked_cells[expiry_column.id]
+
+    assert canonical[0].quantity == Decimal("1.00")
+    assert quantity_cell.raw_value == "1.00"
+    assert expiry_cell.raw_value == "Aug/2028"
+    assert quantity_cell.validation_flags == ("split_from_merged_ocr_token",)
+    assert {
+        token_id
+        for evidence in quantity_cell.evidence
+        for token_id in evidence.token_ids
+    } == {"token-8"}
+
+
 def test_linked_pharmacy_row_consolidates_grounded_adjacent_description() -> None:
     tokens = (
         token(0, "Date/ Time", (80, 10, 170, 25)),

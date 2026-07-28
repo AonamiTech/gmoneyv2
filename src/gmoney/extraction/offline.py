@@ -1477,6 +1477,58 @@ def _split_grounded_merged_numeric_cells(
         columns_by_field.get("net_amount")
         or columns_by_field.get("gross_amount")
     )
+    if (
+        quantity_column is not None
+        and canonical.quantity is not None
+        and not cells_by_id[quantity_column.id].raw_value
+    ):
+        adjacent_column = next(
+            (
+                column
+                for column in columns
+                if column.order == quantity_column.order - 1
+            ),
+            None,
+        )
+        if adjacent_column is not None:
+            adjacent_cell = cells_by_id[adjacent_column.id]
+            merged = re.fullmatch(
+                r"\s*(?P<prefix>.+?)\s*"
+                r"(?P<quantity>[+-]?\d[\d,]*\.\d{1,4})\s*",
+                adjacent_cell.raw_value or "",
+            )
+            if (
+                merged is not None
+                and re.search(
+                    r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)"
+                    r"[/-]\d{4}\b",
+                    merged.group("prefix"),
+                    re.IGNORECASE,
+                )
+                and parse_decimal(merged.group("quantity"))
+                == canonical.quantity
+            ):
+                merged_ids = {
+                    token_id
+                    for item in adjacent_cell.evidence
+                    for token_id in item.token_ids
+                }
+                quantity_ids = field_token_ids("quantity")
+                if quantity_ids and quantity_ids.issubset(merged_ids):
+                    cells_by_id[adjacent_column.id] = populated_cell(
+                        adjacent_cell,
+                        merged.group("prefix").strip(),
+                        adjacent_cell.evidence,
+                    )
+                    cells_by_id[quantity_column.id] = populated_cell(
+                        cells_by_id[quantity_column.id],
+                        merged.group("quantity"),
+                        _filter_evidence_token_ids(
+                            adjacent_cell.evidence,
+                            quantity_ids,
+                        ),
+                    )
+
     if quantity_column is not None and amount_column is not None:
         quantity_cell = cells_by_id[quantity_column.id]
         amount_cell = cells_by_id[amount_column.id]
