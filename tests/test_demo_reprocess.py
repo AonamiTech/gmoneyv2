@@ -2236,7 +2236,14 @@ def test_reprocess_validation_accepts_verified_total_and_settlement_source_rows(
         ]
     )
     for order, label in enumerate(
-        ("Total", "Totals", "Sub Total", "Subtotal", "Bill Amount"),
+        (
+            "Total",
+            "Totals",
+            "Sub Total",
+            "Subtotal",
+            "Bill Amount",
+            "Net Medical Amount",
+        ),
         start=3,
     ):
         printed[0]["rows"].append(

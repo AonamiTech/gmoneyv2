@@ -318,6 +318,7 @@ def _unlinked_financial_row_is_explained(
         "grand total",
         "gross bill amount",
         "net bill amount",
+        "net medical amount",
         "net payable",
         "total bill amount",
         "total gross bill value",
