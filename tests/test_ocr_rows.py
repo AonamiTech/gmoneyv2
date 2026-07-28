@@ -4474,6 +4474,84 @@ def test_headerless_continuation_inherits_date_without_inventing_amount() -> Non
     assert second.rows[0].candidate.amount is None
 
 
+def test_rows_before_later_section_header_inherit_the_prior_page_schema() -> None:
+    first = reconstruct_ocr_rows(
+        (
+            token(0, "Description", (100, 20, 300, 35)),
+            token(1, "Date", (500, 20, 560, 35)),
+            token(2, "UnitPrice", (680, 20, 750, 35)),
+            token(3, "Quantity", (780, 20, 840, 35)),
+            token(4, "Amount", (880, 20, 960, 35)),
+            token(5, "Urine Culture", (100, 55, 300, 70)),
+            token(6, "07/02/2026", (500, 55, 580, 70)),
+            token(7, "460.00", (690, 55, 750, 70)),
+            token(8, "1.00", (790, 55, 830, 70)),
+            token(9, "460.00", (890, 55, 950, 70)),
+        ),
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 10, 980, 90),
+    )
+    page_two = tuple(
+        value.model_copy(update={"page_number": 2, "token_id": f"p2-{value.token_id}"})
+        for value in (
+            token(10, "Glucose Random", (100, 10, 300, 25)),
+            token(11, "08/02/2026", (500, 10, 580, 25)),
+            token(12, "40.00", (690, 10, 750, 25)),
+            token(13, "1.00", (790, 10, 830, 25)),
+            token(14, "40.00", (890, 10, 950, 25)),
+            token(15, "Renal Function Test", (100, 40, 300, 55)),
+            token(16, "08/02/2026", (500, 40, 580, 55)),
+            token(17, "500.00", (690, 40, 750, 55)),
+            token(18, "1.00", (790, 40, 830, 55)),
+            token(19, "500.00", (890, 40, 950, 55)),
+            token(20, "Glucose Random", (100, 70, 300, 85)),
+            token(21, "09/02/2026", (500, 70, 580, 85)),
+            token(22, "40.00", (690, 70, 750, 85)),
+            token(23, "5.00", (790, 70, 830, 85)),
+            token(24, "200.00", (890, 70, 950, 85)),
+            token(25, "Description", (100, 105, 300, 120)),
+            token(26, "Date", (500, 105, 560, 120)),
+            token(27, "UnitPrice", (680, 105, 750, 120)),
+            token(28, "Quantity", (780, 105, 840, 120)),
+            token(29, "Amount", (880, 105, 960, 120)),
+            token(30, "CT Whole Abdomen", (100, 140, 300, 155)),
+            token(31, "06/02/2026", (500, 140, 580, 155)),
+            token(32, "3450.00", (690, 140, 750, 155)),
+            token(33, "1.00", (790, 140, 830, 155)),
+            token(34, "3450.00", (890, 140, 950, 155)),
+        )
+    )
+
+    second = reconstruct_ocr_rows(
+        page_two,
+        page_number=2,
+        table_id="p2-t1",
+        box=(80, 0, 980, 175),
+        prior_schemas=(first.schema,) if first.schema else (),
+    )
+
+    assert [row.candidate.description for row in second.rows] == [
+        "Glucose Random",
+        "Renal Function Test",
+        "Glucose Random",
+        "CT Whole Abdomen",
+    ]
+    assert [row.candidate.amount for row in second.rows] == [
+        Decimal("40.00"),
+        Decimal("500.00"),
+        Decimal("200.00"),
+        Decimal("3450.00"),
+    ]
+    assert len({table.id for table in second.source_tables}) == len(
+        second.source_tables
+    )
+    assert any(
+        "pre_header_continuation" in table.validation_flags
+        for table in second.source_tables
+    )
+
+
 def test_leading_dash_suffixed_date_is_folded_into_linked_source_row() -> None:
     tokens = (
         token(0, "Service Name", (100, 30, 300, 45)),

@@ -2936,6 +2936,55 @@ def reconstruct_ocr_rows(
         end=header_index,
         roles=header_roles,
     )
+    pre_header_reconstruction: ReconstructionResult | None = None
+    if header_valid and header_start > 0 and prior_schemas:
+        inherited_preamble_schema = next(
+            (
+                schema
+                for schema in reversed(prior_schemas)
+                if 0 <= page_number - schema.source_page <= 1
+                and schema.orientation == orientation
+                and "description" in schema.column_centers
+                and "amount" in schema.column_centers
+            ),
+            None,
+        )
+        if inherited_preamble_schema is not None:
+            description_center = inherited_preamble_schema.column_centers["description"]
+            amount_center = inherited_preamble_schema.column_centers["amount"]
+            pre_header_rows = tuple(
+                line
+                for line in lines[:header_start]
+                if len(line.tokens) >= 3
+                and any(
+                    abs(((_center_x(value.token) - left) / width) - amount_center)
+                    <= 0.05
+                    for value in _numeric_tokens(line)
+                )
+                and any(
+                    re.search(r"[A-Za-z]", token.text)
+                    and abs(((_center_x(token) - left) / width) - description_center)
+                    <= 0.16
+                    for token in line.tokens
+                )
+            )
+            if len(pre_header_rows) >= 2:
+                pre_header_ids = {
+                    token.token_id
+                    for line in pre_header_rows
+                    for token in line.tokens
+                }
+                pre_header_reconstruction = reconstruct_ocr_rows(
+                    tuple(
+                        token
+                        for token in original_scoped
+                        if token.token_id in pre_header_ids
+                    ),
+                    page_number=page_number,
+                    table_id=table_id,
+                    box=box,
+                    prior_schemas=(inherited_preamble_schema,),
+                )
     data_lines = lines[header_index + 1 :] if header_valid else lines
     repeated_header_blocks = tuple(
         block for block in merged_headers if header_valid and block.start > header_index
@@ -3134,8 +3183,15 @@ def reconstruct_ocr_rows(
         column_centers,
         description_header_centers,
     )
-    aligned: list[AlignedLedgerRow] = []
-    aligned_description_raw: list[str] = []
+    aligned: list[AlignedLedgerRow] = list(
+        pre_header_reconstruction.rows
+        if pre_header_reconstruction is not None
+        else ()
+    )
+    aligned_description_raw: list[str] = [
+        row.candidate.description or ""
+        for row in aligned
+    ]
     pending_description_tokens: list[OcrToken] = []
     pending_service_date: str | None = None
     pending_service_date_ids: tuple[str, ...] = ()
@@ -4083,6 +4139,34 @@ def reconstruct_ocr_rows(
             width=width,
         )
     )
+    pre_header_source_tables = tuple(
+        table.model_copy(
+            update={
+                "id": f"{table_id}-pre-s{segment}",
+                "rows": tuple(
+                    row.model_copy(
+                        update={
+                            "id": f"{table_id}-pre-s{segment}-r{row.order + 1}",
+                        }
+                    )
+                    for row in table.rows
+                ),
+                "validation_flags": tuple(
+                    dict.fromkeys(
+                        (*table.validation_flags, "pre_header_continuation")
+                    )
+                ),
+            }
+        )
+        for segment, table in enumerate(
+            (
+                pre_header_reconstruction.source_tables
+                if pre_header_reconstruction is not None
+                else ()
+            ),
+            start=1,
+        )
+    )
     return ReconstructionResult(
         rows=tuple(aligned),
         schema=(
@@ -4102,7 +4186,7 @@ def reconstruct_ocr_rows(
             "column_centers": column_centers,
             "header_segments": 1 + len(repeated_header_indexes) if header_valid else 0,
         },
-        source_tables=source_tables,
+        source_tables=(*pre_header_source_tables, *source_tables),
     )
 
 
