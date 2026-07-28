@@ -5,6 +5,10 @@ from pathlib import Path
 
 from gmoney.demo.backfill_totals import backfill_totals
 from gmoney.demo.store import JobStore
+from gmoney.extraction.document_total import (
+    DOCUMENT_TOTAL_VERSION,
+    DOCUMENT_TOTALS_VERSION,
+)
 
 
 def completed_cached_job(root: Path) -> tuple[JobStore, str, Path]:
@@ -69,8 +73,8 @@ def test_backfill_is_dry_by_default_atomic_and_idempotent(tmp_path: Path) -> Non
     applied = backfill_totals(root=tmp_path, apply=True)
     assert applied["updated"] == 1
     result = json.loads(result_path.read_text())
-    assert result["document_total_version"] == "document_total_v2"
-    assert result["document_totals_version"] == "document_totals_v1"
+    assert result["document_total_version"] == DOCUMENT_TOTAL_VERSION
+    assert result["document_totals_version"] == DOCUMENT_TOTALS_VERSION
     assert result["document_total"]["amount"] == "1234.50"
     assert result["document_totals"][0]["amount"] == "1234.50"
 

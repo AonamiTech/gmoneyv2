@@ -202,6 +202,14 @@ def project_hospital(result: dict[str, Any], review: dict[str, Any]) -> dict[str
     }
 
 
+def _finite_decimal(value: object) -> Decimal | None:
+    try:
+        parsed = Decimal(str(value)) if value is not None else None
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    return parsed if parsed is not None and parsed.is_finite() else None
+
+
 def totals_summary(
     result: dict[str, Any],
     review: dict[str, Any],
@@ -251,6 +259,25 @@ def totals_summary(
                     "evidence",
                 )
             }
+
+    has_granular_rows = any(
+        row.get("role") in {"detail", "refund"} for row in included
+    )
+    has_rollup_matching_bill_total = bool(
+        bill_amount is not None
+        and any(
+            row.get("role") == "category_rollup"
+            and row.get("net_amount") is not None
+            and _finite_decimal(row["net_amount"]) == bill_amount
+            for row in included
+        )
+    )
+    if not has_granular_rows and has_rollup_matching_bill_total:
+        # Package bills can print the same overall package rollup in a summary
+        # and again before the included components. Preserve both grounded rows
+        # in the ledger, but do not double-count the repeated document total.
+        item_total = bill_amount
+        missing_amounts = 0
 
     printed_totals: list[dict[str, Any]] = []
     comparable_amounts: set[Decimal] = set()

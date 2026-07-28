@@ -538,6 +538,35 @@ def test_informational_rows_are_visible_but_excluded_from_totals_and_approval(
     assert approved.status_code == 200
 
 
+def test_repeated_package_rollup_matching_bill_total_is_not_double_counted(
+    tmp_path: Path, monkeypatch
+) -> None:
+    client, store = client_for(tmp_path, monkeypatch)
+    job_id, result = completed_job(store)
+    first = result["rows"][0]
+    first["role"] = "category_rollup"
+    first["net_amount_raw"] = "120.00"
+    first["net_amount"] = "120.00"
+    repeated = {
+        **first,
+        "id": "repeated-package-rollup",
+        "row_order": 1,
+        "page_number": 2,
+        "description": "Package Name: Consultation",
+    }
+    result["rows"].append(repeated)
+    result["pages"] = 2
+    (store.job_dir(job_id) / "result.json").write_text(json.dumps(result))
+    store.update(job_id, row_count=2, pages=2, page=2)
+
+    rows = client.get(f"/api/v2/documents/{job_id}/rows").json()
+
+    assert rows["total"] == 2
+    assert rows["totals"]["items_total"] == "120.00"
+    assert rows["totals"]["difference"] == "0.00"
+    assert rows["totals"]["comparison"] == "match"
+
+
 def test_reviewer_can_add_and_soft_reject_a_grounded_row(tmp_path: Path, monkeypatch) -> None:
     client, store = client_for(tmp_path, monkeypatch)
     job_id, _ = completed_job(store)

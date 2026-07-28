@@ -14,8 +14,8 @@ from gmoney.contracts.extraction import (
 )
 from gmoney.extraction.typed_values import parse_decimal
 
-DOCUMENT_TOTAL_VERSION = "document_total_v2"
-DOCUMENT_TOTALS_VERSION = "document_totals_v1"
+DOCUMENT_TOTAL_VERSION = "document_total_v3"
+DOCUMENT_TOTALS_VERSION = "document_totals_v2"
 
 # term, display label, priority, kind, default scope, requires summary context
 FINAL_LABELS: tuple[
@@ -33,6 +33,14 @@ FINAL_LABELS: tuple[
         "net bill amount",
         "Net Bill Amount",
         98,
+        DocumentTotalKind.BILL_TOTAL,
+        DocumentTotalScope.DOCUMENT,
+        False,
+    ),
+    (
+        "net medical amount",
+        "Net Medical Amount",
+        97,
         DocumentTotalKind.BILL_TOTAL,
         DocumentTotalScope.DOCUMENT,
         False,

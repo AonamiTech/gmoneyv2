@@ -71,6 +71,26 @@ def test_specific_bill_label_outranks_later_generic_grand_total() -> None:
     assert total.page_number == 1
 
 
+def test_net_medical_amount_is_an_explicit_bill_total() -> None:
+    candidates = extract_document_total_candidates(
+        (
+            token(0, "Gross Bill Amount", (100, 50, 320, 70)),
+            token(1, "36,235.23", (800, 50, 930, 70)),
+            token(2, "Net Medical Amount", (100, 80, 340, 100)),
+            token(3, "36,235.23", (800, 80, 930, 100)),
+            token(4, "Claim Amount", (100, 110, 280, 130)),
+            token(5, "36,235.00", (800, 110, 930, 130)),
+        )
+    )
+
+    total = select_document_total(candidates)
+
+    assert total is not None
+    assert total.label == "Net Medical Amount"
+    assert total.amount == Decimal("36235.23")
+    assert total.evidence.token_ids == ("p1-token-2", "p1-token-3")
+
+
 def test_later_same_priority_total_wins_and_intermediate_labels_are_rejected() -> None:
     excluded = extract_document_total_candidates(
         (
