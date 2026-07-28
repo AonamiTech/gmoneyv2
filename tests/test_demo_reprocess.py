@@ -2271,6 +2271,54 @@ def test_reprocess_validation_accepts_verified_total_and_settlement_source_rows(
                 "validation_flags": [],
             }
         )
+    printed[0]["columns"].append(
+        {
+            "id": "quantity",
+            "label": "Quantity",
+            "order": 2,
+            "canonical_field": "quantity",
+            "evidence": [evidence(page_sha, "quantity-header")],
+            "validation_flags": [],
+        }
+    )
+    for printed_row in printed[0]["rows"]:
+        printed_row["cells"].append(
+            {
+                "column_id": "quantity",
+                "raw_value": None,
+                "evidence": [],
+                "validation_flags": ["empty_cell"],
+            }
+        )
+    displaced_order = len(printed[0]["rows"])
+    printed[0]["rows"].append(
+        {
+            "id": f"p1-t1-s1-r{displaced_order + 1}",
+            "order": displaced_order,
+            "canonical_row_id": None,
+            "cells": [
+                {
+                    "column_id": "description",
+                    "raw_value": None,
+                    "evidence": [],
+                    "validation_flags": ["empty_cell"],
+                },
+                {
+                    "column_id": "amount",
+                    "raw_value": "100.00",
+                    "evidence": [evidence(page_sha, "displaced-settlement-amount")],
+                    "validation_flags": [],
+                },
+                {
+                    "column_id": "quantity",
+                    "raw_value": "Pre Authorization Amount",
+                    "evidence": [evidence(page_sha, "displaced-settlement-label")],
+                    "validation_flags": [],
+                },
+            ],
+            "validation_flags": [],
+        }
+    )
     new_result = {
         **old_result,
         "document_total": {

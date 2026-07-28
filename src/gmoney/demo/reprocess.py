@@ -412,6 +412,19 @@ def _unlinked_financial_row_is_explained(
             and is_settlement_label(description_values[0])
         ):
             return True
+        displaced_labels = tuple(
+            row_cells[column.id].raw_value
+            for column in table.columns
+            if column.canonical_field not in {"net_amount", "gross_amount"}
+            and row_cells[column.id].raw_value
+            and parse_decimal(row_cells[column.id].raw_value or "") is None
+        )
+        if (
+            not description_values
+            and len(displaced_labels) == 1
+            and is_settlement_label(displaced_labels[0])
+        ):
+            return True
         mapped_descriptions = tuple(
             column
             for column in table.columns
