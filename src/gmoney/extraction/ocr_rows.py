@@ -2900,6 +2900,132 @@ def _numeric_identity(token: OcrToken, value: Decimal) -> tuple[str, float, Deci
     return token.token_id, round(_center_x(token), 6), value
 
 
+def _refine_continuation_schema_from_rows(
+    schema: TableSchemaState,
+    rows: tuple[OcrLine, ...],
+    *,
+    left: float,
+    width: float,
+) -> TableSchemaState:
+    """Adapt a prior-page schema when the continuation shifts horizontally.
+
+    A repeated header later on the page can expose headerless rows that still
+    belong to the previous section.  Reusing the old normalized centers
+    verbatim is unsafe when the next page has different margins.  Keep the
+    prior role ordering, but move Date/Rate/Quantity/Amount only when repeated
+    row geometry and line arithmetic prove the new lanes.
+    """
+    centers = dict(schema.column_centers)
+    stable_centers = _stable_numeric_centers(rows, left, width)
+    prior_amount = centers.get("amount")
+    amount_center = (
+        min(stable_centers, key=lambda center: abs(center - prior_amount))
+        if stable_centers and prior_amount is not None
+        else None
+    )
+    if (
+        amount_center is not None
+        and prior_amount is not None
+        and abs(amount_center - prior_amount) <= 0.08
+    ):
+        centers["amount"] = amount_center
+
+    if (
+        amount_center is not None
+        and "rate" in centers
+        and "quantity" in centers
+    ):
+        non_amount_centers = tuple(
+            center
+            for center in stable_centers
+            if abs(center - amount_center) > 0.035
+        )
+        rate_precedes_quantity = centers["rate"] < centers["quantity"]
+        candidates: list[tuple[int, float, float]] = []
+        for first_index, first_center in enumerate(non_amount_centers):
+            for second_center in non_amount_centers[first_index + 1 :]:
+                rate_center, quantity_center = (
+                    (first_center, second_center)
+                    if rate_precedes_quantity
+                    else (second_center, first_center)
+                )
+                arithmetic_matches = 0
+                comparable_rows = 0
+                for row in rows:
+                    numeric = _numeric_tokens(row)
+                    used: set[tuple[str, float, Decimal]] = set()
+                    amount_pair = _closest_numeric(
+                        numeric,
+                        amount_center,
+                        left,
+                        width,
+                        used,
+                    )
+                    if amount_pair is None:
+                        continue
+                    used.add(_numeric_identity(amount_pair.token, amount_pair.value))
+                    rate_pair = _closest_numeric(
+                        numeric,
+                        rate_center,
+                        left,
+                        width,
+                        used,
+                    )
+                    if rate_pair is None:
+                        continue
+                    used.add(_numeric_identity(rate_pair.token, rate_pair.value))
+                    quantity_pair = _closest_numeric(
+                        numeric,
+                        quantity_center,
+                        left,
+                        width,
+                        used,
+                    )
+                    if quantity_pair is None:
+                        continue
+                    if any(
+                        abs(((_center_x(pair.token) - left) / width) - target)
+                        > 0.04
+                        for pair, target in (
+                            (amount_pair, amount_center),
+                            (rate_pair, rate_center),
+                            (quantity_pair, quantity_center),
+                        )
+                    ):
+                        continue
+                    comparable_rows += 1
+                    expected = rate_pair.value * quantity_pair.value
+                    if abs(expected - abs(amount_pair.value)) <= Decimal("0.01"):
+                        arithmetic_matches += 1
+                candidates.append(
+                    (arithmetic_matches, rate_center, quantity_center)
+                )
+        if candidates:
+            matches, rate_center, quantity_center = max(candidates)
+            minimum_support = max(2, (len(rows) + 1) // 2)
+            if matches >= minimum_support:
+                centers["rate"] = rate_center
+                centers["quantity"] = quantity_center
+
+    date_centers_by_row = tuple(
+        tuple(
+            (_center_x(token) - left) / width
+            for token in row.tokens
+            if DATE_SPAN.search(token.text)
+        )
+        for row in rows
+    )
+    grounded_date_centers = tuple(
+        median(values)
+        for values in date_centers_by_row
+        if values
+    )
+    if len(grounded_date_centers) >= max(2, (len(rows) + 1) // 2):
+        centers["service_date"] = median(grounded_date_centers)
+
+    return replace(schema, column_centers=centers)
+
+
 def reconstruct_ocr_rows(
     tokens: tuple[OcrToken, ...],
     *,
@@ -2969,6 +3095,12 @@ def reconstruct_ocr_rows(
                 )
             )
             if len(pre_header_rows) >= 2:
+                inherited_preamble_schema = _refine_continuation_schema_from_rows(
+                    inherited_preamble_schema,
+                    pre_header_rows,
+                    left=left,
+                    width=width,
+                )
                 pre_header_ids = {
                     token.token_id
                     for line in pre_header_rows

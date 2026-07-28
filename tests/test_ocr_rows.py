@@ -4479,14 +4479,14 @@ def test_rows_before_later_section_header_inherit_the_prior_page_schema() -> Non
         (
             token(0, "Description", (100, 20, 300, 35)),
             token(1, "Date", (500, 20, 560, 35)),
-            token(2, "UnitPrice", (680, 20, 750, 35)),
-            token(3, "Quantity", (780, 20, 840, 35)),
-            token(4, "Amount", (880, 20, 960, 35)),
+            token(2, "UnitPrice", (530, 20, 610, 35)),
+            token(3, "Quantity", (620, 20, 700, 35)),
+            token(4, "Amount", (900, 20, 970, 35)),
             token(5, "Urine Culture", (100, 55, 300, 70)),
             token(6, "07/02/2026", (500, 55, 580, 70)),
-            token(7, "460.00", (690, 55, 750, 70)),
-            token(8, "1.00", (790, 55, 830, 70)),
-            token(9, "460.00", (890, 55, 950, 70)),
+            token(7, "460.00", (540, 55, 600, 70)),
+            token(8, "1.00", (630, 55, 690, 70)),
+            token(9, "460.00", (910, 55, 960, 70)),
         ),
         page_number=1,
         table_id="p1-t1",
@@ -4542,6 +4542,24 @@ def test_rows_before_later_section_header_inherit_the_prior_page_schema() -> Non
         Decimal("500.00"),
         Decimal("200.00"),
         Decimal("3450.00"),
+    ]
+    assert [row.candidate.service_date for row in second.rows] == [
+        "08/02/2026",
+        "08/02/2026",
+        "09/02/2026",
+        "06/02/2026",
+    ]
+    assert [row.candidate.rate for row in second.rows] == [
+        Decimal("40.00"),
+        Decimal("500.00"),
+        Decimal("40.00"),
+        Decimal("3450.00"),
+    ]
+    assert [row.candidate.quantity for row in second.rows] == [
+        Decimal("1.00"),
+        Decimal("1.00"),
+        Decimal("5.00"),
+        Decimal("1.00"),
     ]
     assert len({table.id for table in second.source_tables}) == len(
         second.source_tables
