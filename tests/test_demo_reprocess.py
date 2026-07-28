@@ -2243,6 +2243,9 @@ def test_reprocess_validation_accepts_verified_total_and_settlement_source_rows(
             "Subtotal",
             "Bill Amount",
             "Net Medical Amount",
+            "Pre Authorization Amount",
+            "Co-Payment",
+            "Claim Amount",
         ),
         start=3,
     ):
