@@ -4896,7 +4896,14 @@ def test_pharmacy_expiry_date_does_not_replace_left_transaction_date(
     assert second_cells["description"].raw_value == "Betadine Scrub 50 ML"
 
 
-def test_linked_pharmacy_row_splits_quantity_merged_with_expiry() -> None:
+@pytest.mark.parametrize(
+    ("merged_expiry_quantity", "quantity"),
+    (("Aug/2028 1.00", "1.00"), ("Aug/20282.00", "2.00")),
+)
+def test_linked_pharmacy_row_splits_quantity_merged_with_expiry(
+    merged_expiry_quantity: str,
+    quantity: str,
+) -> None:
     tokens = (
         token(0, "Date", (80, 25, 150, 40)),
         token(1, "ProductName", (290, 25, 430, 40)),
@@ -4906,9 +4913,13 @@ def test_linked_pharmacy_row_splits_quantity_merged_with_expiry() -> None:
         token(5, "Amount", (920, 25, 970, 40)),
         token(6, "06/02/2026", (80, 70, 150, 85)),
         token(7, "NS 100 ML FLEXIDRIP CLARIS", (290, 70, 540, 85)),
-        token(8, "Aug/2028 1.00", (620, 70, 810, 85)),
+        token(8, merged_expiry_quantity, (620, 70, 810, 85)),
         token(9, "44.93", (840, 70, 885, 85)),
-        token(10, "44.93", (920, 70, 970, 85)),
+        token(
+            10,
+            str(Decimal(quantity) * Decimal("44.93")),
+            (920, 70, 970, 85),
+        ),
     )
 
     result = reconstruct_ocr_rows(
@@ -4940,8 +4951,8 @@ def test_linked_pharmacy_row_splits_quantity_merged_with_expiry() -> None:
     quantity_cell = linked_cells[columns_by_field["quantity"].id]
     expiry_cell = linked_cells[expiry_column.id]
 
-    assert canonical[0].quantity == Decimal("1.00")
-    assert quantity_cell.raw_value == "1.00"
+    assert canonical[0].quantity == Decimal(quantity)
+    assert quantity_cell.raw_value == quantity
     assert expiry_cell.raw_value == "Aug/2028"
     assert quantity_cell.validation_flags == ("split_from_merged_ocr_token",)
     assert {

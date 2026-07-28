@@ -1493,18 +1493,15 @@ def _split_grounded_merged_numeric_cells(
         if adjacent_column is not None:
             adjacent_cell = cells_by_id[adjacent_column.id]
             merged = re.fullmatch(
-                r"\s*(?P<prefix>.+?)\s*"
+                r"\s*(?P<prefix>.*?\b"
+                r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)"
+                r"[/-]\d{4})\s*"
                 r"(?P<quantity>[+-]?\d[\d,]*\.\d{1,4})\s*",
                 adjacent_cell.raw_value or "",
+                re.IGNORECASE,
             )
             if (
                 merged is not None
-                and re.search(
-                    r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)"
-                    r"[/-]\d{4}\b",
-                    merged.group("prefix"),
-                    re.IGNORECASE,
-                )
                 and parse_decimal(merged.group("quantity"))
                 == canonical.quantity
             ):
