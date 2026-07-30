@@ -240,6 +240,23 @@ describe("evidence page navigation", () => {
     vi.useRealTimers();
   });
 
+  test("loads the largest history page so completed bills are immediately visible", async () => {
+    render(<Home />);
+
+    await advance(250);
+
+    expect(
+      vi.mocked(fetch).mock.calls.some(([input]) => {
+        const url = new URL(String(input), "http://localhost");
+        return (
+          url.pathname === "/api/v2/documents"
+          && url.searchParams.get("scope") === "history"
+          && url.searchParams.get("limit") === "200"
+        );
+      }),
+    ).toBe(true);
+  });
+
   test("background refresh does not reset a manually selected empty page", async () => {
     render(<Home />);
 

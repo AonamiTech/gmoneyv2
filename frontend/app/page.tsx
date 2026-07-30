@@ -381,7 +381,7 @@ export default function Home() {
     const params = new URLSearchParams({
       scope: "history",
       offset: String(historyOffset),
-      limit: "50",
+      limit: "200",
     });
     if (historyQuery.trim()) params.set("query", historyQuery.trim());
     const result = await request<JobsResult>(`/api/v2/documents?${params}`);
