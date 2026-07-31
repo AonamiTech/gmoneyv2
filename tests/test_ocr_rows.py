@@ -3,7 +3,12 @@ from decimal import Decimal
 import pytest
 
 from gmoney.contracts.evidence import OcrToken, Point, Polygon
-from gmoney.contracts.extraction import RowRole, TableType
+from gmoney.contracts.extraction import (
+    RowRole,
+    SourceCell,
+    SourceColumn,
+    TableType,
+)
 from gmoney.extraction.canonicalize import canonicalize_rows
 from gmoney.extraction.ocr_rows import (
     _clean_description,
@@ -12,6 +17,7 @@ from gmoney.extraction.ocr_rows import (
 )
 from gmoney.extraction.offline import (
     _link_source_tables,
+    _populate_grounded_service_date_cell,
     _recover_grounded_service_dates,
     _recovery_prior_schemas,
 )
@@ -1925,6 +1931,95 @@ def test_headerless_source_date_lane_recovers_grounded_canonical_dates() -> None
         for source_row in linked[0].rows
         if source_row.canonical_row_id is not None
     ] == ["27/07/2026", "28/07/2026"]
+
+
+def test_headerless_date_lane_displays_date_merged_into_another_cell() -> None:
+    tokens = (
+        token(0, "15/07/2026", (80, 30, 170, 45)),
+        token(1, "MNEIPI/100 Item One", (250, 30, 580, 45)),
+        token(2, "25.00", (700, 30, 760, 45)),
+        token(3, "1.00", (790, 30, 830, 45)),
+        token(4, "25.00", (900, 30, 960, 45)),
+        token(
+            5,
+            "15/07/2026 16:17:00 - MNEIPI/101 Item Two",
+            (250, 70, 580, 85),
+        ),
+        token(6, "30.00", (700, 70, 760, 85)),
+        token(7, "1.00", (790, 70, 830, 85)),
+        token(8, "30.00", (900, 70, 960, 85)),
+        token(9, "15/07/2026", (80, 110, 170, 125)),
+        token(10, "MNEIPI/102 Item Three", (250, 110, 580, 125)),
+        token(11, "35.00", (700, 110, 760, 125)),
+        token(12, "1.00", (790, 110, 830, 125)),
+        token(13, "35.00", (900, 110, 960, 125)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(60, 20, 980, 145),
+    )
+    canonical = canonicalize_rows(
+        "d" * 64,
+        1,
+        "p1-t1",
+        "a" * 64,
+        result.rows,
+    )
+    assert len(canonical) == 3
+    merged_source_cell = next(
+        cell
+        for table in result.source_tables
+        for row in table.rows
+        for cell in row.cells
+        if cell.raw_value
+        == "15/07/2026 16:17:00 - MNEIPI/101 Item Two"
+    )
+    columns = (
+        SourceColumn(
+            id="date",
+            label="Date",
+            order=0,
+            canonical_field="service_date_raw",
+            validation_flags=("synthetic_header",),
+        ),
+        SourceColumn(
+            id="printed",
+            label="Column 2",
+            order=1,
+            validation_flags=("synthetic_header",),
+        ),
+    )
+    source_cells = (
+        SourceCell(
+            column_id="date",
+            validation_flags=("empty_cell",),
+        ),
+        SourceCell(
+            column_id="printed",
+            raw_value=merged_source_cell.raw_value,
+            evidence=merged_source_cell.evidence,
+        ),
+    )
+
+    split = _populate_grounded_service_date_cell(
+        source_cells,
+        columns,
+        canonical[1],
+    )
+    cells = {cell.column_id: cell for cell in split}
+    assert cells["date"].raw_value == "15/07/2026 16:17:00"
+    assert cells["date"].evidence
+    assert (
+        "split_from_merged_ocr_token"
+        in cells["date"].validation_flags
+    )
+    assert (
+        cells["printed"].raw_value
+        == "15/07/2026 16:17:00 - MNEIPI/101 Item Two"
+    )
 
 
 def test_payment_and_expiry_dates_are_not_recovered_as_service_dates() -> None:

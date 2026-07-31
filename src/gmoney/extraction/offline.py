@@ -1307,6 +1307,80 @@ def _split_grounded_date_request_description(
     return tuple(cells_by_id[cell.column_id] for cell in cells)
 
 
+def _populate_grounded_service_date_cell(
+    cells: tuple[SourceCell, ...],
+    columns: tuple[SourceColumn, ...],
+    canonical: CanonicalRow,
+) -> tuple[SourceCell, ...]:
+    """Display a grounded date that OCR merged into another Printed cell."""
+    date_columns = tuple(
+        column
+        for column in columns
+        if column.canonical_field == "service_date_raw"
+    )
+    if len(date_columns) != 1 or not canonical.service_date_iso:
+        return cells
+    date_column = date_columns[0]
+    cells_by_id = {cell.column_id: cell for cell in cells}
+    date_cell = cells_by_id[date_column.id]
+    if date_cell.raw_value:
+        return cells
+
+    date_token_ids = {
+        token_id
+        for evidence in canonical.field_evidence.get("service_date", ())
+        for token_id in evidence.token_ids
+    }
+    if not date_token_ids:
+        return cells
+    candidates: list[tuple[str, tuple[EvidenceRef, ...]]] = []
+    for cell in cells:
+        if cell.column_id == date_column.id or not cell.raw_value:
+            continue
+        match = DATE_PREFIX.match(cell.raw_value)
+        if match is None:
+            continue
+        printed_date = cell.raw_value[: match.end()].strip(" -:")
+        if parse_service_date(printed_date) != canonical.service_date_iso:
+            continue
+        cell_token_ids = {
+            token_id
+            for evidence in cell.evidence
+            for token_id in evidence.token_ids
+        }
+        if not date_token_ids.issubset(cell_token_ids):
+            continue
+        date_evidence = _filter_evidence_token_ids(
+            cell.evidence,
+            date_token_ids,
+        )
+        if date_evidence:
+            candidates.append((printed_date, date_evidence))
+    if len(candidates) != 1:
+        return cells
+
+    printed_date, date_evidence = candidates[0]
+    cells_by_id[date_column.id] = date_cell.model_copy(
+        update={
+            "raw_value": printed_date,
+            "evidence": date_evidence,
+            "validation_flags": tuple(
+                dict.fromkeys(
+                    (
+                        *(
+                            flag
+                            for flag in date_cell.validation_flags
+                            if flag != "empty_cell"
+                        ),
+                        "split_from_merged_ocr_token",
+                    )
+                )
+            ),
+        }
+    )
+    return tuple(cells_by_id[cell.column_id] for cell in cells)
+
+
 def _redistribute_grounded_description_from_adjacent_cell(
     cells: tuple[SourceCell, ...],
     columns: tuple[SourceColumn, ...],
@@ -2632,6 +2706,11 @@ def _link_source_tables(
                     matched,
                 )
                 linked_cells = _split_grounded_date_from_description(
+                    linked_cells,
+                    table.columns,
+                    matched,
+                )
+                linked_cells = _populate_grounded_service_date_cell(
                     linked_cells,
                     table.columns,
                     matched,
