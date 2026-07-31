@@ -1379,16 +1379,18 @@ def _validate_result(
                         f"for canonical row {source_row.canonical_row_id}"
                     )
                 if canonical_present and not printed_present:
-                    inherited_service_date_is_grounded = bool(
+                    unmapped_service_date_is_grounded = bool(
                         field == "service_date_raw"
-                        and "service_date_inherited_from_group"
-                        in (canonical.get("validation_flags") or [])
+                        and {
+                            "service_date_inherited_from_group",
+                            "service_date_recovered_from_source_cell",
+                        }.intersection(canonical.get("validation_flags") or [])
                         and grounded_service_date_exists(
                             canonical,
                             field_token_ids,
                         )
                     )
-                    if inherited_service_date_is_grounded:
+                    if unmapped_service_date_is_grounded:
                         continue
                     derived_quantity_has_grounded_operands = bool(
                         derived_quantity_is_proven

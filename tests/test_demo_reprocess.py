@@ -788,6 +788,86 @@ def test_reprocess_validation_accepts_grounded_group_service_date(
         )
 
 
+def test_reprocess_validation_accepts_grounded_recovered_unmapped_service_date(
+    tmp_path: Path,
+) -> None:
+    store, job_id, old_result = setup_job(tmp_path)
+    page_sha = old_result["page_assets"][0]["artifact_sha256"]
+    new_rows = [row("new-row", page_sha)]
+    new_rows[0]["service_date_raw"] = "15/07/2026"
+    new_rows[0]["service_date_iso"] = "2026-07-15"
+    new_rows[0]["field_evidence"]["service_date"] = [
+        evidence(page_sha, "service-date-token")
+    ]
+    new_rows[0]["validation_flags"] = [
+        "service_date_recovered_from_source_cell"
+    ]
+    printed = source_tables(new_rows, page_sha)
+    printed[0]["columns"].insert(
+        0,
+        {
+            "id": "mapped-date",
+            "label": "Date",
+            "order": 0,
+            "canonical_field": "service_date_raw",
+            "evidence": [evidence(page_sha, "header-date")],
+            "validation_flags": [],
+        },
+    )
+    printed[0]["columns"].insert(
+        1,
+        {
+            "id": "mixed-reference",
+            "label": "Reference / Date",
+            "order": 1,
+            "canonical_field": None,
+            "evidence": [evidence(page_sha, "header-reference-date")],
+            "validation_flags": [],
+        },
+    )
+    for order, column in enumerate(printed[0]["columns"]):
+        column["order"] = order
+    printed[0]["rows"][0]["cells"].insert(
+        0,
+        {
+            "column_id": "mapped-date",
+            "raw_value": None,
+            "evidence": [],
+            "validation_flags": ["empty_cell"],
+        },
+    )
+    printed[0]["rows"][0]["cells"].insert(
+        1,
+        {
+            "column_id": "mixed-reference",
+            "raw_value": "15/07/2026",
+            "evidence": [evidence(page_sha, "service-date-token")],
+            "validation_flags": [],
+        },
+    )
+    new_result = {
+        **old_result,
+        "rows": new_rows,
+        "source_tables": printed,
+    }
+
+    _validate_result(
+        store.job_dir(job_id) / "source.pdf",
+        old_result,
+        new_result,
+        store.job_dir(job_id) / "artifacts",
+    )
+
+    printed[0]["rows"][0]["cells"][1]["raw_value"] = "16/07/2026"
+    with pytest.raises(ValueError, match="service_date_raw"):
+        _validate_result(
+            store.job_dir(job_id) / "source.pdf",
+            old_result,
+            new_result,
+            store.job_dir(job_id) / "artifacts",
+        )
+
+
 def test_reprocess_validation_rejects_printed_value_missing_from_canonical_row(
     tmp_path: Path,
 ) -> None:
