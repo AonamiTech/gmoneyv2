@@ -1382,6 +1382,7 @@ def _validate_result(
                     unmapped_service_date_is_grounded = bool(
                         field == "service_date_raw"
                         and {
+                            "service_date_corrected_from_source_cell",
                             "service_date_inherited_from_group",
                             "service_date_recovered_from_source_cell",
                         }.intersection(canonical.get("validation_flags") or [])
@@ -1488,6 +1489,7 @@ def _validate_result(
         if (
             row_payload.get("service_date_raw")
             and {
+                "service_date_corrected_from_source_cell",
                 "service_date_inherited_from_group",
                 "service_date_recovered_from_source_cell",
             }.intersection(row_payload.get("validation_flags") or [])

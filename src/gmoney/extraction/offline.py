@@ -2204,14 +2204,30 @@ def _with_grounded_service_date(
     evidence: tuple[EvidenceRef, ...],
     inherited: bool,
 ) -> CanonicalRow:
-    if row.service_date_raw:
+    correcting_ambiguous_date = bool(
+        row.service_date_raw
+        and row.service_date_iso is None
+        and len(
+            {
+                parsed
+                for match in DATE_SPAN.finditer(row.service_date_raw)
+                if (parsed := parse_service_date(match.group(0))) is not None
+            }
+        )
+        > 1
+    )
+    if row.service_date_raw and not correcting_ambiguous_date:
         return row
     field_evidence = dict(row.field_evidence)
     field_evidence["service_date"] = evidence
     flags = (
-        "service_date_inherited_from_group"
-        if inherited
-        else "service_date_recovered_from_source_cell"
+        "service_date_corrected_from_source_cell"
+        if correcting_ambiguous_date
+        else (
+            "service_date_inherited_from_group"
+            if inherited
+            else "service_date_recovered_from_source_cell"
+        )
     )
     return row.model_copy(
         update={

@@ -2022,6 +2022,53 @@ def test_headerless_date_lane_displays_date_merged_into_another_cell() -> None:
     )
 
 
+def test_grounded_date_lane_corrects_conflated_expiry_and_service_dates() -> None:
+    tokens = (
+        token(0, "27/07/2026", (150, 30, 245, 45)),
+        token(1, "Syringe", (300, 30, 500, 45)),
+        token(2, "1,000.00", (860, 30, 940, 45)),
+        token(3, "28/07/2026", (150, 70, 245, 85)),
+        token(4, "Procedure", (300, 70, 500, 85)),
+        token(5, "4,500.00", (860, 70, 940, 85)),
+    )
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(50, 20, 980, 110),
+    )
+    canonical = canonicalize_rows(
+        "d" * 64,
+        1,
+        "p1-t1",
+        "a" * 64,
+        result.rows,
+    )
+    corrupted = canonical[0].model_copy(
+        update={
+            "service_date_raw": "30/05/2028 27/07/2026",
+            "service_date_iso": None,
+        }
+    )
+
+    recovered = _recover_grounded_service_dates(
+        result.source_tables,
+        (corrupted, canonical[1]),
+    )
+
+    assert recovered[0].service_date_raw == "27/07/2026"
+    assert recovered[0].service_date_iso == "2026-07-27"
+    assert (
+        "service_date_corrected_from_source_cell"
+        in recovered[0].validation_flags
+    )
+    assert {
+        token_id
+        for evidence in recovered[0].field_evidence["service_date"]
+        for token_id in evidence.token_ids
+    } == {"token-0"}
+
+
 def test_payment_and_expiry_dates_are_not_recovered_as_service_dates() -> None:
     charge_tokens = (
         token(0, "Product", (100, 30, 300, 45)),
