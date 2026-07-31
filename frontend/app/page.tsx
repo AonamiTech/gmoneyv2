@@ -223,7 +223,7 @@ const differenceCopy = (value: string | null, comparison: RowsResult["totals"]["
 };
 
 const serviceDate = (value: string | null, raw: string | null) => {
-  if (!value) return raw || "—";
+  if (!value) return raw || "Not printed";
   const [year, month, day] = value.split("-").map(Number);
   if (!year || !month || !day) return value;
   return new Intl.DateTimeFormat("en-IN", {

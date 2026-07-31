@@ -286,6 +286,7 @@ describe("evidence page navigation", () => {
     fireEvent.click(screen.getByRole("button", { name: "Normalized" }));
 
     expect(screen.getByRole("columnheader", { name: "Rate" })).toBeInTheDocument();
+    expect(screen.getByRole("cell", { name: "Not printed" })).toBeInTheDocument();
   });
 
   test("printed rows use server ordinals across multiple tables", async () => {

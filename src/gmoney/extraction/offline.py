@@ -5,6 +5,7 @@ import re
 from collections import Counter
 from collections.abc import Callable, Collection
 from dataclasses import asdict, dataclass, replace
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 from statistics import median
@@ -50,6 +51,7 @@ from gmoney.extraction.document_total import (
 from gmoney.extraction.hospital import detect_hospital
 from gmoney.extraction.ocr_rows import (
     DATE_PREFIX,
+    DATE_SPAN,
     ReconstructionResult,
     TableSchemaState,
     _clean_description,
@@ -2039,6 +2041,500 @@ def _consolidate_grounded_adjacent_descriptions(
     return table.model_copy(update={"rows": tuple(rows)})
 
 
+_SERVICE_DATE_TABLE_TYPES = {
+    TableType.CATEGORY_SUMMARY,
+    TableType.ITEM_LEDGER,
+    TableType.LABORATORY,
+    TableType.PHARMACY,
+}
+_NON_SERVICE_DATE_MARKERS = (
+    "admission date",
+    "bill date",
+    "date of admission",
+    "date of birth",
+    "date of discharge",
+    "discharge date",
+    "dob",
+    "expiry",
+    "print date",
+    "print time",
+    "receipt date",
+)
+
+
+def _source_cell_service_date(
+    cell: SourceCell,
+    column: SourceColumn,
+) -> tuple[str, str, tuple[EvidenceRef, ...]] | None:
+    def normalized(value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", value.casefold()).strip()
+
+    raw = re.sub(r"\s+", " ", cell.raw_value or "").strip()
+    if not raw or not cell.evidence:
+        return None
+    normalized_label = normalized(column.label)
+    normalized_raw = normalized(raw)
+    if (
+        "expiry" in normalized_label
+        or normalized_label in {"exp", "exp date"}
+        or any(marker in normalized_raw for marker in _NON_SERVICE_DATE_MARKERS)
+    ):
+        return None
+    matches = tuple(DATE_SPAN.finditer(raw))
+    parsed = tuple(
+        (match.group(0).strip(), parse_service_date(match.group(0)))
+        for match in matches
+    )
+    valid = tuple((value, iso) for value, iso in parsed if iso is not None)
+    if len(valid) != 1:
+        return None
+    value, iso = valid[0]
+    evidence = tuple(item for item in cell.evidence if item.token_ids)
+    if not evidence:
+        return None
+    return value, iso, evidence
+
+
+def _append_unique_evidence(
+    existing: tuple[EvidenceRef, ...],
+    additions: tuple[EvidenceRef, ...],
+) -> tuple[EvidenceRef, ...]:
+    output = list(existing)
+    signatures = {
+        (
+            item.page_number,
+            item.table_id,
+            item.artifact_sha256,
+            item.token_ids,
+        )
+        for item in output
+    }
+    for item in additions:
+        signature = (
+            item.page_number,
+            item.table_id,
+            item.artifact_sha256,
+            item.token_ids,
+        )
+        if signature not in signatures:
+            output.append(item)
+            signatures.add(signature)
+    return tuple(output)
+
+
+def _with_grounded_service_date(
+    row: CanonicalRow,
+    *,
+    raw: str,
+    iso: str,
+    evidence: tuple[EvidenceRef, ...],
+    inherited: bool,
+) -> CanonicalRow:
+    if row.service_date_raw:
+        return row
+    field_evidence = dict(row.field_evidence)
+    field_evidence["service_date"] = evidence
+    flags = (
+        "service_date_inherited_from_group"
+        if inherited
+        else "service_date_recovered_from_source_cell"
+    )
+    return row.model_copy(
+        update={
+            "service_date_raw": raw,
+            "service_date_iso": iso,
+            "field_evidence": field_evidence,
+            "evidence": _append_unique_evidence(row.evidence, evidence),
+            "validation_flags": tuple(
+                dict.fromkeys((*row.validation_flags, flags))
+            ),
+        }
+    )
+
+
+def _recover_grounded_service_dates(
+    source_tables: tuple[SourceTable, ...] | list[SourceTable],
+    canonical_rows: tuple[CanonicalRow, ...] | list[CanonicalRow],
+) -> list[CanonicalRow]:
+    """Recover printed charge dates without borrowing document metadata.
+
+    Canonical rows and source rows are first linked by their existing amount
+    evidence. A date can then be recovered only from that linked charge row, or
+    from one unlinked date-only row whose adjacency proves a grouped/continued
+    charge date. Payment and metadata tables never participate.
+    """
+
+    rows = list(canonical_rows)
+    row_indexes = {str(row.id): index for index, row in enumerate(rows)}
+    initially_linked = _link_source_tables(source_tables, rows)
+
+    def parsed_date(iso: str) -> date:
+        return date.fromisoformat(iso)
+
+    trusted_dates = [
+        parsed_date(row.service_date_iso)
+        for row in rows
+        if row.service_date_iso
+    ]
+    anchor_markers = (
+        "admission date",
+        "bill date",
+        "date of admission",
+        "date of discharge",
+        "discharge date",
+        "print date",
+        "print time",
+        "receipt date",
+    )
+    for table in initially_linked:
+        columns = {column.id: column for column in table.columns}
+        for source_row in table.rows:
+            for cell in source_row.cells:
+                raw = re.sub(r"\s+", " ", cell.raw_value or "").strip()
+                context = " ".join(
+                    (
+                        columns[cell.column_id].label.casefold(),
+                        raw.casefold(),
+                    )
+                )
+                if (
+                    "expiry" in context
+                    or not any(marker in context for marker in anchor_markers)
+                ):
+                    continue
+                for match in DATE_SPAN.finditer(raw):
+                    if iso := parse_service_date(match.group(0)):
+                        trusted_dates.append(parsed_date(iso))
+
+    column_dates: dict[tuple[str, str], tuple[date, ...]] = {}
+    for table in initially_linked:
+        columns = {column.id: column for column in table.columns}
+        for column in table.columns:
+            values = tuple(
+                parsed_date(candidate[1])
+                for source_row in table.rows
+                for cell in source_row.cells
+                if cell.column_id == column.id
+                if (
+                    candidate := _source_cell_service_date(
+                        cell,
+                        columns[cell.column_id],
+                    )
+                )
+                is not None
+            )
+            column_dates[(table.id, column.id)] = values
+
+    def direct_candidate_is_admissible(
+        table: SourceTable,
+        column: SourceColumn,
+        candidate: tuple[str, str, tuple[EvidenceRef, ...]],
+        canonical: CanonicalRow,
+    ) -> bool:
+        normalized_description = re.sub(
+            r"[^a-z0-9]+",
+            " ",
+            (canonical.description or "").casefold(),
+        ).strip()
+        if (
+            not normalized_description
+            or parse_service_date(canonical.description) is not None
+            or normalized_description.startswith(
+                ("advance ", "payment ", "receipt ", "refund ")
+            )
+            or normalized_description
+            in {"advance", "cash", "cashless", "debit", "finance", "payment"}
+            or re.fullmatch(r"rc\d[\da-z/-]*", normalized_description)
+        ):
+            return False
+        candidate_date = parsed_date(candidate[1])
+        anchor_close = bool(
+            not trusted_dates
+            or min(abs((candidate_date - anchor).days) for anchor in trusted_dates)
+            <= 120
+        )
+        if not anchor_close:
+            return False
+        normalized_label = re.sub(
+            r"[^a-z0-9]+",
+            " ",
+            column.label.casefold(),
+        ).strip()
+        explicit_date_lane = bool(
+            column.canonical_field == "service_date_raw"
+            or (
+                any(word in normalized_label.split() for word in ("date", "time"))
+                and "expiry" not in normalized_label
+            )
+        )
+        if explicit_date_lane:
+            return True
+        if not trusted_dates and DATE_PREFIX.match(candidate[0]) is None:
+            return False
+        dates_in_column = column_dates.get((table.id, column.id), ())
+        if (
+            not trusted_dates
+            and dates_in_column
+            and (max(dates_in_column) - min(dates_in_column)).days > 180
+        ):
+            return False
+        nearby_support = sum(
+            abs((candidate_date - other).days) <= 45
+            for other in dates_in_column
+        )
+        return nearby_support >= 2
+
+    def update(
+        canonical_id: str,
+        candidate: tuple[str, str, tuple[EvidenceRef, ...]],
+        *,
+        inherited: bool,
+    ) -> bool:
+        index = row_indexes.get(canonical_id)
+        if index is None or rows[index].role not in {
+            RowRole.DETAIL,
+            RowRole.REFUND,
+            RowRole.CATEGORY_ROLLUP,
+        }:
+            return False
+        raw, iso, evidence = candidate
+        updated = _with_grounded_service_date(
+            rows[index],
+            raw=raw,
+            iso=iso,
+            evidence=evidence,
+            inherited=inherited,
+        )
+        changed = updated is not rows[index]
+        rows[index] = updated
+        return changed
+
+    for table in initially_linked:
+        if table.table_type not in _SERVICE_DATE_TABLE_TYPES:
+            continue
+        columns = {column.id: column for column in table.columns}
+
+        # Prefer a date printed on the same grounded billable row.
+        for source_row in table.rows:
+            if source_row.canonical_row_id is None:
+                continue
+            canonical_index = row_indexes.get(source_row.canonical_row_id)
+            if canonical_index is None:
+                continue
+            canonical = rows[canonical_index]
+            candidates = tuple(
+                (cell, candidate)
+                for cell in source_row.cells
+                if (
+                    candidate := _source_cell_service_date(
+                        cell,
+                        columns[cell.column_id],
+                    )
+                )
+                is not None
+                and direct_candidate_is_admissible(
+                    table,
+                    columns[cell.column_id],
+                    candidate,
+                    canonical,
+                )
+            )
+            unique_dates = {
+                (raw, iso) for _, (raw, iso, _) in candidates
+            }
+            if len(unique_dates) == 1 and candidates:
+                update(
+                    source_row.canonical_row_id,
+                    candidates[0][1],
+                    inherited=False,
+                )
+
+        # A transaction/sale date is sometimes printed on its own line directly
+        # after the first item. The non-date reference in the same lane, or OCR
+        # description evidence shared with the preceding row, proves direction.
+        for donor_index, donor_row in enumerate(table.rows):
+            if donor_row.canonical_row_id is not None:
+                continue
+            donor_candidates = tuple(
+                (
+                    cell,
+                    candidate,
+                )
+                for cell in donor_row.cells
+                if (
+                    candidate := _source_cell_service_date(
+                        cell,
+                        columns[cell.column_id],
+                    )
+                )
+                is not None
+            )
+            if len(donor_candidates) != 1:
+                continue
+            if any(
+                parse_decimal(cell.raw_value or "") is not None
+                for cell in donor_row.cells
+            ):
+                continue
+            donor_cell, candidate = donor_candidates[0]
+            previous = (
+                table.rows[donor_index - 1] if donor_index > 0 else None
+            )
+            following = (
+                table.rows[donor_index + 1]
+                if donor_index + 1 < len(table.rows)
+                else None
+            )
+            associated_previous = False
+            if previous is not None and previous.canonical_row_id is not None:
+                previous_cells = {
+                    cell.column_id: cell for cell in previous.cells
+                }
+                lane_value = (
+                    previous_cells[donor_cell.column_id].raw_value or ""
+                ).strip()
+                previous_row = rows[
+                    row_indexes[previous.canonical_row_id]
+                ]
+                description_ids = {
+                    token_id
+                    for item in previous_row.field_evidence.get(
+                        "description", ()
+                    )
+                    for token_id in item.token_ids
+                }
+                donor_other_ids = {
+                    token_id
+                    for cell in donor_row.cells
+                    if cell.column_id != donor_cell.column_id
+                    for item in cell.evidence
+                    for token_id in item.token_ids
+                }
+                associated_previous = bool(
+                    (
+                        lane_value
+                        and DATE_SPAN.search(lane_value) is None
+                        and parse_decimal(lane_value) is None
+                        and any(character.isdigit() for character in lane_value)
+                    )
+                    or description_ids.intersection(donor_other_ids)
+                )
+                if associated_previous:
+                    update(
+                        previous.canonical_row_id,
+                        candidate,
+                        inherited=True,
+                    )
+
+            if associated_previous:
+                # Carry within this explicitly delimited transaction group.
+                for grouped_row in table.rows[donor_index + 1 :]:
+                    grouped_cells = {
+                        cell.column_id: cell for cell in grouped_row.cells
+                    }
+                    lane_value = (
+                        grouped_cells[donor_cell.column_id].raw_value or ""
+                    ).strip()
+                    if lane_value:
+                        break
+                    if grouped_row.canonical_row_id is not None:
+                        update(
+                            grouped_row.canonical_row_id,
+                            candidate,
+                            inherited=True,
+                        )
+                continue
+
+            # A bare date immediately before one charge applies only to that row.
+            if (
+                following is not None
+                and following.canonical_row_id is not None
+                and all(
+                    cell.column_id == donor_cell.column_id
+                    or not (cell.raw_value or "").strip()
+                    for cell in donor_row.cells
+                )
+            ):
+                update(
+                    following.canonical_row_id,
+                    candidate,
+                    inherited=True,
+                )
+    return rows
+
+
+def _promote_grounded_date_column(
+    table: SourceTable,
+    canonical_rows: tuple[CanonicalRow, ...],
+) -> SourceTable:
+    """Map one unambiguous raw date lane after canonical evidence proves it."""
+    date_evidence_ids = {
+        token_id
+        for row in canonical_rows
+        if row.service_date_raw
+        for item in row.field_evidence.get("service_date", ())
+        for token_id in item.token_ids
+    }
+    if not date_evidence_ids or table.table_type not in _SERVICE_DATE_TABLE_TYPES:
+        return table
+
+    support: Counter[str] = Counter()
+    for source_row in table.rows:
+        for cell in source_row.cells:
+            cell_ids = {
+                token_id
+                for item in cell.evidence
+                for token_id in item.token_ids
+            }
+            if date_evidence_ids.intersection(cell_ids):
+                support[cell.column_id] += 1
+    if not support:
+        return table
+    ordered = support.most_common()
+    if len(ordered) > 1 and ordered[0][1] == ordered[1][1]:
+        return table
+    selected_id = ordered[0][0]
+    selected = next(column for column in table.columns if column.id == selected_id)
+    if selected.canonical_field not in {None, "service_date_raw"}:
+        return table
+
+    linked_values = tuple(
+        cell.raw_value.strip()
+        for row in table.rows
+        if row.canonical_row_id is not None
+        for cell in row.cells
+        if cell.column_id == selected_id
+        and cell.raw_value
+        and cell.raw_value.strip()
+    )
+    if linked_values and any(
+        DATE_SPAN.search(value) is None for value in linked_values
+    ):
+        return table
+
+    columns = tuple(
+        column.model_copy(
+            update={
+                "label": (
+                    "Date"
+                    if "synthetic_header" in column.validation_flags
+                    else column.label
+                ),
+                "canonical_field": "service_date_raw",
+                "validation_flags": tuple(
+                    dict.fromkeys(
+                        (*column.validation_flags, "inferred_column_role")
+                    )
+                ),
+            }
+        )
+        if column.id == selected_id
+        else column
+        for column in table.columns
+    )
+    return table.model_copy(update={"columns": columns})
+
+
 def _link_source_tables(
     tables: tuple[SourceTable, ...] | list[SourceTable],
     canonical_rows: tuple[CanonicalRow, ...] | list[CanonicalRow],
@@ -2059,6 +2555,7 @@ def _link_source_tables(
             for row in canonical_rows
             if row.page_number == table.page_number and row.table_id == table.table_id
         )
+        table = _promote_grounded_date_column(table, candidates)
         linked_rows = []
         for source_row in table.rows:
             source_ids = {
@@ -3664,6 +4161,7 @@ class OfflineExtractor:
             crop_boxes=source_table_crop_boxes,
         )
         rows = _apply_document_role_policy(_deduplicate(selected_rows))
+        rows = _recover_grounded_service_dates(selected_source_tables, rows)
         source_tables = _link_source_tables(selected_source_tables, rows)
         document_totals = select_document_totals(document_total_candidates)
         document_total: DocumentTotal | None = select_document_total(document_total_candidates)

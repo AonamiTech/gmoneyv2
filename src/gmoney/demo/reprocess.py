@@ -21,6 +21,7 @@ from gmoney.contracts.extraction import SourceTable
 from gmoney.demo.review import structural_issues
 from gmoney.demo.store import JobStore, is_gpu_device, utc_now
 from gmoney.evaluation.corpus import sha256_file
+from gmoney.extraction.ocr_rows import DATE_PREFIX, DATE_SPAN
 from gmoney.extraction.offline import OfflineExtractor
 from gmoney.extraction.typed_values import (
     parse_decimal,
@@ -186,18 +187,44 @@ def _printed_service_date_iso(
     parsed = parse_service_date(raw_value)
     if parsed is not None:
         return parsed
-    request_suffix = _PRINTED_DATE_REQUEST_SUFFIX.search(raw_value)
-    if request_suffix is None:
-        return None
-    bleed = (request_suffix.group("bleed") or "").casefold()
-    if bleed:
-        first_word = next(iter(_normalized(canonical_description).split()), "")
-        if not (
-            first_word.startswith(bleed)
-            or first_word.endswith(bleed)
+    date_prefix = DATE_PREFIX.match(raw_value)
+    if date_prefix is not None:
+        parsed_prefix = parse_service_date(
+            raw_value[: date_prefix.end()].strip(" -:")
+        )
+        remainder = _normalized(raw_value[date_prefix.end() :])
+        description = _normalized(canonical_description)
+        if parsed_prefix is not None and (
+            not remainder
+            or (
+                description
+                and (
+                    description.startswith(remainder)
+                    or remainder.startswith(description)
+                )
+            )
         ):
-            return None
-    return parse_service_date(raw_value[: request_suffix.start()])
+            return parsed_prefix
+    request_suffix = _PRINTED_DATE_REQUEST_SUFFIX.search(raw_value)
+    if request_suffix is not None:
+        bleed = (request_suffix.group("bleed") or "").casefold()
+        if bleed:
+            first_word = next(iter(_normalized(canonical_description).split()), "")
+            if not (
+                first_word.startswith(bleed)
+                or first_word.endswith(bleed)
+            ):
+                return None
+        return parse_service_date(raw_value[: request_suffix.start()])
+    embedded = tuple(DATE_SPAN.finditer(raw_value))
+    if len(embedded) != 1:
+        return None
+    match = embedded[0]
+    prefix = raw_value[: match.start()].strip(" ()[]{}:;,-")
+    suffix = raw_value[match.end() :].strip(" ()[]{}:;,-")
+    if suffix or (not prefix and match.start() == 0):
+        return None
+    return parse_service_date(match.group(0))
 
 
 _SUMMARY_WORDS = {
@@ -1211,6 +1238,38 @@ def _validate_result(
     canonical_rows = {
         str(row["id"]): row for row in new_result.get("rows", [])
     }
+
+    def grounded_service_date_exists(
+        canonical: dict[str, Any],
+        token_ids: set[str],
+    ) -> bool:
+        if not token_ids or not canonical.get("service_date_iso"):
+            return False
+        for source_table in source_tables:
+            if (
+                source_table.page_number != canonical.get("page_number")
+                or source_table.table_id != canonical.get("table_id")
+            ):
+                continue
+            for source_row in source_table.rows:
+                for cell in source_row.cells:
+                    cell_token_ids = {
+                        token_id
+                        for item in cell.evidence
+                        for token_id in item.token_ids
+                    }
+                    if (
+                        token_ids.issubset(cell_token_ids)
+                        and cell.raw_value
+                        and _printed_service_date_iso(
+                            cell.raw_value,
+                            canonical.get("description"),
+                        )
+                        == canonical.get("service_date_iso")
+                    ):
+                        return True
+        return False
+
     linked_ids: set[str] = set()
     evidence_fields = {
         "description": "description",
@@ -1320,6 +1379,17 @@ def _validate_result(
                         f"for canonical row {source_row.canonical_row_id}"
                     )
                 if canonical_present and not printed_present:
+                    inherited_service_date_is_grounded = bool(
+                        field == "service_date_raw"
+                        and "service_date_inherited_from_group"
+                        in (canonical.get("validation_flags") or [])
+                        and grounded_service_date_exists(
+                            canonical,
+                            field_token_ids,
+                        )
+                    )
+                    if inherited_service_date_is_grounded:
+                        continue
                     derived_quantity_has_grounded_operands = bool(
                         derived_quantity_is_proven
                         and field_token_ids
@@ -1413,6 +1483,28 @@ def _validate_result(
                             f"for canonical row {source_row.canonical_row_id}"
                         )
     for row_id, row_payload in canonical_rows.items():
+        if (
+            row_payload.get("service_date_raw")
+            and {
+                "service_date_inherited_from_group",
+                "service_date_recovered_from_source_cell",
+            }.intersection(row_payload.get("validation_flags") or [])
+        ):
+            service_date_token_ids = {
+                str(token_id)
+                for item in (row_payload.get("field_evidence") or {}).get(
+                    "service_date", []
+                )
+                for token_id in item.get("token_ids") or []
+            }
+            if not grounded_service_date_exists(
+                row_payload,
+                service_date_token_ids,
+            ):
+                raise ValueError(
+                    "service_date_raw lacks matching grounded source evidence "
+                    f"for canonical row {row_id}"
+                )
         if (
             "ocr_spatial_graph" in (row_payload.get("source_routes") or [])
             and row_id not in linked_ids
