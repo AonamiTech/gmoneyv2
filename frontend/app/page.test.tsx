@@ -180,6 +180,14 @@ async function advance(milliseconds: number) {
   });
 }
 
+async function openBill() {
+  const filename = screen.getByText("bill.pdf");
+  const button = filename.closest("button");
+  if (!button) throw new Error("Recent bill did not render as an actionable item");
+  fireEvent.click(button);
+  await advance(250);
+}
+
 describe("evidence page navigation", () => {
   let activeRequests = 0;
   let activeJobOverride: Record<string, unknown> | null = null;
@@ -287,6 +295,7 @@ describe("evidence page navigation", () => {
 
     await advance(250);
     await advance(250);
+    await openBill();
     expect(screen.getByText("Source page 1 / 2")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Next page" }));
@@ -303,6 +312,7 @@ describe("evidence page navigation", () => {
 
     await advance(250);
     await advance(250);
+    await openBill();
 
     expect(screen.getByRole("button", { name: "Printed columns" })).toHaveClass("active");
     expect(screen.getByRole("columnheader", { name: "Co-pay %" })).toBeInTheDocument();
@@ -342,6 +352,7 @@ describe("evidence page navigation", () => {
     render(<Home />);
     await advance(250);
     await advance(250);
+    await openBill();
 
     expect(screen.getByRole("cell", { name: "150" })).toBeInTheDocument();
     expect(screen.getByRole("cell", { name: "151" })).toBeInTheDocument();
@@ -359,6 +370,7 @@ describe("evidence page navigation", () => {
     render(<Home />);
     await advance(250);
     await advance(250);
+    await openBill();
 
     expect(
       screen.getByText(
@@ -381,6 +393,7 @@ describe("evidence page navigation", () => {
     render(<Home />);
     await advance(250);
     await advance(250);
+    await openBill();
 
     expect(
       screen.getByText(
@@ -398,6 +411,37 @@ describe("evidence page navigation", () => {
 
     expect(screen.getAllByText("Hospital not identified").length).toBeGreaterThan(0);
     expect(screen.getAllByText("bill.pdf").length).toBeGreaterThan(0);
+  });
+
+  test("opens on the dashboard even when completed history exists", async () => {
+    render(<Home />);
+    await advance(250);
+
+    expect(screen.getByText("Evidence dashboard")).toBeInTheDocument();
+    expect(screen.getByText("Drop hospital bills here")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Dashboard" })).toHaveAttribute("aria-current", "page");
+  });
+
+  test("returns to the dashboard from an evidence review", async () => {
+    render(<Home />);
+    await advance(250);
+    await openBill();
+    expect(screen.getByText("Source page 1 / 2")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Dashboard" }));
+
+    expect(screen.getByText("Drop hospital bills here")).toBeInTheDocument();
+  });
+
+  test("opens and dismisses the mobile navigation drawer", async () => {
+    render(<Home />);
+    await advance(250);
+
+    fireEvent.click(screen.getByRole("button", { name: "Open navigation" }));
+    expect(screen.getByLabelText("Primary navigation")).toHaveClass("open");
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.getByLabelText("Primary navigation")).not.toHaveClass("open");
   });
 
   test("shows active profile hospitals in the training directory", async () => {

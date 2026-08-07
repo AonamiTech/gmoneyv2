@@ -200,6 +200,58 @@ type EditValues = {
   role: string;
   review_disposition: string;
 };
+type AppView = "dashboard" | "active" | "history" | "hospitals" | "review";
+type IconName =
+  | "activity"
+  | "archive"
+  | "building"
+  | "chevron-left"
+  | "chevron-right"
+  | "close"
+  | "dashboard"
+  | "file"
+  | "menu"
+  | "plus"
+  | "search"
+  | "upload";
+
+const iconPaths: Record<IconName, React.ReactNode> = {
+  activity: <><path d="M3 12h4l2.4-6 4.2 12 2.4-6h5" /></>,
+  archive: <><rect x="3" y="5" width="18" height="15" rx="2" /><path d="M3 9h18M9 13h6" /></>,
+  building: <><path d="M4 21V5l8-3 8 3v16M9 21v-4h6v4M8 7h.01M12 7h.01M16 7h.01M8 11h.01M12 11h.01M16 11h.01" /></>,
+  "chevron-left": <path d="m15 18-6-6 6-6" />,
+  "chevron-right": <path d="m9 18 6-6-6-6" />,
+  close: <path d="M6 6l12 12M18 6 6 18" />,
+  dashboard: <><rect x="3" y="3" width="7" height="7" rx="1" /><rect x="14" y="3" width="7" height="7" rx="1" /><rect x="3" y="14" width="7" height="7" rx="1" /><rect x="14" y="14" width="7" height="7" rx="1" /></>,
+  file: <><path d="M6 2h8l4 4v16H6z" /><path d="M14 2v5h5M9 12h6M9 16h6" /></>,
+  menu: <path d="M4 7h16M4 12h16M4 17h16" />,
+  plus: <path d="M12 5v14M5 12h14" />,
+  search: <><circle cx="11" cy="11" r="7" /><path d="m20 20-4-4" /></>,
+  upload: <><path d="M12 16V4m0 0L7 9m5-5 5 5" /><path d="M5 14v6h14v-6" /></>,
+};
+
+function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
+  return (
+    <svg
+      className="icon"
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.7"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      {iconPaths[name]}
+    </svg>
+  );
+}
+
+function AonamiMark() {
+  return <span className="aonami-mark" role="img" aria-label="Aonami" />;
+}
 
 const PAGE_SIZE = 150;
 const emptyEdit: EditValues = {
@@ -296,6 +348,8 @@ const points = (evidence: Evidence | undefined) =>
   evidence?.polygon.points.map((point) => `${point.x},${point.y}`).join(" ") ?? "";
 
 export default function Home() {
+  const [appView, setAppView] = useState<AppView>("dashboard");
+  const [drawerOpen, setDrawerOpen] = useState(false);
   const [activeJobs, setActiveJobs] = useState<Job[]>([]);
   const [historyJobs, setHistoryJobs] = useState<Job[]>([]);
   const [historyTotal, setHistoryTotal] = useState(0);
@@ -344,6 +398,10 @@ export default function Home() {
   const splitView = useRef<HTMLDivElement | null>(null);
   const evidencePane = useRef<HTMLElement | null>(null);
   const previousActiveIds = useRef<Set<string>>(new Set());
+  const selectedJobCache = useRef<Job | null>(null);
+  const drawerPanel = useRef<HTMLElement | null>(null);
+  const menuTrigger = useRef<HTMLButtonElement | null>(null);
+  const drawerWasOpen = useRef(false);
 
   const jobs = useMemo(
     () => [
@@ -358,7 +416,10 @@ export default function Home() {
     () => (railView === "active" ? activeJobs : railView === "history" ? historyJobs : []),
     [activeJobs, historyJobs, railView],
   );
-  const selectedJob = jobs.find((job) => job.id === selectedJobId) ?? null;
+  const currentSelectedJob = jobs.find((job) => job.id === selectedJobId) ?? null;
+  const selectedJob =
+    currentSelectedJob
+    ?? (selectedJobCache.current?.id === selectedJobId ? selectedJobCache.current : null);
   const selectedRow = rowsResult?.rows.find((row) => row.id === selectedRowId) ?? null;
   const selectedRowPage = selectedRow?.page_number ?? null;
   const selectedSource = useMemo(() => {
@@ -385,6 +446,11 @@ export default function Home() {
   const refreshHealth = useCallback(() => {
     request<Health>("/api/v2/health/ready").then(setHealth).catch(() => setHealth(null));
   }, []);
+
+  useEffect(() => {
+    if (currentSelectedJob) selectedJobCache.current = currentSelectedJob;
+    if (!selectedJobId) selectedJobCache.current = null;
+  }, [currentSelectedJob, selectedJobId]);
 
   const refreshActiveJobs = useCallback(async () => {
     const result = await request<JobsResult>("/api/v2/documents?scope=active&limit=200");
@@ -425,8 +491,9 @@ export default function Home() {
 
   useEffect(() => {
     void refreshActiveJobs().catch(() => setError("The active bill queue could not be loaded."));
+    void refreshTrainedHospitals();
     refreshHealth();
-  }, [refreshActiveJobs, refreshHealth]);
+  }, [refreshActiveJobs, refreshHealth, refreshTrainedHospitals]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -436,8 +503,8 @@ export default function Home() {
   }, [refreshHistoryJobs]);
 
   useEffect(() => {
-    if (railView === "hospitals") void refreshTrainedHospitals();
-  }, [railView, refreshTrainedHospitals]);
+    if (appView === "hospitals") void refreshTrainedHospitals();
+  }, [appView, refreshTrainedHospitals]);
 
   useEffect(() => {
     const poll = window.setInterval(() => {
@@ -455,6 +522,33 @@ export default function Home() {
   }, [refreshHistoryJobs]);
 
   useEffect(() => {
+    if (!drawerOpen) {
+      if (drawerWasOpen.current) menuTrigger.current?.focus();
+      drawerWasOpen.current = false;
+      return;
+    }
+    drawerWasOpen.current = true;
+    drawerPanel.current?.querySelector<HTMLButtonElement>("nav button")?.focus();
+    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") setDrawerOpen(false);
+      if (event.key !== "Tab" || !drawerPanel.current) return;
+      const controls = [...drawerPanel.current.querySelectorAll<HTMLElement>("button, [href], input, select, [tabindex]:not([tabindex='-1'])")];
+      if (!controls.length) return;
+      const first = controls[0];
+      const last = controls.at(-1);
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last?.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [drawerOpen]);
+
+  useEffect(() => {
     const currentIds = new Set(activeJobs.map((job) => job.id));
     const jobLeftActiveQueue = [...previousActiveIds.current].some(
       (jobId) => !currentIds.has(jobId),
@@ -464,19 +558,6 @@ export default function Home() {
       void refreshHistoryJobs().catch(() => undefined);
     }
   }, [activeJobs, refreshHistoryJobs]);
-
-  useEffect(() => {
-    if (railView === "hospitals") return;
-    if (railView === "active" && !activeJobs.length && historyJobs.length) {
-      setRailView("history");
-      return;
-    }
-    setSelectedJobId((current) =>
-      current && visibleJobs.some((job) => job.id === current)
-        ? current
-        : (visibleJobs[0]?.id ?? null),
-    );
-  }, [activeJobs.length, historyJobs.length, railView, visibleJobs]);
 
   const loadWorkspace = useCallback(async () => {
     if (!selectedJob || selectedJob.status !== "complete") return;
@@ -573,6 +654,7 @@ export default function Home() {
         ]);
         setRailView("active");
         setSelectedJobId(uploaded[0].id);
+        setAppView("review");
         void refreshActiveJobs();
         refreshHealth();
       } catch (cause) {
@@ -756,7 +838,11 @@ export default function Home() {
       setActiveJobs((current) => current.filter((item) => item.id !== job.id));
       setHistoryJobs((current) => current.filter((item) => item.id !== job.id));
       setHistoryTotal((current) => Math.max(0, current - 1));
-      if (selectedJobId === job.id) setSelectedJobId(null);
+      if (selectedJobId === job.id) {
+        setSelectedJobId(null);
+        setRailView("history");
+        setAppView("history");
+      }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Document could not be deleted");
     }
@@ -773,7 +859,11 @@ export default function Home() {
         { method: "POST" },
       );
       setActiveJobs((current) => current.filter((item) => item.id !== job.id));
-      if (selectedJobId === job.id) setSelectedJobId(null);
+      if (selectedJobId === job.id) {
+        setSelectedJobId(null);
+        setRailView("active");
+        setAppView("active");
+      }
       refreshHealth();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "The bill could not be aborted.");
@@ -893,6 +983,20 @@ export default function Home() {
     return Math.max(14, Math.round((job.page / job.pages) * 94));
   };
 
+  const openSection = (view: Exclude<AppView, "review">) => {
+    setAppView(view);
+    setDrawerOpen(false);
+    if (view === "active" || view === "history" || view === "hospitals") {
+      setRailView(view);
+    }
+  };
+
+  const openJob = (job: Job) => {
+    setSelectedJobId(job.id);
+    setAppView("review");
+    setDrawerOpen(false);
+  };
+
   const evidence = useMemo(() => {
     const total = focusedPrintedTotal;
     if (totalEvidenceActive) {
@@ -944,87 +1048,126 @@ export default function Home() {
     ledgerMode === "printed"
       ? (sourceTablesResult?.total ?? 0)
       : (rowsResult?.total ?? 0);
-  const arrival = !jobs.length && railView !== "hospitals";
   const workerCapacity = health?.worker_capacity ?? 1;
+  const activeProcessing = activeJobs.filter((job) => job.status === "processing").length;
+  const pageTitle =
+    appView === "dashboard"
+      ? "Evidence dashboard"
+      : appView === "active"
+        ? "Active bills"
+        : appView === "history"
+          ? "Bill history"
+          : appView === "hospitals"
+            ? "Trained hospitals"
+            : (selectedJob?.hospital_name ?? "Bill review");
 
   return (
-    <main>
-      <div className="risk-ribbon">
-        Public HTTP demo · no login · shared 30-day bill history · uploads are unencrypted
-      </div>
-      <header className="masthead">
-        <div className="brand-mark">G</div>
-        <div>
-          <p className="eyebrow">Evidence studio · review edition</p>
-          <h1>Read every charge.<br />Resolve every doubt.</h1>
+    <div className="app-shell">
+      <button
+        className={`drawer-backdrop ${drawerOpen ? "open" : ""}`}
+        aria-label="Close navigation"
+        tabIndex={drawerOpen ? 0 : -1}
+        onClick={() => setDrawerOpen(false)}
+      />
+      <aside id="primary-navigation" ref={drawerPanel} className={`shell-sidebar ${drawerOpen ? "open" : ""}`} aria-label="Primary navigation">
+        <div className="brand-lockup">
+          <AonamiMark />
+          <div><strong>GMONEY</strong><span>BY AONAMI</span></div>
         </div>
-        <div className={`mast-status ${health ? "online" : "offline"}`}>
-          <span /> {health ? `${health.worker_capacity} lanes · ${health.active_jobs} active · ${storageSize(health.storage_free_bytes)} free` : "Inference unavailable"}
+        <nav className="primary-nav">
+          <button aria-current={appView === "dashboard" ? "page" : undefined} onClick={() => openSection("dashboard")}><Icon name="dashboard" />Dashboard</button>
+          <button aria-current={appView === "active" ? "page" : undefined} onClick={() => openSection("active")}><Icon name="activity" />Active bills <span>{activeJobs.length}</span></button>
+          <button aria-current={appView === "history" ? "page" : undefined} onClick={() => openSection("history")}><Icon name="archive" />History <span>{historyTotal}</span></button>
+          <button aria-current={appView === "hospitals" ? "page" : undefined} onClick={() => openSection("hospitals")}><Icon name="building" />Hospitals <span>{trainedHospitals.length}</span></button>
+        </nav>
+        <div className="sidebar-foot">
+          <div className={`service-light ${health ? "online" : ""}`}><i />{health ? "GPU service online" : "Inference unavailable"}</div>
+          <span>{health ? `${storageSize(health.storage_free_bytes)} storage free` : "Waiting for health check"}</span>
+          <small>Evidence-grounded review</small>
         </div>
-      </header>
+      </aside>
 
-      {arrival ? (
-        <section className="arrival">
-          <div className="arrival-copy">
-            <p className="folio">01 / Intake</p>
-            <h2>A bill enters.<br /><em>An auditable ledger emerges.</em></h2>
-            <p className="lede">
-              Upload one or more hospital bill PDFs. Up to {workerCapacity} {workerCapacity === 1 ? "document runs" : "documents run"} at once; every accepted value remains linked to the exact source page.
-            </p>
-            <div className="proof-strip">
-              <div><b>300</b><span>DPI evidence</span></div>
-              <div><b>{workerCapacity}×</b><span>inference {workerCapacity === 1 ? "lane" : "lanes"}</span></div>
-              <div><b>30d</b><span>searchable history</span></div>
-            </div>
-            <button className="hospital-directory-link" onClick={() => setRailView("hospitals")}>View trained hospitals →</button>
+      <div className="shell-frame">
+        <header className="shell-topbar">
+          <button ref={menuTrigger} className="menu-button" aria-label="Open navigation" aria-controls="primary-navigation" aria-expanded={drawerOpen} onClick={() => setDrawerOpen(true)}><Icon name="menu" /></button>
+          <div className="topbar-title"><span>GMoney workspace</span><strong>{pageTitle}</strong></div>
+          <div className="topbar-actions">
+            <div className={`health-chip ${health ? "online" : "offline"}`}><i />{health ? `${health.worker_capacity} lanes · ${health.active_jobs} active` : "Offline"}</div>
+            <label className="topbar-upload">
+              <input type="file" multiple accept="application/pdf,.pdf" onChange={acceptFiles} disabled={uploading} />
+              <Icon name="upload" size={16} />{uploading ? "Uploading…" : "Upload bills"}
+            </label>
           </div>
-          <label
-            className={`drop-zone ${dragging ? "is-dragging" : ""}`}
-            onDragOver={(event) => { event.preventDefault(); setDragging(true); }}
-            onDragLeave={() => setDragging(false)}
-            onDrop={drop}
-          >
-            <input type="file" multiple accept="application/pdf,.pdf" onChange={acceptFiles} disabled={uploading} />
-            <span className="drop-index">PDF × MULTI</span>
-            <span className="drop-cross">+</span>
-            <strong>{uploading ? "Transferring…" : "Place bills here"}</strong>
-            <small>or click to choose</small>
-          </label>
-        </section>
-      ) : (
-        <section className="review-desk">
-          <aside className="queue-rail">
+        </header>
+        <div className="public-notice"><span>Public demo</span> No login · shared 30-day history · do not upload protected health information</div>
+
+        <main className="app-main">
+          {appView === "dashboard" ? (
+            <section className="dashboard-view">
+              <div className="dashboard-hero">
+                <div>
+                  <p className="eyebrow">Hospital bill intelligence</p>
+                  <h1>Read every charge.<br />Resolve every doubt.</h1>
+                  <p className="lede">Turn hospital bill PDFs into a grounded ledger where every accepted value remains linked to its exact source page.</p>
+                </div>
+                <div className="dashboard-trust"><i /><span>GPU extraction is {health ? "live" : "being checked"}</span><small>300 DPI evidence · revisioned review</small></div>
+              </div>
+
+              <div className="kpi-grid" aria-label="Workspace status">
+                <article><span>Active lanes</span><strong>{activeProcessing}<small>/{workerCapacity}</small></strong><p>{activeJobs.length} bills in the active queue</p></article>
+                <article><span>Retained bills</span><strong>{historyTotal}</strong><p>Searchable with source evidence</p></article>
+                <article><span>Trained hospitals</span><strong>{trainedHospitals.length}</strong><p>Active hospital-specific profiles</p></article>
+                <article><span>Storage free</span><strong>{storageSize(health?.storage_free_bytes)}</strong><p>Runtime capacity available</p></article>
+              </div>
+
+              <div className="dashboard-grid">
+                <label
+                  className={`drop-zone ${dragging ? "is-dragging" : ""}`}
+                  onDragOver={(event) => { event.preventDefault(); setDragging(true); }}
+                  onDragLeave={() => setDragging(false)}
+                  onDrop={drop}
+                >
+                  <input type="file" multiple accept="application/pdf,.pdf" onChange={acceptFiles} disabled={uploading} />
+                  <span className="upload-icon"><Icon name="upload" size={24} /></span>
+                  <span className="eyebrow">PDF intake · multiple files</span>
+                  <strong>{uploading ? "Transferring bills…" : "Drop hospital bills here"}</strong>
+                  <small>or click to choose PDFs</small>
+                  <em>Each bill is processed independently and retained for 30 days.</em>
+                </label>
+                <section className="recent-panel">
+                  <div className="panel-heading"><div><p className="eyebrow">Latest evidence</p><h2>Recent bills</h2></div><button onClick={() => openSection("history")}>View all <Icon name="chevron-right" size={15} /></button></div>
+                  <div className="recent-list">
+                    {jobs.slice(0, 5).map((job) => (
+                      <button key={job.id} onClick={() => openJob(job)}>
+                        <span className={`job-state ${job.status}`} />
+                        <span><b>{job.hospital_name ?? (job.status === "complete" ? "Hospital not identified" : "Identifying hospital…")}</b><small>{job.original_name}</small></span>
+                        <span className="recent-meta">{job.status === "processing" ? `${progress(job)}%` : job.row_count !== null ? `${job.row_count} rows` : job.status}<Icon name="chevron-right" size={15} /></span>
+                      </button>
+                    ))}
+                    {!jobs.length && <div className="dashboard-empty"><Icon name="file" size={28} /><span>No bills yet</span><small>Your first grounded ledger will appear here.</small></div>}
+                  </div>
+                </section>
+              </div>
+            </section>
+          ) : (
+        <section className={`review-desk ${appView === "review" ? "review-only" : appView === "hospitals" ? "hospital-view" : "index-view"}`}>
+          {appView !== "hospitals" && appView !== "review" && <aside className="queue-rail">
             <div className="rail-head">
               <div>
-                <p className="folio">01 / {railView === "hospitals" ? "Training index" : "Document index"}</p>
+                <p className="eyebrow">{railView === "active" ? "Live processing" : "Evidence archive"}</p>
                 <h2>
-                  {railView === "active" ? activeJobs.length : railView === "history" ? historyTotal : trainedHospitals.length}
-                  {railView === "hospitals" ? " hospitals" : " documents"}
+                  {railView === "active" ? activeJobs.length : historyTotal} bills
                 </h2>
+                <p>{railView === "active" ? "Monitor processing and stop a bill safely." : "Search every retained bill by hospital or filename."}</p>
               </div>
               <label className="compact-upload">
                 <input type="file" multiple accept="application/pdf,.pdf" onChange={acceptFiles} disabled={uploading} />
-                {uploading ? "…" : "+"}
+                <Icon name={uploading ? "activity" : "plus"} /> <span>{uploading ? "Uploading" : "Add bills"}</span>
               </label>
             </div>
-            {railView === "hospitals" ? (
-              <div className="profile-meter">Active, hospital-specific layout profiles</div>
-            ) : (
-              <div className="lane-meter">
-                <span>{activeJobs.filter((job) => job.status === "processing").length} / {health?.worker_capacity ?? 2} lanes occupied</span>
-                <i style={{ width: `${Math.min(100, (activeJobs.filter((job) => job.status === "processing").length / (health?.worker_capacity ?? 2)) * 100)}%` }} />
-              </div>
-            )}
-            <div className="rail-tabs" role="tablist" aria-label="Document index">
-              <button className={railView === "active" ? "active" : ""} onClick={() => setRailView("active")}>
-                Active <span>{activeJobs.length}</span>
-              </button>
-              <button className={railView === "history" ? "active" : ""} onClick={() => setRailView("history")}>
-                History <span>{historyTotal}</span>
-              </button>
-              <button className={railView === "hospitals" ? "active" : ""} onClick={() => setRailView("hospitals")}>
-                Hospitals <span>{trainedHospitals.length}</span>
-              </button>
+            <div className="lane-meter">
+              <span>{activeProcessing} / {health?.worker_capacity ?? 2} lanes occupied</span>
+              <i style={{ width: `${Math.min(100, (activeProcessing / (health?.worker_capacity ?? 2)) * 100)}%` }} />
             </div>
             {railView === "history" && (
               <input
@@ -1038,7 +1181,7 @@ export default function Home() {
             <div className="job-list">
               {visibleJobs.map((job, index) => (
                 <div className="job-card-frame" key={job.id}>
-                  <button className={`job-card ${selectedJobId === job.id ? "selected" : ""}`} onClick={() => setSelectedJobId(job.id)}>
+                  <button className={`job-card ${selectedJobId === job.id ? "selected" : ""}`} onClick={() => openJob(job)}>
                     <span className={`job-state ${job.status}`} />
                     <span className="job-index">{String(index + 1).padStart(2, "0")}</span>
                     <span className="job-copy">
@@ -1063,19 +1206,10 @@ export default function Home() {
                   )}
                 </div>
               ))}
-              {railView === "hospitals" && trainedHospitals.map((item, index) => (
-                <article className="hospital-rail-card" key={item.hospital_id}>
-                  <span>{String(index + 1).padStart(2, "0")}</span>
-                  <div><b>{item.hospital_name}</b><small>{item.active_profile_count} active {item.active_profile_count === 1 ? "profile" : "profiles"}</small></div>
-                </article>
-              ))}
-              {railView !== "hospitals" && !visibleJobs.length && (
+              {!visibleJobs.length && (
                 <div className="rail-empty">
                   {railView === "active" ? "No bills are running." : "No historical bills match."}
                 </div>
-              )}
-              {railView === "hospitals" && !trainedHospitals.length && (
-                <div className="rail-empty">{trainedHospitalsError ?? "No active hospital profiles."}</div>
               )}
               {railView === "history" && historyJobs.length < historyTotal && (
                 <button className="load-history" onClick={() => void refreshHistoryJobs(historyJobs.length, true)}>
@@ -1083,11 +1217,11 @@ export default function Home() {
                 </button>
               )}
             </div>
-            <div className="rail-note">{railView === "hospitals" ? "Shared active-profile registry" : "Public shared index · full evidence retained for 30 days"}</div>
-          </aside>
+            <div className="rail-note">Public shared index · full evidence retained for 30 days</div>
+          </aside>}
 
           <div className="desk-main">
-            {railView === "hospitals" && (
+            {appView === "hospitals" && (
               <section className="hospital-directory">
                 <div className="directory-heading">
                   <div><p className="folio">02 / Training registry</p><h2>Hospitals the system has profiles for.</h2></div>
@@ -1113,7 +1247,7 @@ export default function Home() {
               </section>
             )}
 
-            {railView !== "hospitals" && selectedJob && selectedJob.status !== "complete" && (
+            {appView === "review" && selectedJob && selectedJob.status !== "complete" && (
               <section className="processing-card compact-processing">
                 <div className="processing-meta"><p className="folio">02 / Reconstruction</p><span>{selectedJob.original_name}</span></div>
                 <div className="processing-number">{String(progress(selectedJob)).padStart(2, "0")}<sup>%</sup></div>
@@ -1132,7 +1266,7 @@ export default function Home() {
               </section>
             )}
 
-            {railView !== "hospitals" && selectedJob?.status === "complete" && rowsResult && review && (
+            {appView === "review" && selectedJob?.status === "complete" && rowsResult && review && (
               <section className="workspace">
                 <div className="workspace-head">
                   <div className="hospital-heading">
@@ -1514,9 +1648,10 @@ export default function Home() {
           </div>
         </section>
       )}
-
-      {error && <div className="toast" role="alert">{error}<button onClick={() => setError(null)}>×</button></div>}
-      <footer><span>GMoney / evidence-grounded extraction</span><span>Machine output remains immutable · reviewer changes are revisioned</span></footer>
-    </main>
+        </main>
+        <footer><span>GMoney · BY AONAMI</span><span>Machine output remains immutable · reviewer changes are revisioned</span></footer>
+      </div>
+      {error && <div className="toast" role="alert"><span>{error}</span><button aria-label="Dismiss notification" onClick={() => setError(null)}><Icon name="close" size={16} /></button></div>}
+    </div>
   );
 }
