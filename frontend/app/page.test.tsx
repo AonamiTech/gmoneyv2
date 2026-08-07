@@ -182,6 +182,9 @@ async function advance(milliseconds: number) {
 
 describe("evidence page navigation", () => {
   let activeRequests = 0;
+  let activeJobOverride: Record<string, unknown> | null = null;
+  let historyHospitalName: string | null = "Test Hospital";
+  let abortRequests = 0;
   let sourcePayload: Omit<typeof sourceTables, "unavailable_reason"> & {
     unavailable_reason: "legacy_result" | "no_source_tables" | null;
   } = sourceTables;
@@ -189,10 +192,13 @@ describe("evidence page navigation", () => {
   beforeEach(() => {
     vi.useFakeTimers();
     activeRequests = 0;
+    activeJobOverride = null;
+    historyHospitalName = "Test Hospital";
+    abortRequests = 0;
     sourcePayload = structuredClone(sourceTables);
     vi.stubGlobal(
       "fetch",
-      vi.fn((input: RequestInfo | URL) => {
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
         const url = String(input);
         if (url.includes("/health/ready")) {
           return json({
@@ -207,12 +213,17 @@ describe("evidence page navigation", () => {
         }
         if (url.includes("scope=active")) {
           activeRequests += 1;
+          const documents = activeJobOverride
+            ? [activeJobOverride]
+            : activeRequests === 1
+              ? []
+              : [{ ...job }];
           return json({
-            total: activeRequests === 1 ? 0 : 1,
+            total: documents.length,
             offset: 0,
             limit: 200,
             has_more: false,
-            documents: activeRequests === 1 ? [] : [{ ...job }],
+            documents,
           });
         }
         if (url.includes("scope=history")) {
@@ -221,7 +232,21 @@ describe("evidence page navigation", () => {
             offset: 0,
             limit: 50,
             has_more: false,
-            documents: [{ ...job }],
+            documents: [{ ...job, hospital_name: historyHospitalName }],
+          });
+        }
+        if (url.endsWith("/abort")) {
+          abortRequests += 1;
+          expect(init?.method).toBe("POST");
+          return json({ id: job.id, status: "cancelling" });
+        }
+        if (url.endsWith("/api/v2/hospitals/trained")) {
+          return json({
+            total: 2,
+            hospitals: [
+              { hospital_id: "kamakshi", hospital_name: "Dr. Kamakshi Memorial Hospital", active_profile_count: 2 },
+              { hospital_id: "vijaya", hospital_name: "Vijaya Group of Hospitals", active_profile_count: 1 },
+            ],
           });
         }
         if (url.includes("/source-tables?")) {
@@ -362,5 +387,49 @@ describe("evidence page navigation", () => {
         "No printed table structure was detected; normalized rows are shown.",
       ),
     ).toBeInTheDocument();
+  });
+
+  test("completed bills never use the PDF filename as a hospital-name fallback", async () => {
+    historyHospitalName = null;
+    render(<Home />);
+
+    await advance(250);
+    await advance(250);
+
+    expect(screen.getAllByText("Hospital not identified").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("bill.pdf").length).toBeGreaterThan(0);
+  });
+
+  test("shows active profile hospitals in the training directory", async () => {
+    render(<Home />);
+    await advance(250);
+
+    fireEvent.click(screen.getByRole("button", { name: /Hospitals/ }));
+    await advance(0);
+
+    expect(screen.getAllByText("Dr. Kamakshi Memorial Hospital").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Vijaya Group of Hospitals").length).toBeGreaterThan(0);
+    expect(screen.getByText("2 active layout profiles")).toBeInTheDocument();
+  });
+
+  test("aborts an active bill and removes it from the queue", async () => {
+    activeJobOverride = {
+      ...job,
+      status: "queued",
+      hospital_name: null,
+      hospital_confidence: null,
+      hospital_name_source: null,
+    };
+    vi.stubGlobal("confirm", vi.fn(() => true));
+    render(<Home />);
+    await advance(250);
+
+    fireEvent.click(screen.getByRole("button", { name: /Active/ }));
+    await advance(0);
+    fireEvent.click(screen.getByRole("button", { name: "Abort" }));
+    await advance(0);
+
+    expect(abortRequests).toBe(1);
+    expect(screen.queryByRole("button", { name: "Abort" })).not.toBeInTheDocument();
   });
 });

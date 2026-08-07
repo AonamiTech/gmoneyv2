@@ -95,6 +95,7 @@ def construct(
     profile_key: str,
     profile_version: int,
     hospital_id: str | None = None,
+    hospital_name: str | None = None,
     global_family: str | None = None,
 ) -> None:
     payload = json.loads(observations.read_text())
@@ -104,6 +105,7 @@ def construct(
         profile_key=profile_key,
         profile_version=profile_version,
         hospital_id=hospital_id,
+        hospital_name=hospital_name,
         global_family=global_family,
         construction_dataset_ids=tuple(payload["construction_dataset_ids"]),
     )

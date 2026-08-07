@@ -37,6 +37,8 @@ main::after { content: ""; position: fixed; width: 560px; height: 560px; right: 
 .proof-strip div { flex: 1; padding: 17px 16px 0 0; }
 .proof-strip b { display: block; font: 32px var(--serif); }
 .proof-strip span { font-size: 10px; text-transform: uppercase; letter-spacing: .12em; color: var(--muted); }
+.hospital-directory-link { margin-top: 30px; padding: 8px 0; border: 0; border-bottom: 1px solid var(--ink); color: var(--ink); background: transparent; font-size: 10px; font-weight: 700; letter-spacing: .11em; text-transform: uppercase; cursor: pointer; }
+.hospital-directory-link:hover { color: var(--signal); border-color: var(--signal); }
 .drop-zone { position: relative; min-height: 430px; border: 1px solid var(--ink); background: rgba(255,255,255,.2); display: flex; flex-direction: column; align-items: center; justify-content: center; cursor: pointer; transition: .3s ease; animation: rise .8s .22s both; box-shadow: 18px 18px 0 var(--paper-deep); }
 .drop-zone::before, .drop-zone::after { content: ""; position: absolute; background: var(--ink); }
 .drop-zone::before { width: 48px; height: 1px; left: -24px; top: 50%; }
@@ -68,7 +70,8 @@ main::after { content: ""; position: fixed; width: 560px; height: 560px; right: 
 .compact-upload input { display: none; }
 .lane-meter { position: relative; margin: 23px 0 16px; padding-bottom: 10px; color: var(--muted); font-size: 8px; letter-spacing: .12em; text-transform: uppercase; border-bottom: 2px solid var(--paper-deep); }
 .lane-meter i { position: absolute; height: 2px; left: 0; bottom: -2px; background: var(--signal); transition: width .35s; }
-.rail-tabs { display: grid; grid-template-columns: 1fr 1fr; margin-bottom: 10px; border: 1px solid var(--ink); }
+.profile-meter { margin: 23px 0 16px; padding-bottom: 10px; color: var(--muted); font-size: 8px; letter-spacing: .12em; text-transform: uppercase; border-bottom: 2px solid var(--signal); }
+.rail-tabs { display: grid; grid-template-columns: repeat(3, 1fr); margin-bottom: 10px; border: 1px solid var(--ink); }
 .rail-tabs button { display: flex; align-items: center; justify-content: space-between; padding: 9px 10px; border: 0; color: var(--muted); background: transparent; font-size: 8px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; cursor: pointer; }
 .rail-tabs button + button { border-left: 1px solid var(--line); }
 .rail-tabs button.active { color: var(--paper); background: var(--ink); }
@@ -76,6 +79,7 @@ main::after { content: ""; position: fixed; width: 560px; height: 560px; right: 
 .history-search { width: 100%; margin-bottom: 10px; padding: 10px 11px; border: 1px solid var(--line); border-radius: 0; color: inherit; background: rgba(255,255,255,.24); font-size: 9px; outline: none; }
 .history-search:focus { border-color: var(--ink); box-shadow: inset 3px 0 var(--signal); }
 .job-list { display: flex; flex-direction: column; gap: 7px; overflow: auto; padding-right: 8px; }
+.job-card-frame { position: relative; flex: 0 0 auto; }
 .job-card { position: relative; min-height: 108px; width: 100%; padding: 15px 12px 18px 38px; display: grid; grid-template-columns: 25px 1fr; gap: 8px; text-align: left; color: inherit; background: rgba(255,255,255,.13); border: 1px solid var(--line); cursor: pointer; transition: .18s; overflow: hidden; }
 .job-card:hover { border-color: var(--ink); transform: translateX(3px); }
 .job-card.selected { color: var(--paper); background: var(--ink); border-color: var(--ink); }
@@ -92,12 +96,32 @@ main::after { content: ""; position: fixed; width: 560px; height: 560px; right: 
 .job-card.selected .job-copy small { color: #aeb9b3; }
 .job-progress { position: absolute; left: 0; right: 0; bottom: 0; height: 3px; background: rgba(128,128,128,.15); }
 .job-progress i { display: block; height: 100%; background: var(--signal); transition: width .6s; }
+.job-abort { position: absolute; z-index: 2; right: 9px; bottom: 8px; padding: 2px 0; border: 0; border-bottom: 1px solid currentColor; color: var(--signal); background: transparent; font-size: 7px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; cursor: pointer; }
+.job-abort:disabled, .abort-action:disabled { opacity: .55; cursor: wait; }
+.hospital-rail-card { min-height: 82px; padding: 14px 12px; display: grid; grid-template-columns: 28px 1fr; gap: 8px; border: 1px solid var(--line); background: rgba(255,255,255,.13); }
+.hospital-rail-card > span { color: var(--signal); font: 18px/1 var(--serif); }
+.hospital-rail-card b { display: block; font: 15px/1.15 var(--serif); }
+.hospital-rail-card small { display: block; margin-top: 9px; color: var(--muted); font-size: 7px; letter-spacing: .09em; text-transform: uppercase; }
 .rail-empty { min-height: 110px; display: grid; place-items: center; padding: 20px; color: var(--muted); border: 1px dashed var(--line); font: italic 15px/1.3 var(--serif); text-align: center; }
 .load-history { flex: 0 0 auto; padding: 11px; border: 1px solid var(--ink); color: var(--ink); background: transparent; font-size: 8px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; cursor: pointer; }
 .load-history:hover { color: var(--paper); background: var(--signal); border-color: var(--signal); }
 .rail-note { margin-top: auto; padding-top: 16px; color: var(--muted); font-size: 7px; letter-spacing: .12em; text-transform: uppercase; }
 .desk-main { min-width: 0; padding-left: 24px; }
 .compact-processing { min-height: calc(100vh - 200px); padding: 0 5vw; }
+.abort-action { color: #b63434; }
+
+.hospital-directory { min-height: calc(100vh - 175px); padding: 46px 4vw 50px; animation: reveal .6s both; }
+.directory-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 28px; padding-bottom: 22px; border-bottom: 3px solid var(--ink); }
+.directory-heading h2 { max-width: 760px; margin: 0; font: 400 clamp(42px, 6vw, 82px)/.88 var(--serif); letter-spacing: -.04em; }
+.directory-heading button { flex: 0 0 auto; padding: 8px 0; border: 0; border-bottom: 1px solid var(--signal); color: var(--signal); background: transparent; font-size: 8px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; cursor: pointer; }
+.directory-lede { max-width: 680px; margin: 22px 0 34px; color: var(--muted); font: 15px/1.5 var(--sans); }
+.hospital-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.hospital-grid article { min-height: 190px; padding: 18px; display: flex; flex-direction: column; border: 1px solid var(--ink); background: rgba(255,255,255,.17); box-shadow: 5px 5px 0 var(--paper-deep); }
+.hospital-grid article > span { color: var(--signal); font: 22px/1 var(--serif); }
+.hospital-grid h3 { margin: auto 0 12px; font: 25px/1 var(--serif); overflow-wrap: anywhere; }
+.hospital-grid p { margin: 0 0 9px; color: var(--muted); font-size: 8px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; }
+.hospital-grid small { color: #7c877f; font: 8px/1.3 var(--mono); overflow-wrap: anywhere; }
+.directory-empty { min-height: 220px; display: grid; place-items: center; padding: 30px; color: var(--muted); border: 1px dashed var(--line); font: italic 19px/1.4 var(--serif); text-align: center; }
 
 .workspace { padding-top: 26px; min-height: calc(100vh - 175px); animation: reveal .6s both; }
 .workspace-head { display: flex; justify-content: space-between; gap: 24px; align-items: flex-end; margin-bottom: 18px; }
@@ -292,8 +316,11 @@ footer { display: flex; justify-content: space-between; border-top: 1px solid va
   .review-desk { grid-template-columns: 1fr; }
   .queue-rail { padding-right: 0; border-right: 0; border-bottom: 1px solid var(--ink); }
   .job-list { flex-direction: row; }
-  .job-card { min-width: 245px; }
+  .job-card-frame, .job-card { min-width: 245px; }
   .desk-main { padding-left: 0; }
+  .hospital-directory { padding: 38px 0 50px; }
+  .directory-heading { align-items: flex-start; flex-direction: column; }
+  .hospital-grid { grid-template-columns: 1fr; }
   .workspace-head, .review-toolbar { align-items: stretch; flex-direction: column; }
   .workspace-head h2 { font-size: 39px; }
   .hospital-title-line { align-items: flex-start; flex-direction: column; }

@@ -36,6 +36,7 @@ From the release directory on the GPU host:
 export GMONEY_IMAGE_TAG=<release-id>
 export GMONEY_DATA_ROOT=/home/ubuntu/gmoneyv2-runtime
 export GMONEY_MODEL_ROOT=/home/ubuntu/gmoneyv2-runtime/model-cache
+export GMONEY_PROFILE_ROOT=/home/ubuntu/gmoneyv2-runtime/profiles
 export GMONEY_MIN_FREE_BYTES=10737418240
 export GMONEY_MAX_UPLOAD_BYTES=0
 export GMONEY_GPU_WORKER_CONCURRENCY=1
@@ -51,6 +52,8 @@ free-space floor remain the upload safeguards.
 The model directory must contain both checksum-verified PaddleOCR-VL 1.6 GGUF
 files before startup. The runtime `jobs` and model-cache directories must be
 writable by container UID/GID `10001:10001`.
+Create the profile directory before startup. Its optional `registry.json` is
+mounted read-only into the API and supplies the trained-hospital directory.
 
 ## Acceptance
 

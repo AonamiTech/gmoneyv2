@@ -2887,6 +2887,10 @@ def _heavy_disagrees(reconstruction, provider_candidates) -> bool:
     return bool(heavy and heavy != local)
 
 
+class ExtractionAborted(RuntimeError):
+    """Raised at a safe extraction checkpoint after a user abort request."""
+
+
 class OfflineExtractor:
     def __init__(
         self,
@@ -3558,8 +3562,16 @@ class OfflineExtractor:
         source: Path,
         artifact_root: Path,
         progress: Callable[[int, int], None] | None = None,
+        *,
+        should_abort: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
+        def abort_checkpoint() -> None:
+            if should_abort is not None and should_abort():
+                raise ExtractionAborted
+
+        abort_checkpoint()
         manifest = render_pdf(source, artifact_root / "pages", dpi=300)
+        abort_checkpoint()
         if progress:
             progress(0, len(manifest.pages))
         document_id = manifest.document_sha256
@@ -3578,6 +3590,7 @@ class OfflineExtractor:
         gemini_cost = Decimal("0")
         gemini_provider_disabled_reason: str | None = None
         for page_asset in manifest.pages:
+            abort_checkpoint()
             page_path = artifact_root / "pages" / page_asset.relative_path
             ocr_request = InferenceRequest(
                 request_id=str(uuid4()),
@@ -3590,6 +3603,7 @@ class OfflineExtractor:
                 ocr_request,
                 self.ocr,
             )
+            abort_checkpoint()
             tokens = paddle_ocr_tokens(
                 ocr_response.output,
                 page_asset.page_number,
@@ -3613,6 +3627,7 @@ class OfflineExtractor:
                 layout_request,
                 self.layout,
             )
+            abort_checkpoint()
             layout_boxes = _layout_boxes(layout_response.output)
             result = (ocr_response.output.get("pages") or [{}])[0].get("res") or {}
             proposals = propose_tables_from_ocr(
@@ -3670,6 +3685,7 @@ class OfflineExtractor:
                     }
                 )
             for work in table_work:
+                abort_checkpoint()
                 reconstruction = reconstruct_ocr_rows(
                     tokens,
                     page_number=work.page_number,
@@ -3849,6 +3865,7 @@ class OfflineExtractor:
                     ]
                     job_index = 0
                     while job_index < len(vl_jobs):
+                        abort_checkpoint()
                         asset, cache_name, tile_index = vl_jobs[job_index]
                         vl_request = InferenceRequest(
                             request_id=str(uuid4()),
@@ -3872,6 +3889,9 @@ class OfflineExtractor:
                                 vl_request,
                                 self.vl,
                             )
+                            abort_checkpoint()
+                        except ExtractionAborted:
+                            raise
                         except Exception as error:
                             vl_error = f"provider_error:{type(error).__name__}"
                             vl_retry_reason = vl_error
@@ -4242,9 +4262,11 @@ class OfflineExtractor:
                         **reconstruction.diagnostics,
                     }
                 )
+                abort_checkpoint()
             if progress:
                 progress(page_asset.page_number, len(manifest.pages))
 
+        abort_checkpoint()
         (
             selected_source_tables,
             selected_rows,
@@ -4260,6 +4282,7 @@ class OfflineExtractor:
         source_tables = _link_source_tables(selected_source_tables, rows)
         document_totals = select_document_totals(document_total_candidates)
         document_total: DocumentTotal | None = select_document_total(document_total_candidates)
+        abort_checkpoint()
         return {
             "output_version": "offline_accuracy_spine_v3",
             "document_total_version": DOCUMENT_TOTAL_VERSION,

@@ -193,6 +193,7 @@ class LayoutProfile(VersionedContract):
     profile_version: int = Field(ge=1)
     lifecycle: ProfileLifecycle = ProfileLifecycle.CANDIDATE
     hospital_id: str | None = None
+    hospital_name: str | None = Field(default=None, min_length=2, max_length=200)
     global_family: str | None = None
     page_type: PageType
     table_type: TableType
@@ -217,6 +218,8 @@ class LayoutProfile(VersionedContract):
     def validate_geometry(self) -> LayoutProfile:
         if not self.hospital_id and not self.global_family:
             raise ValueError("profile requires a hospital or global layout-family association")
+        if self.hospital_name and not self.hospital_id:
+            raise ValueError("profile hospital_name requires a hospital_id")
         left, top, right, bottom = self.table_box
         if not (0 <= left < right <= 1 and 0 <= top < bottom <= 1):
             raise ValueError("profile table_box must be normalized to [0, 1]")

@@ -10,8 +10,11 @@ from pathlib import Path
 import fitz
 from fastapi.testclient import TestClient
 
+from gmoney.contracts.extraction import PageType, TableType
+from gmoney.contracts.phase3 import LayoutProfile, ProfileLifecycle
 from gmoney.demo import api
 from gmoney.demo.store import JobStore
+from gmoney.profiles.repository import JsonProfileRepository
 
 
 def client_for(tmp_path: Path, monkeypatch) -> tuple[TestClient, JobStore]:
@@ -696,6 +699,94 @@ def test_active_job_cannot_be_deleted(tmp_path: Path, monkeypatch) -> None:
     assert client.delete(f"/api/v2/documents/{state['id']}").status_code == 409
     store.update(state["id"], status="failed")
     assert client.delete(f"/api/v2/documents/{state['id']}").status_code == 204
+
+
+def test_active_job_can_be_aborted_idempotently_and_removed(tmp_path: Path, monkeypatch) -> None:
+    client, store = client_for(tmp_path, monkeypatch)
+    state = store.create("bill.pdf")
+    store.update(state["id"], status="queued")
+
+    first = client.post(f"/api/v2/documents/{state['id']}/abort")
+    assert first.status_code == 202
+    assert first.json() == {"id": state["id"], "status": "cancelling"}
+    assert store.abort_requested(state["id"])
+    assert client.get("/api/v2/documents", params={"scope": "active"}).json()["total"] == 0
+
+    repeated = client.post(f"/api/v2/documents/{state['id']}/abort")
+    assert repeated.status_code == 202
+    assert store.finalize_abort(state["id"])
+    assert not store.job_dir(state["id"]).exists()
+
+
+def test_completed_job_cannot_be_aborted(tmp_path: Path, monkeypatch) -> None:
+    client, store = client_for(tmp_path, monkeypatch)
+    state = store.create("complete.pdf")
+    store.update(state["id"], status="complete")
+
+    response = client.post(f"/api/v2/documents/{state['id']}/abort")
+
+    assert response.status_code == 409
+    assert store.read(state["id"])["status"] == "complete"
+
+
+def test_trained_hospitals_lists_only_active_hospital_profiles(
+    tmp_path: Path, monkeypatch
+) -> None:
+    client, _ = client_for(tmp_path / "jobs", monkeypatch)
+    registry = tmp_path / "profiles" / "registry.json"
+    repo = JsonProfileRepository(registry)
+
+    def profile(
+        key: str,
+        hospital_id: str | None,
+        hospital_name: str | None,
+        lifecycle: ProfileLifecycle,
+        *,
+        global_family: str | None = None,
+    ) -> LayoutProfile:
+        return LayoutProfile(
+            contract_version="layout_profile_v1",
+            profile_key=key,
+            profile_version=1,
+            lifecycle=lifecycle,
+            hospital_id=hospital_id,
+            hospital_name=hospital_name,
+            global_family=global_family,
+            page_type=PageType.ITEMIZED_CHARGES,
+            table_type=TableType.ITEM_LEDGER,
+            page_aspect_ratio=0.7,
+            table_box=(0.05, 0.15, 0.95, 0.9),
+            supported_fields=("description", "amount"),
+            construction_dataset_ids=("training",),
+        )
+
+    repo.add_profile(
+        profile("vijaya-items", "vijaya", "Vijaya Group of Hospitals", ProfileLifecycle.ACTIVE)
+    )
+    repo.add_profile(
+        profile("vijaya-pharmacy", "vijaya", "Vijaya Group of Hospitals", ProfileLifecycle.ACTIVE)
+    )
+    repo.add_profile(
+        profile("candidate", "candidate-hospital", "Candidate Hospital", ProfileLifecycle.CANDIDATE)
+    )
+    repo.add_profile(
+        profile("global", None, None, ProfileLifecycle.ACTIVE, global_family="generic")
+    )
+    monkeypatch.setattr(api, "PROFILE_REGISTRY", registry)
+
+    response = client.get("/api/v2/hospitals/trained")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "total": 1,
+        "hospitals": [
+            {
+                "hospital_id": "vijaya",
+                "hospital_name": "Vijaya Group of Hospitals",
+                "active_profile_count": 2,
+            }
+        ],
+    }
 
 
 def test_documents_can_be_discovered_in_newest_first_shared_queue(

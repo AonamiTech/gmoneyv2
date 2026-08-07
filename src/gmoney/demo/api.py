@@ -14,6 +14,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, ValidationError
 
 from gmoney.contracts.extraction import SourceTable
+from gmoney.contracts.phase3 import ProfileLifecycle
 from gmoney.demo.review import (
     ReviewValidationError,
     approval_blockers,
@@ -39,6 +40,7 @@ from gmoney.demo.store import (
     utc_now,
     utc_text,
 )
+from gmoney.profiles.repository import JsonProfileRepository
 
 MAX_UPLOAD_BYTES = int(os.environ.get("GMONEY_MAX_UPLOAD_BYTES", "0"))
 MAX_ACTIVE_JOBS = int(os.environ.get("GMONEY_MAX_ACTIVE_JOBS", "20"))
@@ -47,6 +49,9 @@ WORKER_CAPACITY = int(os.environ.get("GMONEY_WORKER_CAPACITY", "2"))
 RETENTION_HOURS = int(os.environ.get("GMONEY_RETENTION_HOURS", "720"))
 MIN_FREE_BYTES = int(os.environ.get("GMONEY_MIN_FREE_BYTES", "0"))
 DEMO_ROOT = Path(os.environ.get("GMONEY_DEMO_ROOT", "/tmp/gmoney-v2-demo"))
+PROFILE_REGISTRY = Path(
+    os.environ.get("GMONEY_PROFILE_REGISTRY", str(DEMO_ROOT / "profile-registry.json"))
+)
 store = JobStore(DEMO_ROOT)
 
 app = FastAPI(
@@ -240,6 +245,38 @@ def ready() -> dict[str, Any]:
         "storage_free_bytes": storage.free,
         "storage_min_free_bytes": MIN_FREE_BYTES,
     }
+
+
+@app.get("/api/v2/hospitals/trained")
+def list_trained_hospitals() -> dict[str, Any]:
+    try:
+        profiles = JsonProfileRepository(PROFILE_REGISTRY).list_profiles()
+    except (OSError, ValueError, ValidationError, json.JSONDecodeError) as error:
+        raise HTTPException(
+            status_code=503,
+            detail="The trained hospital registry is unavailable",
+        ) from error
+
+    hospitals: dict[str, dict[str, Any]] = {}
+    for profile in profiles:
+        if profile.lifecycle is not ProfileLifecycle.ACTIVE or not profile.hospital_id:
+            continue
+        item = hospitals.setdefault(
+            profile.hospital_id,
+            {
+                "hospital_id": profile.hospital_id,
+                "hospital_name": profile.hospital_name or profile.hospital_id,
+                "active_profile_count": 0,
+            },
+        )
+        if profile.hospital_name:
+            item["hospital_name"] = profile.hospital_name
+        item["active_profile_count"] += 1
+    items = sorted(
+        hospitals.values(),
+        key=lambda item: (str(item["hospital_name"]).casefold(), item["hospital_id"]),
+    )
+    return {"total": len(items), "hospitals": items}
 
 
 @app.post("/api/v2/documents", status_code=status.HTTP_202_ACCEPTED)
@@ -770,3 +807,16 @@ def delete_document(job_id: str) -> None:
             status_code=409,
             detail="Active extraction cannot be deleted",
         ) from error
+
+
+@app.post("/api/v2/documents/{job_id}/abort", status_code=status.HTTP_202_ACCEPTED)
+def abort_document(job_id: str) -> dict[str, str]:
+    _state_or_404(job_id)
+    try:
+        state = store.request_abort(job_id)
+    except RuntimeError as error:
+        raise HTTPException(
+            status_code=409,
+            detail="Only queued or processing documents can be aborted",
+        ) from error
+    return {"id": state["id"], "status": "cancelling"}

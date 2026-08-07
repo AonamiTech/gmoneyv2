@@ -3,16 +3,19 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import time
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager
 from datetime import UTC, datetime, timedelta
-from fcntl import LOCK_EX, LOCK_SH, LOCK_UN, flock
+from fcntl import LOCK_EX, LOCK_NB, LOCK_SH, LOCK_UN, flock
 from pathlib import Path
 from typing import Any, TextIO
 from uuid import UUID, uuid4
 
 ACTIVE_STATUSES = {"uploading", "queued", "processing"}
 TERMINAL_STATUSES = {"complete", "failed"}
+ABORTABLE_STATUSES = {"queued", "processing"}
+CANCELLING_STATUS = "cancelling"
 
 
 def is_gpu_device(value: str) -> bool:
@@ -59,10 +62,23 @@ class JobStore:
     def inference_lock_path(self) -> Path:
         return self.jobs_root / ".gpu-inference.lock"
 
-    def acquire_inference_lock(self) -> TextIO:
+    def acquire_inference_lock(
+        self,
+        cancel_requested: Callable[[], bool] | None = None,
+    ) -> TextIO:
         lock = self.inference_lock_path.open("a+")
         try:
-            flock(lock.fileno(), LOCK_EX)
+            while True:
+                if cancel_requested is not None and cancel_requested():
+                    raise JobTransactionError("job_abort_requested")
+                try:
+                    flock(lock.fileno(), LOCK_EX | LOCK_NB)
+                    break
+                except BlockingIOError:
+                    time.sleep(0.1)
+            if cancel_requested is not None and cancel_requested():
+                flock(lock.fileno(), LOCK_UN)
+                raise JobTransactionError("job_abort_requested")
         except BaseException:
             lock.close()
             raise
@@ -115,6 +131,108 @@ class JobStore:
         state.update(changes)
         self.write(job_id, state)
         return state
+
+    @property
+    def abort_marker_name(self) -> str:
+        return ".abort-requested"
+
+    def abort_requested(self, job_id: str) -> bool:
+        directory = self.job_dir(job_id)
+        if (directory / self.abort_marker_name).is_file():
+            return True
+        try:
+            return self.read(job_id).get("status") == CANCELLING_STATUS
+        except KeyError:
+            return True
+
+    def request_abort(self, job_id: str) -> dict[str, Any]:
+        with self.job_lock(job_id, exclusive=True):
+            state = self.read(job_id)
+            current = state.get("status")
+            if current == CANCELLING_STATUS:
+                return state
+            if current not in ABORTABLE_STATUSES:
+                raise RuntimeError("job_not_abortable")
+            marker = self.job_dir(job_id) / self.abort_marker_name
+            marker.touch(mode=0o600, exist_ok=True)
+            state.update(status=CANCELLING_STATUS, error=None)
+            self.write(job_id, state)
+            return state
+
+    def claim_queued(self, job_id: str) -> dict[str, Any] | None:
+        with self.job_lock(job_id, exclusive=True):
+            state = self.read(job_id)
+            if (
+                state.get("status") != "queued"
+                or (self.job_dir(job_id) / self.abort_marker_name).is_file()
+            ):
+                return None
+            state.update(status="processing", page=0, error=None)
+            self.write(job_id, state)
+            return state
+
+    def update_processing_progress(self, job_id: str, page: int, pages: int) -> bool:
+        with self.job_lock(job_id, exclusive=True):
+            state = self.read(job_id)
+            if (
+                state.get("status") != "processing"
+                or (self.job_dir(job_id) / self.abort_marker_name).is_file()
+            ):
+                return False
+            state.update(page=page, pages=pages)
+            self.write(job_id, state)
+            return True
+
+    def publish_processing_result(self, job_id: str, result: dict[str, Any]) -> bool:
+        with self.job_lock(job_id, exclusive=True):
+            state = self.read(job_id)
+            if (
+                state.get("status") != "processing"
+                or (self.job_dir(job_id) / self.abort_marker_name).is_file()
+            ):
+                return False
+            path = self.job_dir(job_id) / "result.json"
+            temporary = path.with_name(f"result.{os.getpid()}.tmp")
+            temporary.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+            temporary.replace(path)
+            return True
+
+    def finish_processing(self, job_id: str, **changes: Any) -> bool:
+        with self.job_lock(job_id, exclusive=True):
+            state = self.read(job_id)
+            if (
+                state.get("status") != "processing"
+                or (self.job_dir(job_id) / self.abort_marker_name).is_file()
+            ):
+                return False
+            state.update(status="complete", error=None, **changes)
+            self.write(job_id, state)
+            return True
+
+    def fail_processing(self, job_id: str, error: str) -> bool:
+        with self.job_lock(job_id, exclusive=True):
+            state = self.read(job_id)
+            if (
+                state.get("status") != "processing"
+                or (self.job_dir(job_id) / self.abort_marker_name).is_file()
+            ):
+                return False
+            state.update(status="failed", error=error)
+            self.write(job_id, state)
+            return True
+
+    def finalize_abort(self, job_id: str) -> bool:
+        directory = self.job_dir(job_id)
+        if not directory.is_dir():
+            return False
+        tombstone = self.jobs_root / f".{job_id}.aborted-{uuid4()}"
+        with self.job_lock(job_id, exclusive=True):
+            state = self.read(job_id)
+            if state.get("status") != CANCELLING_STATUS:
+                return False
+            directory.replace(tombstone)
+        shutil.rmtree(tombstone, ignore_errors=True)
+        return True
 
     @staticmethod
     def empty_review() -> dict[str, Any]:
@@ -413,6 +531,9 @@ class JobStore:
         for journals in rollback_batches.values():
             self._recover_rollback_batch(journals)
         for state in self.states():
+            if state.get("status") == CANCELLING_STATUS:
+                self.finalize_abort(state["id"])
+                continue
             if state.get("status") == "processing":
                 state.update(status="queued", error=None, page=0)
                 self.write(state["id"], state)

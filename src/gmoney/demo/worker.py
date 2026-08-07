@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import time
 from concurrent.futures import Future, ProcessPoolExecutor
@@ -28,23 +27,31 @@ def _extract_and_publish(
     store: JobStore,
     job_id: str,
     extractor: Any,
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
     directory = store.job_dir(job_id)
     state = store.read(job_id)
 
     def progress(page: int, pages: int) -> None:
-        store.update(job_id, status="processing", page=page, pages=pages)
+        if not store.update_processing_progress(job_id, page, pages):
+            raise ExtractionAborted
 
-    result = extractor.extract(
-        directory / "source.pdf",
-        directory / "artifacts",
-        progress,
-    )
+    def should_abort() -> bool:
+        return store.abort_requested(job_id)
+
+    from gmoney.extraction.offline import ExtractionAborted
+
+    try:
+        result = extractor.extract(
+            directory / "source.pdf",
+            directory / "artifacts",
+            progress,
+            should_abort=should_abort,
+        )
+    except ExtractionAborted:
+        return None
     result["source_name"] = state["original_name"]
-    result_path = directory / "result.json"
-    temporary = directory / "result.tmp"
-    temporary.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
-    temporary.replace(result_path)
+    if not store.publish_processing_result(job_id, result):
+        return None
     hospital = result.get("hospital") or {}
     return {
         "row_count": len(result["rows"]),
@@ -53,15 +60,23 @@ def _extract_and_publish(
     }
 
 
-def _run_job(root_value: str, job_id: str, vl_url: str) -> dict[str, Any]:
+def _run_job(root_value: str, job_id: str, vl_url: str) -> dict[str, Any] | None:
     global _extractor, _gpu_inference_lock
     from gmoney.extraction.offline import OfflineExtractor
 
     store = JobStore(Path(root_value))
+    state = store.read(job_id)
+    if state.get("status") == "queued":
+        if store.claim_queued(job_id) is None:
+            return None
+    elif state.get("status") != "processing":
+        return None
     paddle_device = os.environ.get("GMONEY_PADDLE_DEVICE", "cpu")
     vl_device = os.environ.get("GMONEY_VL_DEVICE", "cpu")
     if is_gpu_device(paddle_device):
-        _gpu_inference_lock = store.acquire_inference_lock()
+        _gpu_inference_lock = store.acquire_inference_lock(
+            lambda: store.abort_requested(job_id)
+        )
         return _extract_and_publish(
             store=store,
             job_id=job_id,
@@ -93,7 +108,7 @@ def main() -> None:
     retention_hours = int(os.environ.get("GMONEY_RETENTION_HOURS", "720"))
     store = JobStore(root)
     store.recover()
-    futures: dict[Future[dict[str, Any]], str] = {}
+    futures: dict[Future[dict[str, Any] | None], str] = {}
     last_cleanup = 0.0
     with ProcessPoolExecutor(
         **_executor_options(concurrency, paddle_device)
@@ -104,15 +119,30 @@ def main() -> None:
                     continue
                 try:
                     summary = future.result()
-                    store.update(job_id, status="complete", error=None, **summary)
+                    if summary is None or not store.finish_processing(job_id, **summary):
+                        store.finalize_abort(job_id)
                 except Exception as error:  # noqa: BLE001 - boundary records sanitized failure
-                    store.update(job_id, status="failed", error=type(error).__name__)
+                    try:
+                        if not store.fail_processing(job_id, type(error).__name__):
+                            store.finalize_abort(job_id)
+                    except KeyError:
+                        pass
                 del futures[future]
+
+            running = set(futures.values())
+            for state in store.states():
+                if state.get("status") == "cancelling" and state["id"] not in running:
+                    store.finalize_abort(state["id"])
 
             available = concurrency - len(futures)
             for state in store.queued()[:available]:
                 job_id = state["id"]
-                store.update(job_id, status="processing", page=0, error=None)
+                try:
+                    claimed = store.claim_queued(job_id)
+                except KeyError:
+                    continue
+                if claimed is None:
+                    continue
                 future = executor.submit(_run_job, str(root), job_id, vl_url)
                 futures[future] = job_id
 

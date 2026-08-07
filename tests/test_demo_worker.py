@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import multiprocessing
+import threading
 import time
 from collections.abc import Iterator
 from multiprocessing.connection import Connection
@@ -11,7 +12,8 @@ from typing import Any
 import pytest
 
 from gmoney.demo import worker as worker_module
-from gmoney.demo.store import JobStore
+from gmoney.demo.store import JobStore, JobTransactionError
+from gmoney.extraction.offline import ExtractionAborted
 
 
 @pytest.fixture(autouse=True)
@@ -193,7 +195,10 @@ def test_gpu_job_constructs_extractor_inside_lock_and_publishes_before_release(
 
     tracking_lock = TrackingLock()
 
-    def tracking_inference_lock(locked_store: JobStore) -> TrackingLock:
+    def tracking_inference_lock(
+        locked_store: JobStore,
+        cancel_requested: Any = None,
+    ) -> TrackingLock:
         events.append(("lock_acquired", locked_store.inference_lock_path))
         return tracking_lock
 
@@ -218,6 +223,8 @@ def test_gpu_job_constructs_extractor_inside_lock_and_publishes_before_release(
             source: Path,
             artifact_root: Path,
             progress: Any,
+            *,
+            should_abort: Any = None,
         ) -> dict[str, Any]:
             assert events[-1][0] == "constructed"
             assert source == store.job_dir(job_id) / "source.pdf"
@@ -276,6 +283,8 @@ def test_gpu_job_keeps_lock_until_the_one_task_child_exits(
             source: Path,
             artifact_root: Path,
             progress: Any,
+            *,
+            should_abort: Any = None,
         ) -> dict[str, Any]:
             return {"rows": [], "hospital": None}
 
@@ -361,6 +370,8 @@ def test_failed_gpu_job_keeps_lock_until_the_one_task_child_exits(
             source: Path,
             artifact_root: Path,
             progress: Any,
+            *,
+            should_abort: Any = None,
         ) -> dict[str, Any]:
             raise RuntimeError("gpu extraction failed")
 
@@ -452,6 +463,8 @@ def test_cpu_jobs_reuse_one_extractor_without_inference_lock(
             source: Path,
             artifact_root: Path,
             progress: Any,
+            *,
+            should_abort: Any = None,
         ) -> dict[str, Any]:
             extractions.append(source)
             return {"rows": [], "hospital": None}
@@ -477,6 +490,86 @@ def test_cpu_jobs_reuse_one_extractor_without_inference_lock(
         store.job_dir(first_id) / "source.pdf",
         store.job_dir(second_id) / "source.pdf",
     ]
+
+
+def test_processing_abort_prevents_result_publication(tmp_path: Path) -> None:
+    store = JobStore(tmp_path)
+    job_id = _create_worker_job(store, "Abort me.pdf")
+    started = threading.Event()
+    resume = threading.Event()
+    outcome: list[dict[str, Any] | None] = []
+
+    class BlockingExtractor:
+        def extract(
+            self,
+            source: Path,
+            artifact_root: Path,
+            progress: Any,
+            *,
+            should_abort: Any,
+        ) -> dict[str, Any]:
+            started.set()
+            assert resume.wait(timeout=2)
+            if should_abort():
+                raise ExtractionAborted
+            return {"rows": [{"id": "too-late"}], "hospital": None}
+
+    def run() -> None:
+        outcome.append(
+            worker_module._extract_and_publish(
+                store=store,
+                job_id=job_id,
+                extractor=BlockingExtractor(),
+            )
+        )
+
+    assert store.claim_queued(job_id) is not None
+    thread = threading.Thread(target=run)
+    thread.start()
+    assert started.wait(timeout=2)
+    store.request_abort(job_id)
+    resume.set()
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert outcome == [None]
+    assert not (store.job_dir(job_id) / "result.json").exists()
+    assert store.read(job_id)["status"] == "cancelling"
+    assert store.finalize_abort(job_id)
+
+
+def test_worker_recovery_deletes_interrupted_abort(tmp_path: Path) -> None:
+    store = JobStore(tmp_path)
+    job_id = _create_worker_job(store, "Interrupted abort.pdf")
+    assert store.claim_queued(job_id) is not None
+    store.request_abort(job_id)
+
+    store.recover()
+
+    assert not store.job_dir(job_id).exists()
+
+
+def test_abort_interrupts_wait_for_gpu_inference_lock(tmp_path: Path) -> None:
+    store = JobStore(tmp_path)
+    job_id = _create_worker_job(store, "Waiting for GPU.pdf")
+    assert store.claim_queued(job_id) is not None
+    outcome: list[str] = []
+
+    def wait_for_lock() -> None:
+        try:
+            store.acquire_inference_lock(lambda: store.abort_requested(job_id))
+        except JobTransactionError as error:
+            outcome.append(str(error))
+
+    with store.inference_lock():
+        thread = threading.Thread(target=wait_for_lock)
+        thread.start()
+        time.sleep(0.15)
+        store.request_abort(job_id)
+        thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert outcome == ["job_abort_requested"]
 
 
 def test_gpu_pool_exits_each_child_after_one_task() -> None:

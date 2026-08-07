@@ -38,6 +38,15 @@ type JobsResult = {
   has_more: boolean;
   documents: Job[];
 };
+type TrainedHospital = {
+  hospital_id: string;
+  hospital_name: string;
+  active_profile_count: number;
+};
+type TrainedHospitalsResult = {
+  total: number;
+  hospitals: TrainedHospital[];
+};
 type Point = { x: number; y: number };
 type Evidence = {
   page_number: number;
@@ -291,8 +300,11 @@ export default function Home() {
   const [historyJobs, setHistoryJobs] = useState<Job[]>([]);
   const [historyTotal, setHistoryTotal] = useState(0);
   const [historyQuery, setHistoryQuery] = useState("");
-  const [railView, setRailView] = useState<"active" | "history">("history");
+  const [trainedHospitals, setTrainedHospitals] = useState<TrainedHospital[]>([]);
+  const [trainedHospitalsError, setTrainedHospitalsError] = useState<string | null>(null);
+  const [railView, setRailView] = useState<"active" | "history" | "hospitals">("history");
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
+  const [abortingJobIds, setAbortingJobIds] = useState<Set<string>>(new Set());
   const [rowsResult, setRowsResult] = useState<RowsResult | null>(null);
   const [sourceTablesResult, setSourceTablesResult] = useState<SourceTablesResult | null>(null);
   const [review, setReview] = useState<ReviewSummary | null>(null);
@@ -342,7 +354,10 @@ export default function Home() {
     ],
     [activeJobs, historyJobs],
   );
-  const visibleJobs = railView === "active" ? activeJobs : historyJobs;
+  const visibleJobs = useMemo(
+    () => (railView === "active" ? activeJobs : railView === "history" ? historyJobs : []),
+    [activeJobs, historyJobs, railView],
+  );
   const selectedJob = jobs.find((job) => job.id === selectedJobId) ?? null;
   const selectedRow = rowsResult?.rows.find((row) => row.id === selectedRowId) ?? null;
   const selectedRowPage = selectedRow?.page_number ?? null;
@@ -394,6 +409,20 @@ export default function Home() {
     return result.documents;
   }, [historyQuery]);
 
+  const refreshTrainedHospitals = useCallback(async () => {
+    try {
+      const result = await request<TrainedHospitalsResult>("/api/v2/hospitals/trained");
+      setTrainedHospitals(result.hospitals);
+      setTrainedHospitalsError(null);
+      return result.hospitals;
+    } catch (cause) {
+      setTrainedHospitalsError(
+        cause instanceof Error ? cause.message : "The trained hospital list could not be loaded.",
+      );
+      return [];
+    }
+  }, []);
+
   useEffect(() => {
     void refreshActiveJobs().catch(() => setError("The active bill queue could not be loaded."));
     refreshHealth();
@@ -405,6 +434,10 @@ export default function Home() {
     }, 220);
     return () => window.clearTimeout(timer);
   }, [refreshHistoryJobs]);
+
+  useEffect(() => {
+    if (railView === "hospitals") void refreshTrainedHospitals();
+  }, [railView, refreshTrainedHospitals]);
 
   useEffect(() => {
     const poll = window.setInterval(() => {
@@ -433,6 +466,7 @@ export default function Home() {
   }, [activeJobs, refreshHistoryJobs]);
 
   useEffect(() => {
+    if (railView === "hospitals") return;
     if (railView === "active" && !activeJobs.length && historyJobs.length) {
       setRailView("history");
       return;
@@ -666,7 +700,7 @@ export default function Home() {
     if (!rowsResult) return;
     setFocusedPrintedTotal(null);
     const source = rowsResult.hospital;
-    setHospitalName(source?.name ?? selectedJob?.original_name.replace(/\.pdf$/i, "") ?? "");
+    setHospitalName(source?.name ?? "");
     setHospitalReason(source?.reason ?? "");
     setHospitalEditMode(true);
     setEditMode(false);
@@ -725,6 +759,31 @@ export default function Home() {
       if (selectedJobId === job.id) setSelectedJobId(null);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Document could not be deleted");
+    }
+  };
+
+  const abortJob = async (job: Job) => {
+    if (!window.confirm(`Abort ${job.original_name}? Its partial extraction will be deleted.`)) {
+      return;
+    }
+    setAbortingJobIds((current) => new Set(current).add(job.id));
+    try {
+      await request<{ id: string; status: "cancelling" }>(
+        `/api/v2/documents/${job.id}/abort`,
+        { method: "POST" },
+      );
+      setActiveJobs((current) => current.filter((item) => item.id !== job.id));
+      if (selectedJobId === job.id) setSelectedJobId(null);
+      refreshHealth();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "The bill could not be aborted.");
+      void refreshActiveJobs();
+    } finally {
+      setAbortingJobIds((current) => {
+        const next = new Set(current);
+        next.delete(job.id);
+        return next;
+      });
     }
   };
 
@@ -885,7 +944,7 @@ export default function Home() {
     ledgerMode === "printed"
       ? (sourceTablesResult?.total ?? 0)
       : (rowsResult?.total ?? 0);
-  const arrival = !jobs.length;
+  const arrival = !jobs.length && railView !== "hospitals";
   const workerCapacity = health?.worker_capacity ?? 1;
 
   return (
@@ -917,6 +976,7 @@ export default function Home() {
               <div><b>{workerCapacity}×</b><span>inference {workerCapacity === 1 ? "lane" : "lanes"}</span></div>
               <div><b>30d</b><span>searchable history</span></div>
             </div>
+            <button className="hospital-directory-link" onClick={() => setRailView("hospitals")}>View trained hospitals →</button>
           </div>
           <label
             className={`drop-zone ${dragging ? "is-dragging" : ""}`}
@@ -936,24 +996,34 @@ export default function Home() {
           <aside className="queue-rail">
             <div className="rail-head">
               <div>
-                <p className="folio">01 / Document index</p>
-                <h2>{railView === "active" ? activeJobs.length : historyTotal} documents</h2>
+                <p className="folio">01 / {railView === "hospitals" ? "Training index" : "Document index"}</p>
+                <h2>
+                  {railView === "active" ? activeJobs.length : railView === "history" ? historyTotal : trainedHospitals.length}
+                  {railView === "hospitals" ? " hospitals" : " documents"}
+                </h2>
               </div>
               <label className="compact-upload">
                 <input type="file" multiple accept="application/pdf,.pdf" onChange={acceptFiles} disabled={uploading} />
                 {uploading ? "…" : "+"}
               </label>
             </div>
-            <div className="lane-meter">
-              <span>{activeJobs.filter((job) => job.status === "processing").length} / {health?.worker_capacity ?? 2} lanes occupied</span>
-              <i style={{ width: `${Math.min(100, (activeJobs.filter((job) => job.status === "processing").length / (health?.worker_capacity ?? 2)) * 100)}%` }} />
-            </div>
+            {railView === "hospitals" ? (
+              <div className="profile-meter">Active, hospital-specific layout profiles</div>
+            ) : (
+              <div className="lane-meter">
+                <span>{activeJobs.filter((job) => job.status === "processing").length} / {health?.worker_capacity ?? 2} lanes occupied</span>
+                <i style={{ width: `${Math.min(100, (activeJobs.filter((job) => job.status === "processing").length / (health?.worker_capacity ?? 2)) * 100)}%` }} />
+              </div>
+            )}
             <div className="rail-tabs" role="tablist" aria-label="Document index">
               <button className={railView === "active" ? "active" : ""} onClick={() => setRailView("active")}>
                 Active <span>{activeJobs.length}</span>
               </button>
               <button className={railView === "history" ? "active" : ""} onClick={() => setRailView("history")}>
                 History <span>{historyTotal}</span>
+              </button>
+              <button className={railView === "hospitals" ? "active" : ""} onClick={() => setRailView("hospitals")}>
+                Hospitals <span>{trainedHospitals.length}</span>
               </button>
             </div>
             {railView === "history" && (
@@ -967,36 +1037,45 @@ export default function Home() {
             )}
             <div className="job-list">
               {visibleJobs.map((job, index) => (
-                <button key={job.id} className={`job-card ${selectedJobId === job.id ? "selected" : ""}`} onClick={() => setSelectedJobId(job.id)}>
-                  <span className={`job-state ${job.status}`} />
-                  <span className="job-index">{String(index + 1).padStart(2, "0")}</span>
-                  <span className="job-copy">
-                    <b>
-                      {job.hospital_name ??
-                        (job.status === "complete"
-                          ? job.original_name.replace(/\.pdf$/i, "")
-                          : "Identifying hospital…")}
-                    </b>
-                    <small className="job-file">{job.original_name}</small>
-                    <small>
-                      {job.status === "processing"
-                        ? `page ${job.page} of ${job.pages ?? "?"}`
-                        : job.status}
-                      {job.row_count !== null ? ` · ${job.row_count} rows` : ""}
-                    </small>
-                    <small className="job-time">
-                      {job.status === "complete"
-                        ? `updated ${dateTime(job.last_activity_at)} · expires ${dateTime(job.expires_at)}`
-                        : `received ${dateTime(job.created_at)}`}
-                    </small>
-                  </span>
-                  <span className="job-progress"><i style={{ width: `${progress(job)}%` }} /></span>
-                </button>
+                <div className="job-card-frame" key={job.id}>
+                  <button className={`job-card ${selectedJobId === job.id ? "selected" : ""}`} onClick={() => setSelectedJobId(job.id)}>
+                    <span className={`job-state ${job.status}`} />
+                    <span className="job-index">{String(index + 1).padStart(2, "0")}</span>
+                    <span className="job-copy">
+                      <b>{job.hospital_name ?? (job.status === "complete" ? "Hospital not identified" : "Identifying hospital…")}</b>
+                      <small className="job-file">{job.original_name}</small>
+                      <small>
+                        {job.status === "processing" ? `page ${job.page} of ${job.pages ?? "?"}` : job.status}
+                        {job.row_count !== null ? ` · ${job.row_count} rows` : ""}
+                      </small>
+                      <small className="job-time">
+                        {job.status === "complete"
+                          ? `updated ${dateTime(job.last_activity_at)} · expires ${dateTime(job.expires_at)}`
+                          : `received ${dateTime(job.created_at)}`}
+                      </small>
+                    </span>
+                    <span className="job-progress"><i style={{ width: `${progress(job)}%` }} /></span>
+                  </button>
+                  {(job.status === "queued" || job.status === "processing") && (
+                    <button className="job-abort" disabled={abortingJobIds.has(job.id)} onClick={() => void abortJob(job)}>
+                      {abortingJobIds.has(job.id) ? "Aborting…" : "Abort"}
+                    </button>
+                  )}
+                </div>
               ))}
-              {!visibleJobs.length && (
+              {railView === "hospitals" && trainedHospitals.map((item, index) => (
+                <article className="hospital-rail-card" key={item.hospital_id}>
+                  <span>{String(index + 1).padStart(2, "0")}</span>
+                  <div><b>{item.hospital_name}</b><small>{item.active_profile_count} active {item.active_profile_count === 1 ? "profile" : "profiles"}</small></div>
+                </article>
+              ))}
+              {railView !== "hospitals" && !visibleJobs.length && (
                 <div className="rail-empty">
                   {railView === "active" ? "No bills are running." : "No historical bills match."}
                 </div>
+              )}
+              {railView === "hospitals" && !trainedHospitals.length && (
+                <div className="rail-empty">{trainedHospitalsError ?? "No active hospital profiles."}</div>
               )}
               {railView === "history" && historyJobs.length < historyTotal && (
                 <button className="load-history" onClick={() => void refreshHistoryJobs(historyJobs.length, true)}>
@@ -1004,11 +1083,37 @@ export default function Home() {
                 </button>
               )}
             </div>
-            <div className="rail-note">Public shared index · full evidence retained for 30 days</div>
+            <div className="rail-note">{railView === "hospitals" ? "Shared active-profile registry" : "Public shared index · full evidence retained for 30 days"}</div>
           </aside>
 
           <div className="desk-main">
-            {selectedJob && selectedJob.status !== "complete" && (
+            {railView === "hospitals" && (
+              <section className="hospital-directory">
+                <div className="directory-heading">
+                  <div><p className="folio">02 / Training registry</p><h2>Hospitals the system has profiles for.</h2></div>
+                  <button onClick={() => void refreshTrainedHospitals()}>Refresh registry</button>
+                </div>
+                <p className="directory-lede">Only active, hospital-specific layout profiles appear here. Candidate and archived profiles remain outside the production directory.</p>
+                {trainedHospitalsError ? (
+                  <div className="directory-empty">{trainedHospitalsError}</div>
+                ) : trainedHospitals.length ? (
+                  <div className="hospital-grid">
+                    {trainedHospitals.map((item, index) => (
+                      <article key={item.hospital_id}>
+                        <span>{String(index + 1).padStart(2, "0")}</span>
+                        <h3>{item.hospital_name}</h3>
+                        <p>{item.active_profile_count} active layout {item.active_profile_count === 1 ? "profile" : "profiles"}</p>
+                        <small>{item.hospital_id}</small>
+                      </article>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="directory-empty">No active hospital-specific profiles have been published.</div>
+                )}
+              </section>
+            )}
+
+            {railView !== "hospitals" && selectedJob && selectedJob.status !== "complete" && (
               <section className="processing-card compact-processing">
                 <div className="processing-meta"><p className="folio">02 / Reconstruction</p><span>{selectedJob.original_name}</span></div>
                 <div className="processing-number">{String(progress(selectedJob)).padStart(2, "0")}<sup>%</sup></div>
@@ -1018,17 +1123,22 @@ export default function Home() {
                   <span>{selectedJob.pages ? `page ${selectedJob.page} of ${selectedJob.pages}` : "preparing pages"}</span>
                 </div>
                 {selectedJob.error && <p className="error-note">{selectedJob.error}</p>}
+                {(selectedJob.status === "queued" || selectedJob.status === "processing") && (
+                  <button className="text-action abort-action" disabled={abortingJobIds.has(selectedJob.id)} onClick={() => void abortJob(selectedJob)}>
+                    {abortingJobIds.has(selectedJob.id) ? "Aborting and deleting…" : "Abort this bill"}
+                  </button>
+                )}
                 {selectedJob.status === "failed" && <button className="text-action" onClick={() => void deleteJob(selectedJob)}>Remove failed document</button>}
               </section>
             )}
 
-            {selectedJob?.status === "complete" && rowsResult && review && (
+            {railView !== "hospitals" && selectedJob?.status === "complete" && rowsResult && review && (
               <section className="workspace">
                 <div className="workspace-head">
                   <div className="hospital-heading">
                     <p className="folio">03 / Evidence ledger</p>
                     <div className="hospital-title-line">
-                      <h2>{hospital?.name ?? selectedJob.original_name.replace(/\.pdf$/i, "")}</h2>
+                      <h2>{hospital?.name ?? "Hospital not identified"}</h2>
                       <button onClick={beginHospitalEdit}>Correct label</button>
                     </div>
                     <p className="document-identity">
