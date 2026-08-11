@@ -14,12 +14,14 @@ from gmoney.contracts.extraction import PageType, TableType
 from gmoney.contracts.phase3 import LayoutProfile, ProfileLifecycle
 from gmoney.demo import api
 from gmoney.demo.store import JobStore
+from gmoney.profiles.aliases import JsonAliasRepository
 from gmoney.profiles.repository import JsonProfileRepository
 
 
 def client_for(tmp_path: Path, monkeypatch) -> tuple[TestClient, JobStore]:
     store = JobStore(tmp_path)
     monkeypatch.setattr(api, "store", store)
+    monkeypatch.setattr(api, "ALIAS_REGISTRY", tmp_path / "alias-registry.json")
     return TestClient(api.app), store
 
 
@@ -188,6 +190,150 @@ def test_source_tables_endpoint_returns_dynamic_columns_and_raw_cells(
     assert empty.status_code == 200
     assert empty.json()["available"] is False
     assert empty.json()["unavailable_reason"] == "no_source_tables"
+
+
+def test_hospital_alias_preview_and_apply_preserve_grounded_source_evidence(
+    tmp_path: Path, monkeypatch
+) -> None:
+    client, store = client_for(tmp_path, monkeypatch)
+    job_id, result = completed_job(store)
+    evidence = result["rows"][0]["evidence"]
+    result["source_tables"] = [
+        {
+            "id": "p1-t1-s1",
+            "page_number": 1,
+            "table_id": "p1-t1",
+            "table_type": "item_ledger",
+            "columns": [
+                {
+                    "id": "particular",
+                    "label": "Particular",
+                    "order": 0,
+                    "canonical_field": "description",
+                    "evidence": evidence,
+                },
+                {
+                    "id": "procedure-ref",
+                    "label": "Procedure Ref.",
+                    "order": 1,
+                    "canonical_field": None,
+                    "evidence": evidence,
+                },
+            ],
+            "rows": [
+                {
+                    "id": "p1-t1-s1-r1",
+                    "order": 0,
+                    "canonical_row_id": "machine-row",
+                    "cells": [
+                        {
+                            "column_id": "particular",
+                            "raw_value": "Consultation",
+                            "evidence": evidence,
+                            "validation_flags": [],
+                        },
+                        {
+                            "column_id": "procedure-ref",
+                            "raw_value": "PROC-44",
+                            "evidence": evidence,
+                            "validation_flags": [],
+                        },
+                    ],
+                    "validation_flags": [],
+                }
+            ],
+            "validation_flags": ["unmapped_columns"],
+        }
+    ]
+    (store.job_dir(job_id) / "result.json").write_text(json.dumps(result))
+
+    linked = client.post(
+        f"/api/v2/documents/{job_id}/hospital-link",
+        headers={"If-Match": "0"},
+        json={"create": True, "reason": "Verified hospital for alias training"},
+    )
+    assert linked.status_code == 200
+    hospital_id = linked.json()["hospital_id"]
+
+    preview = client.post(
+        f"/api/v2/documents/{job_id}/column-aliases/preview",
+        json={
+            "hospital_id": hospital_id,
+            "source_label": "Procedure Ref.",
+            "canonical_field": "service_code",
+        },
+    )
+    assert preview.status_code == 200
+    proposal = preview.json()
+    assert proposal["counts"]["fillable"] == 1
+
+    applied = client.post(
+        f"/api/v2/documents/{job_id}/column-aliases/apply",
+        headers={"If-Match": "1"},
+        json={
+            "hospital_id": hospital_id,
+            "source_label": "Procedure Ref.",
+            "canonical_field": "service_code",
+            "preview_digest": proposal["preview_digest"],
+            "registry_revision": proposal["registry_revision"],
+            "overwrite_row_ids": [],
+            "reason": "Procedure Ref is this hospital's service code",
+        },
+    )
+
+    assert applied.status_code == 200
+    rows_payload = client.get(f"/api/v2/documents/{job_id}/rows").json()
+    row = rows_payload["rows"][0]
+    assert row["service_code"] == "PROC-44"
+    assert row["field_evidence"]["service_code"] == evidence
+    assert "service_code" in rows_payload["populated_fields"]
+    assert json.loads((store.job_dir(job_id) / "result.json").read_text()) == result
+    printed = client.get(f"/api/v2/documents/{job_id}/source-tables").json()
+    assert printed["tables"][0]["columns"][1]["canonical_field"] == "service_code"
+    aliases = client.get(f"/api/v2/hospitals/{hospital_id}/aliases").json()
+    assert aliases["aliases"][0]["canonical_field"] == "service_code"
+    assert aliases["aliases"][0]["active"] is True
+    deactivated = client.patch(
+        f"/api/v2/hospitals/{hospital_id}/aliases/{aliases['aliases'][0]['alias_id']}",
+        json={
+            "active": False,
+            "reason": "Retiring an incorrect hospital convention",
+        },
+    )
+    assert deactivated.status_code == 200
+    assert deactivated.json()["alias"]["active"] is False
+
+
+def test_interrupted_alias_operation_is_recovered_as_one_cutover(
+    tmp_path: Path, monkeypatch
+) -> None:
+    client, store = client_for(tmp_path, monkeypatch)
+    job_id, _ = completed_job(store)
+    review = store.read_review(job_id)
+    review["revision"] = 1
+    review["events"].append({"action": "recovered_alias_review"})
+    registry = JsonAliasRepository(api.ALIAS_REGISTRY).read()
+    registry["revision"] = 1
+    registry["events"].append({"action": "recovered_alias_registry"})
+    journal = store.job_dir(job_id) / ".alias-operation.json"
+    journal.write_text(
+        json.dumps(
+            {
+                "version": "alias_operation_v1",
+                "job_id": job_id,
+                "review": review,
+                "registry": registry,
+            }
+        )
+    )
+    (store.job_dir(job_id) / "review.json").write_text(json.dumps(review))
+
+    response = client.get(f"/api/v2/documents/{job_id}/rows")
+
+    assert response.status_code == 200
+    assert store.read_review(job_id)["revision"] == 1
+    assert JsonAliasRepository(api.ALIAS_REGISTRY).read()["revision"] == 1
+    assert not journal.exists()
 
 
 def test_source_table_pagination_returns_global_ordinals_across_tables(
@@ -460,6 +606,84 @@ def test_review_updates_are_revisioned_and_machine_output_is_immutable(
     )
     assert stale.status_code == 409
     assert stale.json()["detail"]["current_revision"] == 1
+
+
+def test_bulk_reject_and_restore_are_atomic_and_revisioned(
+    tmp_path: Path, monkeypatch
+) -> None:
+    client, store = client_for(tmp_path, monkeypatch)
+    job_id, result = completed_job(store)
+    second = {**result["rows"][0], "id": "second-row", "row_order": 1}
+    result["rows"].append(second)
+    (store.job_dir(job_id) / "result.json").write_text(json.dumps(result))
+
+    rejected = client.patch(
+        f"/api/v2/documents/{job_id}/rows/bulk",
+        headers={"If-Match": "0"},
+        json={
+            "row_ids": ["machine-row", "second-row"],
+            "action": "reject",
+            "reason": "Duplicate summary lines",
+        },
+    )
+
+    assert rejected.status_code == 200
+    assert rejected.json()["updated_count"] == 2
+    active = client.get(
+        f"/api/v2/documents/{job_id}/rows?disposition=active"
+    ).json()
+    assert active["total"] == 0
+    assert active["totals"]["items_total"] == "0"
+    rejected_rows = client.get(
+        f"/api/v2/documents/{job_id}/rows?disposition=rejected"
+    ).json()
+    assert {row["id"] for row in rejected_rows["rows"]} == {
+        "machine-row",
+        "second-row",
+    }
+
+    restored = client.patch(
+        f"/api/v2/documents/{job_id}/rows/bulk",
+        headers={"If-Match": "1"},
+        json={
+            "row_ids": ["machine-row", "second-row"],
+            "action": "restore",
+            "reason": "Confirmed as valid charges",
+        },
+    )
+    assert restored.status_code == 200
+    assert client.get(
+        f"/api/v2/documents/{job_id}/rows?disposition=active"
+    ).json()["total"] == 2
+    review = store.read_review(job_id)
+    assert review["revision"] == 2
+    assert [event["action"] for event in review["events"]] == [
+        "rows_rejected",
+        "rows_restored",
+    ]
+
+
+def test_bulk_reject_validates_every_row_before_mutating(
+    tmp_path: Path, monkeypatch
+) -> None:
+    client, store = client_for(tmp_path, monkeypatch)
+    job_id, _ = completed_job(store)
+
+    response = client.patch(
+        f"/api/v2/documents/{job_id}/rows/bulk",
+        headers={"If-Match": "0"},
+        json={
+            "row_ids": ["machine-row", "missing-row"],
+            "action": "reject",
+            "reason": "Invalid mixed selection",
+        },
+    )
+
+    assert response.status_code == 422
+    assert store.read_review(job_id)["revision"] == 0
+    assert client.get(f"/api/v2/documents/{job_id}/rows").json()["rows"][0][
+        "review_disposition"
+    ] == "accepted"
 
 
 def test_conflicting_explicit_document_totals_are_exposed_without_false_difference(
@@ -780,11 +1004,13 @@ def test_trained_hospitals_lists_only_active_hospital_profiles(
     assert response.json() == {
         "total": 1,
         "hospitals": [
-            {
-                "hospital_id": "vijaya",
-                "hospital_name": "Vijaya Group of Hospitals",
-                "active_profile_count": 2,
-            }
+                {
+                    "hospital_id": "vijaya",
+                    "hospital_name": "Vijaya Group of Hospitals",
+                    "active_profile_count": 2,
+                    "alias_count": 0,
+                    "training_sources": ["profile"],
+                }
         ],
     }
 

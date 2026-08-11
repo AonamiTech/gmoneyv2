@@ -14,6 +14,7 @@ from gmoney.extraction.ocr_rows import (
     _clean_description,
     fuse_provider_descriptions,
     reconstruct_ocr_rows,
+    set_header_aliases,
 )
 from gmoney.extraction.offline import (
     _link_source_tables,
@@ -53,6 +54,48 @@ def test_clean_description_collapses_an_exact_ocr_phrase_echo() -> None:
     assert description == "Emeset 2 Ml Inj"
     assert service_date is None
     assert request_no is None
+
+
+def test_hospital_header_alias_maps_an_exact_unseen_column() -> None:
+    tokens = (
+        token(1, "Particular", (40, 30, 260, 50)),
+        token(2, "Procedure Ref.", (360, 30, 520, 50)),
+        token(3, "Amount", (700, 30, 820, 50)),
+        token(4, "Consultation", (40, 80, 260, 100)),
+        token(5, "PROC-44", (360, 80, 520, 100)),
+        token(6, "100.00", (700, 80, 820, 100)),
+    )
+    set_header_aliases({"procedure ref": "service_code"})
+    try:
+        result = reconstruct_ocr_rows(
+            tokens,
+            page_number=1,
+            table_id="p1-t1",
+            box=(0, 0, 900, 160),
+        )
+    finally:
+        set_header_aliases({})
+
+    assert len(result.rows) == 1
+    assert result.rows[0].candidate.service_code == "PROC-44"
+    mapped = {
+        column.label: column.canonical_field
+        for column in result.source_tables[0].columns
+    }
+    assert mapped["Procedure Ref."] == "service_code"
+
+    unrelated = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1-unrelated",
+        box=(0, 0, 900, 160),
+    )
+    assert unrelated.rows[0].candidate.service_code is None
+    unrelated_columns = {
+        column.label: column.canonical_field
+        for column in unrelated.source_tables[0].columns
+    }
+    assert unrelated_columns["Procedure Ref."] is None
 
 
 @pytest.mark.parametrize(

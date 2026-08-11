@@ -73,6 +73,14 @@ def _run_job(root_value: str, job_id: str, vl_url: str) -> dict[str, Any] | None
         return None
     paddle_device = os.environ.get("GMONEY_PADDLE_DEVICE", "cpu")
     vl_device = os.environ.get("GMONEY_VL_DEVICE", "cpu")
+    alias_registry_value = os.environ.get("GMONEY_ALIAS_REGISTRY")
+    alias_registry = Path(alias_registry_value) if alias_registry_value else None
+    extractor_options: dict[str, Any] = {
+        "paddle_device": paddle_device,
+        "vl_device": vl_device,
+    }
+    if alias_registry is not None:
+        extractor_options["alias_registry"] = alias_registry
     if is_gpu_device(paddle_device):
         _gpu_inference_lock = store.acquire_inference_lock(
             lambda: store.abort_requested(job_id)
@@ -82,16 +90,14 @@ def _run_job(root_value: str, job_id: str, vl_url: str) -> dict[str, Any] | None
             job_id=job_id,
             extractor=OfflineExtractor(
                 vl_url,
-                paddle_device=paddle_device,
-                vl_device=vl_device,
+                **extractor_options,
             ),
         )
 
     if _extractor is None:
         _extractor = OfflineExtractor(
             vl_url,
-            paddle_device=paddle_device,
-            vl_device=vl_device,
+            **extractor_options,
         )
     return _extract_and_publish(
         store=store,

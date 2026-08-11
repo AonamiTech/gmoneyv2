@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from decimal import Decimal
 from difflib import SequenceMatcher
@@ -76,6 +77,29 @@ HEADER_TERMS: dict[str, tuple[str, ...]] = {
         "total",
     ),
 }
+
+_ACTIVE_HEADER_ALIASES: ContextVar[dict[str, str] | None] = ContextVar(
+    "gmoney_active_header_aliases", default=None
+)
+_ACTIVE_HEADER_ALIAS_IDS: ContextVar[dict[str, str] | None] = ContextVar(
+    "gmoney_active_header_alias_ids", default=None
+)
+_MATCHED_HEADER_ALIAS_IDS: ContextVar[set[str] | None] = ContextVar(
+    "gmoney_matched_header_alias_ids", default=None
+)
+
+
+def set_header_aliases(
+    aliases: dict[str, str], alias_ids: dict[str, str] | None = None
+) -> None:
+    """Set exact, process-local aliases for the current synchronous extraction job."""
+    _ACTIVE_HEADER_ALIASES.set(dict(aliases))
+    _ACTIVE_HEADER_ALIAS_IDS.set(dict(alias_ids or {}))
+    _MATCHED_HEADER_ALIAS_IDS.set(set())
+
+
+def matched_header_alias_ids() -> tuple[str, ...]:
+    return tuple(sorted(_MATCHED_HEADER_ALIAS_IDS.get() or ()))
 
 RAW_HEADER_TERMS = frozenset(
     {
@@ -529,6 +553,14 @@ def _header_roles(line: OcrLine) -> dict[str, OcrToken]:
     roles: dict[str, OcrToken] = {}
     for token in line.tokens:
         normalized = _normalize(token.text)
+        alias_role = (_ACTIVE_HEADER_ALIASES.get() or {}).get(normalized)
+        if alias_role is not None:
+            roles[alias_role] = token
+            alias_id = (_ACTIVE_HEADER_ALIAS_IDS.get() or {}).get(normalized)
+            matched = _MATCHED_HEADER_ALIAS_IDS.get()
+            if alias_id is not None and matched is not None:
+                matched.add(alias_id)
+            continue
         matches: dict[str, tuple[int, int, int]] = {}
         for role, terms in HEADER_TERMS.items():
             for term in terms:
@@ -968,6 +1000,7 @@ def _wide_amount_snap_has_arithmetic_proof(
 SOURCE_CANONICAL_FIELDS: dict[str, str | None] = {
     "serial": None,
     "description": "description",
+    "section": "section",
     "service_date": "service_date_raw",
     "request_no": "request_no",
     "service_code": "service_code",
@@ -994,6 +1027,7 @@ def _source_label(role: str, token: OcrToken, shared_token: bool) -> str:
         return "Unit/Days"
     return {
         "serial": "Sr. No.",
+        "section": "Section",
         "description": "Particular",
         "service_date": "Date",
         "request_no": "Request No.",
@@ -2800,6 +2834,8 @@ def _structured_field_value_is_valid(role: str, value: str) -> bool:
         )
     if role == "request_no":
         return bool(re.fullmatch(r"[A-Za-z0-9./-]{3,60}", text))
+    if role == "section":
+        return parse_decimal(text) is None and len(text) <= 120
     return False
 
 
@@ -2812,7 +2848,13 @@ def _structured_text_fields(
 ) -> tuple[dict[str, str], dict[str, tuple[str, ...]]]:
     values: dict[str, str] = {}
     evidence: dict[str, tuple[str, ...]] = {}
-    for role in ("service_date", "request_no", "service_code", "hsn_code"):
+    for role in (
+        "section",
+        "service_date",
+        "request_no",
+        "service_code",
+        "hsn_code",
+    ):
         token = _closest_field_token(
             line,
             column_centers.get(role),
@@ -3856,7 +3898,7 @@ def reconstruct_ocr_rows(
                         source_row=source_row,
                         role=RowRole.INFORMATIONAL,
                         cells=tuple(token.text for token in line.tokens),
-                        section=current_section,
+                        section=structured_values.get("section") or current_section,
                         description=description,
                         service_date=service_date,
                         request_no=request_no,
@@ -4211,7 +4253,7 @@ def reconstruct_ocr_rows(
             source_row=source_row,
             role=role,
             cells=tuple(token.text for token in line.tokens),
-            section=current_section,
+            section=structured_values.get("section") or current_section,
             description=description,
             service_date=service_date,
             request_no=request_no,

@@ -193,6 +193,7 @@ describe("evidence page navigation", () => {
   let activeJobOverride: Record<string, unknown> | null = null;
   let historyHospitalName: string | null = "Test Hospital";
   let abortRequests = 0;
+  let bulkPayload: Record<string, unknown> | null = null;
   let sourcePayload: Omit<typeof sourceTables, "unavailable_reason"> & {
     unavailable_reason: "legacy_result" | "no_source_tables" | null;
   } = sourceTables;
@@ -203,6 +204,7 @@ describe("evidence page navigation", () => {
     activeJobOverride = null;
     historyHospitalName = "Test Hospital";
     abortRequests = 0;
+    bulkPayload = null;
     sourcePayload = structuredClone(sourceTables);
     vi.stubGlobal(
       "fetch",
@@ -247,6 +249,10 @@ describe("evidence page navigation", () => {
           abortRequests += 1;
           expect(init?.method).toBe("POST");
           return json({ id: job.id, status: "cancelling" });
+        }
+        if (url.endsWith("/rows/bulk")) {
+          bulkPayload = JSON.parse(String(init?.body));
+          return json({ review_revision: 1, updated_count: 1 });
         }
         if (url.endsWith("/api/v2/hospitals/trained")) {
           return json({
@@ -356,6 +362,42 @@ describe("evidence page navigation", () => {
 
     expect(screen.getByRole("cell", { name: "150" })).toBeInTheDocument();
     expect(screen.getByRole("cell", { name: "151" })).toBeInTheDocument();
+  });
+
+  test("selects visible normalized rows and submits one bulk rejection", async () => {
+    render(<Home />);
+    await advance(250);
+    await advance(250);
+    await openBill();
+
+    fireEvent.click(screen.getByRole("button", { name: "Normalized" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select Consultation" }));
+    expect(screen.getByText("1 selected")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Reject selected" }));
+    fireEvent.change(screen.getByPlaceholderText("Why are these rows being changed?"), {
+      target: { value: "Duplicate summary row" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Reject selected rows" }));
+    await advance(0);
+
+    expect(bulkPayload).toEqual({
+      row_ids: ["row-1"],
+      action: "reject",
+      reason: "Duplicate summary row",
+    });
+  });
+
+  test("opens hospital alias setup from an unmapped printed header", async () => {
+    render(<Home />);
+    await advance(250);
+    await advance(250);
+    await openBill();
+
+    fireEvent.click(screen.getByRole("button", { name: "Co-pay %" }));
+
+    expect(screen.getByRole("heading", { name: "Column aliases" })).toBeInTheDocument();
+    expect(screen.getByText(/Link this grounded bill identity/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Link hospital" })).toBeInTheDocument();
   });
 
   test("legacy printed-column explanation remains visible in normalized mode", async () => {

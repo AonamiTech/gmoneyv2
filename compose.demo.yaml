@@ -52,9 +52,11 @@ services:
       GMONEY_RETENTION_HOURS: "720"
       GMONEY_MIN_FREE_BYTES: "${GMONEY_MIN_FREE_BYTES:-21474836480}"
       GMONEY_PROFILE_REGISTRY: /profiles/registry.json
+      GMONEY_ALIAS_REGISTRY: /runtime-config/alias-registry.json
     volumes:
       - ${GMONEY_DATA_ROOT:-/home/azureuser/gmoneyv2-runtime}/jobs:/runtime/jobs
       - ${GMONEY_PROFILE_ROOT:-/home/azureuser/gmoneyv2-runtime/profiles}:/profiles:ro
+      - ${GMONEY_DATA_ROOT:-/home/azureuser/gmoneyv2-runtime}/config:/runtime-config
     ports:
       - "127.0.0.1:8100:8000"
     restart: unless-stopped
@@ -85,9 +87,11 @@ services:
       GMONEY_VL_URL: http://paddleocr-vl:8111
       GMONEY_WORKER_CONCURRENCY: "2"
       GMONEY_RETENTION_HOURS: "720"
+      GMONEY_ALIAS_REGISTRY: /runtime-config/alias-registry.json
     volumes:
       - ${GMONEY_DATA_ROOT:-/home/azureuser/gmoneyv2-runtime}/jobs:/runtime/jobs
       - /home/azureuser/gmoneyv2-runtime/model-cache:/home/modelworker/.paddlex
+      - ${GMONEY_DATA_ROOT:-/home/azureuser/gmoneyv2-runtime}/config:/runtime-config
     restart: unless-stopped
     stop_grace_period: 60s
     deploy:

@@ -59,8 +59,10 @@ from gmoney.extraction.ocr_rows import (
     _split_merged_serial_description,
     _structured_field_value_is_valid,
     fuse_provider_descriptions,
+    matched_header_alias_ids,
     reconstruct_ocr_rows,
     row_category,
+    set_header_aliases,
     tokens_in_box,
 )
 from gmoney.extraction.ocr_tokens import paddle_ocr_tokens
@@ -104,6 +106,7 @@ from gmoney.inference.paddle import (
     PaddleOcrVlAdapter,
 )
 from gmoney.inference.redaction import redact_crop
+from gmoney.profiles.aliases import CANONICAL_TO_HEADER_ROLE, JsonAliasRepository
 from gmoney.profiles.lifecycle import deterministic_shadow_sample
 from gmoney.profiles.matching import match_profile, profile_to_schema
 from gmoney.profiles.repository import JsonProfileRepository
@@ -2900,12 +2903,14 @@ class OfflineExtractor:
         vl_device: str = "cpu",
         hospital_id: str | None = None,
         profile_registry: Path | None = None,
+        alias_registry: Path | None = None,
         gemini_mode: GeminiMode = GeminiMode.OFF,
         gemini_adapter: AdjudicationAdapter | None = None,
         settings: Settings | None = None,
     ) -> None:
         self.settings = settings or get_settings()
         self.hospital_id = hospital_id
+        self.alias_registry = alias_registry
         self.gemini_mode = gemini_mode
         self.gemini_promotion = None
         if gemini_mode is GeminiMode.ENABLED:
@@ -3565,6 +3570,13 @@ class OfflineExtractor:
         *,
         should_abort: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
+        set_header_aliases({})
+        alias_snapshot = (
+            JsonAliasRepository(self.alias_registry).read()
+            if self.alias_registry is not None and self.alias_registry.exists()
+            else None
+        )
+        resolved_hospital_id = self.hospital_id
         def abort_checkpoint() -> None:
             if should_abort is not None and should_abort():
                 raise ExtractionAborted
@@ -3616,6 +3628,29 @@ class OfflineExtractor:
                     page_width=page_asset.width,
                     page_height=page_asset.height,
                 )
+                if alias_snapshot is not None and resolved_hospital_id is None:
+                    resolved_hospital_id = JsonAliasRepository.resolve_hospital(
+                        alias_snapshot,
+                        str(hospital.get("name") or "") if hospital else None,
+                    )
+                if alias_snapshot is not None and resolved_hospital_id is not None:
+                    active_aliases = JsonAliasRepository.active_aliases(
+                        alias_snapshot, resolved_hospital_id
+                    )
+                    set_header_aliases(
+                        {
+                            alias["normalized_label"]: CANONICAL_TO_HEADER_ROLE[
+                                alias["canonical_field"]
+                            ]
+                            for alias in active_aliases
+                            if alias["canonical_field"] in CANONICAL_TO_HEADER_ROLE
+                        },
+                        {
+                            alias["normalized_label"]: alias["alias_id"]
+                            for alias in active_aliases
+                            if alias["canonical_field"] in CANONICAL_TO_HEADER_ROLE
+                        },
+                    )
             layout_request = InferenceRequest(
                 request_id=str(uuid4()),
                 artifact_sha256=page_asset.artifact_sha256,
@@ -4292,8 +4327,12 @@ class OfflineExtractor:
             ),
             "document_totals": [total.model_dump(mode="json") for total in document_totals],
             "document_id": document_id,
-            "hospital_id": self.hospital_id,
+            "hospital_id": resolved_hospital_id,
             "hospital": hospital,
+            "alias_registry_revision": (
+                alias_snapshot["revision"] if alias_snapshot is not None else None
+            ),
+            "applied_alias_ids": list(matched_header_alias_ids()),
             "source_sha256": sha256_file(source),
             "source_name": source.name,
             "pages": len(manifest.pages),

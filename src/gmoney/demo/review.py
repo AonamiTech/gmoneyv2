@@ -408,6 +408,11 @@ def review_summary(result: dict[str, Any], review: dict[str, Any]) -> dict[str, 
         "issues_open": sum(issue["status"] == "open" for issue in issues),
         "issues": issues,
         "hospital": project_hospital(result, review),
+        "hospital_id": (
+            review.get("document_overrides", {})
+            .get("hospital_link", {})
+            .get("hospital_id")
+        ),
         "approval": review.get("approval"),
     }
 

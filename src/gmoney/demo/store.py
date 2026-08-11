@@ -241,6 +241,7 @@ class JobStore:
             "updated_at": utc_now(),
             "row_overrides": {},
             "added_rows": {},
+            "column_mappings": {},
             "issue_overrides": {},
             "document_overrides": {},
             "events": [],

@@ -40,6 +40,7 @@ export GMONEY_PROFILE_ROOT=/home/ubuntu/gmoneyv2-runtime/profiles
 export GMONEY_MIN_FREE_BYTES=10737418240
 export GMONEY_MAX_UPLOAD_BYTES=0
 export GMONEY_GPU_WORKER_CONCURRENCY=1
+install -d -o 10001 -g 10001 "$GMONEY_DATA_ROOT/jobs" "$GMONEY_DATA_ROOT/config"
 docker compose -f compose.demo.yaml -f compose.gpu.yaml up -d --build
 ```
 
@@ -50,8 +51,9 @@ The API and Nginx do not impose a byte-size limit; the page cap, queue cap, and
 free-space floor remain the upload safeguards.
 
 The model directory must contain both checksum-verified PaddleOCR-VL 1.6 GGUF
-files before startup. The runtime `jobs` and model-cache directories must be
-writable by container UID/GID `10001:10001`.
+files before startup. The runtime `jobs`, `config`, and model-cache directories
+must be writable by container UID/GID `10001:10001`. The `config` directory
+retains the versioned hospital column-alias registry shared by API and worker.
 Create the profile directory before startup. Its optional `registry.json` is
 mounted read-only into the API and supplies the trained-hospital directory.
 
