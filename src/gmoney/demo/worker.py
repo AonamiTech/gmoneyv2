@@ -12,6 +12,7 @@ from gmoney.profiles.aliases import AliasRegistryUnavailable
 
 _extractor: Any = None
 _gpu_inference_lock: TextIO | None = None
+ALIAS_REGISTRY_RETRY_SECONDS = 5.0
 
 
 def _executor_options(
@@ -117,6 +118,45 @@ def _run_job(root_value: str, job_id: str, vl_url: str) -> dict[str, Any] | None
     )
 
 
+def _fail_queued_for_alias_outage(store: JobStore) -> int:
+    failed = 0
+    for state in store.queued():
+        try:
+            if store.fail_queued(str(state["id"]), "alias_registry_unavailable"):
+                failed += 1
+        except KeyError:
+            continue
+    return failed
+
+
+def _probe_alias_registry(
+    coordinator: AliasTransactionCoordinator,
+    store: JobStore,
+) -> bool:
+    try:
+        coordinator.registry_snapshot()
+    except AliasRegistryUnavailable:
+        _fail_queued_for_alias_outage(store)
+        return False
+    return True
+
+
+def _cleanup_jobs(
+    store: JobStore,
+    coordinator: AliasTransactionCoordinator | None,
+    retention_hours: int,
+) -> bool:
+    try:
+        if coordinator is not None:
+            coordinator.cleanup(retention_hours)
+        else:
+            store.cleanup(retention_hours)
+    except AliasRegistryUnavailable:
+        _fail_queued_for_alias_outage(store)
+        return False
+    return True
+
+
 def main() -> None:
     root = Path(os.environ.get("GMONEY_DEMO_ROOT", "/tmp/gmoney-v2-demo"))
     vl_url = os.environ.get("GMONEY_VL_URL", "http://paddleocr-vl:8111")
@@ -131,10 +171,10 @@ def main() -> None:
         if alias_registry_value
         else None
     )
-    if alias_coordinator is not None:
-        alias_coordinator.recover_all()
     futures: dict[Future[dict[str, Any] | None], str] = {}
     last_cleanup = 0.0
+    alias_registry_available = alias_coordinator is None
+    next_alias_probe = 0.0
     with ProcessPoolExecutor(**_executor_options(concurrency, paddle_device)) as executor:
         while True:
             for future, job_id in list(futures.items()):
@@ -162,25 +202,52 @@ def main() -> None:
                 if state.get("status") == "cancelling" and state["id"] not in running:
                     store.finalize_abort(state["id"])
 
-            available = concurrency - len(futures)
-            for state in store.queued()[:available]:
-                job_id = state["id"]
-                try:
-                    claimed = store.claim_queued(job_id)
-                except KeyError:
-                    continue
-                if claimed is None:
-                    continue
-                future = executor.submit(_run_job, str(root), job_id, vl_url)
-                futures[future] = job_id
-
             now = time.monotonic()
+            if alias_coordinator is not None:
+                cleanup_due = now - last_cleanup >= 300
+                should_probe = (
+                    not alias_registry_available
+                    or bool(store.queued())
+                    or cleanup_due
+                )
+                if should_probe and now >= next_alias_probe:
+                    alias_registry_available = _probe_alias_registry(
+                        alias_coordinator,
+                        store,
+                    )
+                    next_alias_probe = (
+                        0.0
+                        if alias_registry_available
+                        else now + ALIAS_REGISTRY_RETRY_SECONDS
+                    )
+                elif not alias_registry_available:
+                    _fail_queued_for_alias_outage(store)
+
+            if alias_registry_available:
+                available = concurrency - len(futures)
+                for state in store.queued()[:available]:
+                    job_id = state["id"]
+                    try:
+                        claimed = store.claim_queued(job_id)
+                    except KeyError:
+                        continue
+                    if claimed is None:
+                        continue
+                    future = executor.submit(_run_job, str(root), job_id, vl_url)
+                    futures[future] = job_id
+
             if now - last_cleanup >= 300:
-                if alias_coordinator is not None:
-                    alias_coordinator.cleanup(retention_hours)
-                else:
-                    store.cleanup(retention_hours)
+                cleanup_succeeded = True
+                if alias_coordinator is None or alias_registry_available:
+                    cleanup_succeeded = _cleanup_jobs(
+                        store,
+                        alias_coordinator,
+                        retention_hours,
+                    )
                 last_cleanup = now
+                if not cleanup_succeeded:
+                    alias_registry_available = False
+                    next_alias_probe = now + ALIAS_REGISTRY_RETRY_SECONDS
             time.sleep(0.5)
 
 

@@ -178,6 +178,15 @@ def test_alias_normalization_and_structured_values_share_strict_runtime_rules() 
     assert parse_alias_field_value("hsn_code", "20/01/2026") is None
 
 
+def test_alias_date_validation_requires_one_complete_valid_date() -> None:
+    assert parse_alias_field_value("service_date", "11/08/2026") is not None
+    assert parse_alias_field_value("service_date", "11/08/2026 23:59") is not None
+    assert parse_alias_field_value("service_date", "99/99/2026") is None
+    assert parse_alias_field_value("service_date", "11/08/2026 discharge") is None
+    assert parse_alias_field_value("service_date", "11/08/2026 27:90") is None
+    assert parse_alias_field_value("service_date", "11/08/2026 - 12/08/2026") is None
+
+
 def test_inference_cache_is_bound_to_artifact_options_and_model(tmp_path: Path) -> None:
     adapter = _FakeAdapter()
     request = InferenceRequest(

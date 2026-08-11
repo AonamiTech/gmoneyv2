@@ -8,14 +8,20 @@ import zipfile
 from pathlib import Path
 
 import fitz
+import pytest
 from fastapi.testclient import TestClient
 
 from gmoney.contracts.extraction import PageType, TableType
 from gmoney.contracts.phase3 import LayoutProfile, ProfileLifecycle
+from gmoney.demo import alias_transactions as alias_transactions_module
 from gmoney.demo import api
-from gmoney.demo.alias_transactions import ALIAS_JOURNAL_VERSION, _digest
+from gmoney.demo.alias_transactions import (
+    ALIAS_JOURNAL_VERSION,
+    AliasTransactionCoordinator,
+    _digest,
+)
 from gmoney.demo.store import JobStore
-from gmoney.profiles.aliases import JsonAliasRepository
+from gmoney.profiles.aliases import AliasRegistryUnavailable, JsonAliasRepository
 from gmoney.profiles.repository import JsonProfileRepository
 
 
@@ -260,7 +266,7 @@ def test_hospital_alias_preview_and_apply_preserve_grounded_source_evidence(
                         },
                         {
                             "column_id": "procedure-ref",
-                            "raw_value": "PROC-44",
+                            "raw_value": "PROC/44",
                             "evidence": evidence,
                             "validation_flags": [],
                         },
@@ -371,6 +377,7 @@ def test_hospital_alias_preview_and_apply_preserve_grounded_source_evidence(
     assert row["service_code"] == "PROC-44"
     assert row["field_evidence"]["service_code"] == evidence
     unchanged = next(item for item in rows_payload["rows"] if item["id"] == "unchanged-row")
+    assert unchanged["service_code"] == "PROC-44"
     assert unchanged["field_evidence"]["service_code"] == evidence
     assert "service_code" in rows_payload["populated_fields"]
     assert json.loads((store.job_dir(job_id) / "result.json").read_text()) == result
@@ -390,6 +397,10 @@ def test_hospital_alias_preview_and_apply_preserve_grounded_source_evidence(
     )
     assert deactivated.status_code == 200
     assert deactivated.json()["alias"]["active"] is False
+    registry_event = JsonAliasRepository(api.ALIAS_REGISTRY).read()["events"][-1]
+    assert registry_event["reviewer"] == "demo-reviewer"
+    assert registry_event["old_active"] is True
+    assert registry_event["new_active"] is False
     stale = client.patch(
         f"/api/v2/hospitals/{hospital_id}/aliases/{aliases['aliases'][0]['alias_id']}",
         json={
@@ -432,14 +443,224 @@ def test_interrupted_alias_operation_is_recovered_as_one_cutover(
             }
         )
     )
-    (store.job_dir(job_id) / "review.json").write_text(json.dumps(review))
+    JsonAliasRepository(api.ALIAS_REGISTRY)._write_unlocked(registry)
 
-    response = client.get(f"/api/v2/documents/{job_id}/rows")
+    response = client.get("/api/v2/hospitals/trained")
 
     assert response.status_code == 200
     assert store.read_review(job_id)["revision"] == 1
     assert JsonAliasRepository(api.ALIAS_REGISTRY).read()["revision"] == 1
     assert not journal.exists()
+
+
+def test_registry_snapshot_holds_one_lock_through_recovery_and_read(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store = JobStore(tmp_path)
+    coordinator = AliasTransactionCoordinator(store, tmp_path / "alias-registry.json")
+    snapshot_in_recovery = threading.Event()
+    release_snapshot = threading.Event()
+    mutation_finished = threading.Event()
+    original_recover = coordinator._recover_all_unlocked
+    snapshots: list[dict[str, object]] = []
+
+    def pausing_recovery() -> None:
+        original_recover()
+        if threading.current_thread().name == "snapshot-reader":
+            snapshot_in_recovery.set()
+            assert release_snapshot.wait(2)
+
+    monkeypatch.setattr(coordinator, "_recover_all_unlocked", pausing_recovery)
+
+    snapshot_thread = threading.Thread(
+        target=lambda: snapshots.append(coordinator.registry_snapshot()),
+        name="snapshot-reader",
+    )
+
+    def mutate() -> None:
+        coordinator.mutate_registry(0, lambda registry: registry)
+        mutation_finished.set()
+
+    mutation_thread = threading.Thread(target=mutate, name="registry-writer")
+    snapshot_thread.start()
+    assert snapshot_in_recovery.wait(2)
+    mutation_thread.start()
+    assert not mutation_finished.wait(0.2)
+    release_snapshot.set()
+    snapshot_thread.join(timeout=2)
+    mutation_thread.join(timeout=2)
+
+    assert not snapshot_thread.is_alive()
+    assert not mutation_thread.is_alive()
+    assert snapshots[0]["revision"] == 0
+    assert mutation_finished.is_set()
+    assert coordinator.registry_snapshot()["revision"] == 1
+
+
+def test_registry_mutation_recovers_pending_cutover_before_incrementing(
+    tmp_path: Path,
+) -> None:
+    store = JobStore(tmp_path)
+    job_id, _ = completed_job(store)
+    coordinator = AliasTransactionCoordinator(store, tmp_path / "alias-registry.json")
+    base_review = store.read_review(job_id)
+    target_review = json.loads(json.dumps(base_review))
+    target_review["revision"] = 1
+    base_registry = coordinator.registry_snapshot()
+    target_registry = json.loads(json.dumps(base_registry))
+    target_registry["revision"] = 1
+    target_registry["events"].append({"action": "pending_alias_cutover"})
+    journal = {
+        "version": ALIAS_JOURNAL_VERSION,
+        "job_id": job_id,
+        "base_review": base_review,
+        "target_review": target_review,
+        "base_registry": base_registry,
+        "target_registry": target_registry,
+        "base_review_sha256": _digest(base_review),
+        "target_review_sha256": _digest(target_review),
+        "base_registry_sha256": _digest(base_registry),
+        "target_registry_sha256": _digest(target_registry),
+    }
+    (store.job_dir(job_id) / ".alias-operation.json").write_text(json.dumps(journal))
+    coordinator.repository._write_unlocked(target_registry)
+
+    updated = coordinator.mutate_registry(
+        1,
+        lambda registry: {
+            **registry,
+            "events": [*registry["events"], {"action": "following_patch"}],
+        },
+    )
+
+    assert updated["revision"] == 2
+    assert store.read_review(job_id)["revision"] == 1
+    assert not (store.job_dir(job_id) / ".alias-operation.json").exists()
+    assert updated["events"][-1]["action"] == "following_patch"
+
+
+@pytest.mark.parametrize(
+    ("failure_phase", "journal_survives"),
+    (
+        ("journal", False),
+        ("registry", True),
+        ("review", True),
+        ("unlink", True),
+    ),
+)
+def test_alias_cutover_failure_boundaries_are_recoverable(
+    tmp_path: Path,
+    monkeypatch,
+    failure_phase: str,
+    journal_survives: bool,
+) -> None:
+    store = JobStore(tmp_path)
+    job_id, _ = completed_job(store)
+    base_review = store.read_review(job_id)
+    (store.job_dir(job_id) / "review.json").write_text(json.dumps(base_review))
+    coordinator = AliasTransactionCoordinator(store, tmp_path / "alias-registry.json")
+    original_replace = alias_transactions_module.durable_json_replace
+    original_write = coordinator.repository._write_unlocked
+    original_unlink = alias_transactions_module.durable_unlink
+
+    if failure_phase in {"journal", "review"}:
+
+        def failing_replace(
+            path: Path,
+            payload: dict[str, object],
+            *,
+            suffix: str = "tmp",
+        ) -> None:
+            if suffix == f"{failure_phase}.tmp":
+                raise OSError(f"simulated {failure_phase} write failure")
+            original_replace(path, payload, suffix=suffix)
+
+        monkeypatch.setattr(alias_transactions_module, "durable_json_replace", failing_replace)
+    elif failure_phase == "registry":
+
+        def failing_registry_write(payload: dict[str, object]) -> None:
+            raise OSError("simulated registry write failure")
+
+        monkeypatch.setattr(coordinator.repository, "_write_unlocked", failing_registry_write)
+    else:
+
+        def failing_unlink(path: Path) -> None:
+            raise OSError("simulated journal unlink failure")
+
+        monkeypatch.setattr(alias_transactions_module, "durable_unlink", failing_unlink)
+
+    def mutation(
+        review: dict[str, object],
+        registry: dict[str, object],
+        result: dict[str, object],
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        assert result["document_id"] == "d" * 64
+        review["events"] = [*review["events"], {"action": "target_review"}]
+        registry["events"] = [*registry["events"], {"action": "target_registry"}]
+        return review, registry
+
+    with pytest.raises(AliasRegistryUnavailable):
+        coordinator.mutate_review_and_registry(job_id, 0, 0, mutation)
+
+    journal = store.job_dir(job_id) / ".alias-operation.json"
+    assert journal.exists() is journal_survives
+    monkeypatch.setattr(alias_transactions_module, "durable_json_replace", original_replace)
+    monkeypatch.setattr(coordinator.repository, "_write_unlocked", original_write)
+    monkeypatch.setattr(alias_transactions_module, "durable_unlink", original_unlink)
+
+    snapshot = coordinator.registry_snapshot()
+    expected_revision = 1 if journal_survives else 0
+    assert snapshot["revision"] == expected_revision
+    assert store.read_review(job_id)["revision"] == expected_revision
+    assert not journal.exists()
+
+
+def test_alias_patch_returns_registry_unavailable_for_corrupt_json(
+    tmp_path: Path, monkeypatch
+) -> None:
+    client, _ = client_for(tmp_path, monkeypatch)
+    api.ALIAS_REGISTRY.write_text("{")
+
+    response = client.patch(
+        "/api/v2/hospitals/hospital/aliases/alias",
+        json={
+            "registry_revision": 0,
+            "active": False,
+            "reason": "Registry integrity failure should be explicit",
+        },
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == {"code": "alias_registry_unavailable"}
+
+
+def test_alias_patch_preserves_missing_alias_response(tmp_path: Path, monkeypatch) -> None:
+    client, _ = client_for(tmp_path, monkeypatch)
+
+    response = client.patch(
+        "/api/v2/hospitals/hospital/aliases/missing",
+        json={
+            "registry_revision": 0,
+            "active": False,
+            "reason": "Unknown aliases remain a not-found response",
+        },
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Column alias was not found"
+
+
+def test_registry_validation_failure_is_reported_as_unavailable(tmp_path: Path) -> None:
+    coordinator = AliasTransactionCoordinator(
+        JobStore(tmp_path),
+        tmp_path / "alias-registry.json",
+    )
+
+    with pytest.raises(AliasRegistryUnavailable):
+        coordinator.mutate_registry(
+            0,
+            lambda registry: {**registry, "registry_version": "unsupported"},
+        )
 
 
 def test_alias_recovery_refuses_to_overwrite_newer_review_state(
@@ -915,6 +1136,23 @@ def test_machine_rejected_rows_are_not_reviewer_restorable(tmp_path: Path, monke
     assert response.status_code == 422
     assert store.read_review(job_id)["revision"] == 0
 
+    corrected = client.patch(
+        f"/api/v2/documents/{job_id}/rows/machine-row",
+        headers={"If-Match": "0"},
+        json={
+            "changes": {"review_disposition": "accepted"},
+            "reason": "Reviewer directly confirmed the machine-rejected charge",
+        },
+    )
+    assert corrected.status_code == 200
+    assert corrected.json()["row"]["review_disposition"] == "accepted"
+    assert corrected.json()["row"]["bulk_action"] == "reject"
+    event = store.read_review(job_id)["events"][-1]
+    assert event["changes"]["review_disposition"] == {
+        "old_disposition": "rejected",
+        "new_disposition": "accepted",
+    }
+
 
 def test_single_row_editor_uses_the_same_reject_restore_state_machine(
     tmp_path: Path, monkeypatch
@@ -933,6 +1171,11 @@ def test_single_row_editor_uses_the_same_reject_restore_state_machine(
     assert rejected.status_code == 200
     assert rejected.json()["row"]["bulk_action"] == "restore"
     assert rejected.json()["row"]["rejection_provenance"]["previous_disposition"] == "accepted"
+    rejection_event = store.read_review(job_id)["events"][-1]
+    assert rejection_event["changes"]["review_disposition"] == {
+        "old_disposition": "accepted",
+        "new_disposition": "rejected",
+    }
 
     repeated = client.patch(
         f"/api/v2/documents/{job_id}/rows/machine-row",
@@ -1307,6 +1550,22 @@ def test_hospital_link_reuses_profile_identity_and_rejects_duplicate_create(
             construction_dataset_ids=("training",),
         )
     )
+    JsonProfileRepository(profile_registry).add_profile(
+        LayoutProfile(
+            contract_version="layout_profile_v1",
+            profile_key="other-hospital-items",
+            profile_version=1,
+            lifecycle=ProfileLifecycle.ACTIVE,
+            hospital_id="profile-other-hospital",
+            hospital_name="Other Hospital",
+            page_type=PageType.ITEMIZED_CHARGES,
+            table_type=TableType.ITEM_LEDGER,
+            page_aspect_ratio=0.7,
+            table_box=(0.05, 0.15, 0.95, 0.9),
+            supported_fields=("description", "amount"),
+            construction_dataset_ids=("training",),
+        )
+    )
     monkeypatch.setattr(api, "PROFILE_REGISTRY", profile_registry)
     job_id, _ = completed_job(store)
 
@@ -1325,6 +1584,22 @@ def test_hospital_link_reuses_profile_identity_and_rejects_duplicate_create(
         "candidate_ids": ["profile-machine-hospital"],
     }
 
+    unrelated = client.post(
+        f"/api/v2/documents/{job_id}/hospital-link",
+        headers={"If-Match": "0"},
+        json={
+            "create": False,
+            "hospital_id": "profile-other-hospital",
+            "registry_revision": 0,
+            "reason": "Attempted unrelated trained hospital selection",
+        },
+    )
+    assert unrelated.status_code == 422
+    assert unrelated.json()["detail"] == {
+        "code": "hospital_selection_not_candidate",
+        "candidate_ids": ["profile-machine-hospital"],
+    }
+
     linked = client.post(
         f"/api/v2/documents/{job_id}/hospital-link",
         headers={"If-Match": "0"},
@@ -1339,6 +1614,8 @@ def test_hospital_link_reuses_profile_identity_and_rejects_duplicate_create(
     hospital = JsonAliasRepository(api.ALIAS_REGISTRY).read()["hospitals"][0]
     assert hospital["hospital_id"] == "profile-machine-hospital"
     assert hospital["origins"] == ["profile", "reviewer_alias"]
+    event = JsonAliasRepository(api.ALIAS_REGISTRY).read()["events"][-1]
+    assert event["reviewer"] == "demo-reviewer"
 
 
 def test_documents_can_be_discovered_in_newest_first_shared_queue(

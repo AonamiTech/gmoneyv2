@@ -165,6 +165,10 @@ class ColumnAliasPatch(BaseModel):
     reason: str = Field(min_length=3, max_length=500)
 
 
+class AliasRegistryItemNotFound(LookupError):
+    pass
+
+
 @app.middleware("http")
 async def private_demo_responses(request: Any, call_next: Any) -> Response:
     response = await call_next(request)
@@ -294,8 +298,14 @@ def _event(
     }
 
 
-def _alias_repository() -> JsonAliasRepository:
-    return JsonAliasRepository(ALIAS_REGISTRY)
+def _registry_event(action: str, reason: str, **details: Any) -> dict[str, Any]:
+    return {
+        "action": action,
+        **details,
+        "reviewer": "demo-reviewer",
+        "reason": reason.strip(),
+        "created_at": utc_now(),
+    }
 
 
 def _alias_coordinator() -> AliasTransactionCoordinator:
@@ -971,6 +981,14 @@ def link_document_hospital(
         if payload.create
         else str(payload.hospital_id)
     )
+    if not payload.create and hospital_id not in candidates:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "hospital_selection_not_candidate",
+                "candidate_ids": candidates,
+            },
+        )
     existing = next(
         (item for item in snapshot["hospitals"] if item["hospital_id"] == hospital_id),
         None,
@@ -1012,6 +1030,23 @@ def link_document_hospital(
                 for variant in item.get("name_variants", [])
             )
         }
+        locked_profile_names = {
+            str(profile.hospital_id): str(profile.hospital_name or profile.hospital_id)
+            for profile in JsonProfileRepository(PROFILE_REGISTRY).list_profiles()
+            if profile.lifecycle is ProfileLifecycle.ACTIVE and profile.hospital_id
+        }
+        locked_profile_matches = {
+            candidate_id
+            for candidate_id, name in locked_profile_names.items()
+            if normalize_hospital_name(name) == normalized_name
+        }
+        locked_candidates = owners | locked_profile_matches
+        if payload.create and locked_candidates:
+            raise ReviewValidationError("Hospital identity now matches an existing hospital")
+        if not payload.create and hospital_id not in locked_candidates:
+            raise ReviewValidationError(
+                "Selected hospital is not a normalized-name candidate"
+            )
         if owners - {hospital_id}:
             raise ReviewValidationError("Hospital name is already linked elsewhere")
         if record is None:
@@ -1046,13 +1081,12 @@ def link_document_hospital(
             )
         record["updated_at"] = utc_now()
         registry["events"].append(
-            {
-                "action": "hospital_linked",
-                "hospital_id": hospital_id,
-                "document_id": result["document_id"],
-                "reason": payload.reason.strip(),
-                "created_at": utc_now(),
-            }
+            _registry_event(
+                "hospital_linked",
+                payload.reason,
+                hospital_id=hospital_id,
+                document_id=result["document_id"],
+            )
         )
         review.setdefault("document_overrides", {})["hospital_link"] = {
             "hospital_id": hospital_id,
@@ -1217,15 +1251,14 @@ def apply_column_alias(
                 reason=payload.reason.strip(),
             )
         snapshot["events"].append(
-            {
-                "action": "column_alias_applied",
-                "alias_id": alias_id,
-                "hospital_id": payload.hospital_id,
-                "canonical_field": locked_preview["canonical_field"],
-                "document_id": locked_result["document_id"],
-                "reason": payload.reason.strip(),
-                "created_at": utc_now(),
-            }
+            _registry_event(
+                "column_alias_applied",
+                payload.reason,
+                alias_id=alias_id,
+                hospital_id=payload.hospital_id,
+                canonical_field=locked_preview["canonical_field"],
+                document_id=locked_result["document_id"],
+            )
         )
         projected = {str(row["id"]): row for row in project_rows(locked_result, current)}
         current.setdefault("column_mappings", {})
@@ -1244,7 +1277,11 @@ def apply_column_alias(
         for candidate in selected:
             row_id = str(candidate["row_id"])
             row = projected[row_id]
-            changes = dict(candidate["changes"])
+            changes = (
+                {}
+                if candidate["classification"] == "unchanged"
+                else dict(candidate["changes"])
+            )
             field_evidence = dict(row.get("field_evidence") or {})
             field_evidence[candidate["evidence_field"]] = candidate["evidence"]
             changes["field_evidence"] = field_evidence
@@ -1313,9 +1350,6 @@ def update_column_alias(
         if payload.canonical_field is not None
         else None
     )
-    repo = _alias_repository()
-    _alias_snapshot()
-
     def mutation(current: dict[str, Any]) -> dict[str, Any]:
         alias = next(
             (
@@ -1326,7 +1360,9 @@ def update_column_alias(
             None,
         )
         if alias is None:
-            raise KeyError(alias_id)
+            raise AliasRegistryItemNotFound(alias_id)
+        old_canonical_field = alias["canonical_field"]
+        old_active = alias["active"]
         if canonical_field is not None:
             alias["canonical_field"] = canonical_field
         if payload.active is not None:
@@ -1334,21 +1370,25 @@ def update_column_alias(
         alias["reason"] = payload.reason.strip()
         alias["updated_at"] = utc_now()
         current["events"].append(
-            {
-                "action": "column_alias_updated",
-                "alias_id": alias_id,
-                "hospital_id": hospital_id,
-                "canonical_field": alias["canonical_field"],
-                "active": alias["active"],
-                "reason": payload.reason.strip(),
-                "created_at": utc_now(),
-            }
+            _registry_event(
+                "column_alias_updated",
+                payload.reason,
+                alias_id=alias_id,
+                hospital_id=hospital_id,
+                old_canonical_field=old_canonical_field,
+                new_canonical_field=alias["canonical_field"],
+                old_active=old_active,
+                new_active=alias["active"],
+            )
         )
         return current
 
     try:
-        updated = repo.mutate(payload.registry_revision, mutation)
-    except KeyError as error:
+        updated = _alias_coordinator().mutate_registry(
+            payload.registry_revision,
+            mutation,
+        )
+    except AliasRegistryItemNotFound as error:
         raise HTTPException(status_code=404, detail="Column alias was not found") from error
     except AliasRegistryRevisionConflict as error:
         raise HTTPException(
@@ -1357,6 +1397,11 @@ def update_column_alias(
                 "code": "alias_registry_revision_conflict",
                 "current_revision": error.current_revision,
             },
+        ) from error
+    except AliasRegistryUnavailable as error:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "alias_registry_unavailable"},
         ) from error
     alias = next(item for item in updated["aliases"] if item["alias_id"] == alias_id)
     return {"registry_revision": updated["revision"], "alias": alias}
@@ -1456,6 +1501,46 @@ def _apply_reviewer_disposition(
     return changed
 
 
+def _apply_direct_disposition(
+    result: dict[str, Any],
+    review: dict[str, Any],
+    row_id: str,
+    desired_disposition: str,
+    reason: str,
+) -> dict[str, str]:
+    """Apply an explicit editor correction without invoking reviewer Restore."""
+    rows = {str(row["id"]): row for row in project_rows(result, review)}
+    if row_id not in rows:
+        raise ReviewValidationError("Row not found")
+    old_disposition = str(rows[row_id].get("review_disposition") or "pending")
+    if row_id in review["added_rows"]:
+        added = review["added_rows"][row_id]
+        added["review_disposition"] = desired_disposition
+        added.pop("rejection", None)
+        added.pop("pre_rejection_disposition", None)
+        added["review_reason"] = reason.strip()
+    else:
+        machine = next(
+            row for row in result.get("rows", []) if str(row["id"]) == row_id
+        )
+        machine_disposition = str(machine.get("review_disposition") or "pending")
+        previous = review["row_overrides"].get(row_id, {})
+        direct_changes = dict(previous.get("changes", {}))
+        if desired_disposition == machine_disposition:
+            direct_changes.pop("review_disposition", None)
+        else:
+            direct_changes["review_disposition"] = desired_disposition
+        review["row_overrides"][row_id] = {
+            "changes": direct_changes,
+            "reason": reason.strip(),
+            "updated_at": utc_now(),
+        }
+    return {
+        "old_disposition": old_disposition,
+        "new_disposition": desired_disposition,
+    }
+
+
 @app.patch("/api/v2/documents/{job_id}/rows/{row_id}")
 def update_row(
     job_id: str,
@@ -1487,20 +1572,32 @@ def update_row(
         rows = {str(row["id"]): row for row in project_rows(result, review)}
         if row_id not in rows:
             raise ReviewValidationError("Row not found")
-        desired_disposition = changes.get("review_disposition")
-        current_disposition = str(rows[row_id].get("review_disposition") or "pending")
+        row_changes = dict(changes)
+        audit_changes = dict(changes)
+        desired_disposition = row_changes.get("review_disposition")
         if desired_disposition == "rejected":
-            _apply_reviewer_disposition(result, review, (row_id,), "reject", payload.reason)
-            changes.pop("review_disposition", None)
-        elif current_disposition == "rejected" and desired_disposition is not None:
-            _apply_reviewer_disposition(result, review, (row_id,), "restore", payload.reason)
+            transition = _apply_reviewer_disposition(
+                result, review, (row_id,), "reject", payload.reason
+            )[row_id]
+            audit_changes["review_disposition"] = transition
+            row_changes.pop("review_disposition", None)
+        elif desired_disposition is not None:
+            transition = _apply_direct_disposition(
+                result,
+                review,
+                row_id,
+                str(desired_disposition),
+                payload.reason,
+            )
+            audit_changes["review_disposition"] = transition
+            row_changes.pop("review_disposition", None)
         if row_id in review["added_rows"]:
-            review["added_rows"][row_id].update(changes)
+            review["added_rows"][row_id].update(row_changes)
             review["added_rows"][row_id]["review_reason"] = payload.reason.strip()
         else:
             previous = review["row_overrides"].get(row_id, {})
             review["row_overrides"][row_id] = {
-                "changes": {**previous.get("changes", {}), **changes},
+                "changes": {**previous.get("changes", {}), **row_changes},
                 "reason": payload.reason.strip(),
                 "updated_at": utc_now(),
                 **(
@@ -1511,7 +1608,7 @@ def update_row(
             }
         review["approval"] = None
         review["events"].append(
-            _event(expected + 1, "row_updated", row_id, payload.reason, changes)
+            _event(expected + 1, "row_updated", row_id, payload.reason, audit_changes)
         )
         return review
 

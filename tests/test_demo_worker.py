@@ -598,3 +598,40 @@ def test_worker_fails_closed_before_ocr_when_alias_registry_is_invalid(
 
     assert store.read(job_id)["status"] == "processing"
     assert not (store.job_dir(job_id) / "result.json").exists()
+
+
+def test_registry_probe_fails_all_queued_jobs_and_recovers_without_worker_exit(
+    tmp_path: Path,
+) -> None:
+    store = JobStore(tmp_path)
+    first_id = _create_worker_job(store, "First queued bill.pdf")
+    second_id = _create_worker_job(store, "Second queued bill.pdf")
+    registry = tmp_path / "alias-registry.json"
+    registry.write_text('{"registry_version":"unsupported"}')
+    coordinator = worker_module.AliasTransactionCoordinator(store, registry)
+
+    assert worker_module._probe_alias_registry(coordinator, store) is False
+    for job_id in (first_id, second_id):
+        state = store.read(job_id)
+        assert state["status"] == "failed"
+        assert state["error"] == "alias_registry_unavailable"
+
+    registry.unlink()
+    recovered_id = _create_worker_job(store, "Bill after registry repair.pdf")
+    assert worker_module._probe_alias_registry(coordinator, store) is True
+    assert store.read(recovered_id)["status"] == "queued"
+
+
+def test_cleanup_registry_failure_fails_queue_without_escaping(tmp_path: Path) -> None:
+    store = JobStore(tmp_path)
+    job_id = _create_worker_job(store, "Queued during cleanup failure.pdf")
+
+    class BrokenCoordinator:
+        def cleanup(self, retention_hours: int) -> int:
+            assert retention_hours == 720
+            raise AliasRegistryUnavailable("corrupt journal")
+
+    assert worker_module._cleanup_jobs(store, BrokenCoordinator(), 720) is False
+    state = store.read(job_id)
+    assert state["status"] == "failed"
+    assert state["error"] == "alias_registry_unavailable"

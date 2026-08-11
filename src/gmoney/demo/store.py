@@ -171,6 +171,16 @@ class JobStore:
             self.write(job_id, state)
             return state
 
+    def fail_queued(self, job_id: str, error: str) -> bool:
+        """Fail a queued job without exposing a transient processing state."""
+        with self.job_lock(job_id, exclusive=True):
+            state = self.read(job_id)
+            if state.get("status") != "queued":
+                return False
+            state.update(status="failed", error=error)
+            self.write(job_id, state)
+            return True
+
     def update_processing_progress(self, job_id: str, page: int, pages: int) -> bool:
         with self.job_lock(job_id, exclusive=True):
             state = self.read(job_id)

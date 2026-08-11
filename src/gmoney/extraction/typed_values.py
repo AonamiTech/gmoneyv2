@@ -177,14 +177,8 @@ def parse_alias_field_value(
         )
     if canonical_field == "service_date":
         parsed_date = parse_service_date(value)
-        if parsed_date is None and not structured_field_value_is_valid(canonical_field, value):
-            return None
         if parsed_date is None:
-            return (
-                {"service_date_raw": value, "service_date_iso": None},
-                "service_date_raw",
-                "service_date",
-            )
+            return None
         return (
             {"service_date_raw": value, "service_date_iso": parsed_date},
             "service_date_iso",

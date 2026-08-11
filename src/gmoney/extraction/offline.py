@@ -106,7 +106,11 @@ from gmoney.inference.paddle import (
     PaddleOcrVlAdapter,
 )
 from gmoney.inference.redaction import redact_crop
-from gmoney.profiles.aliases import CANONICAL_TO_HEADER_ROLE, JsonAliasRepository
+from gmoney.profiles.aliases import (
+    CANONICAL_TO_HEADER_ROLE,
+    AliasRegistryUnavailable,
+    JsonAliasRepository,
+)
 from gmoney.profiles.lifecycle import deterministic_shadow_sample
 from gmoney.profiles.matching import match_profile, profile_to_schema
 from gmoney.profiles.repository import JsonProfileRepository
@@ -3572,13 +3576,10 @@ class OfflineExtractor:
         alias_snapshot: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         set_header_aliases({})
-        if alias_snapshot is None:
-            alias_snapshot = (
-                JsonAliasRepository(self.alias_registry).read()
-                if self.alias_registry is not None and self.alias_registry.exists()
-                else None
-            )
+        if self.alias_registry is not None and alias_snapshot is None:
+            raise AliasRegistryUnavailable("coordinated alias snapshot is required")
         resolved_hospital_id = self.hospital_id
+
         def abort_checkpoint() -> None:
             if should_abort is not None and should_abort():
                 raise ExtractionAborted
