@@ -98,6 +98,29 @@ def test_hospital_header_alias_maps_an_exact_unseen_column() -> None:
     assert unrelated_columns["Procedure Ref."] is None
 
 
+def test_hospital_header_alias_uses_the_shared_punctuation_normalizer() -> None:
+    tokens = (
+        token(1, "Particular", (40, 30, 260, 50)),
+        token(2, "Item #", (360, 30, 520, 50)),
+        token(3, "Amount", (700, 30, 820, 50)),
+        token(4, "Consultation", (40, 80, 260, 100)),
+        token(5, "PROC-44", (360, 80, 520, 100)),
+        token(6, "100.00", (700, 80, 820, 100)),
+    )
+    set_header_aliases({"item": "service_code"})
+    try:
+        result = reconstruct_ocr_rows(
+            tokens,
+            page_number=1,
+            table_id="p1-t1-item",
+            box=(0, 0, 900, 160),
+        )
+    finally:
+        set_header_aliases({})
+
+    assert result.rows[0].candidate.service_code == "PROC-44"
+
+
 @pytest.mark.parametrize(
     ("printed_description", "expected"),
     (

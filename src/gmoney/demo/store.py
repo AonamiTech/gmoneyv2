@@ -270,6 +270,8 @@ class JobStore:
     def _require_stable_workspace(self, job_id: str) -> None:
         if (self.job_dir(job_id) / ".cutover.json").is_file():
             raise JobTransactionError("job_cutover_recovery_required")
+        if (self.job_dir(job_id) / ".alias-operation.json").is_file():
+            raise JobTransactionError("alias_operation_recovery_required")
 
     def read_review(self, job_id: str) -> dict[str, Any]:
         with self.job_lock(job_id, exclusive=False):
@@ -563,10 +565,12 @@ class JobStore:
         return utc_text(self.last_activity(job_id, current) + timedelta(hours=retention_hours))
 
     def delete(self, job_id: str) -> None:
-        state = self.read(job_id)
-        if state.get("status") in ACTIVE_STATUSES:
-            raise RuntimeError("active_job")
-        shutil.rmtree(self.job_dir(job_id))
+        with self.job_lock(job_id, exclusive=True):
+            self._require_stable_workspace(job_id)
+            state = self.read(job_id)
+            if state.get("status") in ACTIVE_STATUSES:
+                raise RuntimeError("active_job")
+            shutil.rmtree(self.job_dir(job_id))
 
     def cleanup(self, retention_hours: int) -> int:
         if retention_hours <= 0:
@@ -574,10 +578,19 @@ class JobStore:
         cutoff = datetime.now(UTC) - timedelta(hours=retention_hours)
         removed = 0
         for state in self.states():
-            if state.get("status") in ACTIVE_STATUSES:
+            try:
+                with self.job_lock(state["id"], exclusive=True):
+                    try:
+                        self._require_stable_workspace(state["id"])
+                    except JobTransactionError:
+                        continue
+                    current = self.read(state["id"])
+                    if current.get("status") in ACTIVE_STATUSES:
+                        continue
+                    updated = self.last_activity(state["id"], current)
+                    if updated < cutoff:
+                        shutil.rmtree(self.job_dir(state["id"]), ignore_errors=True)
+                        removed += 1
+            except FileNotFoundError:
                 continue
-            updated = self.last_activity(state["id"], state)
-            if updated < cutoff:
-                shutil.rmtree(self.job_dir(state["id"]), ignore_errors=True)
-                removed += 1
         return removed

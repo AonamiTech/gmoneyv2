@@ -46,6 +46,7 @@ type TrainedHospital = {
   training_sources: string[];
 };
 type TrainedHospitalsResult = {
+  registry_revision: number;
   total: number;
   hospitals: TrainedHospital[];
 };
@@ -91,6 +92,12 @@ type Row = {
   field_evidence: Record<string, Evidence[]>;
   validation_flags: string[];
   review: ReviewMeta;
+  bulk_action: "reject" | "restore" | null;
+  rejection_provenance: {
+    source: "reviewer";
+    previous_disposition: string;
+    legacy_fallback: boolean;
+  } | null;
 };
 type PrintedTotal = {
   amount: string;
@@ -188,6 +195,8 @@ type ReviewSummary = {
   approval: { status: string; approved_at: string; review_revision: number } | null;
 };
 type AliasCandidate = {
+  candidate_id: string;
+  source_table_id: string;
   source_row_id: string;
   source_column_id: string;
   row_id: string | null;
@@ -202,7 +211,7 @@ type AliasPreview = {
   canonical_field: string;
   review_revision: number;
   registry_revision: number;
-  preview_digest: string;
+  source_digest: string;
   counts: Record<AliasCandidate["classification"], number>;
   candidates: AliasCandidate[];
 };
@@ -388,6 +397,7 @@ export default function Home() {
   const [historyTotal, setHistoryTotal] = useState(0);
   const [historyQuery, setHistoryQuery] = useState("");
   const [trainedHospitals, setTrainedHospitals] = useState<TrainedHospital[]>([]);
+  const [aliasRegistryRevision, setAliasRegistryRevision] = useState(0);
   const [trainedHospitalsError, setTrainedHospitalsError] = useState<string | null>(null);
   const [railView, setRailView] = useState<"active" | "history" | "hospitals">("history");
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
@@ -428,7 +438,7 @@ export default function Home() {
   const [aliasReason, setAliasReason] = useState("");
   const [hospitalChoice, setHospitalChoice] = useState("create");
   const [aliasPreview, setAliasPreview] = useState<AliasPreview | null>(null);
-  const [aliasOverwrites, setAliasOverwrites] = useState<Set<string>>(new Set());
+  const [aliasSelected, setAliasSelected] = useState<Set<string>>(new Set());
   const [hospitalAliases, setHospitalAliases] = useState<HospitalAlias[]>([]);
   const [drawMode, setDrawMode] = useState<"add" | "relink" | "hospital" | null>(null);
   const [draftPolygon, setDraftPolygon] = useState<Point[] | null>(null);
@@ -523,6 +533,7 @@ export default function Home() {
     try {
       const result = await request<TrainedHospitalsResult>("/api/v2/hospitals/trained");
       setTrainedHospitals(result.hospitals);
+      setAliasRegistryRevision(result.registry_revision);
       setTrainedHospitalsError(null);
       return result.hospitals;
     } catch (cause) {
@@ -668,7 +679,7 @@ export default function Home() {
     setAliasColumn(null);
     setAliasPanelOpen(false);
     setAliasPreview(null);
-    setAliasOverwrites(new Set());
+    setAliasSelected(new Set());
     setHospitalAliases([]);
   }, [selectedJobId]);
 
@@ -844,6 +855,7 @@ export default function Home() {
         body: JSON.stringify({
           create,
           hospital_id: create ? null : hospitalChoice,
+          registry_revision: aliasRegistryRevision,
           reason: aliasReason,
         }),
       },
@@ -851,6 +863,8 @@ export default function Home() {
     if (linked) {
       setHospitalChoice(linked.hospital_id);
       setAliasPreview(null);
+      void refreshTrainedHospitals();
+    } else {
       void refreshTrainedHospitals();
     }
   };
@@ -871,15 +885,24 @@ export default function Home() {
         },
       );
       setAliasPreview(preview);
-      setAliasOverwrites(new Set());
+      setAliasRegistryRevision(preview.registry_revision);
+      const selected = new Set<string>();
+      const selectedTargets = new Set<string>();
+      for (const candidate of preview.candidates) {
+        if (!["fillable", "unchanged"].includes(candidate.classification) || !candidate.row_id) continue;
+        if (selectedTargets.has(candidate.row_id)) continue;
+        selectedTargets.add(candidate.row_id);
+        selected.add(candidate.candidate_id);
+      }
+      setAliasSelected(selected);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Alias preview failed");
     }
   };
 
   const applyColumnAlias = async () => {
-    if (!selectedJob || !aliasPreview || aliasReason.trim().length < 3) {
-      setError("Preview the alias and add a short mapping reason.");
+    if (!selectedJob || !aliasPreview || !aliasSelected.size || aliasReason.trim().length < 3) {
+      setError("Select at least one grounded row and add a short mapping reason.");
       return;
     }
     const applied = await mutate(
@@ -890,9 +913,9 @@ export default function Home() {
           hospital_id: aliasPreview.hospital_id,
           source_label: aliasPreview.source_label,
           canonical_field: aliasPreview.canonical_field,
-          preview_digest: aliasPreview.preview_digest,
+          source_digest: aliasPreview.source_digest,
           registry_revision: aliasPreview.registry_revision,
-          overwrite_row_ids: [...aliasOverwrites],
+          selected_candidate_ids: [...aliasSelected],
           reason: aliasReason,
         }),
       },
@@ -901,8 +924,12 @@ export default function Home() {
       setAliasColumn(null);
       setAliasPanelOpen(false);
       setAliasPreview(null);
-      setAliasOverwrites(new Set());
+      setAliasSelected(new Set());
       setAliasReason("");
+      void refreshTrainedHospitals();
+    } else {
+      setAliasPreview(null);
+      setAliasSelected(new Set());
       void refreshTrainedHospitals();
     }
   };
@@ -910,10 +937,11 @@ export default function Home() {
   const loadHospitalAliases = async () => {
     if (!review?.hospital_id) return;
     try {
-      const response = await request<{ aliases: HospitalAlias[] }>(
+      const response = await request<{ registry_revision: number; aliases: HospitalAlias[] }>(
         `/api/v2/hospitals/${review.hospital_id}/aliases`,
       );
       setHospitalAliases(response.aliases);
+      setAliasRegistryRevision(response.registry_revision);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Aliases could not be loaded");
     }
@@ -931,12 +959,18 @@ export default function Home() {
       await request(`/api/v2/hospitals/${review.hospital_id}/aliases/${alias.alias_id}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ...changes, reason: aliasReason }),
+        body: JSON.stringify({
+          ...changes,
+          registry_revision: aliasRegistryRevision,
+          reason: aliasReason,
+        }),
       });
       await loadHospitalAliases();
       void refreshTrainedHospitals();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Alias could not be changed");
+      await loadHospitalAliases();
+      void refreshTrainedHospitals();
     }
   };
 
@@ -1234,7 +1268,12 @@ export default function Home() {
     ledgerMode === "printed"
       ? (sourceTablesResult?.total ?? 0)
       : (rowsResult?.total ?? 0);
-  const visibleRowIds = rowsResult?.rows.map((row) => row.id) ?? [];
+  const visibleBulkAction: "reject" | "restore" =
+    disposition === "rejected" ? "restore" : "reject";
+  const visibleRowIds =
+    rowsResult?.rows
+      .filter((row) => row.bulk_action === visibleBulkAction)
+      .map((row) => row.id) ?? [];
   const allVisibleRowsSelected =
     visibleRowIds.length > 0 && visibleRowIds.every((rowId) => bulkRowIds.has(rowId));
   const optionalFields = new Set(rowsResult?.populated_fields ?? []);
@@ -1545,8 +1584,8 @@ export default function Home() {
                   <div className="bulk-action-bar" role="region" aria-label="Bulk row actions">
                     <strong>{bulkRowIds.size} selected</strong>
                     <span>Only rows on this visible page are selected.</span>
-                    <button onClick={() => setBulkAction(disposition === "rejected" ? "restore" : "reject")}>
-                      {disposition === "rejected" ? "Restore selected" : "Reject selected"}
+                    <button onClick={() => setBulkAction(visibleBulkAction)}>
+                      {visibleBulkAction === "restore" ? "Restore selected" : "Reject selected"}
                     </button>
                     <button className="quiet" onClick={() => setBulkRowIds(new Set())}>Clear</button>
                   </div>
@@ -1622,7 +1661,7 @@ export default function Home() {
                                             setAliasColumn(column);
                                             setAliasTarget(column.canonical_field === "service_date_raw" ? "service_date" : (column.canonical_field ?? "net_amount"));
                                             setAliasPreview(null);
-                                            setAliasOverwrites(new Set());
+                                            setAliasSelected(new Set());
                                             setAliasPanelOpen(true);
                                             void loadHospitalAliases();
                                           }}
@@ -1693,6 +1732,7 @@ export default function Home() {
                                 <input
                                   type="checkbox"
                                   aria-label="Select all rows on this page"
+                                  disabled={!visibleRowIds.length}
                                   checked={allVisibleRowsSelected}
                                   onChange={(event) => setBulkRowIds(event.target.checked ? new Set(visibleRowIds) : new Set())}
                                 />
@@ -1713,6 +1753,7 @@ export default function Home() {
                                     <input
                                       type="checkbox"
                                       aria-label={`Select ${row.description || "unlabelled row"}`}
+                                      disabled={row.bulk_action !== visibleBulkAction}
                                       checked={bulkRowIds.has(row.id)}
                                       onChange={(event) => setBulkRowIds((current) => {
                                         const next = new Set(current);
@@ -1883,9 +1924,9 @@ export default function Home() {
                         ) : (
                           <>
                             <div className="alias-counts"><span><b>{aliasPreview.counts.fillable}</b> fillable</span><span><b>{aliasPreview.counts.conflicting}</b> conflicts</span><span><b>{aliasPreview.counts.invalid}</b> invalid</span><span><b>{aliasPreview.counts.unlinked}</b> unlinked</span></div>
-                            {aliasPreview.candidates.some((item) => item.classification === "conflicting") && <div className="alias-conflicts"><strong>Choose any machine values to replace</strong>{aliasPreview.candidates.filter((item) => item.classification === "conflicting" && item.row_id).map((item) => <label key={item.source_row_id}><input type="checkbox" checked={aliasOverwrites.has(item.row_id!)} onChange={(event) => setAliasOverwrites((current) => { const next = new Set(current); if (event.target.checked) next.add(item.row_id!); else next.delete(item.row_id!); return next; })} /><span>{item.current_value || "—"} → {item.proposed_value || "—"}</span></label>)}</div>}
+                            <div className="alias-conflicts"><strong>Select grounded values to apply</strong>{aliasPreview.candidates.map((item) => { const selectable = ["fillable", "unchanged", "conflicting"].includes(item.classification) && Boolean(item.row_id); return <label key={item.candidate_id} className={selectable ? item.classification : "disabled"}><input type="checkbox" disabled={!selectable} checked={aliasSelected.has(item.candidate_id)} onChange={(event) => setAliasSelected((current) => { const next = new Set(current); if (event.target.checked) { for (const candidate of aliasPreview.candidates) { if (candidate.row_id === item.row_id) next.delete(candidate.candidate_id); } next.add(item.candidate_id); } else next.delete(item.candidate_id); return next; })} /><span><b>{item.classification}</b> · {item.current_value || "—"} → {item.proposed_value || item.source_value || "—"}</span></label>; })}</div>
                             <label><span>Mapping reason</span><input value={aliasReason} onChange={(event) => setAliasReason(event.target.value)} placeholder="Why does this header map to this field?" /></label>
-                            <div className="sheet-actions"><button className="secondary" onClick={() => setAliasPreview(null)}>Back</button><button className="primary" onClick={() => void applyColumnAlias()}>Apply to bill and teach hospital</button></div>
+                            <div className="sheet-actions"><button className="secondary" onClick={() => setAliasPreview(null)}>Back</button><button className="primary" disabled={!aliasSelected.size} onClick={() => void applyColumnAlias()}>Apply {aliasSelected.size || "no"} selected and teach hospital</button></div>
                           </>
                         )}
                       </div>

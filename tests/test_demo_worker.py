@@ -14,6 +14,7 @@ import pytest
 from gmoney.demo import worker as worker_module
 from gmoney.demo.store import JobStore, JobTransactionError
 from gmoney.extraction.offline import ExtractionAborted
+from gmoney.profiles.aliases import AliasRegistryUnavailable
 
 
 @pytest.fixture(autouse=True)
@@ -581,3 +582,19 @@ def test_gpu_pool_exits_each_child_after_one_task() -> None:
 
 def test_cpu_pool_keeps_reusable_children() -> None:
     assert worker_module._executor_options(2, "cpu") == {"max_workers": 2}
+
+
+def test_worker_fails_closed_before_ocr_when_alias_registry_is_invalid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = JobStore(tmp_path)
+    job_id = _create_worker_job(store, "Invalid alias registry.pdf")
+    registry = tmp_path / "alias-registry.json"
+    registry.write_text('{"registry_version":"unsupported"}')
+    monkeypatch.setenv("GMONEY_ALIAS_REGISTRY", str(registry))
+
+    with pytest.raises(AliasRegistryUnavailable):
+        worker_module._run_job(str(tmp_path), job_id, "http://vl.test")
+
+    assert store.read(job_id)["status"] == "processing"
+    assert not (store.job_dir(job_id) / "result.json").exists()

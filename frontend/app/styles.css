@@ -594,6 +594,9 @@ tbody tr.bulk-marked td:first-child { box-shadow: inset 3px 0 var(--blue); }
 .alias-conflicts > strong { font-size: 10px; }
 .alias-conflicts label { grid-template-columns: 18px 1fr; align-items: center; }
 .alias-conflicts input { min-height: 0; padding: 0; }
+.alias-conflicts label.disabled { opacity: .48; }
+.alias-conflicts label b { color: var(--ink); font-size: 8px; letter-spacing: .06em; text-transform: uppercase; }
+.select-cell input:disabled { cursor: not-allowed; opacity: .35; }
 .alias-list { display: grid; gap: 7px; }
 .alias-list article { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 12px; border: 1px solid var(--line-soft); border-radius: 10px; background: var(--paper); }
 .alias-list article.inactive { opacity: .55; }

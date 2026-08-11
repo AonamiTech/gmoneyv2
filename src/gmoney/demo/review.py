@@ -167,12 +167,53 @@ def project_rows(result: dict[str, Any], review: dict[str, Any]) -> list[dict[st
             )
         else:
             row["review"] = _review_metadata("machine", modified=False, reason=None)
+        machine_disposition = str(machine.get("review_disposition") or "pending")
+        rejection = override.get("rejection") if override else None
+        legacy_reviewer_rejection = bool(
+            override
+            and override.get("changes", {}).get("review_disposition") == "rejected"
+            and machine_disposition != "rejected"
+        )
+        if row.get("review_disposition") != "rejected":
+            row["bulk_action"] = "reject"
+            row["rejection_provenance"] = None
+        elif rejection or legacy_reviewer_rejection:
+            previous = (
+                rejection.get("previous_disposition")
+                if isinstance(rejection, dict)
+                else override.get("pre_rejection_disposition", machine_disposition)
+            )
+            row["bulk_action"] = "restore"
+            row["rejection_provenance"] = {
+                "source": "reviewer",
+                "previous_disposition": previous,
+                "legacy_fallback": not isinstance(rejection, dict),
+            }
+        else:
+            row["bulk_action"] = None
+            row["rejection_provenance"] = None
         projected.append(row)
     for added in review.get("added_rows", {}).values():
         row = json.loads(json.dumps(added))
         row["review"] = _review_metadata(
             "reviewer", modified=True, reason=row.pop("review_reason", None)
         )
+        rejection = row.pop("rejection", None)
+        row.pop("pre_rejection_disposition", None)
+        if row.get("review_disposition") == "rejected":
+            row["bulk_action"] = "restore"
+            row["rejection_provenance"] = {
+                "source": "reviewer",
+                "previous_disposition": (
+                    rejection.get("previous_disposition", "accepted")
+                    if isinstance(rejection, dict)
+                    else "accepted"
+                ),
+                "legacy_fallback": not isinstance(rejection, dict),
+            }
+        else:
+            row["bulk_action"] = "reject"
+            row["rejection_provenance"] = None
         projected.append(row)
     projected.sort(key=lambda row: (int(row["page_number"]), int(row["row_order"]), row["id"]))
     return projected

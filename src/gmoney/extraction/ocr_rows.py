@@ -23,7 +23,9 @@ from gmoney.extraction.typed_values import (
     DAY_QUANTITY,
     parse_decimal,
     parse_quantity,
+    structured_field_value_is_valid,
 )
+from gmoney.normalization import normalize_header
 
 HEADER_TERMS: dict[str, tuple[str, ...]] = {
     "serial": ("sr no", "sr n", "s no", "serial no", "#"),
@@ -553,10 +555,11 @@ def _header_roles(line: OcrLine) -> dict[str, OcrToken]:
     roles: dict[str, OcrToken] = {}
     for token in line.tokens:
         normalized = _normalize(token.text)
-        alias_role = (_ACTIVE_HEADER_ALIASES.get() or {}).get(normalized)
+        alias_normalized = normalize_header(token.text)
+        alias_role = (_ACTIVE_HEADER_ALIASES.get() or {}).get(alias_normalized)
         if alias_role is not None:
             roles[alias_role] = token
-            alias_id = (_ACTIVE_HEADER_ALIAS_IDS.get() or {}).get(normalized)
+            alias_id = (_ACTIVE_HEADER_ALIAS_IDS.get() or {}).get(alias_normalized)
             matched = _MATCHED_HEADER_ALIAS_IDS.get()
             if alias_id is not None and matched is not None:
                 matched.add(alias_id)
@@ -2819,24 +2822,7 @@ def _closest_field_token(
 
 
 def _structured_field_value_is_valid(role: str, value: str) -> bool:
-    text = value.strip()
-    if not text:
-        return False
-    if role == "service_date":
-        return DATE_SPAN.search(text) is not None
-    if role == "service_code":
-        return bool(
-            re.fullmatch(r"(?=.*[A-Za-z])(?=.*\d)[A-Za-z0-9./-]{3,30}", text)
-        )
-    if role == "hsn_code":
-        return DATE_SPAN.search(text) is None and bool(
-            re.fullmatch(r"[A-Za-z0-9./-]{3,30}", text)
-        )
-    if role == "request_no":
-        return bool(re.fullmatch(r"[A-Za-z0-9./-]{3,60}", text))
-    if role == "section":
-        return parse_decimal(text) is None and len(text) <= 120
-    return False
+    return structured_field_value_is_valid(role, value)
 
 
 def _structured_text_fields(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -16,6 +17,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from gmoney.contracts.extraction import SourceTable
 from gmoney.contracts.phase3 import ProfileLifecycle
+from gmoney.demo.alias_transactions import AliasTransactionCoordinator
 from gmoney.demo.review import (
     ReviewValidationError,
     approval_blockers,
@@ -41,14 +43,15 @@ from gmoney.demo.store import (
     utc_now,
     utc_text,
 )
-from gmoney.extraction.canonicalize import parse_service_date
-from gmoney.extraction.typed_values import parse_decimal, parse_quantity
+from gmoney.extraction.typed_values import parse_alias_field_value
 from gmoney.profiles.aliases import (
     ALIAS_CANONICAL_FIELDS,
     CANONICAL_TO_SOURCE_FIELD,
     AliasRegistryRevisionConflict,
+    AliasRegistryUnavailable,
     JsonAliasRepository,
-    normalize_alias,
+    normalize_header,
+    normalize_hospital_name,
 )
 from gmoney.profiles.repository import JsonProfileRepository
 
@@ -66,6 +69,7 @@ ALIAS_REGISTRY = Path(
     os.environ.get("GMONEY_ALIAS_REGISTRY", str(DEMO_ROOT / "alias-registry.json"))
 )
 store = JobStore(DEMO_ROOT)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="GMoney V2 Evidence Demo",
@@ -73,6 +77,14 @@ app = FastAPI(
     docs_url="/api/v2/docs",
     openapi_url="/api/v2/openapi.json",
 )
+
+
+@app.on_event("startup")
+def recover_alias_transactions_at_startup() -> None:
+    try:
+        _alias_coordinator().recover_all()
+    except AliasRegistryUnavailable:
+        logger.exception("hospital alias registry recovery failed during API startup")
 
 
 def _byte_limit_label(size: int) -> str:
@@ -129,6 +141,7 @@ class HospitalPatch(BaseModel):
 class HospitalLinkPatch(BaseModel):
     hospital_id: str | None = Field(default=None, min_length=1, max_length=200)
     create: bool = False
+    registry_revision: int = Field(ge=0)
     reason: str = Field(min_length=3, max_length=500)
 
 
@@ -139,13 +152,14 @@ class ColumnAliasPreviewRequest(BaseModel):
 
 
 class ColumnAliasApplyRequest(ColumnAliasPreviewRequest):
-    preview_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    source_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
     registry_revision: int = Field(ge=0)
-    overwrite_row_ids: list[str] = Field(default_factory=list, max_length=500)
+    selected_candidate_ids: list[str] = Field(min_length=1, max_length=500)
     reason: str = Field(min_length=3, max_length=500)
 
 
 class ColumnAliasPatch(BaseModel):
+    registry_revision: int = Field(ge=0)
     canonical_field: str | None = Field(default=None, min_length=1, max_length=100)
     active: bool | None = None
     reason: str = Field(min_length=3, max_length=500)
@@ -180,7 +194,10 @@ def _public_state(state: dict[str, Any]) -> dict[str, Any]:
     if state.get("status") == "complete":
         try:
             hospital_override = (
-                store.read_review(state["id"]).get("document_overrides", {}).get("hospital")
+                _alias_coordinator()
+                .run_job_operation(state["id"], lambda: store.read_review(state["id"]))
+                .get("document_overrides", {})
+                .get("hospital")
             )
         except KeyError:
             hospital_override = None
@@ -201,14 +218,20 @@ def _state_or_404(job_id: str) -> dict[str, Any]:
 
 def _complete_result(job_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
     try:
-        _recover_alias_operation(job_id)
-        state, result, review = store.read_workspace(job_id)
+        state, result, review = _alias_coordinator().run_job_operation(
+            job_id, lambda: store.read_workspace(job_id)
+        )
     except KeyError as error:
         raise HTTPException(status_code=404, detail="Document not found") from error
     except JobTransactionError as error:
         raise HTTPException(
             status_code=409,
             detail="Document workspace is temporarily unavailable",
+        ) from error
+    except AliasRegistryUnavailable as error:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "alias_registry_unavailable"},
         ) from error
     if state.get("status") != "complete":
         raise HTTPException(status_code=409, detail="Extraction is not complete")
@@ -236,7 +259,7 @@ def _mutate(
     mutation: Any,
 ) -> dict[str, Any]:
     try:
-        return store.mutate_review(job_id, expected, mutation)
+        return _alias_coordinator().mutate_review(job_id, expected, mutation)
     except ReviewRevisionConflict as error:
         raise HTTPException(
             status_code=409,
@@ -247,6 +270,10 @@ def _mutate(
         ) from error
     except ReviewValidationError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
+    except AliasRegistryUnavailable as error:
+        raise HTTPException(
+            status_code=503, detail={"code": "alias_registry_unavailable"}
+        ) from error
 
 
 def _event(
@@ -271,53 +298,17 @@ def _alias_repository() -> JsonAliasRepository:
     return JsonAliasRepository(ALIAS_REGISTRY)
 
 
-def _alias_journal_path(job_id: str) -> Path:
-    return store.job_dir(job_id) / ".alias-operation.json"
-
-
-def _write_alias_journal(path: Path, payload: dict[str, Any]) -> None:
-    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-    temporary.replace(path)
-
-
-def _recover_alias_operation(job_id: str) -> None:
-    journal_path = _alias_journal_path(job_id)
-    if not journal_path.is_file():
-        return
-    repo = _alias_repository()
-    with repo.locked(exclusive=True), store.job_lock(job_id, exclusive=True):
-        if not journal_path.is_file():
-            return
-        journal = json.loads(journal_path.read_text())
-        if (
-            journal.get("version") != "alias_operation_v1"
-            or journal.get("job_id") != job_id
-        ):
-            raise JobTransactionError("unsupported_alias_operation_journal")
-        review = journal.get("review")
-        registry = journal.get("registry")
-        if not isinstance(review, dict) or not isinstance(registry, dict):
-            raise JobTransactionError("invalid_alias_operation_journal")
-        repo._validate(registry)
-        store._restore_payload(store.job_dir(job_id) / "review.json", review)
-        repo._write_unlocked(registry)
-        journal_path.unlink()
-
-
-def _recover_alias_operations() -> None:
-    for journal in store.jobs_root.glob("*/.alias-operation.json"):
-        _recover_alias_operation(journal.parent.name)
+def _alias_coordinator() -> AliasTransactionCoordinator:
+    return AliasTransactionCoordinator(store, ALIAS_REGISTRY)
 
 
 def _alias_snapshot() -> dict[str, Any]:
     try:
-        _recover_alias_operations()
-        return _alias_repository().read()
-    except (JobTransactionError, OSError, ValueError, json.JSONDecodeError) as error:
+        return _alias_coordinator().registry_snapshot()
+    except AliasRegistryUnavailable as error:
         raise HTTPException(
             status_code=503,
-            detail="The hospital alias registry is unavailable",
+            detail={"code": "alias_registry_unavailable"},
         ) from error
 
 
@@ -327,40 +318,13 @@ def _mutate_review_and_alias_registry(
     expected_registry_revision: int,
     mutation: Any,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    repo = _alias_repository()
     try:
-        with repo.locked(exclusive=True) as registry:
-            if registry["revision"] != expected_registry_revision:
-                raise AliasRegistryRevisionConflict(registry["revision"])
-            with store.job_lock(job_id, exclusive=True):
-                store._require_stable_workspace(job_id)
-                review = store._read_review_unlocked(job_id)
-                if review["revision"] != expected_review_revision:
-                    raise ReviewRevisionConflict(review["revision"])
-                updated_review, updated_registry = mutation(
-                    json.loads(json.dumps(review)),
-                    json.loads(json.dumps(registry)),
-                )
-                updated_review["revision"] = review["revision"] + 1
-                updated_review["updated_at"] = utc_now()
-                updated_registry["revision"] = registry["revision"] + 1
-                repo._validate(updated_registry)
-                journal_path = _alias_journal_path(job_id)
-                _write_alias_journal(
-                    journal_path,
-                    {
-                        "version": "alias_operation_v1",
-                        "job_id": job_id,
-                        "review": updated_review,
-                        "registry": updated_registry,
-                    },
-                )
-                repo._write_unlocked(updated_registry)
-                store._restore_payload(
-                    store.job_dir(job_id) / "review.json", updated_review
-                )
-                journal_path.unlink()
-                return updated_review, updated_registry
+        return _alias_coordinator().mutate_review_and_registry(
+            job_id,
+            expected_review_revision,
+            expected_registry_revision,
+            mutation,
+        )
     except AliasRegistryRevisionConflict as error:
         raise HTTPException(
             status_code=409,
@@ -379,6 +343,10 @@ def _mutate_review_and_alias_registry(
         ) from error
     except ReviewValidationError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
+    except AliasRegistryUnavailable as error:
+        raise HTTPException(
+            status_code=503, detail={"code": "alias_registry_unavailable"}
+        ) from error
 
 
 def _validate_alias_field(value: str) -> str:
@@ -397,36 +365,7 @@ def _alias_value(
     canonical_field: str,
     raw_value: str,
 ) -> tuple[dict[str, Any], str, str] | None:
-    value = raw_value.strip()
-    if not value:
-        return None
-    if canonical_field in {
-        "quantity",
-        "unit_price",
-        "gross_amount",
-        "discount",
-        "net_amount",
-    }:
-        parsed = parse_quantity(value) if canonical_field == "quantity" else parse_decimal(value)
-        if parsed is None:
-            return None
-        changes = normalize_changes({canonical_field: str(parsed)})
-        evidence_field = {
-            "unit_price": "rate",
-            "net_amount": "amount",
-        }.get(canonical_field, canonical_field)
-        return changes, canonical_field, evidence_field
-    if canonical_field == "service_date":
-        parsed_date = parse_service_date(value)
-        if parsed_date is None:
-            return None
-        return (
-            {"service_date_raw": value, "service_date_iso": parsed_date},
-            "service_date_iso",
-            "service_date",
-        )
-    changes = normalize_changes({canonical_field: value})
-    return changes, canonical_field, canonical_field
+    return parse_alias_field_value(canonical_field, raw_value)
 
 
 def _alias_preview_payload(
@@ -454,31 +393,49 @@ def _alias_preview_payload(
             status_code=409,
             detail="Printed extraction failed grounding validation; reprocess this bill",
         ) from error
-    normalized_label = normalize_alias(request.source_label)
+    normalized_label = normalize_header(request.source_label)
     if not normalized_label:
         raise HTTPException(status_code=422, detail="Alias label is empty after normalization")
     rows = {str(row["id"]): row for row in project_rows(result, review)}
     candidates: list[dict[str, Any]] = []
-    source_column_ids: set[str] = set()
+    source_columns: list[dict[str, str]] = []
     for table in tables:
         matching_columns = [
-            column
-            for column in table.columns
-            if normalize_alias(column.label) == normalized_label
+            column for column in table.columns if normalize_header(column.label) == normalized_label
         ]
         for column in matching_columns:
-            source_column_ids.add(column.id)
+            source_ref = {
+                "source_table_id": table.id,
+                "source_column_id": column.id,
+            }
+            source_columns.append(source_ref)
             for source_row in table.rows:
-                cell = next(
-                    item for item in source_row.cells if item.column_id == column.id
-                )
+                cell = next(item for item in source_row.cells if item.column_id == column.id)
                 base = {
+                    "source_table_id": table.id,
+                    "source_table_name": table.table_id,
+                    "source_page": table.page_number,
                     "source_row_id": source_row.id,
                     "source_column_id": column.id,
+                    "source_column_label": column.label,
+                    "source_column_evidence": [
+                        item.model_dump(mode="json") for item in column.evidence
+                    ],
                     "row_id": source_row.canonical_row_id,
                     "source_value": cell.raw_value,
                     "evidence": [item.model_dump(mode="json") for item in cell.evidence],
                 }
+                candidate_material = "\0".join(
+                    (
+                        str(result["document_id"]),
+                        table.id,
+                        column.id,
+                        source_row.id,
+                        str(source_row.canonical_row_id or ""),
+                        canonical_field,
+                    )
+                )
+                base["candidate_id"] = hashlib.sha256(candidate_material.encode()).hexdigest()
                 if source_row.canonical_row_id is None or source_row.canonical_row_id not in rows:
                     candidates.append({**base, "classification": "unlinked"})
                     continue
@@ -491,7 +448,7 @@ def _alias_preview_payload(
                 proposed = changes.get(comparison_field)
                 if current is None or str(current).strip() == "":
                     classification = "fillable"
-                elif normalize_alias(str(current)) == normalize_alias(str(proposed)):
+                elif normalize_header(str(current)) == normalize_header(str(proposed)):
                     classification = "unchanged"
                 else:
                     classification = "conflicting"
@@ -505,7 +462,7 @@ def _alias_preview_payload(
                         "evidence_field": evidence_field,
                     }
                 )
-    if not source_column_ids:
+    if not source_columns:
         raise HTTPException(status_code=422, detail="Printed header was not found")
     digest_payload = {
         "document_id": result["document_id"],
@@ -514,29 +471,17 @@ def _alias_preview_payload(
         "hospital_id": request.hospital_id,
         "source_label": normalized_label,
         "canonical_field": canonical_field,
-        "columns": sorted(source_column_ids),
-        "rows": [
-            {
-                key: item.get(key)
-                for key in (
-                    "source_row_id",
-                    "row_id",
-                    "source_value",
-                    "classification",
-                    "current_value",
-                    "proposed_value",
-                )
-            }
-            for item in candidates
-        ],
+        "columns": sorted(
+            source_columns,
+            key=lambda item: (item["source_table_id"], item["source_column_id"]),
+        ),
+        "candidates": sorted(candidates, key=lambda item: item["candidate_id"]),
     }
     digest = hashlib.sha256(
         json.dumps(digest_payload, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
     counts = {
-        classification: sum(
-            item["classification"] == classification for item in candidates
-        )
+        classification: sum(item["classification"] == classification for item in candidates)
         for classification in (
             "fillable",
             "unchanged",
@@ -553,8 +498,11 @@ def _alias_preview_payload(
         "canonical_field": canonical_field,
         "review_revision": review["revision"],
         "registry_revision": registry["revision"],
-        "preview_digest": digest,
-        "source_column_ids": sorted(source_column_ids),
+        "source_digest": digest,
+        "source_columns": sorted(
+            source_columns,
+            key=lambda item: (item["source_table_id"], item["source_column_id"]),
+        ),
         "counts": counts,
         "candidates": candidates,
     }
@@ -572,6 +520,7 @@ def live() -> dict[str, str]:
 
 @app.get("/api/v2/health/ready", tags=["health"])
 def ready() -> dict[str, Any]:
+    _alias_snapshot()
     storage = shutil.disk_usage(store.jobs_root)
     return {
         "status": "ready",
@@ -628,8 +577,9 @@ def list_trained_hospitals() -> dict[str, Any]:
             },
         )
         item["hospital_name"] = hospital["hospital_name"]
-        if "reviewer_alias" not in item["training_sources"]:
-            item["training_sources"].append("reviewer_alias")
+        for origin in hospital.get("origins", []):
+            if origin not in item["training_sources"]:
+                item["training_sources"].append(origin)
         item["alias_count"] = sum(
             alias["hospital_id"] == hospital_id and alias.get("active", True)
             for alias in aliases["aliases"]
@@ -638,7 +588,11 @@ def list_trained_hospitals() -> dict[str, Any]:
         hospitals.values(),
         key=lambda item: (str(item["hospital_name"]).casefold(), item["hospital_id"]),
     )
-    return {"total": len(items), "hospitals": items}
+    return {
+        "registry_revision": aliases["revision"],
+        "total": len(items),
+        "hospitals": items,
+    }
 
 
 @app.post("/api/v2/documents", status_code=status.HTTP_202_ACCEPTED)
@@ -719,7 +673,7 @@ def list_documents(
     for state in states:
         try:
             documents.append(_public_state(state))
-        except (KeyError, JobTransactionError):
+        except (KeyError, JobTransactionError, AliasRegistryUnavailable):
             continue
     if query:
         needle = query.casefold().strip()
@@ -756,6 +710,10 @@ def get_document(job_id: str) -> dict[str, Any]:
         raise HTTPException(
             status_code=409,
             detail="Document workspace is temporarily unavailable",
+        ) from error
+    except AliasRegistryUnavailable as error:
+        raise HTTPException(
+            status_code=503, detail={"code": "alias_registry_unavailable"}
         ) from error
 
 
@@ -828,9 +786,7 @@ def get_source_tables(
     source_present = "source_tables" in result
     available = bool(source_payload)
     unavailable_reason = (
-        None
-        if available
-        else ("no_source_tables" if source_present else "legacy_result")
+        None if available else ("no_source_tables" if source_present else "legacy_result")
     )
     try:
         tables = [SourceTable.model_validate(table) for table in source_payload or []]
@@ -847,12 +803,12 @@ def get_source_tables(
                     column.model_copy(
                         update={
                             "canonical_field": CANONICAL_TO_SOURCE_FIELD.get(
-                                str(column_mappings[column.id]["canonical_field"]),
-                                str(column_mappings[column.id]["canonical_field"]),
+                                str(column_mappings[table.id][column.id]["canonical_field"]),
+                                str(column_mappings[table.id][column.id]["canonical_field"]),
                             )
                         }
                     )
-                    if column.id in column_mappings
+                    if column.id in column_mappings.get(table.id, {})
                     else column
                     for column in table.columns
                 )
@@ -968,29 +924,71 @@ def link_document_hospital(
             detail="Select one existing hospital or create one from this bill",
         )
 
-    repo = _alias_repository()
     snapshot = _alias_snapshot()
+    if snapshot["revision"] != payload.registry_revision:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "alias_registry_revision_conflict",
+                "current_revision": snapshot["revision"],
+            },
+        )
     selected_name = str(hospital["name"])
-    hospital_id = (
-        repo.hospital_id_for_name(selected_name)
-        if payload.create
-        else str(payload.hospital_id)
-    )
+    normalized_name = normalize_hospital_name(selected_name)
     profile_names = {
         str(profile.hospital_id): str(profile.hospital_name or profile.hospital_id)
         for profile in JsonProfileRepository(PROFILE_REGISTRY).list_profiles()
         if profile.lifecycle is ProfileLifecycle.ACTIVE and profile.hospital_id
     }
+    registry_matches = {
+        str(item["hospital_id"])
+        for item in snapshot["hospitals"]
+        if any(
+            variant.get("normalized_name") == normalized_name
+            for variant in item.get("name_variants", [])
+        )
+    }
+    profile_matches = {
+        hospital_id
+        for hospital_id, name in profile_names.items()
+        if normalize_hospital_name(name) == normalized_name
+    }
+    candidates = sorted(registry_matches | profile_matches)
+    if payload.create and candidates:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": (
+                    "hospital_identity_ambiguous"
+                    if len(candidates) > 1
+                    else "hospital_already_exists"
+                ),
+                "candidate_ids": candidates,
+            },
+        )
+    hospital_id = (
+        JsonAliasRepository.hospital_id_for_name(selected_name)
+        if payload.create
+        else str(payload.hospital_id)
+    )
     existing = next(
-        (
-            item
-            for item in snapshot["hospitals"]
-            if item["hospital_id"] == hospital_id
-        ),
+        (item for item in snapshot["hospitals"] if item["hospital_id"] == hospital_id),
         None,
     )
     if not payload.create and existing is None and hospital_id not in profile_names:
         raise HTTPException(status_code=422, detail="Selected hospital was not found")
+    conflicting_owner = next(
+        (owner for owner in registry_matches if owner != hospital_id),
+        None,
+    )
+    if conflicting_owner is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "hospital_name_conflict",
+                "candidate_ids": sorted(registry_matches),
+            },
+        )
     canonical_name = (
         str(existing["hospital_name"])
         if existing
@@ -998,28 +996,54 @@ def link_document_hospital(
     )
 
     def coordinated_mutation(
-        review: dict[str, Any], registry: dict[str, Any]
+        review: dict[str, Any], registry: dict[str, Any], locked_result: dict[str, Any]
     ) -> tuple[dict[str, Any], dict[str, Any]]:
+        if locked_result["document_id"] != result["document_id"]:
+            raise ReviewValidationError("Extraction result changed; reload the document")
         record = next(
-            (
-                item
-                for item in registry["hospitals"]
-                if item["hospital_id"] == hospital_id
-            ),
+            (item for item in registry["hospitals"] if item["hospital_id"] == hospital_id),
             None,
         )
-        normalized_name = normalize_alias(selected_name)
+        owners = {
+            str(item["hospital_id"])
+            for item in registry["hospitals"]
+            if any(
+                variant.get("normalized_name") == normalized_name
+                for variant in item.get("name_variants", [])
+            )
+        }
+        if owners - {hospital_id}:
+            raise ReviewValidationError("Hospital name is already linked elsewhere")
         if record is None:
             record = {
                 "hospital_id": hospital_id,
                 "hospital_name": canonical_name,
-                "normalized_names": [normalize_alias(canonical_name)],
+                "origins": [],
+                "name_variants": [],
                 "created_at": utc_now(),
                 "updated_at": utc_now(),
             }
             registry["hospitals"].append(record)
-        if normalized_name not in record["normalized_names"]:
-            record["normalized_names"].append(normalized_name)
+        for origin in (
+            "profile" if hospital_id in profile_names else None,
+            "reviewer_alias",
+        ):
+            if origin and origin not in record["origins"]:
+                record["origins"].append(origin)
+        if not any(
+            variant.get("normalized_name") == normalized_name for variant in record["name_variants"]
+        ):
+            record["name_variants"].append(
+                {
+                    "display_name": selected_name,
+                    "normalized_name": normalized_name,
+                    "verified": True,
+                    "source_document_id": result["document_id"],
+                    "reviewer": "demo-reviewer",
+                    "reason": payload.reason.strip(),
+                    "created_at": utc_now(),
+                }
+            )
         record["updated_at"] = utc_now()
         registry["events"].append(
             {
@@ -1051,7 +1075,7 @@ def link_document_hospital(
     review, updated_registry = _mutate_review_and_alias_registry(
         job_id,
         expected,
-        snapshot["revision"],
+        payload.registry_revision,
         coordinated_mutation,
     )
     return {
@@ -1066,18 +1090,12 @@ def link_document_hospital(
 def list_hospital_aliases(hospital_id: str) -> dict[str, Any]:
     snapshot = _alias_snapshot()
     hospital = next(
-        (
-            item
-            for item in snapshot["hospitals"]
-            if item["hospital_id"] == hospital_id
-        ),
+        (item for item in snapshot["hospitals"] if item["hospital_id"] == hospital_id),
         None,
     )
     if hospital is None:
         raise HTTPException(status_code=404, detail="Hospital was not found")
-    aliases = [
-        item for item in snapshot["aliases"] if item["hospital_id"] == hospital_id
-    ]
+    aliases = [item for item in snapshot["aliases"] if item["hospital_id"] == hospital_id]
     aliases.sort(key=lambda item: (item["normalized_label"], item["alias_id"]))
     return {
         "registry_revision": snapshot["revision"],
@@ -1120,66 +1138,59 @@ def apply_column_alias(
                 "current_revision": registry["revision"],
             },
         )
-    preview = _alias_preview_payload(result, review, registry, payload)
-    if preview["preview_digest"] != payload.preview_digest:
-        raise HTTPException(status_code=409, detail="Alias preview is stale")
-    overwrite_ids = tuple(
-        dict.fromkeys(item.strip() for item in payload.overwrite_row_ids if item.strip())
+    selected_ids = tuple(
+        dict.fromkeys(item.strip() for item in payload.selected_candidate_ids if item.strip())
     )
-    if len(overwrite_ids) != len(payload.overwrite_row_ids):
+    if len(selected_ids) != len(payload.selected_candidate_ids):
         raise HTTPException(
             status_code=422,
-            detail="Overwrite row IDs must be unique and non-empty",
+            detail="Selected candidate IDs must be unique and non-empty",
         )
-    conflicting_ids = {
-        str(item["row_id"])
-        for item in preview["candidates"]
-        if item["classification"] == "conflicting" and item.get("row_id")
-    }
-    unknown_overwrites = set(overwrite_ids) - conflicting_ids
-    if unknown_overwrites:
-        raise HTTPException(
-            status_code=422,
-            detail="Only previewed conflicting rows can be overwritten",
-        )
-    applicable = [
-        item
-        for item in preview["candidates"]
-        if item["classification"] == "fillable"
-        or (
-            item["classification"] == "conflicting"
-            and item.get("row_id") in overwrite_ids
-        )
-    ]
-    unchanged = [
-        item
-        for item in preview["candidates"]
-        if item["classification"] == "unchanged"
-    ]
-    if not applicable and not unchanged:
-        raise HTTPException(
-            status_code=422,
-            detail="Alias has no valid grounded values to confirm",
-        )
-
-    alias_id = next(
-        (
-            item["alias_id"]
-            for item in registry["aliases"]
-            if item["hospital_id"] == payload.hospital_id
-            and item["normalized_label"] == preview["normalized_label"]
-        ),
-        JsonAliasRepository.new_alias_id(),
-    )
+    alias_id_holder: dict[str, str] = {}
+    applied_holder: dict[str, Any] = {}
 
     def coordinated_mutation(
-        current: dict[str, Any], snapshot: dict[str, Any]
+        current: dict[str, Any],
+        snapshot: dict[str, Any],
+        locked_result: dict[str, Any],
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        if not any(
-            item["hospital_id"] == payload.hospital_id
-            for item in snapshot["hospitals"]
-        ):
-            raise ValueError("hospital was removed")
+        locked_preview = _alias_preview_payload(locked_result, current, snapshot, payload)
+        if locked_preview["source_digest"] != payload.source_digest:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "alias_source_digest_conflict"},
+            )
+        candidates_by_id = {
+            str(item["candidate_id"]): item for item in locked_preview["candidates"]
+        }
+        unknown = set(selected_ids) - set(candidates_by_id)
+        if unknown:
+            raise ReviewValidationError("Selected alias candidates are stale or unknown")
+        selected = [candidates_by_id[candidate_id] for candidate_id in selected_ids]
+        invalid = [
+            item["candidate_id"]
+            for item in selected
+            if item["classification"] not in {"fillable", "unchanged", "conflicting"}
+        ]
+        if invalid:
+            raise ReviewValidationError("Invalid or unlinked candidates cannot be selected")
+        targets = [(str(item["row_id"]), str(item["evidence_field"])) for item in selected]
+        if len(set(targets)) != len(targets):
+            raise ReviewValidationError(
+                "Only one source candidate may update each normalized row field"
+            )
+        if not any(item["hospital_id"] == payload.hospital_id for item in snapshot["hospitals"]):
+            raise ReviewValidationError("Hospital was removed")
+        alias_id = next(
+            (
+                item["alias_id"]
+                for item in snapshot["aliases"]
+                if item["hospital_id"] == payload.hospital_id
+                and item["normalized_label"] == locked_preview["normalized_label"]
+            ),
+            JsonAliasRepository.new_alias_id(),
+        )
+        alias_id_holder["value"] = alias_id
         alias = next(
             (item for item in snapshot["aliases"] if item["alias_id"] == alias_id),
             None,
@@ -1188,9 +1199,9 @@ def apply_column_alias(
             alias = {
                 "alias_id": alias_id,
                 "hospital_id": payload.hospital_id,
-                "source_label": preview["source_label"],
-                "normalized_label": preview["normalized_label"],
-                "canonical_field": preview["canonical_field"],
+                "source_label": locked_preview["source_label"],
+                "normalized_label": locked_preview["normalized_label"],
+                "canonical_field": locked_preview["canonical_field"],
                 "active": True,
                 "created_at": utc_now(),
                 "updated_at": utc_now(),
@@ -1199,8 +1210,8 @@ def apply_column_alias(
             snapshot["aliases"].append(alias)
         else:
             alias.update(
-                source_label=preview["source_label"],
-                canonical_field=preview["canonical_field"],
+                source_label=locked_preview["source_label"],
+                canonical_field=locked_preview["canonical_field"],
                 active=True,
                 updated_at=utc_now(),
                 reason=payload.reason.strip(),
@@ -1210,24 +1221,27 @@ def apply_column_alias(
                 "action": "column_alias_applied",
                 "alias_id": alias_id,
                 "hospital_id": payload.hospital_id,
-                "canonical_field": preview["canonical_field"],
-                "document_id": result["document_id"],
+                "canonical_field": locked_preview["canonical_field"],
+                "document_id": locked_result["document_id"],
                 "reason": payload.reason.strip(),
                 "created_at": utc_now(),
             }
         )
-        projected = {str(row["id"]): row for row in project_rows(result, current)}
+        projected = {str(row["id"]): row for row in project_rows(locked_result, current)}
         current.setdefault("column_mappings", {})
-        for column_id in preview["source_column_ids"]:
-            current["column_mappings"][column_id] = {
+        for column_ref in locked_preview["source_columns"]:
+            table_mappings = current["column_mappings"].setdefault(
+                column_ref["source_table_id"], {}
+            )
+            table_mappings[column_ref["source_column_id"]] = {
                 "alias_id": alias_id,
                 "hospital_id": payload.hospital_id,
-                "source_label": preview["source_label"],
-                "canonical_field": preview["canonical_field"],
+                "source_label": locked_preview["source_label"],
+                "canonical_field": locked_preview["canonical_field"],
                 "reason": payload.reason.strip(),
                 "updated_at": utc_now(),
             }
-        for candidate in applicable:
+        for candidate in selected:
             row_id = str(candidate["row_id"])
             row = projected[row_id]
             changes = dict(candidate["changes"])
@@ -1260,12 +1274,15 @@ def apply_column_alias(
                 alias_id,
                 payload.reason,
                 {
-                    "source_label": preview["source_label"],
-                    "canonical_field": preview["canonical_field"],
-                    "updated_row_ids": [item["row_id"] for item in applicable],
+                    "source_label": locked_preview["source_label"],
+                    "canonical_field": locked_preview["canonical_field"],
+                    "updated_row_ids": [item["row_id"] for item in selected],
+                    "selected_candidate_ids": list(selected_ids),
                 },
             )
         )
+        applied_holder["count"] = len(selected)
+        applied_holder["counts"] = locked_preview["counts"]
         return current, snapshot
 
     updated_review, updated_registry = _mutate_review_and_alias_registry(
@@ -1277,9 +1294,9 @@ def apply_column_alias(
     return {
         "review_revision": updated_review["revision"],
         "registry_revision": updated_registry["revision"],
-        "alias_id": alias_id,
-        "updated_count": len(applicable),
-        "skipped": preview["counts"],
+        "alias_id": alias_id_holder["value"],
+        "updated_count": applied_holder["count"],
+        "skipped": applied_holder["counts"],
     }
 
 
@@ -1297,15 +1314,14 @@ def update_column_alias(
         else None
     )
     repo = _alias_repository()
-    snapshot = _alias_snapshot()
+    _alias_snapshot()
 
     def mutation(current: dict[str, Any]) -> dict[str, Any]:
         alias = next(
             (
                 item
                 for item in current["aliases"]
-                if item["alias_id"] == alias_id
-                and item["hospital_id"] == hospital_id
+                if item["alias_id"] == alias_id and item["hospital_id"] == hospital_id
             ),
             None,
         )
@@ -1331,7 +1347,7 @@ def update_column_alias(
         return current
 
     try:
-        updated = repo.mutate(snapshot["revision"], mutation)
+        updated = repo.mutate(payload.registry_revision, mutation)
     except KeyError as error:
         raise HTTPException(status_code=404, detail="Column alias was not found") from error
     except AliasRegistryRevisionConflict as error:
@@ -1353,6 +1369,91 @@ def bulk_update_rows_route(
     if_match: Annotated[str | None, Header(alias="If-Match")] = None,
 ) -> dict[str, Any]:
     return _bulk_update_rows(job_id, payload, if_match)
+
+
+def _apply_reviewer_disposition(
+    result: dict[str, Any],
+    review: dict[str, Any],
+    row_ids: tuple[str, ...],
+    action: Literal["reject", "restore"],
+    reason: str,
+) -> dict[str, dict[str, str]]:
+    rows = {str(row["id"]): row for row in project_rows(result, review)}
+    missing = [row_id for row_id in row_ids if row_id not in rows]
+    if missing:
+        raise ReviewValidationError(f"Rows not found: {', '.join(missing)}")
+    ineligible = [row_id for row_id in row_ids if rows[row_id].get("bulk_action") != action]
+    if ineligible:
+        verb = "rejectable" if action == "reject" else "restorable"
+        raise ReviewValidationError(f"Rows are not {verb}: {', '.join(ineligible)}")
+
+    changed: dict[str, dict[str, str]] = {}
+    machine_rows = {str(row["id"]): row for row in result.get("rows", [])}
+    for row_id in row_ids:
+        row = rows[row_id]
+        if row_id in review["added_rows"]:
+            added = review["added_rows"][row_id]
+            old_disposition = str(row.get("review_disposition") or "accepted")
+            if action == "reject":
+                added["rejection"] = {
+                    "source": "reviewer",
+                    "previous_disposition": old_disposition,
+                    "rejected_at": utc_now(),
+                    "reason": reason.strip(),
+                }
+                added["review_disposition"] = "rejected"
+                new_disposition = "rejected"
+            else:
+                rejection = added.pop("rejection", None)
+                legacy = added.pop("pre_rejection_disposition", None)
+                new_disposition = str(
+                    rejection.get("previous_disposition", "accepted")
+                    if isinstance(rejection, dict)
+                    else legacy or "accepted"
+                )
+                added["review_disposition"] = new_disposition
+            added["review_reason"] = reason.strip()
+        else:
+            machine = machine_rows[row_id]
+            machine_disposition = str(machine.get("review_disposition") or "pending")
+            previous_override = review["row_overrides"].get(row_id, {})
+            previous_changes = dict(previous_override.get("changes", {}))
+            old_disposition = str(row.get("review_disposition") or machine_disposition)
+            if action == "reject":
+                previous_changes["review_disposition"] = "rejected"
+                rejection = {
+                    "source": "reviewer",
+                    "previous_disposition": old_disposition,
+                    "rejected_at": utc_now(),
+                    "reason": reason.strip(),
+                }
+                new_disposition = "rejected"
+            else:
+                saved = previous_override.get("rejection")
+                legacy = previous_override.get("pre_rejection_disposition")
+                new_disposition = str(
+                    saved.get("previous_disposition", machine_disposition)
+                    if isinstance(saved, dict)
+                    else legacy or machine_disposition
+                )
+                if new_disposition == machine_disposition:
+                    previous_changes.pop("review_disposition", None)
+                else:
+                    previous_changes["review_disposition"] = new_disposition
+                rejection = None
+            updated_override = {
+                "changes": previous_changes,
+                "reason": reason.strip(),
+                "updated_at": utc_now(),
+            }
+            if rejection is not None:
+                updated_override["rejection"] = rejection
+            review["row_overrides"][row_id] = updated_override
+        changed[row_id] = {
+            "old_disposition": old_disposition,
+            "new_disposition": new_disposition,
+        }
+    return changed
 
 
 @app.patch("/api/v2/documents/{job_id}/rows/{row_id}")
@@ -1386,6 +1487,13 @@ def update_row(
         rows = {str(row["id"]): row for row in project_rows(result, review)}
         if row_id not in rows:
             raise ReviewValidationError("Row not found")
+        desired_disposition = changes.get("review_disposition")
+        current_disposition = str(rows[row_id].get("review_disposition") or "pending")
+        if desired_disposition == "rejected":
+            _apply_reviewer_disposition(result, review, (row_id,), "reject", payload.reason)
+            changes.pop("review_disposition", None)
+        elif current_disposition == "rejected" and desired_disposition is not None:
+            _apply_reviewer_disposition(result, review, (row_id,), "restore", payload.reason)
         if row_id in review["added_rows"]:
             review["added_rows"][row_id].update(changes)
             review["added_rows"][row_id]["review_reason"] = payload.reason.strip()
@@ -1395,6 +1503,11 @@ def update_row(
                 "changes": {**previous.get("changes", {}), **changes},
                 "reason": payload.reason.strip(),
                 "updated_at": utc_now(),
+                **(
+                    {"rejection": previous["rejection"]}
+                    if isinstance(previous.get("rejection"), dict)
+                    else {}
+                ),
             }
         review["approval"] = None
         review["events"].append(
@@ -1449,28 +1562,10 @@ def reject_row(
     expected = _expected_revision(if_match)
 
     def mutation(review: dict[str, Any]) -> dict[str, Any]:
-        rows = {str(row["id"]): row for row in project_rows(result, review)}
-        if row_id not in rows:
-            raise ReviewValidationError("Row not found")
-        if row_id in review["added_rows"]:
-            review["added_rows"][row_id]["pre_rejection_disposition"] = str(
-                review["added_rows"][row_id].get("review_disposition") or "accepted"
-            )
-            review["added_rows"][row_id]["review_disposition"] = "rejected"
-            review["added_rows"][row_id]["review_reason"] = reason.strip()
-        else:
-            previous = review["row_overrides"].get(row_id, {})
-            review["row_overrides"][row_id] = {
-                "changes": {**previous.get("changes", {}), "review_disposition": "rejected"},
-                "reason": reason.strip(),
-                "updated_at": utc_now(),
-                "pre_rejection_disposition": str(
-                    rows[row_id].get("review_disposition") or "accepted"
-                ),
-            }
+        changes = _apply_reviewer_disposition(result, review, (row_id,), "reject", reason)
         review["approval"] = None
         review["events"].append(
-            _event(expected + 1, "row_rejected", row_id, reason, {"review_disposition": "rejected"})
+            _event(expected + 1, "row_rejected", row_id, reason, changes[row_id])
         )
         return review
 
@@ -1490,75 +1585,9 @@ def _bulk_update_rows(
         raise HTTPException(status_code=422, detail="Row IDs must be unique and non-empty")
 
     def mutation(review: dict[str, Any]) -> dict[str, Any]:
-        rows = {str(row["id"]): row for row in project_rows(result, review)}
-        missing = [row_id for row_id in row_ids if row_id not in rows]
-        if missing:
-            raise ReviewValidationError(f"Rows not found: {', '.join(missing)}")
-        if payload.action == "restore":
-            not_rejected = [
-                row_id
-                for row_id in row_ids
-                if rows[row_id].get("review_disposition") != "rejected"
-            ]
-            if not_rejected:
-                raise ReviewValidationError(
-                    f"Rows are not rejected: {', '.join(not_rejected)}"
-                )
-
-        changes_by_row: dict[str, dict[str, Any]] = {}
-        for row_id in row_ids:
-            row = rows[row_id]
-            if row_id in review["added_rows"]:
-                added = review["added_rows"][row_id]
-                if payload.action == "reject":
-                    previous = str(added.get("review_disposition") or "accepted")
-                    added["pre_rejection_disposition"] = previous
-                    added["review_disposition"] = "rejected"
-                else:
-                    previous = str(added.pop("pre_rejection_disposition", "accepted"))
-                    added["review_disposition"] = previous
-                added["review_reason"] = payload.reason.strip()
-                changes_by_row[row_id] = {
-                    "review_disposition": added["review_disposition"]
-                }
-                continue
-
-            previous_override = review["row_overrides"].get(row_id, {})
-            previous_changes = dict(previous_override.get("changes", {}))
-            if payload.action == "reject":
-                original_disposition = str(
-                    row.get("review_disposition") or "accepted"
-                )
-                previous_changes["review_disposition"] = "rejected"
-                pre_rejection = original_disposition
-            else:
-                machine = next(
-                    item for item in result.get("rows", []) if str(item["id"]) == row_id
-                )
-                pre_rejection = str(
-                    previous_override.get("pre_rejection_disposition")
-                    or machine.get("review_disposition")
-                    or "accepted"
-                )
-                if pre_rejection == str(machine.get("review_disposition") or "accepted"):
-                    previous_changes.pop("review_disposition", None)
-                else:
-                    previous_changes["review_disposition"] = pre_rejection
-            review["row_overrides"][row_id] = {
-                "changes": previous_changes,
-                "reason": payload.reason.strip(),
-                "updated_at": utc_now(),
-                **(
-                    {"pre_rejection_disposition": pre_rejection}
-                    if payload.action == "reject"
-                    else {}
-                ),
-            }
-            changes_by_row[row_id] = {
-                "review_disposition": (
-                    "rejected" if payload.action == "reject" else pre_rejection
-                )
-            }
+        changes_by_row = _apply_reviewer_disposition(
+            result, review, row_ids, payload.action, payload.reason
+        )
 
         review["approval"] = None
         review["events"].append(
@@ -1567,7 +1596,11 @@ def _bulk_update_rows(
                 f"rows_{'rejected' if payload.action == 'reject' else 'restored'}",
                 job_id,
                 payload.reason,
-                {"row_ids": list(row_ids), "rows": changes_by_row},
+                {
+                    "row_ids": list(row_ids),
+                    "count": len(row_ids),
+                    "rows": changes_by_row,
+                },
             )
         )
         return review
@@ -1647,7 +1680,8 @@ def approve_document(
 @app.get("/api/v2/documents/{job_id}/exports/{export_format}")
 def export_document(job_id: str, export_format: Literal["csv", "json", "evidence.zip"]) -> Response:
     if export_format == "evidence.zip":
-        try:
+
+        def build_evidence_export() -> tuple[str, Path]:
             with store.locked_workspace(job_id) as (state, result, review):
                 if state.get("status") != "complete":
                     raise HTTPException(
@@ -1660,13 +1694,20 @@ def export_document(job_id: str, export_format: Literal["csv", "json", "evidence
                         detail="Document must be approved before export",
                     )
                 stem = _download_stem(state["original_name"])
-                bundle = create_evidence_bundle(store, job_id, result, review)
+                return stem, create_evidence_bundle(store, job_id, result, review)
+
+        try:
+            stem, bundle = _alias_coordinator().run_job_operation(job_id, build_evidence_export)
         except KeyError as error:
             raise HTTPException(status_code=404, detail="Document not found") from error
         except JobTransactionError as error:
             raise HTTPException(
                 status_code=409,
                 detail="Document workspace is temporarily unavailable",
+            ) from error
+        except AliasRegistryUnavailable as error:
+            raise HTTPException(
+                status_code=503, detail={"code": "alias_registry_unavailable"}
             ) from error
         except ReviewValidationError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
@@ -1699,13 +1740,19 @@ def export_document(job_id: str, export_format: Literal["csv", "json", "evidence
 @app.get("/api/v2/documents/{job_id}/pages/{page_number}")
 def get_page(job_id: str, page_number: int) -> Response:
     try:
-        state, page = store.read_page_bytes(job_id, page_number)
+        state, page = _alias_coordinator().run_job_operation(
+            job_id, lambda: store.read_page_bytes(job_id, page_number)
+        )
     except KeyError as error:
         raise HTTPException(status_code=404, detail="Document not found") from error
     except JobTransactionError as error:
         if str(error) == "page_not_found":
             raise HTTPException(status_code=404, detail="Page not found") from error
         raise HTTPException(status_code=409, detail="Page is not available") from error
+    except AliasRegistryUnavailable as error:
+        raise HTTPException(
+            status_code=503, detail={"code": "alias_registry_unavailable"}
+        ) from error
     if state.get("status") not in {"processing", "complete"}:
         raise HTTPException(status_code=409, detail="Page is not available")
     return Response(content=page, media_type="image/png")
@@ -1715,7 +1762,11 @@ def get_page(job_id: str, page_number: int) -> Response:
 def delete_document(job_id: str) -> None:
     _state_or_404(job_id)
     try:
-        store.delete(job_id)
+        _alias_coordinator().delete_job(job_id)
+    except AliasRegistryUnavailable as error:
+        raise HTTPException(
+            status_code=503, detail={"code": "alias_registry_unavailable"}
+        ) from error
     except RuntimeError as error:
         raise HTTPException(
             status_code=409,

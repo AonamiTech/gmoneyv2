@@ -9,6 +9,7 @@ from gmoney.extraction.offline import VlAsset, _cached_prediction, _safe_box, _v
 from gmoney.extraction.otsl import parse_otsl, split_otsl_tables
 from gmoney.extraction.rows import extract_candidate_rows
 from gmoney.extraction.typed_values import (
+    parse_alias_field_value,
     parse_decimal,
     parse_quantity,
     parse_service_date,
@@ -19,6 +20,7 @@ from gmoney.inference.contracts import (
     ModelKind,
     ModelSpec,
 )
+from gmoney.normalization import normalize_header
 
 
 class _FakeAdapter:
@@ -163,6 +165,17 @@ def test_service_date_parser_supports_numeric_and_alphabetic_indian_dates() -> N
     assert parse_service_date("10/07/2026, 14:48") == "2026-07-10"
     assert parse_service_date("20/01/2026 99:99:99") is None
     assert parse_service_date("20/01/2026 - 21/01/2026") is None
+
+
+def test_alias_normalization_and_structured_values_share_strict_runtime_rules() -> None:
+    assert normalize_header(" Item # ") == normalize_header("ＩＴＥＭ") == "item"
+    assert normalize_header("Procedure   Ref.") == "procedure ref"
+    assert parse_alias_field_value("request_no", "REQ/2026-44") is not None
+    assert parse_alias_field_value("service_code", "PROC-44") is not None
+    assert parse_alias_field_value("hsn_code", "998311") is not None
+    assert parse_alias_field_value("request_no", "arbitrary request words") is None
+    assert parse_alias_field_value("service_code", "free text") is None
+    assert parse_alias_field_value("hsn_code", "20/01/2026") is None
 
 
 def test_inference_cache_is_bound_to_artifact_options_and_model(tmp_path: Path) -> None:

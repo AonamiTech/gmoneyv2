@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
+from typing import Any
 
 CURRENCY = re.compile(r"(?:₹|inr|rs\.?|rupees?)", re.IGNORECASE)
 NUMERIC = re.compile(r"^[+-]?\d+(?:\.\d{1,4})?$")
@@ -114,3 +115,81 @@ def parse_service_date(value: object) -> str | None:
         except ValueError:
             continue
     return None
+
+
+STRUCTURED_TEXT_PATTERNS = {
+    "service_code": re.compile(r"(?=.*[A-Za-z])(?=.*\d)[A-Za-z0-9./-]{3,30}"),
+    "hsn_code": re.compile(r"[A-Za-z0-9./-]{3,30}"),
+    "request_no": re.compile(r"[A-Za-z0-9./-]{3,60}"),
+}
+
+
+def structured_field_value_is_valid(field: str, value: str) -> bool:
+    text = re.sub(r"\s+", " ", value).strip()
+    if not text:
+        return False
+    if field == "service_date":
+        return DATE_FRAGMENT.search(text) is not None
+    if field in STRUCTURED_TEXT_PATTERNS:
+        if field == "hsn_code" and DATE_FRAGMENT.search(text):
+            return False
+        return STRUCTURED_TEXT_PATTERNS[field].fullmatch(text) is not None
+    if field == "section":
+        return parse_decimal(text) is None and len(text) <= 120
+    if field == "description":
+        return parse_decimal(text) is None and len(text) <= 500
+    return False
+
+
+def parse_alias_field_value(
+    canonical_field: str, raw_value: str
+) -> tuple[dict[str, Any], str, str] | None:
+    """Parse a grounded source cell into canonical review changes."""
+    value = re.sub(r"\s+", " ", raw_value).strip()
+    if not value:
+        return None
+    if canonical_field in {
+        "quantity",
+        "unit_price",
+        "gross_amount",
+        "discount",
+        "net_amount",
+    }:
+        parsed = parse_quantity(value) if canonical_field == "quantity" else parse_decimal(value)
+        if parsed is None:
+            return None
+        rendered = format(parsed, "f")
+        raw_field = {
+            "quantity": "quantity_raw",
+            "unit_price": "unit_price_raw",
+            "gross_amount": "gross_amount_raw",
+            "discount": "discount_raw",
+            "net_amount": "net_amount_raw",
+        }[canonical_field]
+        evidence_field = {
+            "unit_price": "rate",
+            "net_amount": "amount",
+        }.get(canonical_field, canonical_field)
+        return (
+            {canonical_field: rendered, raw_field: value},
+            canonical_field,
+            evidence_field,
+        )
+    if canonical_field == "service_date":
+        parsed_date = parse_service_date(value)
+        if parsed_date is None and not structured_field_value_is_valid(canonical_field, value):
+            return None
+        if parsed_date is None:
+            return (
+                {"service_date_raw": value, "service_date_iso": None},
+                "service_date_raw",
+                "service_date",
+            )
+        return (
+            {"service_date_raw": value, "service_date_iso": parsed_date},
+            "service_date_iso",
+            "service_date",
+        )
+    if not structured_field_value_is_valid(canonical_field, value):
+        return None
+    return ({canonical_field: value}, canonical_field, canonical_field)

@@ -6,7 +6,9 @@ from concurrent.futures import Future, ProcessPoolExecutor
 from pathlib import Path
 from typing import Any, TextIO
 
+from gmoney.demo.alias_transactions import AliasTransactionCoordinator
 from gmoney.demo.store import JobStore, is_gpu_device
+from gmoney.profiles.aliases import AliasRegistryUnavailable
 
 _extractor: Any = None
 _gpu_inference_lock: TextIO | None = None
@@ -27,6 +29,7 @@ def _extract_and_publish(
     store: JobStore,
     job_id: str,
     extractor: Any,
+    alias_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     directory = store.job_dir(job_id)
     state = store.read(job_id)
@@ -41,11 +44,14 @@ def _extract_and_publish(
     from gmoney.extraction.offline import ExtractionAborted
 
     try:
+        extraction_options: dict[str, Any] = {"should_abort": should_abort}
+        if alias_snapshot is not None:
+            extraction_options["alias_snapshot"] = alias_snapshot
         result = extractor.extract(
             directory / "source.pdf",
             directory / "artifacts",
             progress,
-            should_abort=should_abort,
+            **extraction_options,
         )
     except ExtractionAborted:
         return None
@@ -75,6 +81,11 @@ def _run_job(root_value: str, job_id: str, vl_url: str) -> dict[str, Any] | None
     vl_device = os.environ.get("GMONEY_VL_DEVICE", "cpu")
     alias_registry_value = os.environ.get("GMONEY_ALIAS_REGISTRY")
     alias_registry = Path(alias_registry_value) if alias_registry_value else None
+    alias_snapshot = (
+        AliasTransactionCoordinator(store, alias_registry).registry_snapshot()
+        if alias_registry is not None
+        else None
+    )
     extractor_options: dict[str, Any] = {
         "paddle_device": paddle_device,
         "vl_device": vl_device,
@@ -82,9 +93,7 @@ def _run_job(root_value: str, job_id: str, vl_url: str) -> dict[str, Any] | None
     if alias_registry is not None:
         extractor_options["alias_registry"] = alias_registry
     if is_gpu_device(paddle_device):
-        _gpu_inference_lock = store.acquire_inference_lock(
-            lambda: store.abort_requested(job_id)
-        )
+        _gpu_inference_lock = store.acquire_inference_lock(lambda: store.abort_requested(job_id))
         return _extract_and_publish(
             store=store,
             job_id=job_id,
@@ -92,6 +101,7 @@ def _run_job(root_value: str, job_id: str, vl_url: str) -> dict[str, Any] | None
                 vl_url,
                 **extractor_options,
             ),
+            alias_snapshot=alias_snapshot,
         )
 
     if _extractor is None:
@@ -103,6 +113,7 @@ def _run_job(root_value: str, job_id: str, vl_url: str) -> dict[str, Any] | None
         store=store,
         job_id=job_id,
         extractor=_extractor,
+        alias_snapshot=alias_snapshot,
     )
 
 
@@ -114,11 +125,17 @@ def main() -> None:
     retention_hours = int(os.environ.get("GMONEY_RETENTION_HOURS", "720"))
     store = JobStore(root)
     store.recover()
+    alias_registry_value = os.environ.get("GMONEY_ALIAS_REGISTRY")
+    alias_coordinator = (
+        AliasTransactionCoordinator(store, Path(alias_registry_value))
+        if alias_registry_value
+        else None
+    )
+    if alias_coordinator is not None:
+        alias_coordinator.recover_all()
     futures: dict[Future[dict[str, Any] | None], str] = {}
     last_cleanup = 0.0
-    with ProcessPoolExecutor(
-        **_executor_options(concurrency, paddle_device)
-    ) as executor:
+    with ProcessPoolExecutor(**_executor_options(concurrency, paddle_device)) as executor:
         while True:
             for future, job_id in list(futures.items()):
                 if not future.done():
@@ -129,7 +146,12 @@ def main() -> None:
                         store.finalize_abort(job_id)
                 except Exception as error:  # noqa: BLE001 - boundary records sanitized failure
                     try:
-                        if not store.fail_processing(job_id, type(error).__name__):
+                        failure = (
+                            "alias_registry_unavailable"
+                            if isinstance(error, AliasRegistryUnavailable)
+                            else type(error).__name__
+                        )
+                        if not store.fail_processing(job_id, failure):
                             store.finalize_abort(job_id)
                     except KeyError:
                         pass
@@ -154,7 +176,10 @@ def main() -> None:
 
             now = time.monotonic()
             if now - last_cleanup >= 300:
-                store.cleanup(retention_hours)
+                if alias_coordinator is not None:
+                    alias_coordinator.cleanup(retention_hours)
+                else:
+                    store.cleanup(retention_hours)
                 last_cleanup = now
             time.sleep(0.5)
 

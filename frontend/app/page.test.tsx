@@ -78,6 +78,8 @@ const rowsResult = {
         reason: null,
         machine_values: {},
       },
+      bulk_action: "reject",
+      rejection_provenance: null,
     },
   ],
 };
@@ -194,6 +196,8 @@ describe("evidence page navigation", () => {
   let historyHospitalName: string | null = "Test Hospital";
   let abortRequests = 0;
   let bulkPayload: Record<string, unknown> | null = null;
+  let reviewHospitalId: string | null = null;
+  let aliasApplyPayload: Record<string, unknown> | null = null;
   let sourcePayload: Omit<typeof sourceTables, "unavailable_reason"> & {
     unavailable_reason: "legacy_result" | "no_source_tables" | null;
   } = sourceTables;
@@ -205,6 +209,8 @@ describe("evidence page navigation", () => {
     historyHospitalName = "Test Hospital";
     abortRequests = 0;
     bulkPayload = null;
+    reviewHospitalId = null;
+    aliasApplyPayload = null;
     sourcePayload = structuredClone(sourceTables);
     vi.stubGlobal(
       "fetch",
@@ -254,8 +260,38 @@ describe("evidence page navigation", () => {
           bulkPayload = JSON.parse(String(init?.body));
           return json({ review_revision: 1, updated_count: 1 });
         }
+        if (url.endsWith("/column-aliases/preview")) {
+          return json({
+            hospital_id: "hospital-1",
+            source_label: "Co-pay %",
+            canonical_field: "discount",
+            review_revision: 0,
+            registry_revision: 3,
+            source_digest: "d".repeat(64),
+            counts: { fillable: 1, unchanged: 0, conflicting: 0, invalid: 0, unlinked: 0 },
+            candidates: [{
+              candidate_id: "candidate-1",
+              source_table_id: "p1-t1-s1",
+              source_row_id: "p1-t1-s1-r1",
+              source_column_id: "c2",
+              row_id: "row-1",
+              source_value: "10",
+              classification: "fillable",
+              current_value: null,
+              proposed_value: "10",
+            }],
+          });
+        }
+        if (url.endsWith("/column-aliases/apply")) {
+          aliasApplyPayload = JSON.parse(String(init?.body));
+          return json({ review_revision: 1, registry_revision: 4, updated_count: 1 });
+        }
+        if (url.endsWith("/hospitals/hospital-1/aliases")) {
+          return json({ registry_revision: 3, aliases: [] });
+        }
         if (url.endsWith("/api/v2/hospitals/trained")) {
           return json({
+            registry_revision: 0,
             total: 2,
             hospitals: [
               { hospital_id: "kamakshi", hospital_name: "Dr. Kamakshi Memorial Hospital", active_profile_count: 2 },
@@ -267,7 +303,9 @@ describe("evidence page navigation", () => {
           return json(structuredClone(sourcePayload));
         }
         if (url.includes("/rows?")) return json(structuredClone(rowsResult));
-        if (url.endsWith("/review")) return json(structuredClone(review));
+        if (url.endsWith("/review")) {
+          return json({ ...structuredClone(review), hospital_id: reviewHospitalId });
+        }
         throw new Error(`Unexpected request: ${url}`);
       }),
     );
@@ -398,6 +436,38 @@ describe("evidence page navigation", () => {
     expect(screen.getByRole("heading", { name: "Column aliases" })).toBeInTheDocument();
     expect(screen.getByText(/Link this grounded bill identity/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Link hospital" })).toBeInTheDocument();
+  });
+
+  test("selects grounded alias candidates and submits the source digest", async () => {
+    reviewHospitalId = "hospital-1";
+    render(<Home />);
+    await advance(250);
+    await advance(250);
+    await openBill();
+
+    fireEvent.click(screen.getByRole("button", { name: "Co-pay %" }));
+    fireEvent.change(screen.getByLabelText("Normalized field"), {
+      target: { value: "discount" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Preview affected rows" }));
+    await advance(0);
+    fireEvent.change(screen.getByPlaceholderText("Why does this header map to this field?"), {
+      target: { value: "Verified co-pay discount column" },
+    });
+    fireEvent.click(
+      screen.getByRole("button", { name: "Apply 1 selected and teach hospital" }),
+    );
+    await advance(0);
+
+    expect(aliasApplyPayload).toEqual({
+      hospital_id: "hospital-1",
+      source_label: "Co-pay %",
+      canonical_field: "discount",
+      source_digest: "d".repeat(64),
+      registry_revision: 3,
+      selected_candidate_ids: ["candidate-1"],
+      reason: "Verified co-pay discount column",
+    });
   });
 
   test("legacy printed-column explanation remains visible in normalized mode", async () => {

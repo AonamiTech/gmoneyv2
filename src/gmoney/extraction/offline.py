@@ -3569,13 +3569,15 @@ class OfflineExtractor:
         progress: Callable[[int, int], None] | None = None,
         *,
         should_abort: Callable[[], bool] | None = None,
+        alias_snapshot: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         set_header_aliases({})
-        alias_snapshot = (
-            JsonAliasRepository(self.alias_registry).read()
-            if self.alias_registry is not None and self.alias_registry.exists()
-            else None
-        )
+        if alias_snapshot is None:
+            alias_snapshot = (
+                JsonAliasRepository(self.alias_registry).read()
+                if self.alias_registry is not None and self.alias_registry.exists()
+                else None
+            )
         resolved_hospital_id = self.hospital_id
         def abort_checkpoint() -> None:
             if should_abort is not None and should_abort():
