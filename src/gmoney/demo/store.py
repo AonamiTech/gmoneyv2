@@ -159,17 +159,35 @@ class JobStore:
             self.write(job_id, state)
             return state
 
-    def claim_queued(self, job_id: str) -> dict[str, Any] | None:
+    def claim_queued(
+        self,
+        job_id: str,
+        cancel_requested: Callable[[], bool] | None = None,
+    ) -> dict[str, Any] | None:
         with self.job_lock(job_id, exclusive=True):
             state = self.read(job_id)
             if (
                 state.get("status") != "queued"
                 or (self.job_dir(job_id) / self.abort_marker_name).is_file()
+                or (cancel_requested is not None and cancel_requested())
             ):
                 return None
             state.update(status="processing", page=0, error=None)
             self.write(job_id, state)
             return state
+
+    def requeue_claimed(self, job_id: str) -> bool:
+        """Return a claimed job to the queue before it is submitted to a runner."""
+        with self.job_lock(job_id, exclusive=True):
+            state = self.read(job_id)
+            if (
+                state.get("status") != "processing"
+                or (self.job_dir(job_id) / self.abort_marker_name).is_file()
+            ):
+                return False
+            state.update(status="queued", page=0, error=None)
+            self.write(job_id, state)
+            return True
 
     def fail_queued(self, job_id: str, error: str) -> bool:
         """Fail a queued job without exposing a transient processing state."""

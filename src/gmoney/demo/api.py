@@ -1102,10 +1102,9 @@ def link_document_hospital(
             raise HospitalSelectionNotCandidate(locked_candidates)
         if owners - {hospital_id}:
             raise HospitalIdentityConflict("hospital_name_conflict", owners)
-        locked_canonical_name = (
-            str(record["hospital_name"])
-            if record is not None
-            else locked_profile_names.get(hospital_id, selected_name)
+        locked_canonical_name = locked_profile_names.get(
+            hospital_id,
+            str(record["hospital_name"]) if record is not None else selected_name,
         )
         canonical_name_holder["value"] = locked_canonical_name
         if record is None:
@@ -1118,6 +1117,8 @@ def link_document_hospital(
                 "updated_at": utc_now(),
             }
             registry["hospitals"].append(record)
+        else:
+            record["hospital_name"] = locked_canonical_name
         for origin in (
             "profile" if hospital_id in locked_profile_names else None,
             "reviewer_alias",
@@ -1660,6 +1661,11 @@ def update_row(
             )
             audit_changes["review_disposition"] = transition
             row_changes.pop("review_disposition", None)
+        if isinstance(row_changes.get("field_evidence"), dict):
+            row_changes["field_evidence"] = {
+                **(rows[row_id].get("field_evidence") or {}),
+                **row_changes["field_evidence"],
+            }
         if not row_changes and not audit_changes:
             raise ReviewValidationError("At least one row value must change")
         if row_id in review["added_rows"]:

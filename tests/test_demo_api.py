@@ -1128,6 +1128,84 @@ def test_pending_v2_journal_recovers_before_registry_migration(tmp_path: Path) -
     assert not (store.job_dir(job_id) / ".alias-operation.json").exists()
 
 
+@pytest.mark.parametrize("stage", ("journal", "registry", "review"))
+def test_first_v2_journal_recovers_at_every_upgrade_boundary(
+    tmp_path: Path,
+    stage: str,
+) -> None:
+    store = JobStore(tmp_path)
+    job_id, _ = completed_job(store)
+    base_review = store.read_review(job_id)
+    target_review = json.loads(json.dumps(base_review))
+    target_review["revision"] = 1
+    target_review["events"].append({"action": "first_legacy_review"})
+    base_registry = legacy_registry_with_alias(revision=0)
+    base_registry["hospitals"] = []
+    base_registry["aliases"] = []
+    base_registry["events"] = []
+    target_registry = legacy_registry_with_alias(revision=1)
+    registry_path = tmp_path / "alias-registry.json"
+    journal = {
+        "version": ALIAS_JOURNAL_VERSION,
+        "job_id": job_id,
+        "base_review": base_review,
+        "target_review": target_review,
+        "base_registry": base_registry,
+        "target_registry": target_registry,
+        "base_review_sha256": _digest(base_review),
+        "target_review_sha256": _digest(target_review),
+        "base_registry_sha256": _digest(base_registry),
+        "target_registry_sha256": _digest(target_registry),
+    }
+    (store.job_dir(job_id) / ".alias-operation.json").write_text(json.dumps(journal))
+    if stage in {"registry", "review"}:
+        registry_path.write_text(json.dumps(target_registry))
+    if stage == "review":
+        (store.job_dir(job_id) / "review.json").write_text(json.dumps(target_review))
+
+    migrated = AliasTransactionCoordinator(store, registry_path).registry_snapshot()
+
+    assert store.read_review(job_id)["revision"] == 1
+    assert migrated["registry_version"] == ALIAS_REGISTRY_VERSION
+    assert migrated["revision"] == 2
+    assert migrated["aliases"][0]["alias_id"] == "alias-1"
+    assert migrated["events"][-1]["action"] == "alias_registry_migrated"
+    assert not (store.job_dir(job_id) / ".alias-operation.json").exists()
+
+
+def test_missing_registry_refuses_non_empty_journal_base(tmp_path: Path) -> None:
+    store = JobStore(tmp_path)
+    job_id, _ = completed_job(store)
+    base_review = store.read_review(job_id)
+    target_review = json.loads(json.dumps(base_review))
+    target_review["revision"] = 1
+    base_registry = legacy_registry_with_alias(revision=0)
+    target_registry = legacy_registry_with_alias(revision=1)
+    journal = {
+        "version": ALIAS_JOURNAL_VERSION,
+        "job_id": job_id,
+        "base_review": base_review,
+        "target_review": target_review,
+        "base_registry": base_registry,
+        "target_registry": target_registry,
+        "base_review_sha256": _digest(base_review),
+        "target_review_sha256": _digest(target_review),
+        "base_registry_sha256": _digest(base_registry),
+        "target_registry_sha256": _digest(target_registry),
+    }
+    (store.job_dir(job_id) / ".alias-operation.json").write_text(json.dumps(journal))
+
+    with pytest.raises(
+        AliasRegistryUnavailable,
+        match="missing registry cannot recover a non-empty alias base",
+    ):
+        AliasTransactionCoordinator(store, tmp_path / "alias-registry.json").recover_all()
+
+    assert not (tmp_path / "alias-registry.json").exists()
+    review_path = store.job_dir(job_id) / "review.json"
+    assert not review_path.exists() or json.loads(review_path.read_text())["revision"] == 0
+
+
 @pytest.mark.parametrize(
     "corrupt",
     (
@@ -1861,11 +1939,28 @@ def test_service_date_corrections_update_raw_projection_and_clear_authoritativel
     result["rows"][0]["service_date_iso"] = "2026-01-20"
     (store.job_dir(job_id) / "result.json").write_text(json.dumps(result))
 
+    raw_only = client.patch(
+        f"/api/v2/documents/{job_id}/rows/machine-row",
+        headers={"If-Match": "0"},
+        json={
+            "changes": {"service_date_raw": "99/99/2026"},
+            "reason": "Attempted a raw-only date correction",
+        },
+    )
+    assert raw_only.status_code == 422
+    assert raw_only.json()["detail"] == (
+        "service_date_raw requires authoritative service_date_iso"
+    )
+    assert store.read_review(job_id)["revision"] == 0
+
     changed = client.patch(
         f"/api/v2/documents/{job_id}/rows/machine-row",
         headers={"If-Match": "0"},
         json={
-            "changes": {"service_date_iso": "2026-02-21"},
+            "changes": {
+                "service_date_iso": "2026-02-21",
+                "service_date_raw": "99/99/2026",
+            },
             "reason": "Corrected the printed service date",
         },
     )
@@ -1901,6 +1996,61 @@ def test_service_date_corrections_update_raw_projection_and_clear_authoritativel
     )
     assert invalid.status_code == 422
     assert store.read_review(job_id)["revision"] == 2
+
+
+def test_evidence_relink_preserves_unrelated_field_evidence_and_rejection(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    client, store = client_for(tmp_path, monkeypatch)
+    job_id, result = completed_job(store)
+    source_evidence = result["rows"][0]["evidence"][0]
+    date_evidence = {**source_evidence, "token_ids": ["alias-date-token"]}
+    review = store.read_review(job_id)
+    review["row_overrides"]["machine-row"] = {
+        "changes": {
+            "review_disposition": "rejected",
+            "field_evidence": {"service_date": [date_evidence]},
+            "source_routes": ["ocr_spatial_graph", "reviewer_hospital_alias"],
+        },
+        "rejection": {
+            "source": "reviewer",
+            "previous_disposition": "unreadable",
+            "rejected_at": "2026-08-12T00:00:00Z",
+            "reason": "Rejected before evidence relink",
+        },
+        "reason": "Alias-trained date before relink",
+        "updated_at": "2026-08-12T00:00:00Z",
+    }
+    (store.job_dir(job_id) / "review.json").write_text(json.dumps(review))
+
+    relinked = client.patch(
+        f"/api/v2/documents/{job_id}/rows/machine-row",
+        headers={"If-Match": "0"},
+        json={
+            "changes": {"description": "Relinked rejected charge"},
+            "page_number": 1,
+            "polygon": {
+                "points": [
+                    {"x": 12, "y": 12},
+                    {"x": 88, "y": 12},
+                    {"x": 88, "y": 28},
+                    {"x": 12, "y": 28},
+                ]
+            },
+            "reason": "Relinked description evidence only",
+        },
+    )
+
+    assert relinked.status_code == 200
+    row = relinked.json()["row"]
+    assert row["field_evidence"]["service_date"] == [date_evidence]
+    assert set(row["field_evidence"]) >= {"service_date", "description", "amount"}
+    assert row["bulk_action"] == "restore"
+    assert row["rejection_provenance"]["previous_disposition"] == "unreadable"
+    saved = store.read_review(job_id)["row_overrides"]["machine-row"]
+    assert saved["rejection"]["previous_disposition"] == "unreadable"
+    assert saved["changes"]["field_evidence"]["service_date"] == [date_evidence]
 
 
 def test_historical_iso_only_date_clear_hides_machine_raw_date(
@@ -2458,6 +2608,73 @@ def test_hospital_link_persists_profile_metadata_from_locked_snapshot(
     assert review["document_overrides"]["hospital_link"]["hospital_name"] == (
         "MACHINE HOSPITAL"
     )
+
+
+def test_hospital_link_refreshes_existing_record_from_locked_profile_name(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    client, store = client_for(tmp_path / "jobs", monkeypatch)
+    profile_registry = tmp_path / "profiles" / "registry.json"
+    JsonProfileRepository(profile_registry).add_profile(
+        LayoutProfile(
+            contract_version="layout_profile_v1",
+            profile_key="machine-hospital-existing-alias",
+            profile_version=1,
+            lifecycle=ProfileLifecycle.ACTIVE,
+            hospital_id="profile-machine-hospital",
+            hospital_name="Machine Hospital",
+            page_type=PageType.ITEMIZED_CHARGES,
+            table_type=TableType.ITEM_LEDGER,
+            page_aspect_ratio=0.7,
+            table_box=(0.05, 0.15, 0.95, 0.9),
+            supported_fields=("description", "amount"),
+            construction_dataset_ids=("training",),
+        )
+    )
+    monkeypatch.setattr(api, "PROFILE_REGISTRY", profile_registry)
+    existing_registry = registry_with_alias(revision=1)
+    existing_registry["hospitals"][0]["hospital_id"] = "profile-machine-hospital"
+    existing_registry["aliases"][0]["hospital_id"] = "profile-machine-hospital"
+    JsonAliasRepository(api.ALIAS_REGISTRY)._write_unlocked(existing_registry)
+    job_id, _ = completed_job(store)
+    original_list = JsonProfileRepository.list_profiles
+    calls = 0
+
+    def changing_profile_name(repository):
+        nonlocal calls
+        calls += 1
+        profiles = original_list(repository)
+        if calls == 1:
+            return profiles
+        return [
+            profile.model_copy(update={"hospital_name": "MACHINE HOSPITAL"})
+            for profile in profiles
+        ]
+
+    monkeypatch.setattr(JsonProfileRepository, "list_profiles", changing_profile_name)
+
+    response = client.post(
+        f"/api/v2/documents/{job_id}/hospital-link",
+        headers={"If-Match": "0"},
+        json={
+            "create": False,
+            "hospital_id": "profile-machine-hospital",
+            "registry_revision": 1,
+            "reason": "Refresh the existing alias record from the locked profile",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["hospital_name"] == "MACHINE HOSPITAL"
+    registry = JsonAliasRepository(api.ALIAS_REGISTRY).read()
+    assert registry["hospitals"][0]["hospital_name"] == "MACHINE HOSPITAL"
+    assert registry["hospitals"][0]["name_variants"][0]["display_name"] == (
+        "Machine Hospital"
+    )
+    assert store.read_review(job_id)["document_overrides"]["hospital_link"][
+        "hospital_name"
+    ] == "MACHINE HOSPITAL"
 
 
 def test_documents_can_be_discovered_in_newest_first_shared_queue(

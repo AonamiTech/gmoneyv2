@@ -69,6 +69,15 @@ class AliasTransactionCoordinator:
             raise AliasRegistryUnavailable(f"invalid {name} in alias operation journal")
         return payload
 
+    @staticmethod
+    def _is_empty_registry_image(payload: dict[str, Any]) -> bool:
+        return (
+            payload.get("revision") == 0
+            and payload.get("hospitals") == []
+            and payload.get("aliases") == []
+            and payload.get("events") == []
+        )
+
     def _recover_unlocked(self, job_id: str) -> None:
         journal_path = self.journal_path(job_id)
         if not journal_path.is_file():
@@ -92,7 +101,14 @@ class AliasTransactionCoordinator:
             current_review = (
                 self.store._read_review_unlocked(job_id) if review_path.is_file() else base_review
             )
-            current_registry = self.repository._read_supported_unlocked()
+            if self.repository.path.is_file():
+                current_registry = self.repository._read_supported_unlocked()
+            elif self._is_empty_registry_image(base_registry):
+                current_registry = json.loads(json.dumps(base_registry))
+            else:
+                raise AliasRegistryUnavailable(
+                    "missing registry cannot recover a non-empty alias base"
+                )
             if _digest(current_review) not in {_digest(base_review), _digest(target_review)}:
                 raise AliasRegistryUnavailable("newer review state blocks alias recovery")
             if _digest(current_registry) not in {

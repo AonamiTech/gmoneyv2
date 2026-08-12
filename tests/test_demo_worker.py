@@ -751,6 +751,82 @@ def test_worker_loop_uses_five_second_registry_retry_interval(tmp_path: Path) ->
     assert observed_probes == [0.0, 5.0]
 
 
+def test_worker_does_not_claim_when_probe_observes_shutdown(tmp_path: Path) -> None:
+    store = JobStore(tmp_path)
+    job_id = _create_worker_job(store, "Queued before shutdown probe.pdf")
+    stop_event = threading.Event()
+    runner_calls: list[str] = []
+
+    class StoppingCoordinator:
+        def registry_snapshot(self) -> None:
+            stop_event.set()
+
+    def coordinator_factory(store: JobStore, path: Path) -> StoppingCoordinator:
+        return StoppingCoordinator()
+
+    def runner(root_value: str, claimed_id: str, vl_url: str) -> dict[str, Any]:
+        runner_calls.append(claimed_id)
+        return {"row_count": 0}
+
+    worker_module.run_worker_loop(
+        root=tmp_path,
+        vl_url="http://vl.test",
+        paddle_device="cpu",
+        concurrency=1,
+        retention_hours=720,
+        alias_registry=tmp_path / "alias-registry.json",
+        stop_requested=stop_event.is_set,
+        executor_factory=ThreadPoolExecutor,
+        job_runner=runner,
+        coordinator_factory=coordinator_factory,
+    )
+
+    assert store.read(job_id)["status"] == "queued"
+    assert runner_calls == []
+
+
+def test_worker_requeues_claim_when_shutdown_arrives_before_submission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = JobStore(tmp_path)
+    job_id = _create_worker_job(store, "Claim interrupted by shutdown.pdf")
+    stop_event = threading.Event()
+    runner_calls: list[str] = []
+    original_claim = JobStore.claim_queued
+
+    def stopping_claim(
+        claimed_store: JobStore,
+        claimed_id: str,
+        cancel_requested: Any = None,
+    ) -> dict[str, Any] | None:
+        claimed = original_claim(claimed_store, claimed_id, cancel_requested)
+        if claimed is not None:
+            stop_event.set()
+        return claimed
+
+    def runner(root_value: str, claimed_id: str, vl_url: str) -> dict[str, Any]:
+        runner_calls.append(claimed_id)
+        return {"row_count": 0}
+
+    monkeypatch.setattr(JobStore, "claim_queued", stopping_claim)
+
+    worker_module.run_worker_loop(
+        root=tmp_path,
+        vl_url="http://vl.test",
+        paddle_device="cpu",
+        concurrency=1,
+        retention_hours=720,
+        alias_registry=None,
+        stop_requested=stop_event.is_set,
+        executor_factory=ThreadPoolExecutor,
+        job_runner=runner,
+    )
+
+    assert store.read(job_id)["status"] == "queued"
+    assert runner_calls == []
+
+
 def test_spawned_worker_retries_unavailable_registry_after_five_seconds(
     tmp_path: Path,
 ) -> None:

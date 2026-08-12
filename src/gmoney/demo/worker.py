@@ -244,18 +244,42 @@ def run_worker_loop(
                 elif not alias_registry_available:
                     _fail_queued_for_alias_outage(store)
 
+            if stop_requested():
+                draining = True
+                continue
+
             if alias_registry_available:
                 available = concurrency - len(futures)
                 for state in store.queued()[:available]:
+                    if stop_requested():
+                        draining = True
+                        break
                     job_id = state["id"]
                     try:
-                        claimed = store.claim_queued(job_id)
+                        claimed = store.claim_queued(job_id, stop_requested)
                     except KeyError:
                         continue
                     if claimed is None:
+                        if stop_requested():
+                            draining = True
+                            break
                         continue
+                    if stop_requested():
+                        store.requeue_claimed(job_id)
+                        draining = True
+                        break
                     future = executor.submit(job_runner, str(root), job_id, vl_url)
+                    if stop_requested():
+                        draining = True
+                        if future.cancel():
+                            store.requeue_claimed(job_id)
+                            break
                     futures[future] = job_id
+                    if draining:
+                        break
+
+            if draining:
+                continue
 
             if now - last_cleanup >= 300:
                 cleanup_succeeded = True

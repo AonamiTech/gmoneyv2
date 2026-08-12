@@ -88,6 +88,10 @@ def normalize_changes(changes: dict[str, Any]) -> dict[str, Any]:
     unsupported = set(changes) - EDITABLE_FIELDS
     if unsupported:
         raise ReviewValidationError(f"Unsupported fields: {', '.join(sorted(unsupported))}")
+    if "service_date_raw" in changes and "service_date_iso" not in changes:
+        raise ReviewValidationError(
+            "service_date_raw requires authoritative service_date_iso"
+        )
     normalized: dict[str, Any] = {}
     service_date_supplied = "service_date_iso" in changes
     if service_date_supplied:
