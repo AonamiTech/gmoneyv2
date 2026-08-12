@@ -638,7 +638,8 @@ def list_trained_hospitals() -> dict[str, Any]:
                 "training_sources": [],
             },
         )
-        item["hospital_name"] = hospital["hospital_name"]
+        if item["active_profile_count"] == 0:
+            item["hospital_name"] = hospital["hospital_name"]
         for origin in hospital.get("origins", []):
             if origin not in item["training_sources"]:
                 item["training_sources"].append(origin)
@@ -1002,14 +1003,10 @@ def link_document_hospital(
         for profile in JsonProfileRepository(PROFILE_REGISTRY).list_profiles()
         if profile.lifecycle is ProfileLifecycle.ACTIVE and profile.hospital_id
     }
-    registry_matches = {
-        str(item["hospital_id"])
-        for item in snapshot["hospitals"]
-        if any(
-            variant.get("normalized_name") == normalized_name
-            for variant in item.get("name_variants", [])
-        )
-    }
+    registry_matches = JsonAliasRepository.hospital_name_owners(
+        snapshot,
+        selected_name,
+    )
     profile_matches = {
         hospital_id
         for hospital_id, name in profile_names.items()
@@ -1070,14 +1067,7 @@ def link_document_hospital(
             (item for item in registry["hospitals"] if item["hospital_id"] == hospital_id),
             None,
         )
-        owners = {
-            str(item["hospital_id"])
-            for item in registry["hospitals"]
-            if any(
-                variant.get("normalized_name") == normalized_name
-                for variant in item.get("name_variants", [])
-            )
-        }
+        owners = JsonAliasRepository.hospital_name_owners(registry, selected_name)
         locked_profile_names = {
             str(profile.hospital_id): str(profile.hospital_name or profile.hospital_id)
             for profile in JsonProfileRepository(PROFILE_REGISTRY).list_profiles()
@@ -1105,6 +1095,32 @@ def link_document_hospital(
         locked_canonical_name = locked_profile_names.get(
             hospital_id,
             str(record["hospital_name"]) if record is not None else selected_name,
+        )
+        canonical_owners = JsonAliasRepository.hospital_name_owners(
+            registry,
+            locked_canonical_name,
+        )
+        canonical_normalized_name = normalize_hospital_name(locked_canonical_name)
+        canonical_owners.update(
+            candidate_id
+            for candidate_id, name in locked_profile_names.items()
+            if normalize_hospital_name(name) == canonical_normalized_name
+        )
+        conflicting_canonical_owners = canonical_owners - {hospital_id}
+        if conflicting_canonical_owners:
+            raise HospitalIdentityConflict(
+                "hospital_name_conflict",
+                conflicting_canonical_owners,
+            )
+        old_canonical_name = (
+            str(record["hospital_name"]) if record is not None else None
+        )
+        canonical_name_source = (
+            "active_profile"
+            if hospital_id in locked_profile_names
+            else "registry"
+            if record is not None
+            else "reviewer_alias"
         )
         canonical_name_holder["value"] = locked_canonical_name
         if record is None:
@@ -1146,6 +1162,9 @@ def link_document_hospital(
                 payload.reason,
                 hospital_id=hospital_id,
                 document_id=result["document_id"],
+                old_hospital_name=old_canonical_name,
+                new_hospital_name=locked_canonical_name,
+                canonical_name_source=canonical_name_source,
             )
         )
         review.setdefault("document_overrides", {})["hospital_link"] = {
@@ -1161,7 +1180,12 @@ def link_document_hospital(
                 "hospital_linked",
                 hospital_id,
                 payload.reason,
-                {"hospital_name": locked_canonical_name},
+                {
+                    "hospital_name": locked_canonical_name,
+                    "old_hospital_name": old_canonical_name,
+                    "new_hospital_name": locked_canonical_name,
+                    "canonical_name_source": canonical_name_source,
+                },
             )
         )
         return review, registry

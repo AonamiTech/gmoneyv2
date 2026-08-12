@@ -27,6 +27,7 @@ from gmoney.demo.store import JobStore
 from gmoney.profiles.aliases import (
     ALIAS_REGISTRY_VERSION,
     LEGACY_ALIAS_REGISTRY_VERSION,
+    AliasRegistryFormatError,
     AliasRegistryUnavailable,
     JsonAliasRepository,
 )
@@ -2405,6 +2406,47 @@ def test_trained_hospitals_lists_only_active_hospital_profiles(tmp_path: Path, m
     }
 
 
+def test_trained_hospital_directory_prefers_active_profile_name(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    client, _ = client_for(tmp_path / "jobs", monkeypatch)
+    profile_registry = tmp_path / "profiles" / "registry.json"
+    JsonProfileRepository(profile_registry).add_profile(
+        LayoutProfile(
+            contract_version="layout_profile_v1",
+            profile_key="current-hospital-profile",
+            profile_version=1,
+            lifecycle=ProfileLifecycle.ACTIVE,
+            hospital_id="hospital-1",
+            hospital_name="Current Profile Hospital",
+            page_type=PageType.ITEMIZED_CHARGES,
+            table_type=TableType.ITEM_LEDGER,
+            page_aspect_ratio=0.7,
+            table_box=(0.05, 0.15, 0.95, 0.9),
+            supported_fields=("description", "amount"),
+            construction_dataset_ids=("training",),
+        )
+    )
+    monkeypatch.setattr(api, "PROFILE_REGISTRY", profile_registry)
+    stale_registry = registry_with_alias(revision=1)
+    stale_registry["hospitals"][0]["hospital_name"] = "Stale Alias Hospital"
+    JsonAliasRepository(api.ALIAS_REGISTRY)._write_unlocked(stale_registry)
+
+    response = client.get("/api/v2/hospitals/trained")
+
+    assert response.status_code == 200
+    assert response.json()["hospitals"] == [
+        {
+            "hospital_id": "hospital-1",
+            "hospital_name": "Current Profile Hospital",
+            "active_profile_count": 1,
+            "alias_count": 1,
+            "training_sources": ["profile", "reviewer_alias"],
+        }
+    ]
+
+
 def test_hospital_link_reuses_profile_identity_and_rejects_duplicate_create(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -2648,7 +2690,9 @@ def test_hospital_link_refreshes_existing_record_from_locked_profile_name(
         if calls == 1:
             return profiles
         return [
-            profile.model_copy(update={"hospital_name": "MACHINE HOSPITAL"})
+            profile.model_copy(
+                update={"hospital_name": "New Machine Medical Center"}
+            )
             for profile in profiles
         ]
 
@@ -2666,15 +2710,144 @@ def test_hospital_link_refreshes_existing_record_from_locked_profile_name(
     )
 
     assert response.status_code == 200
-    assert response.json()["hospital_name"] == "MACHINE HOSPITAL"
+    assert response.json()["hospital_name"] == "New Machine Medical Center"
     registry = JsonAliasRepository(api.ALIAS_REGISTRY).read()
-    assert registry["hospitals"][0]["hospital_name"] == "MACHINE HOSPITAL"
+    assert registry["hospitals"][0]["hospital_name"] == "New Machine Medical Center"
     assert registry["hospitals"][0]["name_variants"][0]["display_name"] == (
         "Machine Hospital"
     )
+    assert (
+        JsonAliasRepository.resolve_hospital(
+            registry,
+            "New Machine Medical Center",
+        )
+        == "profile-machine-hospital"
+    )
     assert store.read_review(job_id)["document_overrides"]["hospital_link"][
         "hospital_name"
-    ] == "MACHINE HOSPITAL"
+    ] == "New Machine Medical Center"
+    registry_event = registry["events"][-1]
+    assert registry_event["old_hospital_name"] == "Machine Hospital"
+    assert registry_event["new_hospital_name"] == "New Machine Medical Center"
+    assert registry_event["canonical_name_source"] == "active_profile"
+    review_event = store.read_review(job_id)["events"][-1]
+    assert review_event["changes"]["old_hospital_name"] == "Machine Hospital"
+    assert review_event["changes"]["new_hospital_name"] == (
+        "New Machine Medical Center"
+    )
+    assert review_event["changes"]["canonical_name_source"] == "active_profile"
+
+
+def test_hospital_link_rejects_locked_profile_name_owned_by_another_hospital(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    client, store = client_for(tmp_path / "jobs", monkeypatch)
+    profile_registry = tmp_path / "profiles" / "registry.json"
+    JsonProfileRepository(profile_registry).add_profile(
+        LayoutProfile(
+            contract_version="layout_profile_v1",
+            profile_key="machine-hospital-conflicting-name",
+            profile_version=1,
+            lifecycle=ProfileLifecycle.ACTIVE,
+            hospital_id="hospital-1",
+            hospital_name="Machine Hospital",
+            page_type=PageType.ITEMIZED_CHARGES,
+            table_type=TableType.ITEM_LEDGER,
+            page_aspect_ratio=0.7,
+            table_box=(0.05, 0.15, 0.95, 0.9),
+            supported_fields=("description", "amount"),
+            construction_dataset_ids=("training",),
+        )
+    )
+    JsonProfileRepository(profile_registry).add_profile(
+        LayoutProfile(
+            contract_version="layout_profile_v1",
+            profile_key="other-hospital-owning-new-name",
+            profile_version=1,
+            lifecycle=ProfileLifecycle.ACTIVE,
+            hospital_id="hospital-2",
+            hospital_name="New Machine Medical Center",
+            page_type=PageType.ITEMIZED_CHARGES,
+            table_type=TableType.ITEM_LEDGER,
+            page_aspect_ratio=0.7,
+            table_box=(0.05, 0.15, 0.95, 0.9),
+            supported_fields=("description", "amount"),
+            construction_dataset_ids=("training",),
+        )
+    )
+    monkeypatch.setattr(api, "PROFILE_REGISTRY", profile_registry)
+    registry = registry_with_alias(revision=1)
+    JsonAliasRepository(api.ALIAS_REGISTRY)._write_unlocked(registry)
+    job_id, _ = completed_job(store)
+    original_list = JsonProfileRepository.list_profiles
+    calls = 0
+
+    def changing_profile_name(repository):
+        nonlocal calls
+        calls += 1
+        profiles = original_list(repository)
+        if calls == 1:
+            return profiles
+        return [
+            profile.model_copy(
+                update={"hospital_name": "New Machine Medical Center"}
+            )
+            if profile.hospital_id == "hospital-1"
+            else profile
+            for profile in profiles
+        ]
+
+    monkeypatch.setattr(JsonProfileRepository, "list_profiles", changing_profile_name)
+
+    response = client.post(
+        f"/api/v2/documents/{job_id}/hospital-link",
+        headers={"If-Match": "0"},
+        json={
+            "create": False,
+            "hospital_id": "hospital-1",
+            "registry_revision": 1,
+            "reason": "Reject a locked canonical name owned by another hospital",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == {
+        "code": "hospital_name_conflict",
+        "candidate_ids": ["hospital-2"],
+    }
+    assert store.read_review(job_id)["revision"] == 0
+    unchanged = JsonAliasRepository(api.ALIAS_REGISTRY).read()
+    assert unchanged["revision"] == 1
+    assert unchanged["hospitals"][0]["hospital_name"] == "Machine Hospital"
+
+
+def test_hospital_registry_rejects_ambiguous_canonical_name_ownership() -> None:
+    registry = registry_with_alias(revision=1)
+    registry["hospitals"].append(
+        {
+            "hospital_id": "hospital-2",
+            "hospital_name": "Other Hospital",
+            "origins": ["reviewer_alias"],
+            "name_variants": [
+                {
+                    "display_name": "Machine Hospital",
+                    "normalized_name": "machine hospital",
+                    "verified": True,
+                    "source_document_id": "f" * 64,
+                    "reviewer": "test-reviewer",
+                    "reason": "Conflicting historical ownership",
+                    "created_at": "2026-08-12T00:00:00Z",
+                }
+            ],
+            "created_at": "2026-08-12T00:00:00Z",
+            "updated_at": "2026-08-12T00:00:00Z",
+        }
+    )
+
+    assert JsonAliasRepository.resolve_hospital(registry, "Machine Hospital") is None
+    with pytest.raises(AliasRegistryFormatError, match="belongs to multiple hospitals"):
+        JsonAliasRepository(Path("unused.json"))._validate(registry)
 
 
 def test_documents_can_be_discovered_in_newest_first_shared_queue(

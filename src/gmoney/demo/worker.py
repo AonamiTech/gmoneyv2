@@ -121,11 +121,20 @@ def _run_job(root_value: str, job_id: str, vl_url: str) -> dict[str, Any] | None
     )
 
 
-def _fail_queued_for_alias_outage(store: JobStore) -> int:
+def _fail_queued_for_alias_outage(
+    store: JobStore,
+    stop_requested: Callable[[], bool] = lambda: False,
+) -> int:
     failed = 0
     for state in store.queued():
+        if stop_requested():
+            break
         try:
-            if store.fail_queued(str(state["id"]), "alias_registry_unavailable"):
+            if store.fail_queued(
+                str(state["id"]),
+                "alias_registry_unavailable",
+                stop_requested,
+            ):
                 failed += 1
         except KeyError:
             continue
@@ -135,11 +144,12 @@ def _fail_queued_for_alias_outage(store: JobStore) -> int:
 def _probe_alias_registry(
     coordinator: AliasTransactionCoordinator,
     store: JobStore,
+    stop_requested: Callable[[], bool] = lambda: False,
 ) -> bool:
     try:
         coordinator.registry_snapshot()
     except AliasRegistryUnavailable:
-        _fail_queued_for_alias_outage(store)
+        _fail_queued_for_alias_outage(store, stop_requested)
         return False
     return True
 
@@ -148,6 +158,7 @@ def _cleanup_jobs(
     store: JobStore,
     coordinator: AliasTransactionCoordinator | None,
     retention_hours: int,
+    stop_requested: Callable[[], bool] = lambda: False,
 ) -> bool:
     try:
         if coordinator is not None:
@@ -155,7 +166,7 @@ def _cleanup_jobs(
         else:
             store.cleanup(retention_hours)
     except AliasRegistryUnavailable:
-        _fail_queued_for_alias_outage(store)
+        _fail_queued_for_alias_outage(store, stop_requested)
         return False
     return True
 
@@ -235,6 +246,7 @@ def run_worker_loop(
                     alias_registry_available = _probe_alias_registry(
                         alias_coordinator,
                         store,
+                        stop_requested,
                     )
                     next_alias_probe = (
                         0.0
@@ -242,7 +254,7 @@ def run_worker_loop(
                         else now + alias_retry_seconds
                     )
                 elif not alias_registry_available:
-                    _fail_queued_for_alias_outage(store)
+                    _fail_queued_for_alias_outage(store, stop_requested)
 
             if stop_requested():
                 draining = True
@@ -268,7 +280,15 @@ def run_worker_loop(
                         store.requeue_claimed(job_id)
                         draining = True
                         break
-                    future = executor.submit(job_runner, str(root), job_id, vl_url)
+                    try:
+                        future = executor.submit(job_runner, str(root), job_id, vl_url)
+                    except Exception:
+                        if (
+                            not store.requeue_claimed(job_id)
+                            and store.abort_requested(job_id)
+                        ):
+                            store.finalize_abort(job_id)
+                        raise
                     if stop_requested():
                         draining = True
                         if future.cancel():
@@ -288,6 +308,7 @@ def run_worker_loop(
                         store,
                         alias_coordinator,
                         retention_hours,
+                        stop_requested,
                     )
                 last_cleanup = now
                 if not cleanup_succeeded:

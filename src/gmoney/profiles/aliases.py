@@ -166,10 +166,22 @@ class JsonAliasRepository:
             raise AliasRegistryFormatError(
                 "hospital alias registry has duplicate hospital IDs"
             )
-        variant_owners: dict[str, str] = {}
+        name_owners: dict[str, str] = {}
         for hospital in hospitals:
             hospital_id = _required_text(hospital, "hospital_id", "hospital registry entry")
-            _required_text(hospital, "hospital_name", "hospital registry entry")
+            hospital_name = _required_text(
+                hospital, "hospital_name", "hospital registry entry"
+            )
+            canonical_normalized = normalize_hospital_name(hospital_name)
+            if not canonical_normalized:
+                raise AliasRegistryFormatError(
+                    "hospital alias registry has an invalid hospital name"
+                )
+            owner = name_owners.setdefault(canonical_normalized, hospital_id)
+            if owner != hospital_id:
+                raise AliasRegistryFormatError(
+                    "hospital name belongs to multiple hospitals"
+                )
             _required_timestamp(hospital, "created_at", "hospital registry entry")
             _required_timestamp(hospital, "updated_at", "hospital registry entry")
             origins = hospital.get("origins")
@@ -212,7 +224,7 @@ class JsonAliasRepository:
                 _required_text(variant, "reviewer", "hospital name variant")
                 _required_text(variant, "reason", "hospital name variant")
                 _required_timestamp(variant, "created_at", "hospital name variant")
-                owner = variant_owners.setdefault(normalized, hospital_id)
+                owner = name_owners.setdefault(normalized, hospital_id)
                 if owner != hospital_id:
                     raise AliasRegistryFormatError(
                         "hospital name variant belongs to multiple hospitals"
@@ -369,18 +381,26 @@ class JsonAliasRepository:
         return str(uuid5(NAMESPACE_URL, f"gmoney:hospital:{normalized}"))
 
     @staticmethod
-    def resolve_hospital(snapshot: dict[str, Any], name: str | None) -> str | None:
+    def hospital_name_owners(
+        snapshot: dict[str, Any], name: str | None
+    ) -> set[str]:
         normalized = normalize_hospital_name(name or "")
         if not normalized:
-            return None
-        matches = {
+            return set()
+        return {
             str(item["hospital_id"])
             for item in snapshot["hospitals"]
-            if any(
+            if normalize_hospital_name(str(item.get("hospital_name") or ""))
+            == normalized
+            or any(
                 variant.get("normalized_name") == normalized
                 for variant in item.get("name_variants", [])
             )
         }
+
+    @staticmethod
+    def resolve_hospital(snapshot: dict[str, Any], name: str | None) -> str | None:
+        matches = JsonAliasRepository.hospital_name_owners(snapshot, name)
         return next(iter(matches)) if len(matches) == 1 else None
 
     @staticmethod

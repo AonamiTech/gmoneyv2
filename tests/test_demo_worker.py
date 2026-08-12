@@ -714,6 +714,96 @@ def test_cleanup_registry_failure_fails_queue_without_escaping(tmp_path: Path) -
     assert state["error"] == "alias_registry_unavailable"
 
 
+@pytest.mark.parametrize("operation", ("probe", "cleanup"))
+def test_registry_failure_during_shutdown_preserves_queued_jobs(
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    store = JobStore(tmp_path)
+    job_id = _create_worker_job(store, f"Queued during {operation} shutdown.pdf")
+    stop_event = threading.Event()
+
+    class StoppingCoordinator:
+        def registry_snapshot(self) -> None:
+            stop_event.set()
+            raise AliasRegistryUnavailable("registry failed during shutdown")
+
+        def cleanup(self, retention_hours: int) -> int:
+            stop_event.set()
+            raise AliasRegistryUnavailable("cleanup failed during shutdown")
+
+    coordinator = StoppingCoordinator()
+    if operation == "probe":
+        assert (
+            worker_module._probe_alias_registry(
+                coordinator,
+                store,
+                stop_event.is_set,
+            )
+            is False
+        )
+    else:
+        assert (
+            worker_module._cleanup_jobs(
+                store,
+                coordinator,
+                720,
+                stop_event.is_set,
+            )
+            is False
+        )
+
+    assert store.read(job_id)["status"] == "queued"
+
+
+def test_shutdown_stops_alias_outage_failure_between_queued_jobs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = JobStore(tmp_path)
+    first_id = _create_worker_job(store, "First outage bill.pdf")
+    second_id = _create_worker_job(store, "Second outage bill.pdf")
+    stop_event = threading.Event()
+    original_fail = JobStore.fail_queued
+    failures = 0
+
+    def stopping_failure(
+        job_store: JobStore,
+        job_id: str,
+        error: str,
+        cancel_requested: Any = None,
+    ) -> bool:
+        nonlocal failures
+        failed = original_fail(job_store, job_id, error, cancel_requested)
+        failures += int(failed)
+        if failed:
+            stop_event.set()
+        return failed
+
+    monkeypatch.setattr(JobStore, "fail_queued", stopping_failure)
+
+    assert (
+        worker_module._fail_queued_for_alias_outage(store, stop_event.is_set) == 1
+    )
+    assert store.read(first_id)["status"] == "failed"
+    assert store.read(second_id)["status"] == "queued"
+    assert failures == 1
+
+
+def test_shutdown_stops_alias_outage_failure_inside_job_lock(tmp_path: Path) -> None:
+    store = JobStore(tmp_path)
+    job_id = _create_worker_job(store, "Outage bill at shutdown boundary.pdf")
+    checks = 0
+
+    def stop_during_failure() -> bool:
+        nonlocal checks
+        checks += 1
+        return checks >= 2
+
+    assert worker_module._fail_queued_for_alias_outage(store, stop_during_failure) == 0
+    assert store.read(job_id)["status"] == "queued"
+
+
 def test_worker_loop_uses_five_second_registry_retry_interval(tmp_path: Path) -> None:
     observed_probes: list[float] = []
     current_time = 0.0
@@ -760,6 +850,7 @@ def test_worker_does_not_claim_when_probe_observes_shutdown(tmp_path: Path) -> N
     class StoppingCoordinator:
         def registry_snapshot(self) -> None:
             stop_event.set()
+            raise AliasRegistryUnavailable("registry failed during shutdown")
 
     def coordinator_factory(store: JobStore, path: Path) -> StoppingCoordinator:
         return StoppingCoordinator()
@@ -825,6 +916,39 @@ def test_worker_requeues_claim_when_shutdown_arrives_before_submission(
 
     assert store.read(job_id)["status"] == "queued"
     assert runner_calls == []
+
+
+def test_executor_submission_failure_requeues_claim_and_exits_worker(
+    tmp_path: Path,
+) -> None:
+    store = JobStore(tmp_path)
+    job_id = _create_worker_job(store, "Executor rejected bill.pdf")
+
+    class RejectingExecutor:
+        def __init__(self, **options: Any) -> None:
+            assert options["max_workers"] == 1
+
+        def __enter__(self) -> RejectingExecutor:
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            return None
+
+        def submit(self, *args: Any) -> None:
+            raise RuntimeError("executor rejected submission")
+
+    with pytest.raises(RuntimeError, match="executor rejected submission"):
+        worker_module.run_worker_loop(
+            root=tmp_path,
+            vl_url="http://vl.test",
+            paddle_device="cpu",
+            concurrency=1,
+            retention_hours=720,
+            alias_registry=None,
+            executor_factory=RejectingExecutor,
+        )
+
+    assert store.read(job_id)["status"] == "queued"
 
 
 def test_spawned_worker_retries_unavailable_registry_after_five_seconds(
