@@ -78,7 +78,7 @@ const rowsResult = {
         reason: null,
         machine_values: {},
       },
-      bulk_action: "reject",
+      bulk_action: "reject" as "reject" | "restore" | null,
       rejection_provenance: null,
     },
   ],
@@ -196,8 +196,10 @@ describe("evidence page navigation", () => {
   let historyHospitalName: string | null = "Test Hospital";
   let abortRequests = 0;
   let bulkPayload: Record<string, unknown> | null = null;
+  let rowPatchPayload: Record<string, unknown> | null = null;
   let reviewHospitalId: string | null = null;
   let aliasApplyPayload: Record<string, unknown> | null = null;
+  let normalizedRowsPayload = structuredClone(rowsResult);
   let sourcePayload: Omit<typeof sourceTables, "unavailable_reason"> & {
     unavailable_reason: "legacy_result" | "no_source_tables" | null;
   } = sourceTables;
@@ -209,8 +211,10 @@ describe("evidence page navigation", () => {
     historyHospitalName = "Test Hospital";
     abortRequests = 0;
     bulkPayload = null;
+    rowPatchPayload = null;
     reviewHospitalId = null;
     aliasApplyPayload = null;
+    normalizedRowsPayload = structuredClone(rowsResult);
     sourcePayload = structuredClone(sourceTables);
     vi.stubGlobal(
       "fetch",
@@ -260,6 +264,10 @@ describe("evidence page navigation", () => {
           bulkPayload = JSON.parse(String(init?.body));
           return json({ review_revision: 1, updated_count: 1 });
         }
+        if (url.endsWith("/rows/row-1")) {
+          rowPatchPayload = JSON.parse(String(init?.body));
+          return json({ review_revision: 1, row: normalizedRowsPayload.rows[0] });
+        }
         if (url.endsWith("/column-aliases/preview")) {
           return json({
             hospital_id: "hospital-1",
@@ -302,7 +310,7 @@ describe("evidence page navigation", () => {
         if (url.includes("/source-tables?")) {
           return json(structuredClone(sourcePayload));
         }
-        if (url.includes("/rows?")) return json(structuredClone(rowsResult));
+        if (url.includes("/rows?")) return json(structuredClone(normalizedRowsPayload));
         if (url.endsWith("/review")) {
           return json({ ...structuredClone(review), hospital_id: reviewHospitalId });
         }
@@ -422,6 +430,37 @@ describe("evidence page navigation", () => {
       row_ids: ["row-1"],
       action: "reject",
       reason: "Duplicate summary row",
+    });
+  });
+
+  test("edits a rejected row without resubmitting its unchanged disposition", async () => {
+    normalizedRowsPayload.rows[0] = {
+      ...normalizedRowsPayload.rows[0],
+      review_disposition: "rejected",
+      bulk_action: null,
+    };
+    render(<Home />);
+    await advance(250);
+    await advance(250);
+    await openBill();
+
+    fireEvent.click(screen.getByRole("button", { name: "Normalized" }));
+    fireEvent.click(screen.getAllByText("Consultation")[0]);
+    fireEvent.click(screen.getByRole("button", { name: "Review row ↗" }));
+    expect(screen.getByLabelText("Disposition")).toHaveValue("rejected");
+    expect(screen.queryByRole("button", { name: "Reject row" })).not.toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Description"), {
+      target: { value: "Corrected rejected consultation" },
+    });
+    fireEvent.change(screen.getByPlaceholderText("What did you verify or change?"), {
+      target: { value: "Corrected description while retaining rejection" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save correction" }));
+    await advance(0);
+
+    expect(rowPatchPayload).toEqual({
+      changes: { description: "Corrected rejected consultation" },
+      reason: "Corrected description while retaining rejection",
     });
   });
 

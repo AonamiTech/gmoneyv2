@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import time
+from collections.abc import Callable
 from concurrent.futures import Future, ProcessPoolExecutor
 from pathlib import Path
 from typing import Any, TextIO
@@ -157,26 +158,35 @@ def _cleanup_jobs(
     return True
 
 
-def main() -> None:
-    root = Path(os.environ.get("GMONEY_DEMO_ROOT", "/tmp/gmoney-v2-demo"))
-    vl_url = os.environ.get("GMONEY_VL_URL", "http://paddleocr-vl:8111")
-    paddle_device = os.environ.get("GMONEY_PADDLE_DEVICE", "cpu")
-    concurrency = int(os.environ.get("GMONEY_WORKER_CONCURRENCY", "3"))
-    retention_hours = int(os.environ.get("GMONEY_RETENTION_HOURS", "720"))
+def run_worker_loop(
+    *,
+    root: Path,
+    vl_url: str,
+    paddle_device: str,
+    concurrency: int,
+    retention_hours: int,
+    alias_registry: Path | None,
+    stop_requested: Callable[[], bool] = lambda: False,
+    executor_factory: Callable[..., Any] = ProcessPoolExecutor,
+    job_runner: Callable[[str, str, str], dict[str, Any] | None] = _run_job,
+    coordinator_factory: Callable[[JobStore, Path], AliasTransactionCoordinator] = (
+        AliasTransactionCoordinator
+    ),
+    alias_retry_seconds: float = ALIAS_REGISTRY_RETRY_SECONDS,
+    clock: Callable[[], float] = time.monotonic,
+    sleeper: Callable[[float], None] = time.sleep,
+) -> None:
     store = JobStore(root)
     store.recover()
-    alias_registry_value = os.environ.get("GMONEY_ALIAS_REGISTRY")
     alias_coordinator = (
-        AliasTransactionCoordinator(store, Path(alias_registry_value))
-        if alias_registry_value
-        else None
+        coordinator_factory(store, alias_registry) if alias_registry is not None else None
     )
     futures: dict[Future[dict[str, Any] | None], str] = {}
     last_cleanup = 0.0
     alias_registry_available = alias_coordinator is None
     next_alias_probe = 0.0
-    with ProcessPoolExecutor(**_executor_options(concurrency, paddle_device)) as executor:
-        while True:
+    with executor_factory(**_executor_options(concurrency, paddle_device)) as executor:
+        while not stop_requested():
             for future, job_id in list(futures.items()):
                 if not future.done():
                     continue
@@ -202,7 +212,7 @@ def main() -> None:
                 if state.get("status") == "cancelling" and state["id"] not in running:
                     store.finalize_abort(state["id"])
 
-            now = time.monotonic()
+            now = clock()
             if alias_coordinator is not None:
                 cleanup_due = now - last_cleanup >= 300
                 should_probe = (
@@ -218,7 +228,7 @@ def main() -> None:
                     next_alias_probe = (
                         0.0
                         if alias_registry_available
-                        else now + ALIAS_REGISTRY_RETRY_SECONDS
+                        else now + alias_retry_seconds
                     )
                 elif not alias_registry_available:
                     _fail_queued_for_alias_outage(store)
@@ -233,7 +243,7 @@ def main() -> None:
                         continue
                     if claimed is None:
                         continue
-                    future = executor.submit(_run_job, str(root), job_id, vl_url)
+                    future = executor.submit(job_runner, str(root), job_id, vl_url)
                     futures[future] = job_id
 
             if now - last_cleanup >= 300:
@@ -247,8 +257,20 @@ def main() -> None:
                 last_cleanup = now
                 if not cleanup_succeeded:
                     alias_registry_available = False
-                    next_alias_probe = now + ALIAS_REGISTRY_RETRY_SECONDS
-            time.sleep(0.5)
+                    next_alias_probe = now + alias_retry_seconds
+            sleeper(0.5)
+
+
+def main() -> None:
+    alias_registry_value = os.environ.get("GMONEY_ALIAS_REGISTRY")
+    run_worker_loop(
+        root=Path(os.environ.get("GMONEY_DEMO_ROOT", "/tmp/gmoney-v2-demo")),
+        vl_url=os.environ.get("GMONEY_VL_URL", "http://paddleocr-vl:8111"),
+        paddle_device=os.environ.get("GMONEY_PADDLE_DEVICE", "cpu"),
+        concurrency=int(os.environ.get("GMONEY_WORKER_CONCURRENCY", "3")),
+        retention_hours=int(os.environ.get("GMONEY_RETENTION_HOURS", "720")),
+        alias_registry=(Path(alias_registry_value) if alias_registry_value else None),
+    )
 
 
 if __name__ == "__main__":

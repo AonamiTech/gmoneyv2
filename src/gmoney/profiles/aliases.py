@@ -4,6 +4,7 @@ import json
 import os
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from datetime import datetime
 from fcntl import LOCK_EX, LOCK_SH, flock
 from pathlib import Path
 from typing import Any
@@ -105,6 +106,28 @@ class AliasRegistryUnavailable(RuntimeError):
     """The registry or an interrupted cross-file operation cannot be trusted."""
 
 
+class AliasRegistryFormatError(ValueError):
+    """Persisted alias registry content does not satisfy the v2 schema."""
+
+
+def _required_text(payload: dict[str, Any], field: str, context: str) -> str:
+    value = payload.get(field)
+    if not isinstance(value, str) or not value.strip():
+        raise AliasRegistryFormatError(f"{context} has an invalid {field}")
+    return value.strip()
+
+
+def _required_timestamp(payload: dict[str, Any], field: str, context: str) -> str:
+    value = _required_text(payload, field, context)
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise AliasRegistryFormatError(f"{context} has an invalid {field}") from error
+    if parsed.tzinfo is None:
+        raise AliasRegistryFormatError(f"{context} has an invalid {field}")
+    return value
+
+
 class JsonAliasRepository:
     """Versioned, durable registry shared by the demo API and extraction workers."""
 
@@ -113,72 +136,127 @@ class JsonAliasRepository:
         self.lock_path = path.with_suffix(f"{path.suffix}.lock")
 
     def _validate(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            raise AliasRegistryFormatError("hospital alias registry is not an object")
         if payload.get("registry_version") != ALIAS_REGISTRY_VERSION:
-            raise ValueError("unsupported hospital alias registry")
+            raise AliasRegistryFormatError("unsupported hospital alias registry")
         if payload.get("header_normalizer_version") != HEADER_NORMALIZER_VERSION:
-            raise ValueError("unsupported header normalizer")
+            raise AliasRegistryFormatError("unsupported header normalizer")
         if payload.get("hospital_normalizer_version") != HOSPITAL_NORMALIZER_VERSION:
-            raise ValueError("unsupported hospital-name normalizer")
-        if not isinstance(payload.get("revision"), int) or payload["revision"] < 0:
-            raise ValueError("invalid hospital alias registry revision")
+            raise AliasRegistryFormatError("unsupported hospital-name normalizer")
+        if type(payload.get("revision")) is not int or payload["revision"] < 0:
+            raise AliasRegistryFormatError("invalid hospital alias registry revision")
         hospitals = payload.get("hospitals")
         aliases = payload.get("aliases")
         events = payload.get("events")
         if not all(isinstance(item, list) for item in (hospitals, aliases, events)):
-            raise ValueError("invalid hospital alias registry collections")
+            raise AliasRegistryFormatError("invalid hospital alias registry collections")
+        if not all(isinstance(item, dict) for item in (*hospitals, *aliases, *events)):
+            raise AliasRegistryFormatError("invalid hospital alias registry entry")
 
-        hospital_ids = {str(item.get("hospital_id") or "") for item in hospitals}
+        hospital_ids = {
+            _required_text(item, "hospital_id", "hospital registry entry")
+            for item in hospitals
+        }
         if "" in hospital_ids or len(hospital_ids) != len(hospitals):
-            raise ValueError("hospital alias registry has duplicate hospital IDs")
+            raise AliasRegistryFormatError(
+                "hospital alias registry has duplicate hospital IDs"
+            )
         variant_owners: dict[str, str] = {}
         for hospital in hospitals:
-            if not str(hospital.get("hospital_name") or "").strip():
-                raise ValueError("hospital alias registry has an empty hospital name")
+            hospital_id = _required_text(hospital, "hospital_id", "hospital registry entry")
+            _required_text(hospital, "hospital_name", "hospital registry entry")
+            _required_timestamp(hospital, "created_at", "hospital registry entry")
+            _required_timestamp(hospital, "updated_at", "hospital registry entry")
             origins = hospital.get("origins")
             if (
                 not isinstance(origins, list)
                 or not origins
+                or not all(isinstance(origin, str) for origin in origins)
+                or len(set(origins)) != len(origins)
                 or not set(origins)
                 <= {
                     "profile",
                     "reviewer_alias",
                 }
             ):
-                raise ValueError("hospital alias registry has invalid origins")
+                raise AliasRegistryFormatError("hospital alias registry has invalid origins")
             variants = hospital.get("name_variants")
-            if not isinstance(variants, list) or not variants:
-                raise ValueError("hospital alias registry has no verified name variants")
+            if (
+                not isinstance(variants, list)
+                or not variants
+                or not all(isinstance(variant, dict) for variant in variants)
+            ):
+                raise AliasRegistryFormatError(
+                    "hospital alias registry has no verified name variants"
+                )
             seen: set[str] = set()
             for variant in variants:
-                display = str(variant.get("display_name") or "").strip()
-                normalized = str(variant.get("normalized_name") or "")
+                display = _required_text(variant, "display_name", "hospital name variant")
+                normalized = _required_text(
+                    variant, "normalized_name", "hospital name variant"
+                )
                 if not display or normalize_hospital_name(display) != normalized:
-                    raise ValueError("hospital alias registry has an invalid name variant")
-                if not variant.get("verified", False) or normalized in seen:
-                    raise ValueError("hospital alias registry has duplicate/unverified variants")
-                owner = variant_owners.setdefault(normalized, str(hospital["hospital_id"]))
-                if owner != hospital["hospital_id"]:
-                    raise ValueError("hospital name variant belongs to multiple hospitals")
+                    raise AliasRegistryFormatError(
+                        "hospital alias registry has an invalid name variant"
+                    )
+                if variant.get("verified") is not True or normalized in seen:
+                    raise AliasRegistryFormatError(
+                        "hospital alias registry has duplicate/unverified variants"
+                    )
+                _required_text(variant, "source_document_id", "hospital name variant")
+                _required_text(variant, "reviewer", "hospital name variant")
+                _required_text(variant, "reason", "hospital name variant")
+                _required_timestamp(variant, "created_at", "hospital name variant")
+                owner = variant_owners.setdefault(normalized, hospital_id)
+                if owner != hospital_id:
+                    raise AliasRegistryFormatError(
+                        "hospital name variant belongs to multiple hospitals"
+                    )
                 seen.add(normalized)
 
-        alias_ids = {str(item.get("alias_id") or "") for item in aliases}
+        alias_ids = {
+            _required_text(item, "alias_id", "hospital alias") for item in aliases
+        }
         if "" in alias_ids or len(alias_ids) != len(aliases):
-            raise ValueError("hospital alias registry has duplicate alias IDs")
+            raise AliasRegistryFormatError("hospital alias registry has duplicate alias IDs")
         alias_keys = {
-            (str(item.get("hospital_id") or ""), str(item.get("normalized_label") or ""))
+            (
+                _required_text(item, "hospital_id", "hospital alias"),
+                _required_text(item, "normalized_label", "hospital alias"),
+            )
             for item in aliases
         }
         if len(alias_keys) != len(aliases):
-            raise ValueError("hospital alias registry has duplicate normalized labels")
+            raise AliasRegistryFormatError(
+                "hospital alias registry has duplicate normalized labels"
+            )
         for alias in aliases:
             if alias.get("hospital_id") not in hospital_ids:
-                raise ValueError("hospital alias references an unknown hospital")
+                raise AliasRegistryFormatError(
+                    "hospital alias references an unknown hospital"
+                )
             if alias.get("canonical_field") not in ALIAS_CANONICAL_FIELDS:
-                raise ValueError("hospital alias references an unsupported field")
-            if normalize_header(str(alias.get("source_label") or "")) != alias.get(
+                raise AliasRegistryFormatError(
+                    "hospital alias references an unsupported field"
+                )
+            source_label = _required_text(alias, "source_label", "hospital alias")
+            if normalize_header(source_label) != alias.get(
                 "normalized_label"
             ):
-                raise ValueError("hospital alias has an invalid normalized label")
+                raise AliasRegistryFormatError(
+                    "hospital alias has an invalid normalized label"
+                )
+            if type(alias.get("active")) is not bool:
+                raise AliasRegistryFormatError("hospital alias has invalid active state")
+            _required_text(alias, "reason", "hospital alias")
+            _required_timestamp(alias, "created_at", "hospital alias")
+            _required_timestamp(alias, "updated_at", "hospital alias")
+        for event in events:
+            _required_text(event, "action", "hospital alias audit event")
+            _required_text(event, "reviewer", "hospital alias audit event")
+            _required_text(event, "reason", "hospital alias audit event")
+            _required_timestamp(event, "created_at", "hospital alias audit event")
         return payload
 
     def _read_unlocked(self) -> dict[str, Any]:
@@ -242,7 +320,7 @@ class JsonAliasRepository:
         return tuple(
             alias
             for alias in snapshot["aliases"]
-            if alias["hospital_id"] == hospital_id and alias.get("active", True)
+            if alias["hospital_id"] == hospital_id and alias.get("active") is True
         )
 
     @staticmethod

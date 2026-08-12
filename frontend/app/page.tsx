@@ -308,6 +308,27 @@ const emptyEdit: EditValues = {
   review_disposition: "accepted",
 };
 
+const editValuesForRow = (row: Row): EditValues => ({
+  description: row.description ?? "",
+  service_date_iso: row.service_date_iso ?? "",
+  quantity: row.quantity ?? "",
+  unit_price: row.unit_price ?? "",
+  gross_amount: row.gross_amount ?? "",
+  discount: row.discount ?? "",
+  net_amount: row.net_amount ?? "",
+  role: row.role,
+  review_disposition: row.review_disposition,
+});
+
+const changedEditValues = (row: Row, edited: EditValues) => {
+  const original = editValuesForRow(row);
+  return Object.fromEntries(
+    Object.entries(edited).filter(
+      ([field, value]) => original[field as keyof EditValues] !== value,
+    ),
+  );
+};
+
 const money = (value: string | null) =>
   value === null || value === ""
     ? "—"
@@ -747,17 +768,7 @@ export default function Home() {
   const beginEdit = () => {
     if (!selectedRow) return;
     setFocusedPrintedTotal(null);
-    setEditValues({
-      description: selectedRow.description ?? "",
-      service_date_iso: selectedRow.service_date_iso ?? "",
-      quantity: selectedRow.quantity ?? "",
-      unit_price: selectedRow.unit_price ?? "",
-      gross_amount: selectedRow.gross_amount ?? "",
-      discount: selectedRow.discount ?? "",
-      net_amount: selectedRow.net_amount ?? "",
-      role: selectedRow.role,
-      review_disposition: selectedRow.review_disposition,
-    });
+    setEditValues(editValuesForRow(selectedRow));
     setReason(selectedRow.review.reason ?? "");
     setEditMode(true);
     setAddMode(false);
@@ -794,7 +805,12 @@ export default function Home() {
       setError("Add a short correction reason before saving.");
       return;
     }
-    const payload: Record<string, unknown> = { changes: editValues, reason };
+    const changes = changedEditValues(selectedRow, editValues);
+    if (!Object.keys(changes).length && !draftPolygon) {
+      setError("Change at least one row value or relink its evidence before saving.");
+      return;
+    }
+    const payload: Record<string, unknown> = { changes, reason };
     if (draftPolygon) {
       payload.page_number = viewPage;
       payload.polygon = { points: draftPolygon };
@@ -1964,14 +1980,14 @@ export default function Home() {
                         <label><span>Discount</span><input value={editValues.discount} onChange={(event) => setEditValues({ ...editValues, discount: event.target.value })} /></label>
                         <label><span>Net amount</span><input value={editValues.net_amount} onChange={(event) => setEditValues({ ...editValues, net_amount: event.target.value })} /></label>
                         <label><span>Role</span><select value={editValues.role} onChange={(event) => setEditValues({ ...editValues, role: event.target.value })}><option value="detail">Detail</option><option value="informational">Informational</option><option value="category_rollup">Category rollup</option><option value="refund">Refund</option></select></label>
-                        <label><span>Disposition</span><select value={editValues.review_disposition} onChange={(event) => setEditValues({ ...editValues, review_disposition: event.target.value })}><option value="accepted">Accepted</option><option value="pending">Pending</option><option value="unreadable">Unreadable</option></select></label>
+                        <label><span>Disposition</span><select value={editValues.review_disposition} onChange={(event) => setEditValues({ ...editValues, review_disposition: event.target.value })}>{selectedRow?.review_disposition === "rejected" && <option value="rejected">Rejected</option>}<option value="accepted">Accepted</option><option value="pending">Pending</option><option value="unreadable">Unreadable</option></select></label>
                         <label className="wide"><span>Review reason</span><input value={reason} onChange={(event) => setReason(event.target.value)} placeholder="What did you verify or change?" /></label>
                       </div>
                     )}
                     <div className="sheet-actions">
                       <button className="secondary" onClick={() => { setDrawMode(hospitalEditMode ? "hospital" : addMode ? "add" : "relink"); setDraftPolygon(null); }}>{draftPolygon ? "Redraw evidence" : hospitalEditMode ? "Draw header evidence" : addMode ? "Draw evidence above" : "Relink evidence"}</button>
                       <button className="secondary" onClick={() => { setEditMode(false); setAddMode(false); setHospitalEditMode(false); setDrawMode(null); setDraftPolygon(null); }}>Cancel</button>
-                      {!addMode && !hospitalEditMode && <button className="danger" onClick={() => void rejectSelected()}>Reject row</button>}
+                      {!addMode && !hospitalEditMode && selectedRow?.bulk_action === "reject" && <button className="danger" onClick={() => void rejectSelected()}>Reject row</button>}
                       <button className="primary" onClick={() => void (hospitalEditMode ? saveHospital() : addMode ? addRow() : saveEdit())}>{hospitalEditMode ? "Save hospital identity" : addMode ? "Add grounded row" : "Save correction"}</button>
                     </div>
                   </div>

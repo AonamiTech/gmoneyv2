@@ -16,6 +16,7 @@ from gmoney.demo.store import (
     utc_now,
 )
 from gmoney.profiles.aliases import (
+    AliasRegistryFormatError,
     AliasRegistryRevisionConflict,
     AliasRegistryUnavailable,
     JsonAliasRepository,
@@ -26,7 +27,15 @@ from gmoney.profiles.aliases import (
 T = TypeVar("T")
 ALIAS_JOURNAL = ".alias-operation.json"
 ALIAS_JOURNAL_VERSION = "alias_operation_v2"
-ALIAS_STORAGE_ERRORS = (AttributeError, KeyError, OSError, TypeError, ValueError)
+ALIAS_STORAGE_ERRORS = (
+    AttributeError,
+    KeyError,
+    OSError,
+    TypeError,
+    UnicodeError,
+    json.JSONDecodeError,
+    AliasRegistryFormatError,
+)
 
 
 def _digest(payload: dict[str, Any]) -> str:
@@ -273,10 +282,10 @@ class AliasTransactionCoordinator:
         cutoff = datetime.now(UTC) - timedelta(hours=retention_hours)
         removed = 0
         try:
-            for observed in self.store.states():
-                job_id = str(observed["id"])
-                with self.repository.locked(exclusive=True):
-                    self._recover_all_unlocked()
+            with self.repository.locked(exclusive=True):
+                self._recover_all_unlocked()
+                for observed in self.store.states():
+                    job_id = str(observed["id"])
                     with self.store.job_lock(job_id, exclusive=True):
                         try:
                             state = self.store.read(job_id)

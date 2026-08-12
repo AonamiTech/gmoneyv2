@@ -169,6 +169,19 @@ class AliasRegistryItemNotFound(LookupError):
     pass
 
 
+class HospitalSelectionNotCandidate(ReviewValidationError):
+    def __init__(self, candidate_ids: set[str] | list[str]) -> None:
+        super().__init__("Selected hospital is not a normalized-name candidate")
+        self.candidate_ids = sorted(candidate_ids)
+
+
+class HospitalIdentityConflict(ReviewValidationError):
+    def __init__(self, code: str, candidate_ids: set[str] | list[str]) -> None:
+        super().__init__(code)
+        self.code = code
+        self.candidate_ids = sorted(candidate_ids)
+
+
 @app.middleware("http")
 async def private_demo_responses(request: Any, call_next: Any) -> Response:
     response = await call_next(request)
@@ -272,6 +285,19 @@ def _mutate(
                 "current_revision": error.current_revision,
             },
         ) from error
+    except HospitalSelectionNotCandidate as error:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "hospital_selection_not_candidate",
+                "candidate_ids": error.candidate_ids,
+            },
+        ) from error
+    except HospitalIdentityConflict as error:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": error.code, "candidate_ids": error.candidate_ids},
+        ) from error
     except ReviewValidationError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
     except AliasRegistryUnavailable as error:
@@ -350,6 +376,19 @@ def _mutate_review_and_alias_registry(
                 "code": "review_revision_conflict",
                 "current_revision": error.current_revision,
             },
+        ) from error
+    except HospitalSelectionNotCandidate as error:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "hospital_selection_not_candidate",
+                "candidate_ids": error.candidate_ids,
+            },
+        ) from error
+    except HospitalIdentityConflict as error:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": error.code, "candidate_ids": error.candidate_ids},
         ) from error
     except ReviewValidationError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
@@ -1042,13 +1081,18 @@ def link_document_hospital(
         }
         locked_candidates = owners | locked_profile_matches
         if payload.create and locked_candidates:
-            raise ReviewValidationError("Hospital identity now matches an existing hospital")
-        if not payload.create and hospital_id not in locked_candidates:
-            raise ReviewValidationError(
-                "Selected hospital is not a normalized-name candidate"
+            raise HospitalIdentityConflict(
+                (
+                    "hospital_identity_ambiguous"
+                    if len(locked_candidates) > 1
+                    else "hospital_already_exists"
+                ),
+                locked_candidates,
             )
+        if not payload.create and hospital_id not in locked_candidates:
+            raise HospitalSelectionNotCandidate(locked_candidates)
         if owners - {hospital_id}:
-            raise ReviewValidationError("Hospital name is already linked elsewhere")
+            raise HospitalIdentityConflict("hospital_name_conflict", owners)
         if record is None:
             record = {
                 "hospital_id": hospital_id,
@@ -1550,7 +1594,7 @@ def update_row(
 ) -> dict[str, Any]:
     result, _ = _complete_result(job_id)
     expected = _expected_revision(if_match)
-    changes = normalize_changes(payload.changes)
+    changes = normalize_changes(payload.changes) if payload.changes else {}
     if (payload.page_number is None) != (payload.polygon is None):
         raise HTTPException(
             status_code=422,
@@ -1567,6 +1611,8 @@ def update_row(
             field_evidence={"description": [evidence], "amount": [evidence]},
             page_number=payload.page_number,
         )
+    if not changes:
+        raise HTTPException(status_code=422, detail="At least one row value must change")
 
     def mutation(review: dict[str, Any]) -> dict[str, Any]:
         rows = {str(row["id"]): row for row in project_rows(result, review)}
@@ -1575,7 +1621,11 @@ def update_row(
         row_changes = dict(changes)
         audit_changes = dict(changes)
         desired_disposition = row_changes.get("review_disposition")
-        if desired_disposition == "rejected":
+        current_disposition = str(rows[row_id].get("review_disposition") or "pending")
+        if desired_disposition == current_disposition:
+            row_changes.pop("review_disposition", None)
+            audit_changes.pop("review_disposition", None)
+        elif desired_disposition == "rejected":
             transition = _apply_reviewer_disposition(
                 result, review, (row_id,), "reject", payload.reason
             )[row_id]
@@ -1591,6 +1641,8 @@ def update_row(
             )
             audit_changes["review_disposition"] = transition
             row_changes.pop("review_disposition", None)
+        if not row_changes and not audit_changes:
+            raise ReviewValidationError("At least one row value must change")
         if row_id in review["added_rows"]:
             review["added_rows"][row_id].update(row_changes)
             review["added_rows"][row_id]["review_reason"] = payload.reason.strip()

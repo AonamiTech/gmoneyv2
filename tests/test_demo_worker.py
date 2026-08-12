@@ -5,6 +5,7 @@ import multiprocessing
 import threading
 import time
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import Any
@@ -177,6 +178,48 @@ def _create_worker_job(store: JobStore, source_name: str) -> str:
     (store.job_dir(state["id"]) / "source.pdf").write_bytes(b"%PDF-worker-test")
     store.update(state["id"], status="queued")
     return str(state["id"])
+
+
+def _controlled_worker_job(
+    root_value: str,
+    job_id: str,
+    vl_url: str,
+) -> dict[str, Any]:
+    assert vl_url == "http://vl.test"
+    store = JobStore(Path(root_value))
+    directory = store.job_dir(job_id)
+    (directory / ".test-runner-started").touch()
+    hold = directory / ".test-hold"
+    while hold.exists():
+        time.sleep(0.02)
+    return {"row_count": 1, "hospital_name": "Test Hospital"}
+
+
+def _run_controlled_worker_loop(
+    root_value: str,
+    registry_value: str,
+    stop_event: Any,
+) -> None:
+    worker_module.run_worker_loop(
+        root=Path(root_value),
+        vl_url="http://vl.test",
+        paddle_device="cpu",
+        concurrency=1,
+        retention_hours=720,
+        alias_registry=Path(registry_value),
+        stop_requested=stop_event.is_set,
+        executor_factory=ThreadPoolExecutor,
+        job_runner=_controlled_worker_job,
+    )
+
+
+def _wait_until(predicate: Any, timeout: float = 8.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.02)
+    raise AssertionError("timed out waiting for worker state")
 
 
 def test_gpu_job_constructs_extractor_inside_lock_and_publishes_before_release(
@@ -635,3 +678,90 @@ def test_cleanup_registry_failure_fails_queue_without_escaping(tmp_path: Path) -
     state = store.read(job_id)
     assert state["status"] == "failed"
     assert state["error"] == "alias_registry_unavailable"
+
+
+def test_worker_loop_uses_five_second_registry_retry_interval(tmp_path: Path) -> None:
+    observed_probes: list[float] = []
+    current_time = 0.0
+
+    class UnavailableCoordinator:
+        def registry_snapshot(self) -> None:
+            observed_probes.append(current_time)
+            raise AliasRegistryUnavailable("registry unavailable")
+
+    def coordinator_factory(store: JobStore, path: Path) -> UnavailableCoordinator:
+        assert path == tmp_path / "alias-registry.json"
+        return UnavailableCoordinator()
+
+    def clock() -> float:
+        return current_time
+
+    def sleeper(seconds: float) -> None:
+        nonlocal current_time
+        current_time += seconds
+
+    worker_module.run_worker_loop(
+        root=tmp_path,
+        vl_url="http://vl.test",
+        paddle_device="cpu",
+        concurrency=1,
+        retention_hours=720,
+        alias_registry=tmp_path / "alias-registry.json",
+        stop_requested=lambda: current_time > 5.0,
+        executor_factory=ThreadPoolExecutor,
+        coordinator_factory=coordinator_factory,
+        clock=clock,
+        sleeper=sleeper,
+    )
+
+    assert observed_probes == [0.0, 5.0]
+
+
+def test_worker_process_survives_registry_outage_and_recovers_later_job(
+    tmp_path: Path,
+) -> None:
+    store = JobStore(tmp_path)
+    registry = tmp_path / "alias-registry.json"
+    first_id = _create_worker_job(store, "Already running.pdf")
+    first_hold = store.job_dir(first_id) / ".test-hold"
+    first_hold.touch()
+    context = multiprocessing.get_context("spawn")
+    stop_event = context.Event()
+    process = context.Process(
+        target=_run_controlled_worker_loop,
+        args=(str(tmp_path), str(registry), stop_event),
+    )
+    process.start()
+    try:
+        _wait_until(
+            lambda: (store.job_dir(first_id) / ".test-runner-started").exists()
+            and store.read(first_id)["status"] == "processing",
+            timeout=30,
+        )
+
+        registry.write_text('{"registry_version":"unsupported"}')
+        outage_id = _create_worker_job(store, "Queued during outage.pdf")
+        _wait_until(lambda: store.read(outage_id)["status"] == "failed")
+        assert store.read(outage_id)["error"] == "alias_registry_unavailable"
+        assert process.is_alive()
+
+        first_hold.unlink()
+        _wait_until(lambda: store.read(first_id)["status"] == "complete")
+        assert process.is_alive()
+
+        newly_queued_id = _create_worker_job(store, "Newly queued during outage.pdf")
+        _wait_until(lambda: store.read(newly_queued_id)["status"] == "failed")
+        assert store.read(newly_queued_id)["error"] == "alias_registry_unavailable"
+
+        registry.unlink()
+        time.sleep(worker_module.ALIAS_REGISTRY_RETRY_SECONDS + 0.75)
+        recovered_id = _create_worker_job(store, "Processed after repair.pdf")
+        _wait_until(lambda: store.read(recovered_id)["status"] == "complete")
+        assert process.is_alive()
+    finally:
+        stop_event.set()
+        process.join(timeout=5)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+    assert process.exitcode == 0
