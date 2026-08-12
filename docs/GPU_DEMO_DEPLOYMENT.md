@@ -37,10 +37,12 @@ export GMONEY_IMAGE_TAG=<release-id>
 export GMONEY_DATA_ROOT=/home/ubuntu/gmoneyv2-runtime
 export GMONEY_MODEL_ROOT=/home/ubuntu/gmoneyv2-runtime/model-cache
 export GMONEY_PROFILE_ROOT=/home/ubuntu/gmoneyv2-runtime/profiles
+export GMONEY_PROFILE_REGISTRY_LOCK=/home/ubuntu/gmoneyv2-runtime/config/profile-registry.lock
 export GMONEY_MIN_FREE_BYTES=10737418240
 export GMONEY_MAX_UPLOAD_BYTES=0
 export GMONEY_GPU_WORKER_CONCURRENCY=1
-install -d -o 10001 -g 10001 "$GMONEY_DATA_ROOT/jobs" "$GMONEY_DATA_ROOT/config"
+install -d -o 10001 -g 10001 \
+  "$GMONEY_DATA_ROOT/jobs" "$GMONEY_DATA_ROOT/config" "$GMONEY_PROFILE_ROOT"
 docker compose -f compose.demo.yaml -f compose.gpu.yaml up -d --build
 ```
 
@@ -55,7 +57,10 @@ files before startup. The runtime `jobs`, `config`, and model-cache directories
 must be writable by container UID/GID `10001:10001`. The `config` directory
 retains the versioned hospital column-alias registry shared by API and worker.
 Create the profile directory before startup. Its optional `registry.json` is
-mounted read-only into the API and supplies the trained-hospital directory.
+mounted read-only into the API and worker. Both services coordinate snapshots
+through `$GMONEY_DATA_ROOT/config/profile-registry.lock`. Any live
+`gmoney-profiles` CLI mutation must export `GMONEY_PROFILE_REGISTRY_LOCK` with
+that same host path before writing the registry.
 
 ## Acceptance
 

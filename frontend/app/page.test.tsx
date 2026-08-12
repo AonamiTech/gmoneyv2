@@ -199,6 +199,7 @@ describe("evidence page navigation", () => {
   let rowPatchPayload: Record<string, unknown> | null = null;
   let reviewHospitalId: string | null = null;
   let aliasApplyPayload: Record<string, unknown> | null = null;
+  let hospitalLinkPayload: Record<string, unknown> | null = null;
   let normalizedRowsPayload = structuredClone(rowsResult);
   let sourcePayload: Omit<typeof sourceTables, "unavailable_reason"> & {
     unavailable_reason: "legacy_result" | "no_source_tables" | null;
@@ -214,6 +215,7 @@ describe("evidence page navigation", () => {
     rowPatchPayload = null;
     reviewHospitalId = null;
     aliasApplyPayload = null;
+    hospitalLinkPayload = null;
     normalizedRowsPayload = structuredClone(rowsResult);
     sourcePayload = structuredClone(sourceTables);
     vi.stubGlobal(
@@ -222,6 +224,8 @@ describe("evidence page navigation", () => {
         const url = String(input);
         if (url.includes("/health/ready")) {
           return json({
+            profile_revision: 4,
+            alias_registry_revision: 0,
             active_jobs: 0,
             worker_capacity: 2,
             queue_capacity: 20,
@@ -290,6 +294,16 @@ describe("evidence page navigation", () => {
             }],
           });
         }
+        if (url.endsWith("/hospital-link")) {
+          hospitalLinkPayload = JSON.parse(String(init?.body));
+          return json({
+            review_revision: 1,
+            registry_revision: 1,
+            profile_revision: 4,
+            hospital_id: "created-hospital",
+            hospital_name: "Test Hospital",
+          });
+        }
         if (url.endsWith("/column-aliases/apply")) {
           aliasApplyPayload = JSON.parse(String(init?.body));
           return json({ review_revision: 1, registry_revision: 4, updated_count: 1 });
@@ -300,6 +314,7 @@ describe("evidence page navigation", () => {
         if (url.endsWith("/api/v2/hospitals/trained")) {
           return json({
             registry_revision: 0,
+            profile_revision: 4,
             total: 2,
             hospitals: [
               { hospital_id: "kamakshi", hospital_name: "Dr. Kamakshi Memorial Hospital", active_profile_count: 2 },
@@ -475,6 +490,28 @@ describe("evidence page navigation", () => {
     expect(screen.getByRole("heading", { name: "Column aliases" })).toBeInTheDocument();
     expect(screen.getByText(/Link this grounded bill identity/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Link hospital" })).toBeInTheDocument();
+  });
+
+  test("links a hospital with both observed registry revisions", async () => {
+    render(<Home />);
+    await advance(250);
+    await advance(250);
+    await openBill();
+
+    fireEvent.click(screen.getByRole("button", { name: "Co-pay %" }));
+    fireEvent.change(screen.getByPlaceholderText("How was this hospital identity verified?"), {
+      target: { value: "Verified grounded hospital identity" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Link hospital" }));
+    await advance(0);
+
+    expect(hospitalLinkPayload).toEqual({
+      create: true,
+      hospital_id: null,
+      registry_revision: 0,
+      profile_revision: 4,
+      reason: "Verified grounded hospital identity",
+    });
   });
 
   test("selects grounded alias candidates and submits the source digest", async () => {

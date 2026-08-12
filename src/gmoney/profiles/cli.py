@@ -156,7 +156,18 @@ def transition(
     reason: str,
 ) -> None:
     repo = JsonProfileRepository(registry)
-    current = repo.get(profile_key, profile_version)
+    snapshot = repo.snapshot()
+    current = next(
+        (
+            item
+            for item in snapshot.profiles
+            if item.profile_key == profile_key
+            and item.profile_version == profile_version
+        ),
+        None,
+    )
+    if current is None:
+        raise KeyError(f"unknown profile: {profile_key}@{profile_version}")
     updated, event = transition_profile(current, to_state, reason)
     replacements = [updated]
     events = [event]
@@ -164,7 +175,7 @@ def transition(
         active = next(
             (
                 item
-                for item in repo.list_profiles()
+                for item in snapshot.profiles
                 if item.profile_key == profile_key
                 and item.profile_version != profile_version
                 and item.lifecycle is ProfileLifecycle.ACTIVE
@@ -181,7 +192,11 @@ def transition(
             events.append(archive_event)
             updated = updated.model_copy(update={"supersedes_version": active.profile_version})
             replacements[0] = updated
-    repo.replace_profiles(tuple(replacements), tuple(events))
+    repo.replace_profiles(
+        tuple(replacements),
+        tuple(events),
+        expected_revision=snapshot.revision,
+    )
     typer.echo(f"{profile_key}@{profile_version}: {current.lifecycle} -> {to_state}")
 
 
@@ -191,7 +206,14 @@ def rollback(
     profile_key: str,
 ) -> None:
     repo = JsonProfileRepository(registry)
-    current, previous = rollback_profile(repo.list_profiles(), profile_key)
+    snapshot = repo.snapshot()
+    current, previous = rollback_profile(snapshot.profiles, profile_key)
+    previous_before = next(
+        item
+        for item in snapshot.profiles
+        if item.profile_key == previous.profile_key
+        and item.profile_version == previous.profile_version
+    )
     now = datetime.now(UTC)
     events = (
         ProfileEvent(
@@ -205,15 +227,17 @@ def rollback(
         ProfileEvent(
             profile_key=previous.profile_key,
             profile_version=previous.profile_version,
-            from_state=repo.get(
-                previous.profile_key, previous.profile_version
-            ).lifecycle,
+            from_state=previous_before.lifecycle,
             to_state=ProfileLifecycle.ACTIVE,
             reason=f"rollback from version {current.profile_version}",
             occurred_at=now,
         ),
     )
-    repo.replace_profiles((current, previous), events)
+    repo.replace_profiles(
+        (current, previous),
+        events,
+        expected_revision=snapshot.revision,
+    )
     typer.echo(f"rolled back {profile_key} to version {previous.profile_version}")
 
 
@@ -230,13 +254,28 @@ def drift(
     )
     if decision.drifted:
         repo = JsonProfileRepository(registry)
-        current = repo.get(profile_key, profile_version)
+        snapshot = repo.snapshot()
+        current = next(
+            (
+                item
+                for item in snapshot.profiles
+                if item.profile_key == profile_key
+                and item.profile_version == profile_version
+            ),
+            None,
+        )
+        if current is None:
+            raise KeyError(f"unknown profile: {profile_key}@{profile_version}")
         updated, event = transition_profile(
             current,
             ProfileLifecycle.DRIFTED,
             ",".join(decision.reasons) or "drift gate",
         )
-        repo.replace_profile(updated, event)
+        repo.replace_profile(
+            updated,
+            event,
+            expected_revision=snapshot.revision,
+        )
     typer.echo(json.dumps(decision.model_dump(mode="json"), indent=2, sort_keys=True))
 
 

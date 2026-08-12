@@ -113,7 +113,7 @@ from gmoney.profiles.aliases import (
 )
 from gmoney.profiles.lifecycle import deterministic_shadow_sample
 from gmoney.profiles.matching import match_profile, profile_to_schema
-from gmoney.profiles.repository import JsonProfileRepository
+from gmoney.profiles.repository import JsonProfileRepository, combined_hospital_name_owners
 from gmoney.settings import Settings, get_settings
 
 app = typer.Typer(no_args_is_help=True)
@@ -3574,6 +3574,7 @@ class OfflineExtractor:
         *,
         should_abort: Callable[[], bool] | None = None,
         alias_snapshot: dict[str, Any] | None = None,
+        profile_identities: dict[str, dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         set_header_aliases({})
         if self.alias_registry is not None and alias_snapshot is None:
@@ -3632,9 +3633,15 @@ class OfflineExtractor:
                     page_height=page_asset.height,
                 )
                 if alias_snapshot is not None and resolved_hospital_id is None:
-                    resolved_hospital_id = JsonAliasRepository.resolve_hospital(
+                    identity_owners = combined_hospital_name_owners(
+                        profile_identities or {},
                         alias_snapshot,
                         str(hospital.get("name") or "") if hospital else None,
+                    )
+                    resolved_hospital_id = (
+                        next(iter(identity_owners))
+                        if len(identity_owners) == 1
+                        else None
                     )
                 if alias_snapshot is not None and resolved_hospital_id is not None:
                     active_aliases = JsonAliasRepository.active_aliases(

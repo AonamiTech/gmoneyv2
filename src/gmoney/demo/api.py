@@ -16,7 +16,6 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, ValidationError
 
 from gmoney.contracts.extraction import SourceTable
-from gmoney.contracts.phase3 import ProfileLifecycle
 from gmoney.demo.alias_transactions import AliasTransactionCoordinator
 from gmoney.demo.review import (
     ReviewValidationError,
@@ -53,7 +52,17 @@ from gmoney.profiles.aliases import (
     normalize_header,
     normalize_hospital_name,
 )
-from gmoney.profiles.repository import JsonProfileRepository
+from gmoney.profiles.repository import (
+    HospitalIdentityConflict as PersistedHospitalIdentityConflict,
+)
+from gmoney.profiles.repository import (
+    JsonProfileRepository,
+    ProfileRegistryRevisionConflict,
+    ProfileRegistryUnavailable,
+    active_hospital_identities,
+    combined_hospital_name_owners,
+    validate_combined_hospital_identities,
+)
 
 MAX_UPLOAD_BYTES = int(os.environ.get("GMONEY_MAX_UPLOAD_BYTES", "0"))
 MAX_ACTIVE_JOBS = int(os.environ.get("GMONEY_MAX_ACTIVE_JOBS", "20"))
@@ -64,6 +73,12 @@ MIN_FREE_BYTES = int(os.environ.get("GMONEY_MIN_FREE_BYTES", "0"))
 DEMO_ROOT = Path(os.environ.get("GMONEY_DEMO_ROOT", "/tmp/gmoney-v2-demo"))
 PROFILE_REGISTRY = Path(
     os.environ.get("GMONEY_PROFILE_REGISTRY", str(DEMO_ROOT / "profile-registry.json"))
+)
+PROFILE_REGISTRY_LOCK = Path(
+    os.environ.get(
+        "GMONEY_PROFILE_REGISTRY_LOCK",
+        str(PROFILE_REGISTRY.with_suffix(f"{PROFILE_REGISTRY.suffix}.lock")),
+    )
 )
 ALIAS_REGISTRY = Path(
     os.environ.get("GMONEY_ALIAS_REGISTRY", str(DEMO_ROOT / "alias-registry.json"))
@@ -142,6 +157,7 @@ class HospitalLinkPatch(BaseModel):
     hospital_id: str | None = Field(default=None, min_length=1, max_length=200)
     create: bool = False
     registry_revision: int = Field(ge=0)
+    profile_revision: int = Field(ge=0)
     reason: str = Field(min_length=3, max_length=500)
 
 
@@ -351,6 +367,10 @@ def _alias_coordinator() -> AliasTransactionCoordinator:
     return AliasTransactionCoordinator(store, ALIAS_REGISTRY)
 
 
+def _profile_repository() -> JsonProfileRepository:
+    return JsonProfileRepository(PROFILE_REGISTRY, PROFILE_REGISTRY_LOCK)
+
+
 def _alias_snapshot() -> dict[str, Any]:
     try:
         return _alias_coordinator().registry_snapshot()
@@ -358,6 +378,28 @@ def _alias_snapshot() -> dict[str, Any]:
         raise HTTPException(
             status_code=503,
             detail={"code": "alias_registry_unavailable"},
+        ) from error
+
+
+def _identity_snapshots() -> tuple[Any, dict[str, Any], dict[str, dict[str, Any]]]:
+    try:
+        with _profile_repository().locked_snapshot() as profile_snapshot:
+            aliases = _alias_snapshot()
+            identities = active_hospital_identities(profile_snapshot)
+            validate_combined_hospital_identities(identities, aliases)
+            return profile_snapshot.model_copy(deep=True), aliases, identities
+    except ProfileRegistryUnavailable as error:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "profile_registry_unavailable"},
+        ) from error
+    except PersistedHospitalIdentityConflict as error:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "hospital_identity_conflict",
+                "candidate_ids": error.owner_ids,
+            },
         ) from error
 
 
@@ -408,6 +450,73 @@ def _mutate_review_and_alias_registry(
     except AliasRegistryUnavailable as error:
         raise HTTPException(
             status_code=503, detail={"code": "alias_registry_unavailable"}
+        ) from error
+
+
+def _mutate_hospital_link(
+    job_id: str,
+    expected_review_revision: int,
+    expected_registry_revision: int,
+    expected_profile_revision: int,
+    mutation: Any,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    try:
+        return _alias_coordinator().mutate_review_and_registry_with_profiles(
+            job_id,
+            expected_review_revision,
+            expected_registry_revision,
+            _profile_repository(),
+            expected_profile_revision,
+            mutation,
+        )
+    except ProfileRegistryRevisionConflict as error:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "profile_registry_revision_conflict",
+                "current_revision": error.current_revision,
+            },
+        ) from error
+    except ProfileRegistryUnavailable as error:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "profile_registry_unavailable"},
+        ) from error
+    except AliasRegistryRevisionConflict as error:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "alias_registry_revision_conflict",
+                "current_revision": error.current_revision,
+            },
+        ) from error
+    except ReviewRevisionConflict as error:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "review_revision_conflict",
+                "current_revision": error.current_revision,
+            },
+        ) from error
+    except HospitalSelectionNotCandidate as error:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "hospital_selection_not_candidate",
+                "candidate_ids": error.candidate_ids,
+            },
+        ) from error
+    except HospitalIdentityConflict as error:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": error.code, "candidate_ids": error.candidate_ids},
+        ) from error
+    except ReviewValidationError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    except AliasRegistryUnavailable as error:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "alias_registry_unavailable"},
         ) from error
 
 
@@ -582,10 +691,12 @@ def live() -> dict[str, str]:
 
 @app.get("/api/v2/health/ready", tags=["health"])
 def ready() -> dict[str, Any]:
-    _alias_snapshot()
+    profiles, aliases, _ = _identity_snapshots()
     storage = shutil.disk_usage(store.jobs_root)
     return {
         "status": "ready",
+        "profile_revision": profiles.revision,
+        "alias_registry_revision": aliases["revision"],
         "active_jobs": store.active_count(),
         "worker_capacity": WORKER_CAPACITY,
         "queue_capacity": MAX_ACTIVE_JOBS,
@@ -598,34 +709,16 @@ def ready() -> dict[str, Any]:
 
 @app.get("/api/v2/hospitals/trained")
 def list_trained_hospitals() -> dict[str, Any]:
-    try:
-        profiles = JsonProfileRepository(PROFILE_REGISTRY).list_profiles()
-    except (OSError, ValueError, ValidationError, json.JSONDecodeError) as error:
-        raise HTTPException(
-            status_code=503,
-            detail="The trained hospital registry is unavailable",
-        ) from error
-
-    aliases = _alias_snapshot()
+    profiles, aliases, identities = _identity_snapshots()
     hospitals: dict[str, dict[str, Any]] = {}
-    for profile in profiles:
-        if profile.lifecycle is not ProfileLifecycle.ACTIVE or not profile.hospital_id:
-            continue
-        item = hospitals.setdefault(
-            profile.hospital_id,
-            {
-                "hospital_id": profile.hospital_id,
-                "hospital_name": profile.hospital_name or profile.hospital_id,
-                "active_profile_count": 0,
-                "alias_count": 0,
-                "training_sources": ["profile"],
-            },
-        )
-        if profile.hospital_name:
-            item["hospital_name"] = profile.hospital_name
-        if "profile" not in item["training_sources"]:
-            item["training_sources"].append("profile")
-        item["active_profile_count"] += 1
+    for hospital_id, identity in identities.items():
+        hospitals[hospital_id] = {
+            "hospital_id": hospital_id,
+            "hospital_name": identity["hospital_name"] or hospital_id,
+            "active_profile_count": identity["active_profile_count"],
+            "alias_count": 0,
+            "training_sources": ["profile"],
+        }
     for hospital in aliases["hospitals"]:
         hospital_id = str(hospital["hospital_id"])
         item = hospitals.setdefault(
@@ -638,7 +731,8 @@ def list_trained_hospitals() -> dict[str, Any]:
                 "training_sources": [],
             },
         )
-        if item["active_profile_count"] == 0:
+        profile_name = identities.get(hospital_id, {}).get("hospital_name")
+        if not profile_name:
             item["hospital_name"] = hospital["hospital_name"]
         for origin in hospital.get("origins", []):
             if origin not in item["training_sources"]:
@@ -653,6 +747,7 @@ def list_trained_hospitals() -> dict[str, Any]:
     )
     return {
         "registry_revision": aliases["revision"],
+        "profile_revision": profiles.revision,
         "total": len(items),
         "hospitals": items,
     }
@@ -987,7 +1082,7 @@ def link_document_hospital(
             detail="Select one existing hospital or create one from this bill",
         )
 
-    snapshot = _alias_snapshot()
+    profile_snapshot, snapshot, profile_identities = _identity_snapshots()
     if snapshot["revision"] != payload.registry_revision:
         raise HTTPException(
             status_code=409,
@@ -996,23 +1091,22 @@ def link_document_hospital(
                 "current_revision": snapshot["revision"],
             },
         )
+    if profile_snapshot.revision != payload.profile_revision:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "profile_registry_revision_conflict",
+                "current_revision": profile_snapshot.revision,
+            },
+        )
     selected_name = str(hospital["name"])
     normalized_name = normalize_hospital_name(selected_name)
-    profile_names = {
-        str(profile.hospital_id): str(profile.hospital_name or profile.hospital_id)
-        for profile in JsonProfileRepository(PROFILE_REGISTRY).list_profiles()
-        if profile.lifecycle is ProfileLifecycle.ACTIVE and profile.hospital_id
-    }
-    registry_matches = JsonAliasRepository.hospital_name_owners(
+    registry_matches = combined_hospital_name_owners(
+        profile_identities,
         snapshot,
         selected_name,
     )
-    profile_matches = {
-        hospital_id
-        for hospital_id, name in profile_names.items()
-        if normalize_hospital_name(name) == normalized_name
-    }
-    candidates = sorted(registry_matches | profile_matches)
+    candidates = sorted(registry_matches)
     if payload.create and candidates:
         raise HTTPException(
             status_code=409,
@@ -1042,7 +1136,7 @@ def link_document_hospital(
         (item for item in snapshot["hospitals"] if item["hospital_id"] == hospital_id),
         None,
     )
-    if not payload.create and existing is None and hospital_id not in profile_names:
+    if not payload.create and existing is None and hospital_id not in profile_identities:
         raise HTTPException(status_code=422, detail="Selected hospital was not found")
     conflicting_owner = next(
         (owner for owner in registry_matches if owner != hospital_id),
@@ -1059,7 +1153,10 @@ def link_document_hospital(
     canonical_name_holder: dict[str, str] = {}
 
     def coordinated_mutation(
-        review: dict[str, Any], registry: dict[str, Any], locked_result: dict[str, Any]
+        review: dict[str, Any],
+        registry: dict[str, Any],
+        locked_result: dict[str, Any],
+        locked_profile_snapshot: Any,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         if locked_result["document_id"] != result["document_id"]:
             raise ReviewValidationError("Extraction result changed; reload the document")
@@ -1067,18 +1164,20 @@ def link_document_hospital(
             (item for item in registry["hospitals"] if item["hospital_id"] == hospital_id),
             None,
         )
-        owners = JsonAliasRepository.hospital_name_owners(registry, selected_name)
-        locked_profile_names = {
-            str(profile.hospital_id): str(profile.hospital_name or profile.hospital_id)
-            for profile in JsonProfileRepository(PROFILE_REGISTRY).list_profiles()
-            if profile.lifecycle is ProfileLifecycle.ACTIVE and profile.hospital_id
-        }
-        locked_profile_matches = {
-            candidate_id
-            for candidate_id, name in locked_profile_names.items()
-            if normalize_hospital_name(name) == normalized_name
-        }
-        locked_candidates = owners | locked_profile_matches
+        locked_identities = active_hospital_identities(locked_profile_snapshot)
+        try:
+            validate_combined_hospital_identities(locked_identities, registry)
+        except PersistedHospitalIdentityConflict as error:
+            raise HospitalIdentityConflict(
+                "hospital_identity_ambiguous",
+                set(error.owner_ids),
+            ) from error
+        owners = combined_hospital_name_owners(
+            locked_identities,
+            registry,
+            selected_name,
+        )
+        locked_candidates = owners
         if payload.create and locked_candidates:
             raise HospitalIdentityConflict(
                 (
@@ -1092,19 +1191,20 @@ def link_document_hospital(
             raise HospitalSelectionNotCandidate(locked_candidates)
         if owners - {hospital_id}:
             raise HospitalIdentityConflict("hospital_name_conflict", owners)
-        locked_canonical_name = locked_profile_names.get(
-            hospital_id,
-            str(record["hospital_name"]) if record is not None else selected_name,
+        profile_identity = locked_identities.get(hospital_id)
+        locked_profile_name = (
+            str(profile_identity["hospital_name"])
+            if profile_identity and profile_identity.get("hospital_name")
+            else None
         )
-        canonical_owners = JsonAliasRepository.hospital_name_owners(
+        locked_canonical_name = (
+            locked_profile_name
+            or (str(record["hospital_name"]) if record is not None else selected_name)
+        )
+        canonical_owners = combined_hospital_name_owners(
+            locked_identities,
             registry,
             locked_canonical_name,
-        )
-        canonical_normalized_name = normalize_hospital_name(locked_canonical_name)
-        canonical_owners.update(
-            candidate_id
-            for candidate_id, name in locked_profile_names.items()
-            if normalize_hospital_name(name) == canonical_normalized_name
         )
         conflicting_canonical_owners = canonical_owners - {hospital_id}
         if conflicting_canonical_owners:
@@ -1117,7 +1217,7 @@ def link_document_hospital(
         )
         canonical_name_source = (
             "active_profile"
-            if hospital_id in locked_profile_names
+            if locked_profile_name
             else "registry"
             if record is not None
             else "reviewer_alias"
@@ -1136,7 +1236,7 @@ def link_document_hospital(
         else:
             record["hospital_name"] = locked_canonical_name
         for origin in (
-            "profile" if hospital_id in locked_profile_names else None,
+            "profile" if hospital_id in locked_identities else None,
             "reviewer_alias",
         ):
             if origin and origin not in record["origins"]:
@@ -1165,6 +1265,7 @@ def link_document_hospital(
                 old_hospital_name=old_canonical_name,
                 new_hospital_name=locked_canonical_name,
                 canonical_name_source=canonical_name_source,
+                profile_revision=locked_profile_snapshot.revision,
             )
         )
         review.setdefault("document_overrides", {})["hospital_link"] = {
@@ -1185,20 +1286,23 @@ def link_document_hospital(
                     "old_hospital_name": old_canonical_name,
                     "new_hospital_name": locked_canonical_name,
                     "canonical_name_source": canonical_name_source,
+                    "profile_revision": locked_profile_snapshot.revision,
                 },
             )
         )
         return review, registry
 
-    review, updated_registry = _mutate_review_and_alias_registry(
+    review, updated_registry = _mutate_hospital_link(
         job_id,
         expected,
         payload.registry_revision,
+        payload.profile_revision,
         coordinated_mutation,
     )
     return {
         "review_revision": review["revision"],
         "registry_revision": updated_registry["revision"],
+        "profile_revision": payload.profile_revision,
         "hospital_id": hospital_id,
         "hospital_name": canonical_name_holder["value"],
     }

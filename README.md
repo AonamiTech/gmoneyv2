@@ -33,6 +33,7 @@ passing frozen promotion decision.
 .venv/bin/gmoney-profiles benchmark --variants 20000 --queries 100
 
 # Hospital-specific profiles can carry the display name shown in the demo directory.
+export GMONEY_PROFILE_REGISTRY_LOCK=/home/azureuser/gmoneyv2-runtime/config/profile-registry.lock
 .venv/bin/gmoney-profiles construct \
   --registry /home/azureuser/gmoneyv2-runtime/profiles/registry.json \
   --observations data/phase3/hospital-observations.json \

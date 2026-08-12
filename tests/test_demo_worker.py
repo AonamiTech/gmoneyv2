@@ -14,10 +14,20 @@ from typing import Any
 
 import pytest
 
+from gmoney.contracts.extraction import PageType, TableType
+from gmoney.contracts.phase3 import LayoutProfile, ProfileLifecycle
 from gmoney.demo import worker as worker_module
 from gmoney.demo.store import JobStore, JobTransactionError
 from gmoney.extraction.offline import ExtractionAborted
-from gmoney.profiles.aliases import AliasRegistryUnavailable
+from gmoney.profiles.aliases import (
+    AliasRegistryUnavailable,
+    JsonAliasRepository,
+    empty_alias_registry,
+)
+from gmoney.profiles.repository import (
+    JsonProfileRepository,
+    combined_hospital_name_owners,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -570,6 +580,190 @@ def test_cpu_jobs_reuse_one_extractor_without_inference_lock(
     ]
 
 
+def test_worker_uses_current_profile_name_to_resolve_existing_aliases(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = JobStore(tmp_path)
+    job_id = _create_worker_job(store, "Renamed hospital bill.pdf")
+    profile_path = tmp_path / "profiles.json"
+    JsonProfileRepository(profile_path).add_profile(
+        LayoutProfile(
+            contract_version="layout_profile_v1",
+            profile_key="renamed-hospital-items",
+            profile_version=1,
+            lifecycle=ProfileLifecycle.ACTIVE,
+            hospital_id="hospital-1",
+            hospital_name="New Machine Medical Center",
+            page_type=PageType.ITEMIZED_CHARGES,
+            table_type=TableType.ITEM_LEDGER,
+            page_aspect_ratio=0.7,
+            table_box=(0.05, 0.15, 0.95, 0.9),
+            supported_fields=("description", "amount"),
+            construction_dataset_ids=("training",),
+        )
+    )
+    alias_path = tmp_path / "aliases.json"
+    aliases = empty_alias_registry()
+    aliases.update(
+        revision=1,
+        hospitals=[
+            {
+                "hospital_id": "hospital-1",
+                "hospital_name": "Old Machine Hospital",
+                "origins": ["profile", "reviewer_alias"],
+                "name_variants": [
+                    {
+                        "display_name": "Old Machine Hospital",
+                        "normalized_name": "old machine hospital",
+                        "verified": True,
+                        "source_document_id": "d" * 64,
+                        "reviewer": "test-reviewer",
+                        "reason": "Verified historical hospital name",
+                        "created_at": "2026-08-12T00:00:00Z",
+                    }
+                ],
+                "created_at": "2026-08-12T00:00:00Z",
+                "updated_at": "2026-08-12T00:00:00Z",
+            }
+        ],
+        aliases=[
+            {
+                "alias_id": "alias-1",
+                "hospital_id": "hospital-1",
+                "source_label": "Amount Rs",
+                "normalized_label": "amount rs",
+                "canonical_field": "net_amount",
+                "active": True,
+                "reason": "Verified printed amount header",
+                "created_at": "2026-08-12T00:00:00Z",
+                "updated_at": "2026-08-12T00:00:00Z",
+            }
+        ],
+        events=[
+            {
+                "action": "column_alias_applied",
+                "reviewer": "test-reviewer",
+                "reason": "Verified printed amount header",
+                "created_at": "2026-08-12T00:00:00Z",
+            }
+        ],
+    )
+    JsonAliasRepository(alias_path)._write_unlocked(aliases)
+
+    class FakeOfflineExtractor:
+        def __init__(self, vl_url: str, **options: Any) -> None:
+            assert vl_url == "http://vl.test"
+
+        def extract(
+            self,
+            source: Path,
+            artifact_root: Path,
+            progress: Any,
+            *,
+            should_abort: Any,
+            alias_snapshot: dict[str, Any],
+            profile_identities: dict[str, dict[str, Any]],
+        ) -> dict[str, Any]:
+            assert combined_hospital_name_owners(
+                profile_identities,
+                alias_snapshot,
+                "New Machine Medical Center",
+            ) == {"hospital-1"}
+            assert JsonAliasRepository.active_aliases(
+                alias_snapshot,
+                "hospital-1",
+            )[0]["normalized_label"] == "amount rs"
+            return {"rows": [], "hospital": None}
+
+    monkeypatch.setattr(
+        "gmoney.extraction.offline.OfflineExtractor",
+        FakeOfflineExtractor,
+    )
+    monkeypatch.setenv("GMONEY_PROFILE_REGISTRY", str(profile_path))
+    monkeypatch.setenv("GMONEY_ALIAS_REGISTRY", str(alias_path))
+
+    summary = worker_module._run_job(str(tmp_path), job_id, "http://vl.test")
+
+    assert summary is not None
+    assert summary["row_count"] == 0
+
+
+def test_worker_fails_queued_bill_on_combined_hospital_identity_conflict(
+    tmp_path: Path,
+) -> None:
+    store = JobStore(tmp_path)
+    job_id = _create_worker_job(store, "Ambiguous hospital bill.pdf")
+    profile_path = tmp_path / "profiles.json"
+    JsonProfileRepository(profile_path).add_profile(
+        LayoutProfile(
+            contract_version="layout_profile_v1",
+            profile_key="conflicting-profile",
+            profile_version=1,
+            lifecycle=ProfileLifecycle.ACTIVE,
+            hospital_id="hospital-2",
+            hospital_name="Machine Hospital",
+            page_type=PageType.ITEMIZED_CHARGES,
+            table_type=TableType.ITEM_LEDGER,
+            page_aspect_ratio=0.7,
+            table_box=(0.05, 0.15, 0.95, 0.9),
+            supported_fields=("description", "amount"),
+            construction_dataset_ids=("training",),
+        )
+    )
+    alias_path = tmp_path / "aliases.json"
+    aliases = empty_alias_registry()
+    aliases.update(
+        revision=1,
+        hospitals=[
+            {
+                "hospital_id": "hospital-1",
+                "hospital_name": "Machine Hospital",
+                "origins": ["reviewer_alias"],
+                "name_variants": [
+                    {
+                        "display_name": "Machine Hospital",
+                        "normalized_name": "machine hospital",
+                        "verified": True,
+                        "source_document_id": "d" * 64,
+                        "reviewer": "test-reviewer",
+                        "reason": "Verified hospital identity",
+                        "created_at": "2026-08-12T00:00:00Z",
+                    }
+                ],
+                "created_at": "2026-08-12T00:00:00Z",
+                "updated_at": "2026-08-12T00:00:00Z",
+            }
+        ],
+    )
+    JsonAliasRepository(alias_path)._write_unlocked(aliases)
+    current_time = 0.0
+    runner_calls: list[str] = []
+
+    def sleeper(seconds: float) -> None:
+        nonlocal current_time
+        current_time += seconds
+
+    worker_module.run_worker_loop(
+        root=tmp_path,
+        vl_url="http://vl.test",
+        paddle_device="cpu",
+        concurrency=1,
+        retention_hours=720,
+        alias_registry=alias_path,
+        profile_registry=profile_path,
+        stop_requested=lambda: current_time > 0.5,
+        executor_factory=ThreadPoolExecutor,
+        job_runner=lambda root, claimed, url: runner_calls.append(claimed),
+        clock=lambda: current_time,
+        sleeper=sleeper,
+    )
+
+    assert runner_calls == []
+    assert store.read(job_id)["status"] == "failed"
+    assert store.read(job_id)["error"] == "hospital_identity_conflict"
+
+
 def test_processing_abort_prevents_result_publication(tmp_path: Path) -> None:
     store = JobStore(tmp_path)
     job_id = _create_worker_job(store, "Abort me.pdf")
@@ -841,6 +1035,45 @@ def test_worker_loop_uses_five_second_registry_retry_interval(tmp_path: Path) ->
     assert observed_probes == [0.0, 5.0]
 
 
+def test_worker_recovers_profile_registry_after_five_seconds(tmp_path: Path) -> None:
+    store = JobStore(tmp_path)
+    outage_id = _create_worker_job(store, "Queued during profile outage.pdf")
+    profile_path = tmp_path / "profiles.json"
+    profile_path.write_text('{"registry_version":"unsupported"}')
+    current_time = 0.0
+    recovered_id: str | None = None
+
+    def clock() -> float:
+        return current_time
+
+    def sleeper(seconds: float) -> None:
+        nonlocal current_time, recovered_id
+        current_time += seconds
+        if current_time == 5.0:
+            profile_path.unlink()
+            recovered_id = _create_worker_job(store, "Queued after profile recovery.pdf")
+
+    worker_module.run_worker_loop(
+        root=tmp_path,
+        vl_url="http://vl.test",
+        paddle_device="cpu",
+        concurrency=1,
+        retention_hours=720,
+        alias_registry=None,
+        profile_registry=profile_path,
+        stop_requested=lambda: current_time > 6.0,
+        executor_factory=ThreadPoolExecutor,
+        job_runner=lambda *args: {"row_count": 3},
+        clock=clock,
+        sleeper=sleeper,
+    )
+
+    assert store.read(outage_id)["status"] == "failed"
+    assert store.read(outage_id)["error"] == "profile_registry_unavailable"
+    assert recovered_id is not None
+    assert store.read(recovered_id)["status"] == "complete"
+
+
 def test_worker_does_not_claim_when_probe_observes_shutdown(tmp_path: Path) -> None:
     store = JobStore(tmp_path)
     job_id = _create_worker_job(store, "Queued before shutdown probe.pdf")
@@ -949,6 +1182,54 @@ def test_executor_submission_failure_requeues_claim_and_exits_worker(
         )
 
     assert store.read(job_id)["status"] == "queued"
+
+
+def test_submission_failure_drains_previously_submitted_jobs_before_exit(
+    tmp_path: Path,
+) -> None:
+    store = JobStore(tmp_path)
+    first_id = _create_worker_job(store, "Submitted before pool failure.pdf")
+    second_id = _create_worker_job(store, "Rejected by pool.pdf")
+    completed: list[str] = []
+
+    def runner(root_value: str, job_id: str, vl_url: str) -> dict[str, Any]:
+        completed.append(job_id)
+        return {"row_count": 7, "hospital_name": "Machine Hospital"}
+
+    class PartiallyRejectingExecutor:
+        def __init__(self, **options: Any) -> None:
+            assert options["max_workers"] == 2
+            self.pool = ThreadPoolExecutor(max_workers=1)
+            self.submissions = 0
+
+        def __enter__(self) -> PartiallyRejectingExecutor:
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            self.pool.shutdown(wait=True)
+
+        def submit(self, *args: Any):
+            self.submissions += 1
+            if self.submissions == 2:
+                raise RuntimeError("executor rejected second submission")
+            return self.pool.submit(*args)
+
+    with pytest.raises(RuntimeError, match="executor rejected second submission"):
+        worker_module.run_worker_loop(
+            root=tmp_path,
+            vl_url="http://vl.test",
+            paddle_device="cpu",
+            concurrency=2,
+            retention_hours=720,
+            alias_registry=None,
+            executor_factory=PartiallyRejectingExecutor,
+            job_runner=runner,
+        )
+
+    assert completed == [first_id]
+    assert store.read(first_id)["status"] == "complete"
+    assert store.read(first_id)["row_count"] == 7
+    assert store.read(second_id)["status"] == "queued"
 
 
 def test_spawned_worker_retries_unavailable_registry_after_five_seconds(

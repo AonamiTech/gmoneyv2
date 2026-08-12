@@ -12,6 +12,13 @@ from typing import Any, TextIO
 from gmoney.demo.alias_transactions import AliasTransactionCoordinator
 from gmoney.demo.store import JobStore, is_gpu_device
 from gmoney.profiles.aliases import AliasRegistryUnavailable
+from gmoney.profiles.repository import (
+    HospitalIdentityConflict,
+    JsonProfileRepository,
+    ProfileRegistryUnavailable,
+    active_hospital_identities,
+    validate_combined_hospital_identities,
+)
 
 _extractor: Any = None
 _gpu_inference_lock: TextIO | None = None
@@ -34,6 +41,7 @@ def _extract_and_publish(
     job_id: str,
     extractor: Any,
     alias_snapshot: dict[str, Any] | None = None,
+    profile_identities: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     directory = store.job_dir(job_id)
     state = store.read(job_id)
@@ -51,6 +59,8 @@ def _extract_and_publish(
         extraction_options: dict[str, Any] = {"should_abort": should_abort}
         if alias_snapshot is not None:
             extraction_options["alias_snapshot"] = alias_snapshot
+        if profile_identities is not None:
+            extraction_options["profile_identities"] = profile_identities
         result = extractor.extract(
             directory / "source.pdf",
             directory / "artifacts",
@@ -85,10 +95,15 @@ def _run_job(root_value: str, job_id: str, vl_url: str) -> dict[str, Any] | None
     vl_device = os.environ.get("GMONEY_VL_DEVICE", "cpu")
     alias_registry_value = os.environ.get("GMONEY_ALIAS_REGISTRY")
     alias_registry = Path(alias_registry_value) if alias_registry_value else None
-    alias_snapshot = (
-        AliasTransactionCoordinator(store, alias_registry).registry_snapshot()
+    profile_registry_value = os.environ.get("GMONEY_PROFILE_REGISTRY")
+    profile_registry = Path(profile_registry_value) if profile_registry_value else None
+    alias_snapshot, profile_identities = _runtime_identity_snapshots(
+        AliasTransactionCoordinator(store, alias_registry)
         if alias_registry is not None
-        else None
+        else None,
+        JsonProfileRepository(profile_registry)
+        if profile_registry is not None
+        else None,
     )
     extractor_options: dict[str, Any] = {
         "paddle_device": paddle_device,
@@ -106,6 +121,7 @@ def _run_job(root_value: str, job_id: str, vl_url: str) -> dict[str, Any] | None
                 **extractor_options,
             ),
             alias_snapshot=alias_snapshot,
+            profile_identities=profile_identities,
         )
 
     if _extractor is None:
@@ -118,11 +134,13 @@ def _run_job(root_value: str, job_id: str, vl_url: str) -> dict[str, Any] | None
         job_id=job_id,
         extractor=_extractor,
         alias_snapshot=alias_snapshot,
+        profile_identities=profile_identities,
     )
 
 
-def _fail_queued_for_alias_outage(
+def _fail_queued_for_registry_outage(
     store: JobStore,
+    error: str,
     stop_requested: Callable[[], bool] = lambda: False,
 ) -> int:
     failed = 0
@@ -132,13 +150,78 @@ def _fail_queued_for_alias_outage(
         try:
             if store.fail_queued(
                 str(state["id"]),
-                "alias_registry_unavailable",
+                error,
                 stop_requested,
             ):
                 failed += 1
         except KeyError:
             continue
     return failed
+
+
+def _fail_queued_for_alias_outage(
+    store: JobStore,
+    stop_requested: Callable[[], bool] = lambda: False,
+) -> int:
+    return _fail_queued_for_registry_outage(
+        store,
+        "alias_registry_unavailable",
+        stop_requested,
+    )
+
+
+def _fail_queued_for_profile_outage(
+    store: JobStore,
+    stop_requested: Callable[[], bool] = lambda: False,
+) -> int:
+    return _fail_queued_for_registry_outage(
+        store,
+        "profile_registry_unavailable",
+        stop_requested,
+    )
+
+
+def _runtime_identity_snapshots(
+    alias_coordinator: AliasTransactionCoordinator | None,
+    profile_repository: JsonProfileRepository | None,
+) -> tuple[dict[str, Any] | None, dict[str, dict[str, Any]] | None]:
+    if profile_repository is not None:
+        with profile_repository.locked_snapshot() as profile_snapshot:
+            identities = active_hospital_identities(profile_snapshot)
+            aliases = (
+                alias_coordinator.registry_snapshot()
+                if alias_coordinator is not None
+                else None
+            )
+            if aliases is not None:
+                validate_combined_hospital_identities(identities, aliases)
+            return aliases, identities
+    aliases = (
+        alias_coordinator.registry_snapshot()
+        if alias_coordinator is not None
+        else None
+    )
+    return aliases, None
+
+
+def _probe_runtime_registries(
+    alias_coordinator: AliasTransactionCoordinator | None,
+    profile_repository: JsonProfileRepository | None,
+    store: JobStore,
+    stop_requested: Callable[[], bool] = lambda: False,
+) -> str | None:
+    try:
+        _runtime_identity_snapshots(alias_coordinator, profile_repository)
+    except ProfileRegistryUnavailable:
+        error = "profile_registry_unavailable"
+    except AliasRegistryUnavailable:
+        error = "alias_registry_unavailable"
+    except HospitalIdentityConflict:
+        error = "hospital_identity_conflict"
+    else:
+        return None
+    _fail_queued_for_registry_outage(store, error, stop_requested)
+    return error
 
 
 def _probe_alias_registry(
@@ -150,6 +233,19 @@ def _probe_alias_registry(
         coordinator.registry_snapshot()
     except AliasRegistryUnavailable:
         _fail_queued_for_alias_outage(store, stop_requested)
+        return False
+    return True
+
+
+def _probe_profile_registry(
+    repository: JsonProfileRepository,
+    store: JobStore,
+    stop_requested: Callable[[], bool] = lambda: False,
+) -> bool:
+    try:
+        repository.snapshot()
+    except ProfileRegistryUnavailable:
+        _fail_queued_for_profile_outage(store, stop_requested)
         return False
     return True
 
@@ -179,6 +275,7 @@ def run_worker_loop(
     concurrency: int,
     retention_hours: int,
     alias_registry: Path | None,
+    profile_registry: Path | None = None,
     stop_requested: Callable[[], bool] = lambda: False,
     executor_factory: Callable[..., Any] = ProcessPoolExecutor,
     job_runner: Callable[[str, str, str], dict[str, Any] | None] = _run_job,
@@ -194,11 +291,18 @@ def run_worker_loop(
     alias_coordinator = (
         coordinator_factory(store, alias_registry) if alias_registry is not None else None
     )
+    profile_repository = (
+        JsonProfileRepository(profile_registry) if profile_registry is not None else None
+    )
     futures: dict[Future[dict[str, Any] | None], str] = {}
     last_cleanup = 0.0
-    alias_registry_available = alias_coordinator is None
-    next_alias_probe = 0.0
+    runtime_registries_available = (
+        alias_coordinator is None and profile_repository is None
+    )
+    registry_error: str | None = None
+    next_registry_probe = 0.0
     draining = False
+    fatal_error: Exception | None = None
     with executor_factory(**_executor_options(concurrency, paddle_device)) as executor:
         while True:
             if stop_requested():
@@ -215,6 +319,10 @@ def run_worker_loop(
                         failure = (
                             "alias_registry_unavailable"
                             if isinstance(error, AliasRegistryUnavailable)
+                            else "profile_registry_unavailable"
+                            if isinstance(error, ProfileRegistryUnavailable)
+                            else "hospital_identity_conflict"
+                            if isinstance(error, HospitalIdentityConflict)
                             else type(error).__name__
                         )
                         if not store.fail_processing(job_id, failure):
@@ -230,37 +338,44 @@ def run_worker_loop(
 
             if draining:
                 if not futures:
+                    if fatal_error is not None:
+                        raise fatal_error
                     break
                 sleeper(0.5)
                 continue
 
             now = clock()
-            if alias_coordinator is not None:
+            if alias_coordinator is not None or profile_repository is not None:
                 cleanup_due = now - last_cleanup >= 300
                 should_probe = (
-                    not alias_registry_available
+                    not runtime_registries_available
                     or bool(store.queued())
                     or cleanup_due
                 )
-                if should_probe and now >= next_alias_probe:
-                    alias_registry_available = _probe_alias_registry(
+                if should_probe and now >= next_registry_probe:
+                    registry_error = _probe_runtime_registries(
                         alias_coordinator,
+                        profile_repository,
                         store,
                         stop_requested,
                     )
-                    next_alias_probe = (
+                    runtime_registries_available = registry_error is None
+                    next_registry_probe = (
                         0.0
-                        if alias_registry_available
+                        if runtime_registries_available
                         else now + alias_retry_seconds
                     )
-                elif not alias_registry_available:
-                    _fail_queued_for_alias_outage(store, stop_requested)
-
+                elif not runtime_registries_available and registry_error is not None:
+                    _fail_queued_for_registry_outage(
+                        store,
+                        registry_error,
+                        stop_requested,
+                    )
             if stop_requested():
                 draining = True
                 continue
 
-            if alias_registry_available:
+            if runtime_registries_available:
                 available = concurrency - len(futures)
                 for state in store.queued()[:available]:
                     if stop_requested():
@@ -282,13 +397,15 @@ def run_worker_loop(
                         break
                     try:
                         future = executor.submit(job_runner, str(root), job_id, vl_url)
-                    except Exception:
+                    except Exception as error:
                         if (
                             not store.requeue_claimed(job_id)
                             and store.abort_requested(job_id)
                         ):
                             store.finalize_abort(job_id)
-                        raise
+                        fatal_error = error
+                        draining = True
+                        break
                     if stop_requested():
                         draining = True
                         if future.cancel():
@@ -303,7 +420,7 @@ def run_worker_loop(
 
             if now - last_cleanup >= 300:
                 cleanup_succeeded = True
-                if alias_coordinator is None or alias_registry_available:
+                if runtime_registries_available:
                     cleanup_succeeded = _cleanup_jobs(
                         store,
                         alias_coordinator,
@@ -312,8 +429,9 @@ def run_worker_loop(
                     )
                 last_cleanup = now
                 if not cleanup_succeeded:
-                    alias_registry_available = False
-                    next_alias_probe = now + alias_retry_seconds
+                    runtime_registries_available = False
+                    registry_error = "alias_registry_unavailable"
+                    next_registry_probe = now + alias_retry_seconds
             sleeper(0.5)
 
 
@@ -331,6 +449,7 @@ def shutdown_event() -> threading.Event:
 
 def main() -> None:
     alias_registry_value = os.environ.get("GMONEY_ALIAS_REGISTRY")
+    profile_registry_value = os.environ.get("GMONEY_PROFILE_REGISTRY")
     stop_event = shutdown_event()
     run_worker_loop(
         root=Path(os.environ.get("GMONEY_DEMO_ROOT", "/tmp/gmoney-v2-demo")),
@@ -339,6 +458,9 @@ def main() -> None:
         concurrency=int(os.environ.get("GMONEY_WORKER_CONCURRENCY", "3")),
         retention_hours=int(os.environ.get("GMONEY_RETENTION_HOURS", "720")),
         alias_registry=(Path(alias_registry_value) if alias_registry_value else None),
+        profile_registry=(
+            Path(profile_registry_value) if profile_registry_value else None
+        ),
         stop_requested=stop_event.is_set,
     )
 

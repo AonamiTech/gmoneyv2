@@ -47,6 +47,7 @@ type TrainedHospital = {
 };
 type TrainedHospitalsResult = {
   registry_revision: number;
+  profile_revision: number;
   total: number;
   hospitals: TrainedHospital[];
 };
@@ -223,6 +224,8 @@ type HospitalAlias = {
   reason: string;
 };
 type Health = {
+  profile_revision: number;
+  alias_registry_revision: number;
   active_jobs: number;
   worker_capacity: number;
   queue_capacity: number;
@@ -419,6 +422,7 @@ export default function Home() {
   const [historyQuery, setHistoryQuery] = useState("");
   const [trainedHospitals, setTrainedHospitals] = useState<TrainedHospital[]>([]);
   const [aliasRegistryRevision, setAliasRegistryRevision] = useState(0);
+  const [profileRegistryRevision, setProfileRegistryRevision] = useState<number | null>(null);
   const [trainedHospitalsError, setTrainedHospitalsError] = useState<string | null>(null);
   const [railView, setRailView] = useState<"active" | "history" | "hospitals">("history");
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
@@ -555,9 +559,11 @@ export default function Home() {
       const result = await request<TrainedHospitalsResult>("/api/v2/hospitals/trained");
       setTrainedHospitals(result.hospitals);
       setAliasRegistryRevision(result.registry_revision);
+      setProfileRegistryRevision(result.profile_revision);
       setTrainedHospitalsError(null);
       return result.hospitals;
     } catch (cause) {
+      setProfileRegistryRevision(null);
       setTrainedHospitalsError(
         cause instanceof Error ? cause.message : "The trained hospital list could not be loaded.",
       );
@@ -859,6 +865,10 @@ export default function Home() {
   };
 
   const linkAliasHospital = async () => {
+    if (profileRegistryRevision === null) {
+      setError("The trained hospital registry is still loading.");
+      return;
+    }
     if (!selectedJob || aliasReason.trim().length < 3) {
       setError("Add a short reason for linking this hospital.");
       return;
@@ -872,6 +882,7 @@ export default function Home() {
           create,
           hospital_id: create ? null : hospitalChoice,
           registry_revision: aliasRegistryRevision,
+          profile_revision: profileRegistryRevision,
           reason: aliasReason,
         }),
       },
@@ -1929,7 +1940,7 @@ export default function Home() {
                         <p>Link this grounded bill identity to a durable hospital before teaching its printed vocabulary.</p>
                         <label><span>Hospital record</span><select value={hospitalChoice} onChange={(event) => setHospitalChoice(event.target.value)}><option value="create">Create from “{hospital?.name ?? "current hospital"}”</option>{trainedHospitals.map((item) => <option key={item.hospital_id} value={item.hospital_id}>{item.hospital_name}</option>)}</select></label>
                         <label><span>Review reason</span><input value={aliasReason} onChange={(event) => setAliasReason(event.target.value)} placeholder="How was this hospital identity verified?" /></label>
-                        <button className="primary" onClick={() => void linkAliasHospital()}>Link hospital</button>
+                        <button className="primary" disabled={profileRegistryRevision === null} onClick={() => void linkAliasHospital()}>Link hospital</button>
                       </div>
                     ) : aliasColumn ? (
                       <div className="alias-map-step">

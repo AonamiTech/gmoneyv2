@@ -23,6 +23,10 @@ from gmoney.profiles.aliases import (
     durable_json_replace,
     durable_unlink,
 )
+from gmoney.profiles.repository import (
+    JsonProfileRepository,
+    ProfileRegistryRevisionConflict,
+)
 
 T = TypeVar("T")
 ALIAS_JOURNAL = ".alias-operation.json"
@@ -291,6 +295,37 @@ class AliasTransactionCoordinator:
 
                 self._storage(persist_cutover, "alias registry mutation failed")
                 return updated_review, updated_registry
+
+    def mutate_review_and_registry_with_profiles(
+        self,
+        job_id: str,
+        expected_review_revision: int,
+        expected_registry_revision: int,
+        profile_repository: JsonProfileRepository,
+        expected_profile_revision: int,
+        mutation: Callable[
+            [dict[str, Any], dict[str, Any], dict[str, Any], Any],
+            tuple[dict[str, Any], dict[str, Any]],
+        ],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Hold the profile snapshot stable through alias/review cutover."""
+        with profile_repository.locked_snapshot() as profile_snapshot:
+            if profile_snapshot.revision != expected_profile_revision:
+                raise ProfileRegistryRevisionConflict(profile_snapshot.revision)
+
+            def coordinated_mutation(
+                review: dict[str, Any],
+                registry: dict[str, Any],
+                result: dict[str, Any],
+            ) -> tuple[dict[str, Any], dict[str, Any]]:
+                return mutation(review, registry, result, profile_snapshot)
+
+            return self.mutate_review_and_registry(
+                job_id,
+                expected_review_revision,
+                expected_registry_revision,
+                coordinated_mutation,
+            )
 
     def delete_job(self, job_id: str) -> None:
         try:
