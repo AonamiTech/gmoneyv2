@@ -16,6 +16,9 @@ from gmoney.contracts.phase3 import (
     ProfileLifecycle,
     ProfileMetrics,
 )
+from gmoney.demo.alias_transactions import AliasTransactionCoordinator
+from gmoney.demo.store import JobStore
+from gmoney.profiles.aliases import JsonAliasRepository, empty_alias_registry
 from gmoney.profiles.construction import build_profile
 from gmoney.profiles.lifecycle import (
     activation_failures,
@@ -28,9 +31,12 @@ from gmoney.profiles.matching import match_profile
 from gmoney.profiles.repository import (
     LEGACY_PROFILE_REGISTRY_VERSION,
     PROFILE_REGISTRY_VERSION,
+    HospitalIdentityConflict,
     JsonProfileRepository,
+    ProfileMutationCoordinationRequired,
     ProfileRegistryFormatError,
     ProfileRegistryRevisionConflict,
+    ProfileRegistryUnavailable,
     active_hospital_identities,
 )
 
@@ -228,6 +234,121 @@ def test_profile_repository_reads_v1_and_upgrades_on_first_write(tmp_path) -> No
     assert upgraded["revision"] == 1
 
 
+@pytest.mark.parametrize("revision", [False, "3", 3.0, -1])
+def test_v2_profile_registry_requires_an_exact_non_negative_integer_revision(
+    tmp_path: Path,
+    revision: object,
+) -> None:
+    path = tmp_path / "profiles.json"
+    path.write_text(
+        json.dumps(
+            {
+                "registry_version": PROFILE_REGISTRY_VERSION,
+                "revision": revision,
+                "profiles": [],
+                "events": [],
+            }
+        )
+    )
+
+    with pytest.raises(ProfileRegistryUnavailable):
+        JsonProfileRepository(path).snapshot()
+
+
+def test_v2_profile_registry_requires_the_revision_field(tmp_path: Path) -> None:
+    path = tmp_path / "profiles.json"
+    path.write_text(
+        json.dumps(
+            {
+                "registry_version": PROFILE_REGISTRY_VERSION,
+                "profiles": [],
+                "events": [],
+            }
+        )
+    )
+
+    with pytest.raises(ProfileRegistryUnavailable):
+        JsonProfileRepository(path).snapshot()
+
+
+@pytest.mark.parametrize("revision", [False, "0", 0.0, 1])
+def test_v1_profile_registry_rejects_non_exact_legacy_zero_revisions(
+    tmp_path: Path,
+    revision: object,
+) -> None:
+    path = tmp_path / "profiles.json"
+    path.write_text(
+        json.dumps(
+            {
+                "registry_version": LEGACY_PROFILE_REGISTRY_VERSION,
+                "revision": revision,
+                "profiles": [],
+                "events": [],
+            }
+        )
+    )
+
+    with pytest.raises(ProfileRegistryUnavailable):
+        JsonProfileRepository(path).snapshot()
+
+
+def test_coordinated_profile_write_rejects_cross_registry_identity_conflict(
+    tmp_path: Path,
+) -> None:
+    profile_path = tmp_path / "profiles.json"
+    repository = JsonProfileRepository(profile_path)
+    current = profile(lifecycle=ProfileLifecycle.ACTIVE).model_copy(
+        update={"hospital_name": "Original Hospital"}
+    )
+    repository.add_profile(current)
+    alias_path = tmp_path / "alias-registry.json"
+    aliases = empty_alias_registry()
+    aliases.update(
+        revision=1,
+        hospitals=[
+            {
+                "hospital_id": "H2",
+                "hospital_name": "Taken Hospital",
+                "origins": ["reviewer_alias"],
+                "name_variants": [
+                    {
+                        "display_name": "Taken Hospital",
+                        "normalized_name": "taken hospital",
+                        "verified": True,
+                        "source_document_id": "d" * 64,
+                        "reviewer": "test-reviewer",
+                        "reason": "Verified hospital identity",
+                        "created_at": "2026-08-12T00:00:00Z",
+                    }
+                ],
+                "created_at": "2026-08-12T00:00:00Z",
+                "updated_at": "2026-08-12T00:00:00Z",
+            }
+        ],
+    )
+    JsonAliasRepository(alias_path)._write_unlocked(aliases)
+    coordinator = AliasTransactionCoordinator(JobStore(tmp_path), alias_path)
+    before = profile_path.read_bytes()
+
+    with pytest.raises(HospitalIdentityConflict) as conflict:
+        coordinator.mutate_profile_registry(
+            repository,
+            1,
+            lambda snapshot: repository.replace_in_snapshot(
+                snapshot,
+                (current.model_copy(update={"hospital_name": "Taken Hospital"}),),
+            ),
+        )
+
+    assert conflict.value.owner_ids == ["H1", "H2"]
+    assert profile_path.read_bytes() == before
+    assert repository.snapshot().revision == 1
+    profiles, observed_aliases, identities = coordinator.identity_snapshots(repository)
+    assert profiles.revision == 1
+    assert observed_aliases["revision"] == 1
+    assert identities["H1"]["hospital_name"] == "Original Hospital"
+
+
 def test_profile_repository_rejects_stale_writes(tmp_path) -> None:
     repo = JsonProfileRepository(tmp_path / "profiles.json")
     item = profile()
@@ -241,6 +362,19 @@ def test_profile_repository_rejects_stale_writes(tmp_path) -> None:
 
     assert conflict.value.current_revision == 1
     assert repo.snapshot().revision == 1
+
+
+def test_direct_profile_write_is_disabled_when_alias_registry_is_configured(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GMONEY_ALIAS_REGISTRY", str(tmp_path / "aliases.json"))
+    repository = JsonProfileRepository(tmp_path / "profiles.json")
+
+    with pytest.raises(ProfileMutationCoordinationRequired):
+        repository.add_profile(profile())
+
+    assert not repository.path.exists()
 
 
 def test_active_profile_identity_validation_and_stable_display(tmp_path) -> None:

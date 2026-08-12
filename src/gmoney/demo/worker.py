@@ -6,9 +6,11 @@ import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import Future, ProcessPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TextIO
 
+from gmoney.contracts.phase3 import ProfileRegistrySnapshot
 from gmoney.demo.alias_transactions import AliasTransactionCoordinator
 from gmoney.demo.store import JobStore, is_gpu_device
 from gmoney.profiles.aliases import AliasRegistryUnavailable
@@ -17,12 +19,18 @@ from gmoney.profiles.repository import (
     JsonProfileRepository,
     ProfileRegistryUnavailable,
     active_hospital_identities,
-    validate_combined_hospital_identities,
 )
 
 _extractor: Any = None
 _gpu_inference_lock: TextIO | None = None
 ALIAS_REGISTRY_RETRY_SECONDS = 5.0
+
+
+@dataclass(frozen=True)
+class RuntimeIdentitySnapshot:
+    aliases: dict[str, Any] | None
+    profiles: ProfileRegistrySnapshot | None
+    identities: dict[str, dict[str, Any]] | None
 
 
 def _executor_options(
@@ -42,6 +50,7 @@ def _extract_and_publish(
     extractor: Any,
     alias_snapshot: dict[str, Any] | None = None,
     profile_identities: dict[str, dict[str, Any]] | None = None,
+    profile_snapshot: ProfileRegistrySnapshot | None = None,
 ) -> dict[str, Any] | None:
     directory = store.job_dir(job_id)
     state = store.read(job_id)
@@ -61,6 +70,9 @@ def _extract_and_publish(
             extraction_options["alias_snapshot"] = alias_snapshot
         if profile_identities is not None:
             extraction_options["profile_identities"] = profile_identities
+        if profile_snapshot is not None:
+            extraction_options["profiles"] = profile_snapshot.profiles
+            extraction_options["profile_registry_revision"] = profile_snapshot.revision
         result = extractor.extract(
             directory / "source.pdf",
             directory / "artifacts",
@@ -80,7 +92,12 @@ def _extract_and_publish(
     }
 
 
-def _run_job(root_value: str, job_id: str, vl_url: str) -> dict[str, Any] | None:
+def _run_job(
+    root_value: str,
+    job_id: str,
+    vl_url: str,
+    identity_snapshot: RuntimeIdentitySnapshot | None = None,
+) -> dict[str, Any] | None:
     global _extractor, _gpu_inference_lock
     from gmoney.extraction.offline import OfflineExtractor
 
@@ -97,14 +114,15 @@ def _run_job(root_value: str, job_id: str, vl_url: str) -> dict[str, Any] | None
     alias_registry = Path(alias_registry_value) if alias_registry_value else None
     profile_registry_value = os.environ.get("GMONEY_PROFILE_REGISTRY")
     profile_registry = Path(profile_registry_value) if profile_registry_value else None
-    alias_snapshot, profile_identities = _runtime_identity_snapshots(
-        AliasTransactionCoordinator(store, alias_registry)
-        if alias_registry is not None
-        else None,
-        JsonProfileRepository(profile_registry)
-        if profile_registry is not None
-        else None,
-    )
+    if identity_snapshot is None:
+        identity_snapshot = _runtime_identity_snapshots(
+            AliasTransactionCoordinator(store, alias_registry)
+            if alias_registry is not None
+            else None,
+            JsonProfileRepository(profile_registry)
+            if profile_registry is not None
+            else None,
+        )
     extractor_options: dict[str, Any] = {
         "paddle_device": paddle_device,
         "vl_device": vl_device,
@@ -120,8 +138,9 @@ def _run_job(root_value: str, job_id: str, vl_url: str) -> dict[str, Any] | None
                 vl_url,
                 **extractor_options,
             ),
-            alias_snapshot=alias_snapshot,
-            profile_identities=profile_identities,
+            alias_snapshot=identity_snapshot.aliases,
+            profile_identities=identity_snapshot.identities,
+            profile_snapshot=identity_snapshot.profiles,
         )
 
     if _extractor is None:
@@ -133,8 +152,9 @@ def _run_job(root_value: str, job_id: str, vl_url: str) -> dict[str, Any] | None
         store=store,
         job_id=job_id,
         extractor=_extractor,
-        alias_snapshot=alias_snapshot,
-        profile_identities=profile_identities,
+        alias_snapshot=identity_snapshot.aliases,
+        profile_identities=identity_snapshot.identities,
+        profile_snapshot=identity_snapshot.profiles,
     )
 
 
@@ -184,24 +204,26 @@ def _fail_queued_for_profile_outage(
 def _runtime_identity_snapshots(
     alias_coordinator: AliasTransactionCoordinator | None,
     profile_repository: JsonProfileRepository | None,
-) -> tuple[dict[str, Any] | None, dict[str, dict[str, Any]] | None]:
+) -> RuntimeIdentitySnapshot:
+    if profile_repository is not None and alias_coordinator is not None:
+        profiles, aliases, identities = alias_coordinator.identity_snapshots(
+            profile_repository
+        )
+        return RuntimeIdentitySnapshot(aliases, profiles, identities)
     if profile_repository is not None:
         with profile_repository.locked_snapshot() as profile_snapshot:
             identities = active_hospital_identities(profile_snapshot)
-            aliases = (
-                alias_coordinator.registry_snapshot()
-                if alias_coordinator is not None
-                else None
+            return RuntimeIdentitySnapshot(
+                None,
+                profile_snapshot.model_copy(deep=True),
+                identities,
             )
-            if aliases is not None:
-                validate_combined_hospital_identities(identities, aliases)
-            return aliases, identities
     aliases = (
         alias_coordinator.registry_snapshot()
         if alias_coordinator is not None
         else None
     )
-    return aliases, None
+    return RuntimeIdentitySnapshot(aliases, None, None)
 
 
 def _probe_runtime_registries(
@@ -209,9 +231,9 @@ def _probe_runtime_registries(
     profile_repository: JsonProfileRepository | None,
     store: JobStore,
     stop_requested: Callable[[], bool] = lambda: False,
-) -> str | None:
+) -> tuple[str | None, RuntimeIdentitySnapshot | None]:
     try:
-        _runtime_identity_snapshots(alias_coordinator, profile_repository)
+        snapshot = _runtime_identity_snapshots(alias_coordinator, profile_repository)
     except ProfileRegistryUnavailable:
         error = "profile_registry_unavailable"
     except AliasRegistryUnavailable:
@@ -219,9 +241,9 @@ def _probe_runtime_registries(
     except HospitalIdentityConflict:
         error = "hospital_identity_conflict"
     else:
-        return None
+        return None, snapshot
     _fail_queued_for_registry_outage(store, error, stop_requested)
-    return error
+    return error, None
 
 
 def _probe_alias_registry(
@@ -278,7 +300,10 @@ def run_worker_loop(
     profile_registry: Path | None = None,
     stop_requested: Callable[[], bool] = lambda: False,
     executor_factory: Callable[..., Any] = ProcessPoolExecutor,
-    job_runner: Callable[[str, str, str], dict[str, Any] | None] = _run_job,
+    job_runner: Callable[
+        [str, str, str, RuntimeIdentitySnapshot],
+        dict[str, Any] | None,
+    ] = _run_job,
     coordinator_factory: Callable[[JobStore, Path], AliasTransactionCoordinator] = (
         AliasTransactionCoordinator
     ),
@@ -303,6 +328,7 @@ def run_worker_loop(
     next_registry_probe = 0.0
     draining = False
     fatal_error: Exception | None = None
+    pending_identity_snapshot: RuntimeIdentitySnapshot | None = None
     with executor_factory(**_executor_options(concurrency, paddle_device)) as executor:
         while True:
             if stop_requested():
@@ -353,13 +379,18 @@ def run_worker_loop(
                     or cleanup_due
                 )
                 if should_probe and now >= next_registry_probe:
-                    registry_error = _probe_runtime_registries(
+                    registry_error, observed_snapshot = _probe_runtime_registries(
                         alias_coordinator,
                         profile_repository,
                         store,
                         stop_requested,
                     )
                     runtime_registries_available = registry_error is None
+                    pending_identity_snapshot = (
+                        observed_snapshot
+                        if runtime_registries_available and store.queued()
+                        else None
+                    )
                     next_registry_probe = (
                         0.0
                         if runtime_registries_available
@@ -382,6 +413,31 @@ def run_worker_loop(
                         draining = True
                         break
                     job_id = state["id"]
+                    identity_snapshot = pending_identity_snapshot
+                    pending_identity_snapshot = None
+                    if identity_snapshot is None:
+                        try:
+                            identity_snapshot = _runtime_identity_snapshots(
+                                alias_coordinator,
+                                profile_repository,
+                            )
+                        except ProfileRegistryUnavailable:
+                            registry_error = "profile_registry_unavailable"
+                        except AliasRegistryUnavailable:
+                            registry_error = "alias_registry_unavailable"
+                        except HospitalIdentityConflict:
+                            registry_error = "hospital_identity_conflict"
+                        else:
+                            registry_error = None
+                        if registry_error is not None:
+                            runtime_registries_available = False
+                            next_registry_probe = now + alias_retry_seconds
+                            _fail_queued_for_registry_outage(
+                                store,
+                                registry_error,
+                                stop_requested,
+                            )
+                            break
                     try:
                         claimed = store.claim_queued(job_id, stop_requested)
                     except KeyError:
@@ -396,7 +452,13 @@ def run_worker_loop(
                         draining = True
                         break
                     try:
-                        future = executor.submit(job_runner, str(root), job_id, vl_url)
+                        future = executor.submit(
+                            job_runner,
+                            str(root),
+                            job_id,
+                            vl_url,
+                            identity_snapshot,
+                        )
                     except Exception as error:
                         if (
                             not store.requeue_claimed(job_id)

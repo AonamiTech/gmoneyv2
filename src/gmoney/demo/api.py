@@ -383,11 +383,7 @@ def _alias_snapshot() -> dict[str, Any]:
 
 def _identity_snapshots() -> tuple[Any, dict[str, Any], dict[str, dict[str, Any]]]:
     try:
-        with _profile_repository().locked_snapshot() as profile_snapshot:
-            aliases = _alias_snapshot()
-            identities = active_hospital_identities(profile_snapshot)
-            validate_combined_hospital_identities(identities, aliases)
-            return profile_snapshot.model_copy(deep=True), aliases, identities
+        return _alias_coordinator().identity_snapshots(_profile_repository())
     except ProfileRegistryUnavailable as error:
         raise HTTPException(
             status_code=503,
@@ -712,26 +708,31 @@ def list_trained_hospitals() -> dict[str, Any]:
     profiles, aliases, identities = _identity_snapshots()
     hospitals: dict[str, dict[str, Any]] = {}
     for hospital_id, identity in identities.items():
+        if not identity["hospital_name"]:
+            continue
         hospitals[hospital_id] = {
             "hospital_id": hospital_id,
-            "hospital_name": identity["hospital_name"] or hospital_id,
+            "hospital_name": identity["hospital_name"],
             "active_profile_count": identity["active_profile_count"],
             "alias_count": 0,
             "training_sources": ["profile"],
         }
     for hospital in aliases["hospitals"]:
         hospital_id = str(hospital["hospital_id"])
+        profile_identity = identities.get(hospital_id)
         item = hospitals.setdefault(
             hospital_id,
             {
                 "hospital_id": hospital_id,
                 "hospital_name": hospital["hospital_name"],
-                "active_profile_count": 0,
+                "active_profile_count": (
+                    profile_identity["active_profile_count"] if profile_identity else 0
+                ),
                 "alias_count": 0,
-                "training_sources": [],
+                "training_sources": ["profile"] if profile_identity else [],
             },
         )
-        profile_name = identities.get(hospital_id, {}).get("hospital_name")
+        profile_name = (profile_identity or {}).get("hospital_name")
         if not profile_name:
             item["hospital_name"] = hospital["hospital_name"]
         for origin in hospital.get("origins", []):

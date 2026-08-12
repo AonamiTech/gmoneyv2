@@ -196,8 +196,10 @@ def _controlled_worker_job(
     root_value: str,
     job_id: str,
     vl_url: str,
+    identity_snapshot: worker_module.RuntimeIdentitySnapshot,
 ) -> dict[str, Any]:
     assert vl_url == "http://vl.test"
+    assert isinstance(identity_snapshot, worker_module.RuntimeIdentitySnapshot)
     store = JobStore(Path(root_value))
     directory = store.job_dir(job_id)
     (directory / ".test-runner-started").touch()
@@ -664,6 +666,8 @@ def test_worker_uses_current_profile_name_to_resolve_existing_aliases(
             should_abort: Any,
             alias_snapshot: dict[str, Any],
             profile_identities: dict[str, dict[str, Any]],
+            profiles: tuple[LayoutProfile, ...],
+            profile_registry_revision: int,
         ) -> dict[str, Any]:
             assert combined_hospital_name_owners(
                 profile_identities,
@@ -674,6 +678,8 @@ def test_worker_uses_current_profile_name_to_resolve_existing_aliases(
                 alias_snapshot,
                 "hospital-1",
             )[0]["normalized_label"] == "amount rs"
+            assert profiles[0].hospital_name == "New Machine Medical Center"
+            assert profile_registry_revision == 1
             return {"rows": [], "hospital": None}
 
     monkeypatch.setattr(
@@ -687,6 +693,95 @@ def test_worker_uses_current_profile_name_to_resolve_existing_aliases(
 
     assert summary is not None
     assert summary["row_count"] == 0
+
+
+def test_claimed_job_uses_captured_identity_snapshot_after_profile_rename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = JobStore(tmp_path)
+    job_id = _create_worker_job(store, "Captured identity bill.pdf")
+    profile_path = tmp_path / "profiles.json"
+    repository = JsonProfileRepository(profile_path)
+    original = LayoutProfile(
+        contract_version="layout_profile_v1",
+        profile_key="captured-profile",
+        profile_version=1,
+        lifecycle=ProfileLifecycle.ACTIVE,
+        hospital_id="hospital-1",
+        hospital_name="Original Hospital",
+        page_type=PageType.ITEMIZED_CHARGES,
+        table_type=TableType.ITEM_LEDGER,
+        page_aspect_ratio=0.7,
+        table_box=(0.05, 0.15, 0.95, 0.9),
+        supported_fields=("description", "amount"),
+        construction_dataset_ids=("training",),
+    )
+    repository.add_profile(original)
+    alias_path = tmp_path / "alias-registry.json"
+    coordinator = worker_module.AliasTransactionCoordinator(store, alias_path)
+    captured = worker_module._runtime_identity_snapshots(coordinator, repository)
+    coordinator.mutate_profile_registry(
+        repository,
+        1,
+        lambda snapshot: repository.replace_in_snapshot(
+            snapshot,
+            (original.model_copy(update={"hospital_name": "Renamed Hospital"}),),
+        ),
+    )
+
+    class CapturingExtractor:
+        def __init__(self, vl_url: str, **options: Any) -> None:
+            assert vl_url == "http://vl.test"
+
+        def extract(
+            self,
+            source: Path,
+            artifact_root: Path,
+            progress: Any,
+            *,
+            should_abort: Any,
+            alias_snapshot: dict[str, Any],
+            profile_identities: dict[str, dict[str, Any]],
+            profiles: tuple[LayoutProfile, ...],
+            profile_registry_revision: int,
+        ) -> dict[str, Any]:
+            assert profiles[0].hospital_name == "Original Hospital"
+            assert profile_identities["hospital-1"]["hospital_name"] == (
+                "Original Hospital"
+            )
+            assert profile_registry_revision == 1
+            assert alias_snapshot["revision"] == 0
+            return {
+                "rows": [],
+                "hospital": None,
+                "profile_registry_revision": profile_registry_revision,
+                "alias_registry_revision": alias_snapshot["revision"],
+            }
+
+    monkeypatch.setattr(
+        "gmoney.extraction.offline.OfflineExtractor",
+        CapturingExtractor,
+    )
+    monkeypatch.setenv("GMONEY_PROFILE_REGISTRY", str(profile_path))
+    monkeypatch.setenv("GMONEY_ALIAS_REGISTRY", str(alias_path))
+
+    summary = worker_module._run_job(
+        str(tmp_path),
+        job_id,
+        "http://vl.test",
+        captured,
+    )
+
+    assert summary == {
+        "row_count": 0,
+        "hospital_name": None,
+        "hospital_confidence": None,
+    }
+    published = json.loads((store.job_dir(job_id) / "result.json").read_text())
+    assert published["profile_registry_revision"] == 1
+    assert published["alias_registry_revision"] == 0
+    assert repository.snapshot().revision == 2
 
 
 def test_worker_fails_queued_bill_on_combined_hospital_identity_conflict(
@@ -754,7 +849,7 @@ def test_worker_fails_queued_bill_on_combined_hospital_identity_conflict(
         profile_registry=profile_path,
         stop_requested=lambda: current_time > 0.5,
         executor_factory=ThreadPoolExecutor,
-        job_runner=lambda root, claimed, url: runner_calls.append(claimed),
+        job_runner=lambda root, claimed, url, identity: runner_calls.append(claimed),
         clock=lambda: current_time,
         sleeper=sleeper,
     )
@@ -1088,7 +1183,12 @@ def test_worker_does_not_claim_when_probe_observes_shutdown(tmp_path: Path) -> N
     def coordinator_factory(store: JobStore, path: Path) -> StoppingCoordinator:
         return StoppingCoordinator()
 
-    def runner(root_value: str, claimed_id: str, vl_url: str) -> dict[str, Any]:
+    def runner(
+        root_value: str,
+        claimed_id: str,
+        vl_url: str,
+        identity_snapshot: worker_module.RuntimeIdentitySnapshot,
+    ) -> dict[str, Any]:
         runner_calls.append(claimed_id)
         return {"row_count": 0}
 
@@ -1129,7 +1229,12 @@ def test_worker_requeues_claim_when_shutdown_arrives_before_submission(
             stop_event.set()
         return claimed
 
-    def runner(root_value: str, claimed_id: str, vl_url: str) -> dict[str, Any]:
+    def runner(
+        root_value: str,
+        claimed_id: str,
+        vl_url: str,
+        identity_snapshot: worker_module.RuntimeIdentitySnapshot,
+    ) -> dict[str, Any]:
         runner_calls.append(claimed_id)
         return {"row_count": 0}
 
@@ -1192,7 +1297,12 @@ def test_submission_failure_drains_previously_submitted_jobs_before_exit(
     second_id = _create_worker_job(store, "Rejected by pool.pdf")
     completed: list[str] = []
 
-    def runner(root_value: str, job_id: str, vl_url: str) -> dict[str, Any]:
+    def runner(
+        root_value: str,
+        job_id: str,
+        vl_url: str,
+        identity_snapshot: worker_module.RuntimeIdentitySnapshot,
+    ) -> dict[str, Any]:
         completed.append(job_id)
         return {"row_count": 7, "hospital_name": "Machine Hospital"}
 

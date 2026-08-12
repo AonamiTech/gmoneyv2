@@ -32,11 +32,11 @@ passing frozen promotion decision.
 # Inspect profile-registry capacity for 5,000 hospitals / 20,000 variants.
 .venv/bin/gmoney-profiles benchmark --variants 20000 --queries 100
 
-# Hospital-specific profiles can carry the display name shown in the demo directory.
-export GMONEY_PROFILE_REGISTRY_LOCK=/home/azureuser/gmoneyv2-runtime/config/profile-registry.lock
-.venv/bin/gmoney-profiles construct \
-  --registry /home/azureuser/gmoneyv2-runtime/profiles/registry.json \
-  --observations data/phase3/hospital-observations.json \
+# Live hospital-specific profile writes use the coordinated admin container.
+docker compose -f compose.demo.yaml --profile admin run --rm \
+  -v "$PWD/data/phase3/hospital-observations.json:/admin-input/observations.json:ro" \
+  profile-admin construct \
+  --observations /admin-input/observations.json \
   --profile-key hospital-items \
   --profile-version 1 \
   --hospital-id hospital-id \

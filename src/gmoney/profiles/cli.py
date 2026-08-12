@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import resource
+import tempfile
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -16,13 +18,42 @@ from gmoney.contracts.phase3 import (
     LayoutProfile,
     ProfileEvent,
     ProfileLifecycle,
+    ProfileRegistrySnapshot,
 )
+from gmoney.demo.alias_transactions import AliasTransactionCoordinator
+from gmoney.demo.store import JobStore
 from gmoney.profiles.construction import build_profile
 from gmoney.profiles.lifecycle import evaluate_drift, rollback_profile, transition_profile
 from gmoney.profiles.matching import match_profile
 from gmoney.profiles.repository import JsonProfileRepository
 
 app = typer.Typer(no_args_is_help=True)
+
+
+def _writer(
+    registry: Path,
+    alias_registry: Path,
+    jobs_root: Path,
+) -> tuple[JsonProfileRepository, AliasTransactionCoordinator]:
+    if jobs_root.name != "jobs":
+        raise typer.BadParameter("--jobs-root must identify the runtime jobs directory")
+    repository = JsonProfileRepository(registry)
+    coordinator = AliasTransactionCoordinator(JobStore(jobs_root.parent), alias_registry)
+    return repository, coordinator
+
+
+def _add_coordinated(
+    registry: Path,
+    alias_registry: Path,
+    jobs_root: Path,
+    profile: LayoutProfile,
+) -> None:
+    repository, coordinator = _writer(registry, alias_registry, jobs_root)
+    coordinator.mutate_profile_registry(
+        repository,
+        None,
+        lambda snapshot: repository.add_to_snapshot(snapshot, profile),
+    )
 
 
 @app.command("benchmark")
@@ -90,10 +121,21 @@ def benchmark(
 
 @app.command("construct")
 def construct(
-    registry: Annotated[Path, typer.Option(dir_okay=False)],
+    registry: Annotated[
+        Path,
+        typer.Option(dir_okay=False, envvar="GMONEY_PROFILE_REGISTRY"),
+    ],
     observations: Annotated[Path, typer.Option(exists=True, dir_okay=False)],
     profile_key: str,
     profile_version: int,
+    alias_registry: Annotated[
+        Path,
+        typer.Option(dir_okay=False, envvar="GMONEY_ALIAS_REGISTRY"),
+    ],
+    jobs_root: Annotated[
+        Path,
+        typer.Option(file_okay=False, envvar="GMONEY_JOBS_ROOT"),
+    ],
     hospital_id: str | None = None,
     hospital_name: str | None = None,
     global_family: str | None = None,
@@ -109,17 +151,28 @@ def construct(
         global_family=global_family,
         construction_dataset_ids=tuple(payload["construction_dataset_ids"]),
     )
-    JsonProfileRepository(registry).add_profile(profile)
+    _add_coordinated(registry, alias_registry, jobs_root, profile)
     typer.echo(json.dumps(profile.model_dump(mode="json"), indent=2, sort_keys=True))
 
 
 @app.command("add")
 def add(
-    registry: Annotated[Path, typer.Option(dir_okay=False)],
+    registry: Annotated[
+        Path,
+        typer.Option(dir_okay=False, envvar="GMONEY_PROFILE_REGISTRY"),
+    ],
     profile: Annotated[Path, typer.Option(exists=True, dir_okay=False)],
+    alias_registry: Annotated[
+        Path,
+        typer.Option(dir_okay=False, envvar="GMONEY_ALIAS_REGISTRY"),
+    ],
+    jobs_root: Annotated[
+        Path,
+        typer.Option(file_okay=False, envvar="GMONEY_JOBS_ROOT"),
+    ],
 ) -> None:
     item = LayoutProfile.model_validate_json(profile.read_text())
-    JsonProfileRepository(registry).add_profile(item)
+    _add_coordinated(registry, alias_registry, jobs_root, item)
     typer.echo(f"added {item.profile_key}@{item.profile_version}")
 
 
@@ -149,112 +202,27 @@ def match(
 
 @app.command("transition")
 def transition(
-    registry: Annotated[Path, typer.Option(exists=True, dir_okay=False)],
+    registry: Annotated[
+        Path,
+        typer.Option(exists=True, dir_okay=False, envvar="GMONEY_PROFILE_REGISTRY"),
+    ],
     profile_key: str,
     profile_version: int,
     to_state: ProfileLifecycle,
     reason: str,
+    alias_registry: Annotated[
+        Path,
+        typer.Option(dir_okay=False, envvar="GMONEY_ALIAS_REGISTRY"),
+    ],
+    jobs_root: Annotated[
+        Path,
+        typer.Option(file_okay=False, envvar="GMONEY_JOBS_ROOT"),
+    ],
 ) -> None:
-    repo = JsonProfileRepository(registry)
-    snapshot = repo.snapshot()
-    current = next(
-        (
-            item
-            for item in snapshot.profiles
-            if item.profile_key == profile_key
-            and item.profile_version == profile_version
-        ),
-        None,
-    )
-    if current is None:
-        raise KeyError(f"unknown profile: {profile_key}@{profile_version}")
-    updated, event = transition_profile(current, to_state, reason)
-    replacements = [updated]
-    events = [event]
-    if to_state is ProfileLifecycle.ACTIVE:
-        active = next(
-            (
-                item
-                for item in snapshot.profiles
-                if item.profile_key == profile_key
-                and item.profile_version != profile_version
-                and item.lifecycle is ProfileLifecycle.ACTIVE
-            ),
-            None,
-        )
-        if active is not None:
-            archived, archive_event = transition_profile(
-                active,
-                ProfileLifecycle.ARCHIVED,
-                f"superseded by version {profile_version}",
-            )
-            replacements.append(archived)
-            events.append(archive_event)
-            updated = updated.model_copy(update={"supersedes_version": active.profile_version})
-            replacements[0] = updated
-    repo.replace_profiles(
-        tuple(replacements),
-        tuple(events),
-        expected_revision=snapshot.revision,
-    )
-    typer.echo(f"{profile_key}@{profile_version}: {current.lifecycle} -> {to_state}")
+    repo, coordinator = _writer(registry, alias_registry, jobs_root)
+    current_lifecycle: dict[str, ProfileLifecycle] = {}
 
-
-@app.command("rollback")
-def rollback(
-    registry: Annotated[Path, typer.Option(exists=True, dir_okay=False)],
-    profile_key: str,
-) -> None:
-    repo = JsonProfileRepository(registry)
-    snapshot = repo.snapshot()
-    current, previous = rollback_profile(snapshot.profiles, profile_key)
-    previous_before = next(
-        item
-        for item in snapshot.profiles
-        if item.profile_key == previous.profile_key
-        and item.profile_version == previous.profile_version
-    )
-    now = datetime.now(UTC)
-    events = (
-        ProfileEvent(
-            profile_key=current.profile_key,
-            profile_version=current.profile_version,
-            from_state=ProfileLifecycle.ACTIVE,
-            to_state=ProfileLifecycle.ARCHIVED,
-            reason=f"rollback to version {previous.profile_version}",
-            occurred_at=now,
-        ),
-        ProfileEvent(
-            profile_key=previous.profile_key,
-            profile_version=previous.profile_version,
-            from_state=previous_before.lifecycle,
-            to_state=ProfileLifecycle.ACTIVE,
-            reason=f"rollback from version {current.profile_version}",
-            occurred_at=now,
-        ),
-    )
-    repo.replace_profiles(
-        (current, previous),
-        events,
-        expected_revision=snapshot.revision,
-    )
-    typer.echo(f"rolled back {profile_key} to version {previous.profile_version}")
-
-
-@app.command("drift")
-def drift(
-    registry: Annotated[Path, typer.Option(exists=True, dir_okay=False)],
-    observations: Annotated[Path, typer.Option(exists=True, dir_okay=False)],
-    profile_key: str,
-    profile_version: int,
-) -> None:
-    payload = json.loads(observations.read_text())
-    decision = evaluate_drift(
-        tuple(DriftObservation.model_validate(item) for item in payload["observations"])
-    )
-    if decision.drifted:
-        repo = JsonProfileRepository(registry)
-        snapshot = repo.snapshot()
+    def mutation(snapshot: ProfileRegistrySnapshot) -> ProfileRegistrySnapshot:
         current = next(
             (
                 item
@@ -266,17 +234,211 @@ def drift(
         )
         if current is None:
             raise KeyError(f"unknown profile: {profile_key}@{profile_version}")
-        updated, event = transition_profile(
-            current,
-            ProfileLifecycle.DRIFTED,
-            ",".join(decision.reasons) or "drift gate",
+        current_lifecycle["value"] = current.lifecycle
+        updated, event = transition_profile(current, to_state, reason)
+        replacements = [updated]
+        events = [event]
+        if to_state is ProfileLifecycle.ACTIVE:
+            active = next(
+                (
+                    item
+                    for item in snapshot.profiles
+                    if item.profile_key == profile_key
+                    and item.profile_version != profile_version
+                    and item.lifecycle is ProfileLifecycle.ACTIVE
+                ),
+                None,
+            )
+            if active is not None:
+                archived, archive_event = transition_profile(
+                    active,
+                    ProfileLifecycle.ARCHIVED,
+                    f"superseded by version {profile_version}",
+                )
+                replacements.append(archived)
+                events.append(archive_event)
+                replacements[0] = updated.model_copy(
+                    update={"supersedes_version": active.profile_version}
+                )
+        return repo.replace_in_snapshot(snapshot, tuple(replacements), tuple(events))
+
+    coordinator.mutate_profile_registry(
+        repo,
+        None,
+        mutation,
+    )
+    typer.echo(
+        f"{profile_key}@{profile_version}: {current_lifecycle['value']} -> {to_state}"
+    )
+
+
+@app.command("rollback")
+def rollback(
+    registry: Annotated[
+        Path,
+        typer.Option(exists=True, dir_okay=False, envvar="GMONEY_PROFILE_REGISTRY"),
+    ],
+    profile_key: str,
+    alias_registry: Annotated[
+        Path,
+        typer.Option(dir_okay=False, envvar="GMONEY_ALIAS_REGISTRY"),
+    ],
+    jobs_root: Annotated[
+        Path,
+        typer.Option(file_okay=False, envvar="GMONEY_JOBS_ROOT"),
+    ],
+) -> None:
+    repo, coordinator = _writer(registry, alias_registry, jobs_root)
+    restored_version: dict[str, int] = {}
+
+    def mutation(snapshot: ProfileRegistrySnapshot) -> ProfileRegistrySnapshot:
+        current, previous = rollback_profile(snapshot.profiles, profile_key)
+        restored_version["value"] = previous.profile_version
+        previous_before = next(
+            item
+            for item in snapshot.profiles
+            if item.profile_key == previous.profile_key
+            and item.profile_version == previous.profile_version
         )
-        repo.replace_profile(
-            updated,
-            event,
-            expected_revision=snapshot.revision,
+        now = datetime.now(UTC)
+        events = (
+            ProfileEvent(
+                profile_key=current.profile_key,
+                profile_version=current.profile_version,
+                from_state=ProfileLifecycle.ACTIVE,
+                to_state=ProfileLifecycle.ARCHIVED,
+                reason=f"rollback to version {previous.profile_version}",
+                occurred_at=now,
+            ),
+            ProfileEvent(
+                profile_key=previous.profile_key,
+                profile_version=previous.profile_version,
+                from_state=previous_before.lifecycle,
+                to_state=ProfileLifecycle.ACTIVE,
+                reason=f"rollback from version {current.profile_version}",
+                occurred_at=now,
+            ),
+        )
+        return repo.replace_in_snapshot(snapshot, (current, previous), events)
+
+    coordinator.mutate_profile_registry(
+        repo,
+        None,
+        mutation,
+    )
+    typer.echo(f"rolled back {profile_key} to version {restored_version['value']}")
+
+
+@app.command("drift")
+def drift(
+    registry: Annotated[
+        Path,
+        typer.Option(exists=True, dir_okay=False, envvar="GMONEY_PROFILE_REGISTRY"),
+    ],
+    observations: Annotated[Path, typer.Option(exists=True, dir_okay=False)],
+    profile_key: str,
+    profile_version: int,
+    alias_registry: Annotated[
+        Path,
+        typer.Option(dir_okay=False, envvar="GMONEY_ALIAS_REGISTRY"),
+    ],
+    jobs_root: Annotated[
+        Path,
+        typer.Option(file_okay=False, envvar="GMONEY_JOBS_ROOT"),
+    ],
+) -> None:
+    payload = json.loads(observations.read_text())
+    decision = evaluate_drift(
+        tuple(DriftObservation.model_validate(item) for item in payload["observations"])
+    )
+    if decision.drifted:
+        repo, coordinator = _writer(registry, alias_registry, jobs_root)
+
+        def mutation(snapshot: ProfileRegistrySnapshot) -> ProfileRegistrySnapshot:
+            current = next(
+                (
+                    item
+                    for item in snapshot.profiles
+                    if item.profile_key == profile_key
+                    and item.profile_version == profile_version
+                ),
+                None,
+            )
+            if current is None:
+                raise KeyError(f"unknown profile: {profile_key}@{profile_version}")
+            updated, event = transition_profile(
+                current,
+                ProfileLifecycle.DRIFTED,
+                ",".join(decision.reasons) or "drift gate",
+            )
+            return repo.replace_in_snapshot(snapshot, (updated,), (event,))
+
+        coordinator.mutate_profile_registry(
+            repo,
+            None,
+            mutation,
         )
     typer.echo(json.dumps(decision.model_dump(mode="json"), indent=2, sort_keys=True))
+
+
+@app.command("validate")
+def validate_registries(
+    registry: Annotated[
+        Path,
+        typer.Option(dir_okay=False, envvar="GMONEY_PROFILE_REGISTRY"),
+    ],
+    alias_registry: Annotated[
+        Path,
+        typer.Option(dir_okay=False, envvar="GMONEY_ALIAS_REGISTRY"),
+    ],
+    jobs_root: Annotated[
+        Path,
+        typer.Option(file_okay=False, envvar="GMONEY_JOBS_ROOT"),
+    ],
+) -> None:
+    repository, coordinator = _writer(registry, alias_registry, jobs_root)
+    profiles, aliases, identities = coordinator.identity_snapshots(repository)
+    typer.echo(
+        json.dumps(
+            {
+                "status": "valid",
+                "profile_revision": profiles.revision,
+                "alias_registry_revision": aliases["revision"],
+                "active_hospital_count": len(identities),
+            },
+            sort_keys=True,
+        )
+    )
+
+
+@app.command("check-access")
+def check_access(
+    registry: Annotated[
+        Path,
+        typer.Option(dir_okay=False, envvar="GMONEY_PROFILE_REGISTRY"),
+    ],
+    alias_registry: Annotated[
+        Path,
+        typer.Option(dir_okay=False, envvar="GMONEY_ALIAS_REGISTRY"),
+    ],
+    jobs_root: Annotated[
+        Path,
+        typer.Option(file_okay=False, envvar="GMONEY_JOBS_ROOT"),
+    ],
+) -> None:
+    repository, coordinator = _writer(registry, alias_registry, jobs_root)
+    directories = (registry.parent, alias_registry.parent, jobs_root)
+    for directory in directories:
+        directory.mkdir(parents=True, exist_ok=True)
+        descriptor, probe = tempfile.mkstemp(prefix=".gmoney-access-", dir=directory)
+        try:
+            os.write(descriptor, b"profile-admin-access-check\n")
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+            Path(probe).unlink(missing_ok=True)
+    coordinator.identity_snapshots(repository)
+    typer.echo("profile administration paths and locks are writable")
 
 
 if __name__ == "__main__":

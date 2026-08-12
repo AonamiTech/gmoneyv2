@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, TypeVar
 
+from gmoney.contracts.phase3 import ProfileRegistrySnapshot
 from gmoney.demo.store import (
     ACTIVE_STATUSES,
     JobStore,
@@ -24,8 +25,13 @@ from gmoney.profiles.aliases import (
     durable_unlink,
 )
 from gmoney.profiles.repository import (
+    PROFILE_STORAGE_ERRORS,
     JsonProfileRepository,
+    ProfileRegistryFormatError,
     ProfileRegistryRevisionConflict,
+    ProfileRegistryUnavailable,
+    active_hospital_identities,
+    validate_combined_hospital_identities,
 )
 
 T = TypeVar("T")
@@ -169,6 +175,62 @@ class AliasTransactionCoordinator:
             raise
         except ALIAS_STORAGE_ERRORS as error:
             raise AliasRegistryUnavailable("alias registry is unavailable") from error
+
+    def identity_snapshots(
+        self,
+        profile_repository: JsonProfileRepository,
+    ) -> tuple[ProfileRegistrySnapshot, dict[str, Any], dict[str, dict[str, Any]]]:
+        """Read one validated profile/alias identity view under the global lock order."""
+        with profile_repository.locked_snapshot() as profile_snapshot:
+            aliases = self.registry_snapshot()
+            identities = active_hospital_identities(profile_snapshot)
+            validate_combined_hospital_identities(identities, aliases)
+            return (
+                profile_snapshot.model_copy(deep=True),
+                json.loads(json.dumps(aliases)),
+                json.loads(json.dumps(identities)),
+            )
+
+    def mutate_profile_registry(
+        self,
+        profile_repository: JsonProfileRepository,
+        expected_profile_revision: int | None,
+        mutation: Callable[[ProfileRegistrySnapshot], ProfileRegistrySnapshot],
+    ) -> ProfileRegistrySnapshot:
+        """Validate aliases and profiles together before committing a profile write."""
+        with (
+            profile_repository.lock(exclusive=True),
+            self.repository.lock(exclusive=True),
+        ):
+            self._storage(
+                self._recover_all_unlocked,
+                "alias registry recovery failed",
+            )
+            aliases = self._storage(
+                self.repository._read_unlocked,
+                "alias registry read failed",
+            )
+            try:
+                current = profile_repository._load_unlocked()
+            except ProfileRegistryUnavailable:
+                raise
+            except (*PROFILE_STORAGE_ERRORS, ProfileRegistryFormatError) as error:
+                raise ProfileRegistryUnavailable(
+                    "profile registry is unavailable"
+                ) from error
+            if (
+                expected_profile_revision is not None
+                and current.revision != expected_profile_revision
+            ):
+                raise ProfileRegistryRevisionConflict(current.revision)
+            updated = profile_repository._updated_snapshot_unlocked(
+                current,
+                mutation,
+            )
+            identities = active_hospital_identities(updated)
+            validate_combined_hospital_identities(identities, aliases)
+            profile_repository._write_unlocked(updated)
+            return updated.model_copy(deep=True)
 
     def mutate_registry(
         self,

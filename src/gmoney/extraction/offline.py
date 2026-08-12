@@ -32,6 +32,7 @@ from gmoney.contracts.phase3 import (
     AdjudicationRequest,
     GeminiMode,
     LayoutObservation,
+    LayoutProfile,
     ProfileLifecycle,
     ProfileMatch,
     RecoveryAttempt,
@@ -2907,6 +2908,7 @@ class OfflineExtractor:
         vl_device: str = "cpu",
         hospital_id: str | None = None,
         profile_registry: Path | None = None,
+        profiles: tuple[LayoutProfile, ...] | None = None,
         alias_registry: Path | None = None,
         gemini_mode: GeminiMode = GeminiMode.OFF,
         gemini_adapter: AdjudicationAdapter | None = None,
@@ -2930,11 +2932,15 @@ class OfflineExtractor:
         self.ocr = PaddleOcrV6Adapter(device=paddle_device)
         self.layout = PaddleDocLayoutV3Adapter(device=paddle_device)
         self.vl = PaddleOcrVlAdapter(base_url=vl_url, device=vl_device)
-        self.profiles = (
-            JsonProfileRepository(profile_registry).list_profiles()
-            if profile_registry is not None and profile_registry.exists()
-            else ()
-        )
+        self.profile_registry_revision: int | None = None
+        if profiles is not None:
+            self.profiles = profiles
+        elif profile_registry is not None and profile_registry.exists():
+            profile_snapshot = JsonProfileRepository(profile_registry).snapshot()
+            self.profiles = profile_snapshot.profiles
+            self.profile_registry_revision = profile_snapshot.revision
+        else:
+            self.profiles = ()
         self.gemini = gemini_adapter
         if (
             self.gemini is None
@@ -3575,11 +3581,14 @@ class OfflineExtractor:
         should_abort: Callable[[], bool] | None = None,
         alias_snapshot: dict[str, Any] | None = None,
         profile_identities: dict[str, dict[str, Any]] | None = None,
+        profiles: tuple[LayoutProfile, ...] | None = None,
+        profile_registry_revision: int | None = None,
     ) -> dict[str, Any]:
         set_header_aliases({})
         if self.alias_registry is not None and alias_snapshot is None:
             raise AliasRegistryUnavailable("coordinated alias snapshot is required")
         resolved_hospital_id = self.hospital_id
+        job_profiles = self.profiles if profiles is None else profiles
 
         def abort_checkpoint() -> None:
             if should_abort is not None and should_abort():
@@ -3746,6 +3755,7 @@ class OfflineExtractor:
                     box=work.box,
                     reconstruction=reconstruction,
                     tokens=tokens,
+                    profiles=job_profiles,
                 )
                 shadow_profile_match = self._profile_match(
                     document_id=document_id,
@@ -3757,7 +3767,7 @@ class OfflineExtractor:
                     tokens=tokens,
                     profiles=tuple(
                         profile
-                        for profile in self.profiles
+                        for profile in job_profiles
                         if profile.lifecycle is ProfileLifecycle.SHADOW
                     ),
                     include_shadow=True,
@@ -3766,7 +3776,7 @@ class OfflineExtractor:
                 if profile_match is not None and profile_match.selected:
                     selected_profile = next(
                         profile
-                        for profile in self.profiles
+                        for profile in job_profiles
                         if profile.profile_key == profile_match.profile_key
                         and profile.profile_version == profile_match.profile_version
                     )
@@ -4341,6 +4351,11 @@ class OfflineExtractor:
             "hospital": hospital,
             "alias_registry_revision": (
                 alias_snapshot["revision"] if alias_snapshot is not None else None
+            ),
+            "profile_registry_revision": (
+                profile_registry_revision
+                if profile_registry_revision is not None
+                else getattr(self, "profile_registry_revision", None)
             ),
             "applied_alias_ids": list(matched_header_alias_ids()),
             "source_sha256": sha256_file(source),

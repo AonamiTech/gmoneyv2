@@ -67,6 +67,24 @@ services:
       timeout: 5s
       retries: 12
 
+  profile-admin:
+    profiles: ["admin"]
+    image: gmoney-v2-api:${GMONEY_IMAGE_TAG:-local}
+    build:
+      context: .
+      dockerfile: infra/docker/api.Dockerfile
+    entrypoint: ["gmoney-profiles"]
+    user: "10001:10001"
+    environment:
+      GMONEY_PROFILE_REGISTRY: /profiles/registry.json
+      GMONEY_PROFILE_REGISTRY_LOCK: /runtime-config/profile-registry.lock
+      GMONEY_ALIAS_REGISTRY: /runtime-config/alias-registry.json
+      GMONEY_JOBS_ROOT: /runtime/jobs
+    volumes:
+      - ${GMONEY_DATA_ROOT:-/home/azureuser/gmoneyv2-runtime}/jobs:/runtime/jobs
+      - ${GMONEY_PROFILE_ROOT:-/home/azureuser/gmoneyv2-runtime/profiles}:/profiles
+      - ${GMONEY_DATA_ROOT:-/home/azureuser/gmoneyv2-runtime}/config:/runtime-config
+
   worker:
     image: gmoney-v2-worker:${GMONEY_IMAGE_TAG:-local}
     build:

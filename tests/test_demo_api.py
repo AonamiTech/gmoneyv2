@@ -2485,6 +2485,11 @@ def test_nameless_profile_retains_alias_canonical_hospital_name(
     directory = client.get("/api/v2/hospitals/trained")
     assert directory.status_code == 200
     assert directory.json()["hospitals"][0]["hospital_name"] == "Machine Hospital"
+    assert directory.json()["hospitals"][0]["active_profile_count"] == 1
+    assert directory.json()["hospitals"][0]["training_sources"] == [
+        "profile",
+        "reviewer_alias",
+    ]
     assert directory.json()["profile_revision"] == 1
 
     job_id, _ = completed_job(store)
@@ -2506,6 +2511,41 @@ def test_nameless_profile_retains_alias_canonical_hospital_name(
     assert registry["hospitals"][0]["hospital_name"] == "Machine Hospital"
     assert registry["events"][-1]["canonical_name_source"] == "registry"
     assert registry["events"][-1]["profile_revision"] == 1
+
+
+def test_completely_nameless_profile_is_not_exposed_as_a_trained_hospital(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    client, _ = client_for(tmp_path / "jobs", monkeypatch)
+    profile_registry = tmp_path / "profiles" / "registry.json"
+    JsonProfileRepository(profile_registry).add_profile(
+        LayoutProfile(
+            contract_version="layout_profile_v1",
+            profile_key="unresolvable-profile",
+            profile_version=1,
+            lifecycle=ProfileLifecycle.ACTIVE,
+            hospital_id="hospital-without-name",
+            hospital_name=None,
+            page_type=PageType.ITEMIZED_CHARGES,
+            table_type=TableType.ITEM_LEDGER,
+            page_aspect_ratio=0.7,
+            table_box=(0.05, 0.15, 0.95, 0.9),
+            supported_fields=("description", "amount"),
+            construction_dataset_ids=("training",),
+        )
+    )
+    monkeypatch.setattr(api, "PROFILE_REGISTRY", profile_registry)
+
+    directory = client.get("/api/v2/hospitals/trained")
+
+    assert directory.status_code == 200
+    assert directory.json() == {
+        "registry_revision": 0,
+        "profile_revision": 1,
+        "total": 0,
+        "hospitals": [],
+    }
 
 
 def test_profile_registry_outages_return_structured_503(

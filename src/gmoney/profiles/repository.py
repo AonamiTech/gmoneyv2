@@ -42,6 +42,10 @@ class ProfileRegistryFormatError(ValueError):
     """Profile identities do not satisfy the active ownership contract."""
 
 
+class ProfileMutationCoordinationRequired(RuntimeError):
+    """Live profile writes must validate the configured alias registry."""
+
+
 class HospitalIdentityConflict(RuntimeError):
     def __init__(self, owner_ids: set[str]) -> None:
         super().__init__("hospital identity belongs to multiple hospitals")
@@ -207,9 +211,13 @@ class JsonProfileRepository:
         if version not in {LEGACY_PROFILE_REGISTRY_VERSION, PROFILE_REGISTRY_VERSION}:
             raise ProfileRegistryFormatError("unsupported profile registry")
         if version == LEGACY_PROFILE_REGISTRY_VERSION:
-            if payload.get("revision", 0) != 0:
+            if "revision" in payload and (
+                type(payload["revision"]) is not int or payload["revision"] != 0
+            ):
                 raise ProfileRegistryFormatError("legacy profile registry has a revision")
             payload = {**payload, "revision": 0}
+        elif "revision" not in payload or type(payload["revision"]) is not int:
+            raise ProfileRegistryFormatError("profile registry has an invalid revision")
         snapshot = ProfileRegistrySnapshot.model_validate(payload)
         active_hospital_identities(snapshot)
         return snapshot
@@ -245,12 +253,28 @@ class JsonProfileRepository:
         except PROFILE_STORAGE_ERRORS as error:
             raise ProfileRegistryUnavailable("profile registry write failed") from error
 
+    def _updated_snapshot_unlocked(
+        self,
+        current: ProfileRegistrySnapshot,
+        mutation: Callable[[ProfileRegistrySnapshot], ProfileRegistrySnapshot],
+    ) -> ProfileRegistrySnapshot:
+        return mutation(current.model_copy(deep=True)).model_copy(
+            update={
+                "registry_version": PROFILE_REGISTRY_VERSION,
+                "revision": current.revision + 1,
+            }
+        )
+
     def _mutate(
         self,
         mutation: Callable[[ProfileRegistrySnapshot], ProfileRegistrySnapshot],
         *,
         expected_revision: int | None = None,
     ) -> ProfileRegistrySnapshot:
+        if os.environ.get("GMONEY_ALIAS_REGISTRY"):
+            raise ProfileMutationCoordinationRequired(
+                "live profile writes require the profile/alias transaction coordinator"
+            )
         with self.lock(exclusive=True):
             try:
                 current = self._load_unlocked()
@@ -258,12 +282,7 @@ class JsonProfileRepository:
                 raise ProfileRegistryUnavailable("profile registry is unavailable") from error
             if expected_revision is not None and current.revision != expected_revision:
                 raise ProfileRegistryRevisionConflict(current.revision)
-            updated = mutation(current.model_copy(deep=True)).model_copy(
-                update={
-                    "registry_version": PROFILE_REGISTRY_VERSION,
-                    "revision": current.revision + 1,
-                }
-            )
+            updated = self._updated_snapshot_unlocked(current, mutation)
             self._write_unlocked(updated)
             return updated
 
@@ -274,28 +293,32 @@ class JsonProfileRepository:
         return self.snapshot().events
 
     def add_profile(self, profile: LayoutProfile) -> None:
-        def mutation(snapshot: ProfileRegistrySnapshot) -> ProfileRegistrySnapshot:
-            identity = (profile.profile_key, profile.profile_version)
-            if any(
-                (item.profile_key, item.profile_version) == identity
-                for item in snapshot.profiles
-            ):
-                raise ValueError(
-                    "profile version already exists: "
-                    f"{profile.profile_key}@{profile.profile_version}"
-                )
-            return snapshot.model_copy(
-                update={
-                    "profiles": tuple(
-                        sorted(
-                            (*snapshot.profiles, profile),
-                            key=lambda item: (item.profile_key, item.profile_version),
-                        )
-                    )
-                }
-            )
+        self._mutate(lambda snapshot: self.add_to_snapshot(snapshot, profile))
 
-        self._mutate(mutation)
+    @staticmethod
+    def add_to_snapshot(
+        snapshot: ProfileRegistrySnapshot,
+        profile: LayoutProfile,
+    ) -> ProfileRegistrySnapshot:
+        identity = (profile.profile_key, profile.profile_version)
+        if any(
+            (item.profile_key, item.profile_version) == identity
+            for item in snapshot.profiles
+        ):
+            raise ValueError(
+                "profile version already exists: "
+                f"{profile.profile_key}@{profile.profile_version}"
+            )
+        return snapshot.model_copy(
+            update={
+                "profiles": tuple(
+                    sorted(
+                        (*snapshot.profiles, profile),
+                        key=lambda item: (item.profile_key, item.profile_version),
+                    )
+                )
+            }
+        )
 
     def replace_profile(
         self,
@@ -317,36 +340,44 @@ class JsonProfileRepository:
         *,
         expected_revision: int | None = None,
     ) -> None:
-        def mutation(snapshot: ProfileRegistrySnapshot) -> ProfileRegistrySnapshot:
-            replacements = {
-                (profile.profile_key, profile.profile_version): profile
-                for profile in profiles
-            }
-            if len(replacements) != len(profiles):
-                raise ValueError("duplicate profile replacement identity")
-            replaced: set[tuple[str, int]] = set()
-            updated: list[LayoutProfile] = []
-            for item in snapshot.profiles:
-                identity = (item.profile_key, item.profile_version)
-                if identity in replacements:
-                    updated.append(replacements[identity])
-                    replaced.add(identity)
-                else:
-                    updated.append(item)
-            missing = replacements.keys() - replaced
-            if missing:
-                rendered = ", ".join(
-                    f"{key}@{version}" for key, version in sorted(missing)
-                )
-                raise KeyError(f"unknown profile versions: {rendered}")
-            return snapshot.model_copy(
-                update={
-                    "profiles": tuple(updated),
-                    "events": (*snapshot.events, *events),
-                }
-            )
+        self._mutate(
+            lambda snapshot: self.replace_in_snapshot(snapshot, profiles, events),
+            expected_revision=expected_revision,
+        )
 
-        self._mutate(mutation, expected_revision=expected_revision)
+    @staticmethod
+    def replace_in_snapshot(
+        snapshot: ProfileRegistrySnapshot,
+        profiles: tuple[LayoutProfile, ...],
+        events: tuple[ProfileEvent, ...] = (),
+    ) -> ProfileRegistrySnapshot:
+        replacements = {
+            (profile.profile_key, profile.profile_version): profile
+            for profile in profiles
+        }
+        if len(replacements) != len(profiles):
+            raise ValueError("duplicate profile replacement identity")
+        replaced: set[tuple[str, int]] = set()
+        updated: list[LayoutProfile] = []
+        for item in snapshot.profiles:
+            identity = (item.profile_key, item.profile_version)
+            if identity in replacements:
+                updated.append(replacements[identity])
+                replaced.add(identity)
+            else:
+                updated.append(item)
+        missing = replacements.keys() - replaced
+        if missing:
+            rendered = ", ".join(
+                f"{key}@{version}" for key, version in sorted(missing)
+            )
+            raise KeyError(f"unknown profile versions: {rendered}")
+        return snapshot.model_copy(
+            update={
+                "profiles": tuple(updated),
+                "events": (*snapshot.events, *events),
+            }
+        )
 
     def get(self, profile_key: str, profile_version: int | None = None) -> LayoutProfile:
         matches = [

@@ -59,13 +59,41 @@ retains the versioned hospital column-alias registry shared by API and worker.
 Create the profile directory before startup. Its optional `registry.json` is
 mounted read-only into the API and worker. Both services coordinate snapshots
 through `$GMONEY_DATA_ROOT/config/profile-registry.lock`. Any live
-`gmoney-profiles` CLI mutation must export `GMONEY_PROFILE_REGISTRY_LOCK` with
-that same host path before writing the registry.
+profile mutation must run through the on-demand administrative container, which
+uses the same UID, registry paths, and profile-to-alias lock order as the live
+services. Host-side `gmoney-profiles` writes are unsupported.
+
+Before a release or profile mutation, validate the combined registries and the
+container's real write permissions:
+
+```bash
+docker compose -f compose.demo.yaml -f compose.gpu.yaml --profile admin \
+  run --rm profile-admin check-access
+docker compose -f compose.demo.yaml -f compose.gpu.yaml --profile admin \
+  run --rm profile-admin validate
+```
+
+Run mutating commands through the same service. Registry, alias, jobs, and lock
+paths come from the service environment and must not be overridden:
+
+```bash
+docker compose -f compose.demo.yaml -f compose.gpu.yaml --profile admin \
+  run --rm -v /path/to/new-profile.json:/admin-input/profile.json:ro \
+  profile-admin add --profile /admin-input/profile.json
+docker compose -f compose.demo.yaml -f compose.gpu.yaml --profile admin \
+  run --rm profile-admin transition PROFILE_KEY PROFILE_VERSION active \
+  "holdout gates passed"
+```
+
+The admin service is profile-gated and is not started by the normal `up`
+command. The API and worker retain read-only profile mounts.
 
 ## Acceptance
 
 - Python tests, Ruff, frontend lint/typecheck/build, and merged Compose
   validation pass for the exact release source.
+- The `profile-admin check-access` and `profile-admin validate` commands pass
+  against the persisted runtime before container cutover.
 - Host and disposable CUDA-container `nvidia-smi` checks pass. Paddle reports a
   CUDA build, sees GPU 0, and loads PP-OCRv6 plus PP-DocLayoutV3 on `gpu:0`.
 - llama.cpp reports CUDA initialization and GPU layer offload; both model and

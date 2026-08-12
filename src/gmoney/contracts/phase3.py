@@ -294,7 +294,7 @@ class DriftDecision(ContractModel):
 
 class ProfileRegistrySnapshot(ContractModel):
     registry_version: str = "profile_registry_v2"
-    revision: int = Field(default=0, ge=0)
+    revision: int = Field(default=0, ge=0, strict=True)
     profiles: tuple[LayoutProfile, ...] = ()
     events: tuple[ProfileEvent, ...] = ()
 
