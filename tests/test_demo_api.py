@@ -24,7 +24,12 @@ from gmoney.demo.alias_transactions import (
     _digest,
 )
 from gmoney.demo.store import JobStore
-from gmoney.profiles.aliases import AliasRegistryUnavailable, JsonAliasRepository
+from gmoney.profiles.aliases import (
+    ALIAS_REGISTRY_VERSION,
+    LEGACY_ALIAS_REGISTRY_VERSION,
+    AliasRegistryUnavailable,
+    JsonAliasRepository,
+)
 from gmoney.profiles.repository import JsonProfileRepository
 
 
@@ -55,7 +60,7 @@ def registry_event(action: str) -> dict[str, str]:
 
 def registry_with_alias(revision: int = 1) -> dict[str, object]:
     return {
-        "registry_version": "hospital_alias_registry_v2",
+        "registry_version": ALIAS_REGISTRY_VERSION,
         "revision": revision,
         "header_normalizer_version": "header_normalizer_v1",
         "hospital_normalizer_version": "hospital_name_normalizer_v1",
@@ -94,6 +99,14 @@ def registry_with_alias(revision: int = 1) -> dict[str, object]:
         ],
         "events": [registry_event("column_alias_applied")],
     }
+
+
+def legacy_registry_with_alias(revision: int = 1) -> dict[str, object]:
+    registry = registry_with_alias(revision)
+    registry["registry_version"] = LEGACY_ALIAS_REGISTRY_VERSION
+    for event in registry["events"]:
+        event.pop("reviewer", None)
+    return registry
 
 
 def _run_alias_cutover_to_boundary(
@@ -176,6 +189,32 @@ def _concurrent_alias_patch(
         },
     )
     sender.send(("patch", response.status_code, response.json()))
+
+
+def _run_alias_cutover_paused_after_registry_write(
+    root_value: str,
+    registry_value: str,
+    job_id: str,
+    registry_written,
+    release,
+) -> None:
+    store = JobStore(Path(root_value))
+    coordinator = AliasTransactionCoordinator(store, Path(registry_value))
+    original_write = coordinator.repository._write_unlocked
+
+    def pausing_write(payload):
+        original_write(payload)
+        registry_written.set()
+        release.wait()
+
+    coordinator.repository._write_unlocked = pausing_write
+
+    def mutation(review, registry, result):
+        review["events"] = [*review["events"], {"action": "target_review"}]
+        registry["events"] = [*registry["events"], registry_event("target_registry")]
+        return review, registry
+
+    coordinator.mutate_review_and_registry(job_id, 0, 0, mutation)
 
 
 def test_pdf_upload_status_and_shared_listing_endpoint(tmp_path: Path, monkeypatch) -> None:
@@ -867,6 +906,77 @@ def test_pending_journal_serializes_concurrent_snapshot_and_alias_patch(
     assert not (store.job_dir(job_id) / ".alias-operation.json").exists()
 
 
+def test_snapshot_cannot_observe_future_registry_before_review_is_durable(
+    tmp_path: Path,
+) -> None:
+    store = JobStore(tmp_path)
+    job_id, _ = completed_job(store)
+    base_review = store.read_review(job_id)
+    (store.job_dir(job_id) / "review.json").write_text(json.dumps(base_review))
+    registry_path = tmp_path / "alias-registry.json"
+    context = multiprocessing.get_context("spawn")
+    registry_written = context.Event()
+    release = context.Event()
+    cutover = context.Process(
+        target=_run_alias_cutover_paused_after_registry_write,
+        args=(
+            str(tmp_path),
+            str(registry_path),
+            job_id,
+            registry_written,
+            release,
+        ),
+    )
+    receiver, sender = context.Pipe(duplex=False)
+    snapshot = context.Process(
+        target=_concurrent_registry_snapshot,
+        args=(str(tmp_path), str(registry_path), registry_written, sender),
+    )
+    cutover.start()
+    snapshot.start()
+    sender.close()
+    try:
+        assert registry_written.wait(8)
+        assert json.loads(registry_path.read_text())["revision"] == 1
+        assert json.loads(
+            (store.job_dir(job_id) / "review.json").read_text()
+        )["revision"] == 0
+        assert not receiver.poll(0.5)
+        release.set()
+        assert receiver.poll(8)
+        assert receiver.recv() == ("snapshot", 1)
+    finally:
+        release.set()
+        receiver.close()
+        for process in (cutover, snapshot):
+            process.join(timeout=5)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+    assert cutover.exitcode == 0
+    assert snapshot.exitcode == 0
+    assert store.read_review(job_id)["revision"] == 1
+
+
+@pytest.mark.parametrize(
+    "error",
+    (AttributeError("callback bug"), KeyError("callback bug"), TypeError("callback bug")),
+)
+def test_registry_callback_programming_errors_are_not_reported_as_outages(
+    tmp_path: Path,
+    error: Exception,
+) -> None:
+    coordinator = AliasTransactionCoordinator(
+        JobStore(tmp_path), tmp_path / "alias-registry.json"
+    )
+
+    def broken_callback(registry):
+        raise error
+
+    with pytest.raises(type(error), match="callback bug"):
+        coordinator.mutate_registry(0, broken_callback)
+
+
 def test_alias_patch_returns_registry_unavailable_for_corrupt_json(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -902,17 +1012,120 @@ def test_alias_patch_preserves_missing_alias_response(tmp_path: Path, monkeypatc
     assert response.json()["detail"] == "Column alias was not found"
 
 
-def test_registry_validation_failure_is_reported_as_unavailable(tmp_path: Path) -> None:
+def test_callback_registry_validation_failure_is_not_reported_as_outage(
+    tmp_path: Path,
+) -> None:
     coordinator = AliasTransactionCoordinator(
         JobStore(tmp_path),
         tmp_path / "alias-registry.json",
     )
 
-    with pytest.raises(AliasRegistryUnavailable):
+    with pytest.raises(ValueError, match="unsupported hospital alias registry"):
         coordinator.mutate_registry(
             0,
             lambda registry: {**registry, "registry_version": "unsupported"},
         )
+
+
+def test_generated_v2_registry_is_migrated_once_to_strict_v3(tmp_path: Path) -> None:
+    path = tmp_path / "alias-registry.json"
+    legacy = legacy_registry_with_alias(revision=7)
+    path.write_text(json.dumps(legacy))
+    coordinator = AliasTransactionCoordinator(JobStore(tmp_path), path)
+
+    migrated = coordinator.registry_snapshot()
+
+    assert migrated["registry_version"] == ALIAS_REGISTRY_VERSION
+    assert migrated["revision"] == 8
+    assert migrated["events"][0]["reviewer"] == "legacy-unknown"
+    assert migrated["events"][-1]["action"] == "alias_registry_migrated"
+    assert migrated["events"][-1]["reviewer"] == "system:migration"
+    assert json.loads(path.read_text()) == migrated
+    assert coordinator.registry_snapshot() == migrated
+
+
+def test_concurrent_processes_migrate_v2_registry_idempotently(tmp_path: Path) -> None:
+    registry_path = tmp_path / "alias-registry.json"
+    registry_path.write_text(json.dumps(legacy_registry_with_alias(revision=4)))
+    JobStore(tmp_path)
+    context = multiprocessing.get_context("spawn")
+    start_event = context.Event()
+    receiver, sender = context.Pipe(duplex=False)
+    processes = [
+        context.Process(
+            target=_concurrent_registry_snapshot,
+            args=(str(tmp_path), str(registry_path), start_event, sender),
+        )
+        for _ in range(2)
+    ]
+    for process in processes:
+        process.start()
+    sender.close()
+    start_event.set()
+    try:
+        assert receiver.poll(8)
+        first = receiver.recv()
+        assert receiver.poll(8)
+        second = receiver.recv()
+    finally:
+        receiver.close()
+        for process in processes:
+            process.join(timeout=5)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+    assert all(process.exitcode == 0 for process in processes)
+    assert first == ("snapshot", 5)
+    assert second == ("snapshot", 5)
+    final = JsonAliasRepository(registry_path).read()
+    assert final["revision"] == 5
+    assert sum(
+        event["action"] == "alias_registry_migrated" for event in final["events"]
+    ) == 1
+
+
+def test_pending_v2_journal_recovers_before_registry_migration(tmp_path: Path) -> None:
+    store = JobStore(tmp_path)
+    job_id, _ = completed_job(store)
+    base_review = store.read_review(job_id)
+    target_review = json.loads(json.dumps(base_review))
+    target_review["revision"] = 1
+    target_review["events"].append({"action": "legacy_target_review"})
+    base_registry = legacy_registry_with_alias(revision=0)
+    target_registry = json.loads(json.dumps(base_registry))
+    target_registry["revision"] = 1
+    target_registry["aliases"][0]["active"] = False
+    target_registry["events"].append(
+        {
+            "action": "legacy_target_registry",
+            "reason": "Legacy cutover pending during upgrade",
+            "created_at": "2026-08-12T00:01:00Z",
+        }
+    )
+    registry_path = tmp_path / "alias-registry.json"
+    registry_path.write_text(json.dumps(target_registry))
+    journal = {
+        "version": ALIAS_JOURNAL_VERSION,
+        "job_id": job_id,
+        "base_review": base_review,
+        "target_review": target_review,
+        "base_registry": base_registry,
+        "target_registry": target_registry,
+        "base_review_sha256": _digest(base_review),
+        "target_review_sha256": _digest(target_review),
+        "base_registry_sha256": _digest(base_registry),
+        "target_registry_sha256": _digest(target_registry),
+    }
+    (store.job_dir(job_id) / ".alias-operation.json").write_text(json.dumps(journal))
+
+    migrated = AliasTransactionCoordinator(store, registry_path).registry_snapshot()
+
+    assert store.read_review(job_id)["revision"] == 1
+    assert migrated["registry_version"] == ALIAS_REGISTRY_VERSION
+    assert migrated["revision"] == 2
+    assert migrated["aliases"][0]["active"] is False
+    assert migrated["events"][-1]["action"] == "alias_registry_migrated"
+    assert not (store.job_dir(job_id) / ".alias-operation.json").exists()
 
 
 @pytest.mark.parametrize(
@@ -933,7 +1146,7 @@ def test_alias_registry_rejects_malformed_typed_fields(
     corrupt,
 ) -> None:
     registry = {
-        "registry_version": "hospital_alias_registry_v2",
+        "registry_version": ALIAS_REGISTRY_VERSION,
         "revision": 1,
         "header_normalizer_version": "header_normalizer_v1",
         "hospital_normalizer_version": "hospital_name_normalizer_v1",
@@ -992,7 +1205,7 @@ def test_cleanup_recovers_alias_journals_once_for_many_jobs(
     recover_calls = 0
     lock_calls = 0
     original_recover = coordinator._recover_all_unlocked
-    original_locked = coordinator.repository.locked
+    original_lock = coordinator.repository.lock
 
     def tracking_recover() -> None:
         nonlocal recover_calls
@@ -1000,14 +1213,14 @@ def test_cleanup_recovers_alias_journals_once_for_many_jobs(
         original_recover()
 
     @contextmanager
-    def tracking_locked(*, exclusive: bool):
+    def tracking_lock(*, exclusive: bool):
         nonlocal lock_calls
         lock_calls += 1
-        with original_locked(exclusive=exclusive) as registry:
-            yield registry
+        with original_lock(exclusive=exclusive):
+            yield
 
     monkeypatch.setattr(coordinator, "_recover_all_unlocked", tracking_recover)
-    monkeypatch.setattr(coordinator.repository, "locked", tracking_locked)
+    monkeypatch.setattr(coordinator.repository, "lock", tracking_lock)
 
     assert coordinator.cleanup(720) == 0
     assert recover_calls == 1
@@ -1467,6 +1680,56 @@ def test_repeated_reject_is_atomic_and_preserves_restoration_provenance(
     assert active["bulk_action"] == "reject"
 
 
+def test_legacy_rejection_provenance_survives_field_edits_and_restore(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    client, store = client_for(tmp_path, monkeypatch)
+    job_id, _ = completed_job(store)
+    review = store.read_review(job_id)
+    review["row_overrides"]["machine-row"] = {
+        "changes": {"review_disposition": "rejected"},
+        "pre_rejection_disposition": "unreadable",
+        "reason": "Legacy reviewer rejection",
+        "updated_at": "2026-08-01T00:00:00Z",
+    }
+    (store.job_dir(job_id) / "review.json").write_text(json.dumps(review))
+
+    edited = client.patch(
+        f"/api/v2/documents/{job_id}/rows/machine-row",
+        headers={"If-Match": "0"},
+        json={
+            "changes": {"description": "Corrected legacy rejected charge"},
+            "reason": "Corrected text without changing legacy rejection",
+        },
+    )
+
+    assert edited.status_code == 200
+    row = edited.json()["row"]
+    assert row["bulk_action"] == "restore"
+    assert row["rejection_provenance"] == {
+        "source": "reviewer",
+        "previous_disposition": "unreadable",
+        "legacy_fallback": True,
+    }
+    saved = store.read_review(job_id)["row_overrides"]["machine-row"]
+    assert saved["pre_rejection_disposition"] == "unreadable"
+
+    restored = client.patch(
+        f"/api/v2/documents/{job_id}/rows/bulk",
+        headers={"If-Match": "1"},
+        json={
+            "row_ids": ["machine-row"],
+            "action": "restore",
+            "reason": "Restored to the saved legacy disposition",
+        },
+    )
+
+    assert restored.status_code == 200
+    restored_row = client.get(f"/api/v2/documents/{job_id}/rows").json()["rows"][0]
+    assert restored_row["review_disposition"] == "unreadable"
+
+
 def test_machine_rejected_rows_are_not_reviewer_restorable(tmp_path: Path, monkeypatch) -> None:
     client, store = client_for(tmp_path, monkeypatch)
     job_id, result = completed_job(store)
@@ -1586,6 +1849,82 @@ def test_single_row_editor_uses_the_same_reject_restore_state_machine(
     assert restored.status_code == 200
     assert restored.json()["row"]["review_disposition"] == "accepted"
     assert restored.json()["row"]["bulk_action"] == "reject"
+
+
+def test_service_date_corrections_update_raw_projection_and_clear_authoritatively(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    client, store = client_for(tmp_path, monkeypatch)
+    job_id, result = completed_job(store)
+    result["rows"][0]["service_date_raw"] = "20/01/2026"
+    result["rows"][0]["service_date_iso"] = "2026-01-20"
+    (store.job_dir(job_id) / "result.json").write_text(json.dumps(result))
+
+    changed = client.patch(
+        f"/api/v2/documents/{job_id}/rows/machine-row",
+        headers={"If-Match": "0"},
+        json={
+            "changes": {"service_date_iso": "2026-02-21"},
+            "reason": "Corrected the printed service date",
+        },
+    )
+
+    assert changed.status_code == 200
+    assert changed.json()["row"]["service_date_iso"] == "2026-02-21"
+    assert changed.json()["row"]["service_date_raw"] == "2026-02-21"
+    assert changed.json()["row"]["review"]["machine_values"] == {
+        "service_date_iso": "2026-01-20",
+        "service_date_raw": "20/01/2026",
+    }
+
+    cleared = client.patch(
+        f"/api/v2/documents/{job_id}/rows/machine-row",
+        headers={"If-Match": "1"},
+        json={
+            "changes": {"service_date_iso": ""},
+            "reason": "Confirmed that no service date is printed",
+        },
+    )
+
+    assert cleared.status_code == 200
+    assert cleared.json()["row"]["service_date_iso"] is None
+    assert cleared.json()["row"]["service_date_raw"] is None
+
+    invalid = client.patch(
+        f"/api/v2/documents/{job_id}/rows/machine-row",
+        headers={"If-Match": "2"},
+        json={
+            "changes": {"service_date_iso": "2026-02-30"},
+            "reason": "Attempted an impossible date",
+        },
+    )
+    assert invalid.status_code == 422
+    assert store.read_review(job_id)["revision"] == 2
+
+
+def test_historical_iso_only_date_clear_hides_machine_raw_date(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    client, store = client_for(tmp_path, monkeypatch)
+    job_id, result = completed_job(store)
+    result["rows"][0]["service_date_raw"] = "20/01/2026"
+    result["rows"][0]["service_date_iso"] = "2026-01-20"
+    (store.job_dir(job_id) / "result.json").write_text(json.dumps(result))
+    review = store.read_review(job_id)
+    review["row_overrides"]["machine-row"] = {
+        "changes": {"service_date_iso": None},
+        "reason": "Historical clear before paired date overrides",
+        "updated_at": "2026-08-01T00:00:00Z",
+    }
+    (store.job_dir(job_id) / "review.json").write_text(json.dumps(review))
+
+    row = client.get(f"/api/v2/documents/{job_id}/rows").json()["rows"][0]
+
+    assert row["service_date_iso"] is None
+    assert row["service_date_raw"] is None
+    assert row["review"]["machine_values"]["service_date_raw"] == "20/01/2026"
 
 
 def test_conflicting_explicit_document_totals_are_exposed_without_false_difference(
@@ -2057,6 +2396,68 @@ def test_hospital_link_locked_revalidation_returns_fresh_candidate_contract(
     }
     assert store.read_review(job_id)["revision"] == 0
     assert JsonAliasRepository(api.ALIAS_REGISTRY).read()["revision"] == 0
+
+
+def test_hospital_link_persists_profile_metadata_from_locked_snapshot(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    client, store = client_for(tmp_path / "jobs", monkeypatch)
+    profile_registry = tmp_path / "profiles" / "registry.json"
+    JsonProfileRepository(profile_registry).add_profile(
+        LayoutProfile(
+            contract_version="layout_profile_v1",
+            profile_key="machine-hospital-current-name",
+            profile_version=1,
+            lifecycle=ProfileLifecycle.ACTIVE,
+            hospital_id="profile-machine-hospital",
+            hospital_name="Machine Hospital",
+            page_type=PageType.ITEMIZED_CHARGES,
+            table_type=TableType.ITEM_LEDGER,
+            page_aspect_ratio=0.7,
+            table_box=(0.05, 0.15, 0.95, 0.9),
+            supported_fields=("description", "amount"),
+            construction_dataset_ids=("training",),
+        )
+    )
+    monkeypatch.setattr(api, "PROFILE_REGISTRY", profile_registry)
+    job_id, _ = completed_job(store)
+    original_list = JsonProfileRepository.list_profiles
+    calls = 0
+
+    def changing_profile_name(repository):
+        nonlocal calls
+        calls += 1
+        profiles = original_list(repository)
+        if calls == 1:
+            return profiles
+        return [
+            profile.model_copy(update={"hospital_name": "MACHINE HOSPITAL"})
+            for profile in profiles
+        ]
+
+    monkeypatch.setattr(JsonProfileRepository, "list_profiles", changing_profile_name)
+
+    response = client.post(
+        f"/api/v2/documents/{job_id}/hospital-link",
+        headers={"If-Match": "0"},
+        json={
+            "create": False,
+            "hospital_id": "profile-machine-hospital",
+            "registry_revision": 0,
+            "reason": "Use the current locked profile identity",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["hospital_name"] == "MACHINE HOSPITAL"
+    registry = JsonAliasRepository(api.ALIAS_REGISTRY).read()
+    assert registry["hospitals"][0]["hospital_name"] == "MACHINE HOSPITAL"
+    assert registry["hospitals"][0]["origins"] == ["profile", "reviewer_alias"]
+    review = store.read_review(job_id)
+    assert review["document_overrides"]["hospital_link"]["hospital_name"] == (
+        "MACHINE HOSPITAL"
+    )
 
 
 def test_documents_can_be_discovered_in_newest_first_shared_queue(

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import signal
+import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import Future, ProcessPoolExecutor
@@ -185,8 +187,11 @@ def run_worker_loop(
     last_cleanup = 0.0
     alias_registry_available = alias_coordinator is None
     next_alias_probe = 0.0
+    draining = False
     with executor_factory(**_executor_options(concurrency, paddle_device)) as executor:
-        while not stop_requested():
+        while True:
+            if stop_requested():
+                draining = True
             for future, job_id in list(futures.items()):
                 if not future.done():
                     continue
@@ -211,6 +216,12 @@ def run_worker_loop(
             for state in store.states():
                 if state.get("status") == "cancelling" and state["id"] not in running:
                     store.finalize_abort(state["id"])
+
+            if draining:
+                if not futures:
+                    break
+                sleeper(0.5)
+                continue
 
             now = clock()
             if alias_coordinator is not None:
@@ -261,8 +272,21 @@ def run_worker_loop(
             sleeper(0.5)
 
 
+def shutdown_event() -> threading.Event:
+    event = threading.Event()
+
+    def request_shutdown(signum: int, frame: Any) -> None:
+        del signum, frame
+        event.set()
+
+    signal.signal(signal.SIGTERM, request_shutdown)
+    signal.signal(signal.SIGINT, request_shutdown)
+    return event
+
+
 def main() -> None:
     alias_registry_value = os.environ.get("GMONEY_ALIAS_REGISTRY")
+    stop_event = shutdown_event()
     run_worker_loop(
         root=Path(os.environ.get("GMONEY_DEMO_ROOT", "/tmp/gmoney-v2-demo")),
         vl_url=os.environ.get("GMONEY_VL_URL", "http://paddleocr-vl:8111"),
@@ -270,6 +294,7 @@ def main() -> None:
         concurrency=int(os.environ.get("GMONEY_WORKER_CONCURRENCY", "3")),
         retention_hours=int(os.environ.get("GMONEY_RETENTION_HOURS", "720")),
         alias_registry=(Path(alias_registry_value) if alias_registry_value else None),
+        stop_requested=stop_event.is_set,
     )
 
 

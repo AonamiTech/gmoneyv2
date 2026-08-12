@@ -7,6 +7,7 @@ import json
 import math
 import re
 import zipfile
+from datetime import date
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
@@ -88,7 +89,28 @@ def normalize_changes(changes: dict[str, Any]) -> dict[str, Any]:
     if unsupported:
         raise ReviewValidationError(f"Unsupported fields: {', '.join(sorted(unsupported))}")
     normalized: dict[str, Any] = {}
+    service_date_supplied = "service_date_iso" in changes
+    if service_date_supplied:
+        value = changes["service_date_iso"]
+        if value is None or not str(value).strip():
+            normalized["service_date_iso"] = None
+            normalized["service_date_raw"] = None
+        else:
+            candidate = str(value).strip()
+            try:
+                parsed = date.fromisoformat(candidate)
+            except ValueError as error:
+                raise ReviewValidationError(
+                    "service_date_iso is not a valid ISO date"
+                ) from error
+            rendered = parsed.isoformat()
+            if rendered != candidate:
+                raise ReviewValidationError("service_date_iso is not a valid ISO date")
+            normalized["service_date_iso"] = rendered
+            normalized["service_date_raw"] = rendered
     for field, value in changes.items():
+        if service_date_supplied and field in {"service_date_iso", "service_date_raw"}:
+            continue
         if field in EDITABLE_TEXT_FIELDS:
             if value is None or not str(value).strip():
                 normalized[field] = None
@@ -149,7 +171,9 @@ def project_rows(result: dict[str, Any], review: dict[str, Any]) -> list[dict[st
         row.setdefault("review_disposition", "pending")
         override = review.get("row_overrides", {}).get(str(row["id"]))
         if override:
-            changes = override.get("changes", {})
+            changes = dict(override.get("changes", {}))
+            if "service_date_iso" in changes and "service_date_raw" not in changes:
+                changes["service_date_raw"] = changes["service_date_iso"]
             row.update(changes)
             flags = list(row.get("validation_flags", []))
             if "reviewer_corrected" not in flags:

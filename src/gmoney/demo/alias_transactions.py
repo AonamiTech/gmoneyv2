@@ -54,6 +54,15 @@ class AliasTransactionCoordinator:
         return self.store.job_dir(job_id) / ALIAS_JOURNAL
 
     @staticmethod
+    def _storage(operation: Callable[[], T], message: str) -> T:
+        try:
+            return operation()
+        except AliasRegistryUnavailable:
+            raise
+        except ALIAS_STORAGE_ERRORS as error:
+            raise AliasRegistryUnavailable(message) from error
+
+    @staticmethod
     def _assert_image(journal: dict[str, Any], name: str) -> dict[str, Any]:
         payload = journal.get(name)
         if not isinstance(payload, dict) or _digest(payload) != journal.get(f"{name}_sha256"):
@@ -72,8 +81,8 @@ class AliasTransactionCoordinator:
             target_review = self._assert_image(journal, "target_review")
             base_registry = self._assert_image(journal, "base_registry")
             target_registry = self._assert_image(journal, "target_registry")
-            self.repository._validate(base_registry)
-            self.repository._validate(target_registry)
+            self.repository._validate_supported(base_registry)
+            self.repository._validate_supported(target_registry)
             if target_review.get("revision") != base_review.get("revision", -1) + 1:
                 raise AliasRegistryUnavailable("invalid review revision in alias journal")
             if target_registry.get("revision") != base_registry.get("revision", -1) + 1:
@@ -83,7 +92,7 @@ class AliasTransactionCoordinator:
             current_review = (
                 self.store._read_review_unlocked(job_id) if review_path.is_file() else base_review
             )
-            current_registry = self.repository._read_unlocked()
+            current_registry = self.repository._read_supported_unlocked()
             if _digest(current_review) not in {_digest(base_review), _digest(target_review)}:
                 raise AliasRegistryUnavailable("newer review state blocks alias recovery")
             if _digest(current_registry) not in {
@@ -92,7 +101,7 @@ class AliasTransactionCoordinator:
             }:
                 raise AliasRegistryUnavailable("newer registry state blocks alias recovery")
 
-            self.repository._write_unlocked(target_registry)
+            self.repository._write_supported_unlocked(target_registry)
             durable_json_replace(
                 self.store.job_dir(job_id) / "review.json",
                 target_review,
@@ -105,10 +114,8 @@ class AliasTransactionCoordinator:
             raise AliasRegistryUnavailable("alias operation recovery failed") from error
 
     def recover_job(self, job_id: str) -> None:
-        if not self.journal_path(job_id).is_file():
-            return
         try:
-            with self.repository.locked(exclusive=True):
+            with self.repository.lock(exclusive=True):
                 self._recover_all_unlocked()
         except AliasRegistryUnavailable:
             raise
@@ -117,7 +124,7 @@ class AliasTransactionCoordinator:
 
     def recover_all(self) -> None:
         try:
-            with self.repository.locked(exclusive=True):
+            with self.repository.lock(exclusive=True):
                 self._recover_all_unlocked()
         except AliasRegistryUnavailable:
             raise
@@ -131,10 +138,11 @@ class AliasTransactionCoordinator:
             job_id = journal_path.parent.name
             with self.store.job_lock(job_id, exclusive=True):
                 self._recover_unlocked(job_id)
+        self.repository._migrate_unlocked()
 
     def registry_snapshot(self) -> dict[str, Any]:
         try:
-            with self.repository.locked(exclusive=True):
+            with self.repository.lock(exclusive=True):
                 self._recover_all_unlocked()
                 return json.loads(json.dumps(self.repository._read_unlocked()))
         except AliasRegistryUnavailable:
@@ -148,22 +156,25 @@ class AliasTransactionCoordinator:
         mutation: Callable[[dict[str, Any]], dict[str, Any]],
     ) -> dict[str, Any]:
         """Recover, compare, and mutate without releasing the registry lock."""
-        try:
-            with self.repository.locked(exclusive=True):
-                self._recover_all_unlocked()
-                current = self.repository._read_unlocked()
-                if current["revision"] != expected_revision:
-                    raise AliasRegistryRevisionConflict(current["revision"])
-                updated = mutation(json.loads(json.dumps(current)))
-                updated["revision"] = current["revision"] + 1
-                self.repository._write_unlocked(updated)
-                return updated
-        except AliasRegistryRevisionConflict:
-            raise
-        except AliasRegistryUnavailable:
-            raise
-        except ALIAS_STORAGE_ERRORS as error:
-            raise AliasRegistryUnavailable("alias registry mutation failed") from error
+        with self.repository.lock(exclusive=True):
+            self._storage(
+                self._recover_all_unlocked,
+                "alias registry recovery failed",
+            )
+            current = self._storage(
+                self.repository._read_unlocked,
+                "alias registry read failed",
+            )
+            if current["revision"] != expected_revision:
+                raise AliasRegistryRevisionConflict(current["revision"])
+            updated = mutation(json.loads(json.dumps(current)))
+            updated["revision"] = current["revision"] + 1
+            self.repository._validate(updated)
+            self._storage(
+                lambda: self.repository._write_unlocked(updated),
+                "alias registry write failed",
+            )
+            return updated
 
     def run_job_operation(self, job_id: str, operation: Callable[[], T]) -> T:
         for attempt in range(2):
@@ -196,54 +207,61 @@ class AliasTransactionCoordinator:
             tuple[dict[str, Any], dict[str, Any]],
         ],
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        try:
-            with self.repository.locked(exclusive=True):
-                self._recover_all_unlocked()
-                with self.store.job_lock(job_id, exclusive=True):
-                    self.store._require_stable_workspace(job_id)
-                    registry = self.repository._read_unlocked()
-                    review = self.store._read_review_unlocked(job_id)
-                    review_path = self.store.job_dir(job_id) / "review.json"
-                    if not review_path.is_file():
-                        durable_json_replace(review_path, review, suffix="review.base.tmp")
-                    result_path = self.store.job_dir(job_id) / "result.json"
-                    if not result_path.is_file():
-                        raise JobTransactionError("extraction_result_unavailable")
-                    result = json.loads(result_path.read_text())
-                    if registry["revision"] != expected_registry_revision:
-                        raise AliasRegistryRevisionConflict(registry["revision"])
-                    if review["revision"] != expected_review_revision:
-                        raise ReviewRevisionConflict(review["revision"])
-                    updated_review, updated_registry = mutation(
-                        json.loads(json.dumps(review)),
-                        json.loads(json.dumps(registry)),
-                        result,
-                    )
-                    updated_review["revision"] = review["revision"] + 1
-                    updated_review["updated_at"] = utc_now()
-                    updated_registry["revision"] = registry["revision"] + 1
-                    self.repository._validate(updated_registry)
-                    journal = {
-                        "version": ALIAS_JOURNAL_VERSION,
-                        "job_id": job_id,
-                        "base_review": review,
-                        "target_review": updated_review,
-                        "base_registry": registry,
-                        "target_registry": updated_registry,
-                    }
-                    journal.update(
-                        {
-                            f"{name}_sha256": _digest(payload)
-                            for name, payload in tuple(journal.items())
-                            if name
-                            in {
-                                "base_review",
-                                "target_review",
-                                "base_registry",
-                                "target_registry",
-                            }
+        with self.repository.lock(exclusive=True):
+            self._storage(
+                self._recover_all_unlocked,
+                "alias registry recovery failed",
+            )
+            with self.store.job_lock(job_id, exclusive=True):
+                self.store._require_stable_workspace(job_id)
+                registry = self._storage(
+                    self.repository._read_unlocked,
+                    "alias registry read failed",
+                )
+                review = self.store._read_review_unlocked(job_id)
+                review_path = self.store.job_dir(job_id) / "review.json"
+                if not review_path.is_file():
+                    durable_json_replace(review_path, review, suffix="review.base.tmp")
+                result_path = self.store.job_dir(job_id) / "result.json"
+                if not result_path.is_file():
+                    raise JobTransactionError("extraction_result_unavailable")
+                result = json.loads(result_path.read_text())
+                if registry["revision"] != expected_registry_revision:
+                    raise AliasRegistryRevisionConflict(registry["revision"])
+                if review["revision"] != expected_review_revision:
+                    raise ReviewRevisionConflict(review["revision"])
+                updated_review, updated_registry = mutation(
+                    json.loads(json.dumps(review)),
+                    json.loads(json.dumps(registry)),
+                    result,
+                )
+                updated_review["revision"] = review["revision"] + 1
+                updated_review["updated_at"] = utc_now()
+                updated_registry["revision"] = registry["revision"] + 1
+                self.repository._validate(updated_registry)
+                journal = {
+                    "version": ALIAS_JOURNAL_VERSION,
+                    "job_id": job_id,
+                    "base_review": review,
+                    "target_review": updated_review,
+                    "base_registry": registry,
+                    "target_registry": updated_registry,
+                }
+                journal.update(
+                    {
+                        f"{name}_sha256": _digest(payload)
+                        for name, payload in tuple(journal.items())
+                        if name
+                        in {
+                            "base_review",
+                            "target_review",
+                            "base_registry",
+                            "target_registry",
                         }
-                    )
+                    }
+                )
+
+                def persist_cutover() -> None:
                     durable_json_replace(
                         self.journal_path(job_id), journal, suffix="journal.tmp"
                     )
@@ -254,17 +272,13 @@ class AliasTransactionCoordinator:
                         suffix="review.tmp",
                     )
                     durable_unlink(self.journal_path(job_id))
-                    return updated_review, updated_registry
-        except (AliasRegistryRevisionConflict, ReviewRevisionConflict):
-            raise
-        except AliasRegistryUnavailable:
-            raise
-        except ALIAS_STORAGE_ERRORS as error:
-            raise AliasRegistryUnavailable("alias registry mutation failed") from error
+
+                self._storage(persist_cutover, "alias registry mutation failed")
+                return updated_review, updated_registry
 
     def delete_job(self, job_id: str) -> None:
         try:
-            with self.repository.locked(exclusive=True):
+            with self.repository.lock(exclusive=True):
                 self._recover_all_unlocked()
                 with self.store.job_lock(job_id, exclusive=True):
                     state = self.store.read(job_id)
@@ -282,7 +296,7 @@ class AliasTransactionCoordinator:
         cutoff = datetime.now(UTC) - timedelta(hours=retention_hours)
         removed = 0
         try:
-            with self.repository.locked(exclusive=True):
+            with self.repository.lock(exclusive=True):
                 self._recover_all_unlocked()
                 for observed in self.store.states():
                     job_id = str(observed["id"])

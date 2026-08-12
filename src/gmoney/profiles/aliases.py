@@ -4,7 +4,7 @@ import json
 import os
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import UTC, datetime
 from fcntl import LOCK_EX, LOCK_SH, flock
 from pathlib import Path
 from typing import Any
@@ -17,7 +17,8 @@ from gmoney.normalization import (
     normalize_hospital_name,
 )
 
-ALIAS_REGISTRY_VERSION = "hospital_alias_registry_v2"
+LEGACY_ALIAS_REGISTRY_VERSION = "hospital_alias_registry_v2"
+ALIAS_REGISTRY_VERSION = "hospital_alias_registry_v3"
 
 ALIAS_CANONICAL_FIELDS = frozenset(
     {
@@ -107,7 +108,7 @@ class AliasRegistryUnavailable(RuntimeError):
 
 
 class AliasRegistryFormatError(ValueError):
-    """Persisted alias registry content does not satisfy the v2 schema."""
+    """Persisted alias registry content does not satisfy a supported schema."""
 
 
 def _required_text(payload: dict[str, Any], field: str, context: str) -> str:
@@ -135,11 +136,14 @@ class JsonAliasRepository:
         self.path = path
         self.lock_path = path.with_suffix(f"{path.suffix}.lock")
 
-    def _validate(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def _validate_contents(
+        self,
+        payload: dict[str, Any],
+        *,
+        require_event_reviewer: bool,
+    ) -> dict[str, Any]:
         if not isinstance(payload, dict):
             raise AliasRegistryFormatError("hospital alias registry is not an object")
-        if payload.get("registry_version") != ALIAS_REGISTRY_VERSION:
-            raise AliasRegistryFormatError("unsupported hospital alias registry")
         if payload.get("header_normalizer_version") != HEADER_NORMALIZER_VERSION:
             raise AliasRegistryFormatError("unsupported header normalizer")
         if payload.get("hospital_normalizer_version") != HOSPITAL_NORMALIZER_VERSION:
@@ -254,10 +258,33 @@ class JsonAliasRepository:
             _required_timestamp(alias, "updated_at", "hospital alias")
         for event in events:
             _required_text(event, "action", "hospital alias audit event")
-            _required_text(event, "reviewer", "hospital alias audit event")
+            if require_event_reviewer or "reviewer" in event:
+                _required_text(event, "reviewer", "hospital alias audit event")
             _required_text(event, "reason", "hospital alias audit event")
             _required_timestamp(event, "created_at", "hospital alias audit event")
         return payload
+
+    def _validate(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(payload, dict) or payload.get(
+            "registry_version"
+        ) != ALIAS_REGISTRY_VERSION:
+            raise AliasRegistryFormatError("unsupported hospital alias registry")
+        return self._validate_contents(payload, require_event_reviewer=True)
+
+    def _validate_supported(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            raise AliasRegistryFormatError("hospital alias registry is not an object")
+        version = payload.get("registry_version")
+        if version == ALIAS_REGISTRY_VERSION:
+            return self._validate_contents(payload, require_event_reviewer=True)
+        if version == LEGACY_ALIAS_REGISTRY_VERSION:
+            return self._validate_contents(payload, require_event_reviewer=False)
+        raise AliasRegistryFormatError("unsupported hospital alias registry")
+
+    def _read_supported_unlocked(self) -> dict[str, Any]:
+        if not self.path.is_file():
+            return empty_alias_registry()
+        return self._validate_supported(json.loads(self.path.read_text()))
 
     def _read_unlocked(self) -> dict[str, Any]:
         if not self.path.is_file():
@@ -267,23 +294,68 @@ class JsonAliasRepository:
     def _write_unlocked(self, payload: dict[str, Any]) -> None:
         durable_json_replace(self.path, self._validate(payload), suffix="registry.tmp")
 
+    def _write_supported_unlocked(self, payload: dict[str, Any]) -> None:
+        durable_json_replace(
+            self.path,
+            self._validate_supported(payload),
+            suffix="registry.tmp",
+        )
+
+    def _migrate_unlocked(self) -> dict[str, Any]:
+        current = self._read_supported_unlocked()
+        if current["registry_version"] == ALIAS_REGISTRY_VERSION:
+            return current
+        migrated = json.loads(json.dumps(current))
+        for event in migrated["events"]:
+            event.setdefault("reviewer", "legacy-unknown")
+        migrated["registry_version"] = ALIAS_REGISTRY_VERSION
+        migrated["revision"] = current["revision"] + 1
+        migrated["events"].append(
+            {
+                "action": "alias_registry_migrated",
+                "from_registry_version": LEGACY_ALIAS_REGISTRY_VERSION,
+                "to_registry_version": ALIAS_REGISTRY_VERSION,
+                "reviewer": "system:migration",
+                "reason": "Migrated the alias registry to the strict v3 schema",
+                "created_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            }
+        )
+        self._write_unlocked(migrated)
+        return migrated
+
+    @contextmanager
+    def lock(self, *, exclusive: bool) -> Iterator[None]:
+        try:
+            self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+            lock = self.lock_path.open("a+")
+            try:
+                flock(lock.fileno(), LOCK_EX if exclusive else LOCK_SH)
+            except OSError:
+                lock.close()
+                raise
+        except OSError as error:
+            raise AliasRegistryUnavailable("alias registry lock is unavailable") from error
+        try:
+            yield
+        finally:
+            lock.close()
+
     @contextmanager
     def locked(self, *, exclusive: bool) -> Iterator[dict[str, Any]]:
-        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.lock_path.open("a+") as lock:
-            flock(lock.fileno(), LOCK_EX if exclusive else LOCK_SH)
-            yield self._read_unlocked()
+        with self.lock(exclusive=exclusive):
+            yield self._read_supported_unlocked()
 
     def read(self) -> dict[str, Any]:
-        with self.locked(exclusive=False) as payload:
-            return json.loads(json.dumps(payload))
+        with self.locked(exclusive=True):
+            return json.loads(json.dumps(self._migrate_unlocked()))
 
     def mutate(
         self,
         expected_revision: int,
         mutation: Callable[[dict[str, Any]], dict[str, Any]],
     ) -> dict[str, Any]:
-        with self.locked(exclusive=True) as current:
+        with self.locked(exclusive=True):
+            current = self._migrate_unlocked()
             if current["revision"] != expected_revision:
                 raise AliasRegistryRevisionConflict(current["revision"])
             updated = mutation(json.loads(json.dumps(current)))

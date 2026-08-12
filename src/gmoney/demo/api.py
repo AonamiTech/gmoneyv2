@@ -334,6 +334,19 @@ def _registry_event(action: str, reason: str, **details: Any) -> dict[str, Any]:
     }
 
 
+def _merge_row_override(
+    previous: dict[str, Any],
+    changes: dict[str, Any],
+    reason: str,
+) -> dict[str, Any]:
+    """Update row values without discarding disposition provenance metadata."""
+    updated = dict(previous)
+    updated["changes"] = {**previous.get("changes", {}), **changes}
+    updated["reason"] = reason.strip()
+    updated["updated_at"] = utc_now()
+    return updated
+
+
 def _alias_coordinator() -> AliasTransactionCoordinator:
     return AliasTransactionCoordinator(store, ALIAS_REGISTRY)
 
@@ -1046,11 +1059,7 @@ def link_document_hospital(
                 "candidate_ids": sorted(registry_matches),
             },
         )
-    canonical_name = (
-        str(existing["hospital_name"])
-        if existing
-        else profile_names.get(hospital_id, selected_name)
-    )
+    canonical_name_holder: dict[str, str] = {}
 
     def coordinated_mutation(
         review: dict[str, Any], registry: dict[str, Any], locked_result: dict[str, Any]
@@ -1093,10 +1102,16 @@ def link_document_hospital(
             raise HospitalSelectionNotCandidate(locked_candidates)
         if owners - {hospital_id}:
             raise HospitalIdentityConflict("hospital_name_conflict", owners)
+        locked_canonical_name = (
+            str(record["hospital_name"])
+            if record is not None
+            else locked_profile_names.get(hospital_id, selected_name)
+        )
+        canonical_name_holder["value"] = locked_canonical_name
         if record is None:
             record = {
                 "hospital_id": hospital_id,
-                "hospital_name": canonical_name,
+                "hospital_name": locked_canonical_name,
                 "origins": [],
                 "name_variants": [],
                 "created_at": utc_now(),
@@ -1104,7 +1119,7 @@ def link_document_hospital(
             }
             registry["hospitals"].append(record)
         for origin in (
-            "profile" if hospital_id in profile_names else None,
+            "profile" if hospital_id in locked_profile_names else None,
             "reviewer_alias",
         ):
             if origin and origin not in record["origins"]:
@@ -1134,7 +1149,7 @@ def link_document_hospital(
         )
         review.setdefault("document_overrides", {})["hospital_link"] = {
             "hospital_id": hospital_id,
-            "hospital_name": canonical_name,
+            "hospital_name": locked_canonical_name,
             "reason": payload.reason.strip(),
             "updated_at": utc_now(),
         }
@@ -1145,7 +1160,7 @@ def link_document_hospital(
                 "hospital_linked",
                 hospital_id,
                 payload.reason,
-                {"hospital_name": canonical_name},
+                {"hospital_name": locked_canonical_name},
             )
         )
         return review, registry
@@ -1160,7 +1175,7 @@ def link_document_hospital(
         "review_revision": review["revision"],
         "registry_revision": updated_registry["revision"],
         "hospital_id": hospital_id,
-        "hospital_name": canonical_name,
+        "hospital_name": canonical_name_holder["value"],
     }
 
 
@@ -1342,11 +1357,11 @@ def apply_column_alias(
                 current["added_rows"][row_id]["review_reason"] = payload.reason.strip()
             else:
                 previous = current["row_overrides"].get(row_id, {})
-                current["row_overrides"][row_id] = {
-                    "changes": {**previous.get("changes", {}), **changes},
-                    "reason": payload.reason.strip(),
-                    "updated_at": utc_now(),
-                }
+                current["row_overrides"][row_id] = _merge_row_override(
+                    previous,
+                    changes,
+                    payload.reason,
+                )
         current["approval"] = None
         current["events"].append(
             _event(
@@ -1394,6 +1409,7 @@ def update_column_alias(
         if payload.canonical_field is not None
         else None
     )
+
     def mutation(current: dict[str, Any]) -> dict[str, Any]:
         alias = next(
             (
@@ -1594,7 +1610,10 @@ def update_row(
 ) -> dict[str, Any]:
     result, _ = _complete_result(job_id)
     expected = _expected_revision(if_match)
-    changes = normalize_changes(payload.changes) if payload.changes else {}
+    try:
+        changes = normalize_changes(payload.changes) if payload.changes else {}
+    except ReviewValidationError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
     if (payload.page_number is None) != (payload.polygon is None):
         raise HTTPException(
             status_code=422,
@@ -1648,16 +1667,11 @@ def update_row(
             review["added_rows"][row_id]["review_reason"] = payload.reason.strip()
         else:
             previous = review["row_overrides"].get(row_id, {})
-            review["row_overrides"][row_id] = {
-                "changes": {**previous.get("changes", {}), **row_changes},
-                "reason": payload.reason.strip(),
-                "updated_at": utc_now(),
-                **(
-                    {"rejection": previous["rejection"]}
-                    if isinstance(previous.get("rejection"), dict)
-                    else {}
-                ),
-            }
+            review["row_overrides"][row_id] = _merge_row_override(
+                previous,
+                row_changes,
+                payload.reason,
+            )
         review["approval"] = None
         review["events"].append(
             _event(expected + 1, "row_updated", row_id, payload.reason, audit_changes)

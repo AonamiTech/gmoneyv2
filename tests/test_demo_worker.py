@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import multiprocessing
+import os
+import signal
 import threading
 import time
 from collections.abc import Iterator
@@ -210,6 +212,38 @@ def _run_controlled_worker_loop(
         stop_requested=stop_event.is_set,
         executor_factory=ThreadPoolExecutor,
         job_runner=_controlled_worker_job,
+    )
+
+
+def _run_signal_controlled_worker_loop(root_value: str, registry_value: str) -> None:
+    stop_event = worker_module.shutdown_event()
+    _run_controlled_worker_loop(root_value, registry_value, stop_event)
+
+
+def _run_registry_retry_timing_worker(
+    root_value: str,
+    registry_value: str,
+    stop_event: Any,
+    sender: Connection,
+) -> None:
+    class UnavailableCoordinator:
+        def registry_snapshot(self) -> None:
+            sender.send(time.monotonic())
+            raise AliasRegistryUnavailable("registry unavailable")
+
+    def coordinator_factory(store: JobStore, path: Path) -> UnavailableCoordinator:
+        return UnavailableCoordinator()
+
+    worker_module.run_worker_loop(
+        root=Path(root_value),
+        vl_url="http://vl.test",
+        paddle_device="cpu",
+        concurrency=1,
+        retention_hours=720,
+        alias_registry=Path(registry_value),
+        stop_requested=stop_event.is_set,
+        executor_factory=ThreadPoolExecutor,
+        coordinator_factory=coordinator_factory,
     )
 
 
@@ -715,6 +749,83 @@ def test_worker_loop_uses_five_second_registry_retry_interval(tmp_path: Path) ->
     )
 
     assert observed_probes == [0.0, 5.0]
+
+
+def test_spawned_worker_retries_unavailable_registry_after_five_seconds(
+    tmp_path: Path,
+) -> None:
+    context = multiprocessing.get_context("spawn")
+    stop_event = context.Event()
+    receiver, sender = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_run_registry_retry_timing_worker,
+        args=(
+            str(tmp_path),
+            str(tmp_path / "alias-registry.json"),
+            stop_event,
+            sender,
+        ),
+    )
+    process.start()
+    sender.close()
+    try:
+        assert receiver.poll(8)
+        first = receiver.recv()
+        assert receiver.poll(8)
+        second = receiver.recv()
+        assert 5.0 <= second - first < 6.0
+    finally:
+        stop_event.set()
+        receiver.close()
+        process.join(timeout=5)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+    assert process.exitcode == 0
+
+
+def test_sigterm_drains_running_job_without_claiming_new_work(
+    tmp_path: Path,
+) -> None:
+    store = JobStore(tmp_path)
+    registry = tmp_path / "alias-registry.json"
+    running_id = _create_worker_job(store, "Running during shutdown.pdf")
+    hold = store.job_dir(running_id) / ".test-hold"
+    hold.touch()
+    context = multiprocessing.get_context("spawn")
+    process = context.Process(
+        target=_run_signal_controlled_worker_loop,
+        args=(str(tmp_path), str(registry)),
+    )
+    process.start()
+    try:
+        _wait_until(
+            lambda: (store.job_dir(running_id) / ".test-runner-started").exists()
+            and store.read(running_id)["status"] == "processing",
+            timeout=30,
+        )
+        os.kill(process.pid, signal.SIGTERM)
+        time.sleep(0.75)
+        assert process.is_alive()
+        queued_id = _create_worker_job(store, "Queued during shutdown.pdf")
+        time.sleep(0.75)
+        assert store.read(queued_id)["status"] == "queued"
+
+        hold.unlink()
+        process.join(timeout=8)
+
+        assert not process.is_alive()
+        assert process.exitcode == 0
+        assert store.read(running_id)["status"] == "complete"
+        assert store.read(queued_id)["status"] == "queued"
+    finally:
+        hold.unlink(missing_ok=True)
+        if process.is_alive():
+            os.kill(process.pid, signal.SIGTERM)
+            process.join(timeout=5)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
 
 
 def test_worker_process_survives_registry_outage_and_recovers_later_job(
