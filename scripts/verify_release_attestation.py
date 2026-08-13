@@ -6,13 +6,14 @@ import json
 import re
 import subprocess
 import urllib.request
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 RELEASE_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 RELEASE_LABEL = "org.opencontainers.image.revision"
 SERVICES = ("api", "frontend", "worker")
+UTC = timezone.utc  # noqa: UP017 - deployment hosts include Python 3.10.
 
 
 def _run(command: list[str]) -> str:
