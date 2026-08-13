@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import logging
 import os
 import signal
 import threading
@@ -7,23 +9,27 @@ import time
 from collections.abc import Callable
 from concurrent.futures import Future, ProcessPoolExecutor
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TextIO
 
 from gmoney.contracts.phase3 import ProfileRegistrySnapshot
 from gmoney.demo.alias_transactions import AliasTransactionCoordinator
 from gmoney.demo.store import JobStore, is_gpu_device
-from gmoney.profiles.aliases import AliasRegistryUnavailable
+from gmoney.profiles.aliases import AliasRegistryUnavailable, durable_json_replace
 from gmoney.profiles.repository import (
     HospitalIdentityConflict,
     JsonProfileRepository,
     ProfileRegistryUnavailable,
     active_hospital_identities,
 )
+from gmoney.release import build_revision
 
 _extractor: Any = None
 _gpu_inference_lock: TextIO | None = None
 ALIAS_REGISTRY_RETRY_SECONDS = 5.0
+WORKER_STATUS_INTERVAL_SECONDS = 10.0
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -82,6 +88,7 @@ def _extract_and_publish(
     except ExtractionAborted:
         return None
     result["source_name"] = state["original_name"]
+    result["worker_release_revision"] = build_revision()
     if not store.publish_processing_result(job_id, result):
         return None
     hospital = result.get("hospital") or {}
@@ -310,6 +317,8 @@ def run_worker_loop(
     alias_retry_seconds: float = ALIAS_REGISTRY_RETRY_SECONDS,
     clock: Callable[[], float] = time.monotonic,
     sleeper: Callable[[float], None] = time.sleep,
+    worker_status_path: Path | None = None,
+    identity_captured: Callable[[RuntimeIdentitySnapshot], None] | None = None,
 ) -> None:
     store = JobStore(root)
     store.recover()
@@ -329,8 +338,46 @@ def run_worker_loop(
     draining = False
     fatal_error: Exception | None = None
     pending_identity_snapshot: RuntimeIdentitySnapshot | None = None
+    release_revision = build_revision()
+    worker_started_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    last_worker_status = float("-inf")
+    logger.info(
+        json.dumps(
+            {
+                "event": "worker_started",
+                "release_revision": release_revision,
+                "paddle_device": paddle_device,
+                "concurrency": concurrency,
+            },
+            sort_keys=True,
+        )
+    )
+
+    def publish_worker_status(now: float, status: str = "running") -> None:
+        nonlocal last_worker_status
+        if worker_status_path is None:
+            return
+        durable_json_replace(
+            worker_status_path,
+            {
+                "status_version": "worker_status_v1",
+                "status": status,
+                "release_revision": release_revision,
+                "started_at": worker_started_at,
+                "updated_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                "pid": os.getpid(),
+                "paddle_device": paddle_device,
+                "concurrency": concurrency,
+            },
+            suffix="worker-status.tmp",
+        )
+        last_worker_status = now
+
     with executor_factory(**_executor_options(concurrency, paddle_device)) as executor:
         while True:
+            now = clock()
+            if now - last_worker_status >= WORKER_STATUS_INTERVAL_SECONDS:
+                publish_worker_status(now)
             if stop_requested():
                 draining = True
             for future, job_id in list(futures.items()):
@@ -370,7 +417,6 @@ def run_worker_loop(
                 sleeper(0.5)
                 continue
 
-            now = clock()
             if alias_coordinator is not None or profile_repository is not None:
                 cleanup_due = now - last_cleanup >= 300
                 should_probe = (
@@ -438,6 +484,8 @@ def run_worker_loop(
                                 stop_requested,
                             )
                             break
+                    if identity_captured is not None:
+                        identity_captured(identity_snapshot)
                     try:
                         claimed = store.claim_queued(job_id, stop_requested)
                     except KeyError:
@@ -474,6 +522,26 @@ def run_worker_loop(
                             store.requeue_claimed(job_id)
                             break
                     futures[future] = job_id
+                    logger.info(
+                        json.dumps(
+                            {
+                                "event": "worker_job_submitted",
+                                "job_id": job_id,
+                                "release_revision": release_revision,
+                                "profile_registry_revision": (
+                                    identity_snapshot.profiles.revision
+                                    if identity_snapshot.profiles is not None
+                                    else None
+                                ),
+                                "alias_registry_revision": (
+                                    identity_snapshot.aliases.get("revision")
+                                    if identity_snapshot.aliases is not None
+                                    else None
+                                ),
+                            },
+                            sort_keys=True,
+                        )
+                    )
                     if draining:
                         break
 
@@ -495,6 +563,7 @@ def run_worker_loop(
                     registry_error = "alias_registry_unavailable"
                     next_registry_probe = now + alias_retry_seconds
             sleeper(0.5)
+    publish_worker_status(clock(), "stopped")
 
 
 def shutdown_event() -> threading.Event:
@@ -510,6 +579,8 @@ def shutdown_event() -> threading.Event:
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO)
+    build_revision()
     alias_registry_value = os.environ.get("GMONEY_ALIAS_REGISTRY")
     profile_registry_value = os.environ.get("GMONEY_PROFILE_REGISTRY")
     stop_event = shutdown_event()
@@ -522,6 +593,11 @@ def main() -> None:
         alias_registry=(Path(alias_registry_value) if alias_registry_value else None),
         profile_registry=(
             Path(profile_registry_value) if profile_registry_value else None
+        ),
+        worker_status_path=(
+            Path(value)
+            if (value := os.environ.get("GMONEY_WORKER_STATUS_PATH"))
+            else None
         ),
         stop_requested=stop_event.is_set,
     )

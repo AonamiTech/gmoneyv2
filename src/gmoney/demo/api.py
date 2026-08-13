@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 from contextlib import suppress
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -63,6 +64,7 @@ from gmoney.profiles.repository import (
     combined_hospital_name_owners,
     validate_combined_hospital_identities,
 )
+from gmoney.release import build_revision
 
 MAX_UPLOAD_BYTES = int(os.environ.get("GMONEY_MAX_UPLOAD_BYTES", "0"))
 MAX_ACTIVE_JOBS = int(os.environ.get("GMONEY_MAX_ACTIVE_JOBS", "20"))
@@ -70,6 +72,10 @@ MAX_PDF_PAGES = int(os.environ.get("GMONEY_MAX_PDF_PAGES", "200"))
 WORKER_CAPACITY = int(os.environ.get("GMONEY_WORKER_CAPACITY", "2"))
 RETENTION_HOURS = int(os.environ.get("GMONEY_RETENTION_HOURS", "720"))
 MIN_FREE_BYTES = int(os.environ.get("GMONEY_MIN_FREE_BYTES", "0"))
+RELEASE_REVISION = build_revision()
+WORKER_STATUS_MAX_AGE_SECONDS = int(
+    os.environ.get("GMONEY_WORKER_STATUS_MAX_AGE_SECONDS", "30")
+)
 DEMO_ROOT = Path(os.environ.get("GMONEY_DEMO_ROOT", "/tmp/gmoney-v2-demo"))
 PROFILE_REGISTRY = Path(
     os.environ.get("GMONEY_PROFILE_REGISTRY", str(DEMO_ROOT / "profile-registry.json"))
@@ -82,6 +88,9 @@ PROFILE_REGISTRY_LOCK = Path(
 )
 ALIAS_REGISTRY = Path(
     os.environ.get("GMONEY_ALIAS_REGISTRY", str(DEMO_ROOT / "alias-registry.json"))
+)
+WORKER_STATUS_PATH = (
+    Path(value) if (value := os.environ.get("GMONEY_WORKER_STATUS_PATH")) else None
 )
 store = JobStore(DEMO_ROOT)
 logger = logging.getLogger(__name__)
@@ -686,11 +695,40 @@ def live() -> dict[str, str]:
 
 
 @app.get("/api/v2/health/ready", tags=["health"])
-def ready() -> dict[str, Any]:
+def ready(response: Response) -> dict[str, Any]:
     profiles, aliases, _ = _identity_snapshots()
     storage = shutil.disk_usage(store.jobs_root)
+    worker_release_revision: str | None = None
+    worker_status_updated_at: str | None = None
+    release_consistent = True
+    worker_ready = True
+    if WORKER_STATUS_PATH is not None:
+        try:
+            worker_status = json.loads(WORKER_STATUS_PATH.read_text())
+            worker_release_revision = str(worker_status["release_revision"])
+            worker_status_updated_at = str(worker_status["updated_at"])
+            updated_at = datetime.fromisoformat(
+                worker_status_updated_at.replace("Z", "+00:00")
+            )
+            age = (datetime.now(UTC) - updated_at).total_seconds()
+            worker_ready = (
+                worker_status.get("status") == "running"
+                and updated_at.tzinfo is not None
+                and -5 <= age <= WORKER_STATUS_MAX_AGE_SECONDS
+            )
+            release_consistent = worker_release_revision == RELEASE_REVISION
+        except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+            worker_ready = False
+            release_consistent = False
+    status_value = "ready" if worker_ready and release_consistent else "unready"
+    if status_value != "ready":
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
     return {
-        "status": "ready",
+        "status": status_value,
+        "release_revision": RELEASE_REVISION,
+        "worker_release_revision": worker_release_revision,
+        "worker_status_updated_at": worker_status_updated_at,
+        "release_consistent": release_consistent,
         "profile_revision": profiles.revision,
         "alias_registry_revision": aliases["revision"],
         "active_jobs": store.active_count(),

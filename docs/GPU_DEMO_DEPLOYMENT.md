@@ -34,6 +34,8 @@ From the release directory on the GPU host:
 
 ```bash
 export GMONEY_IMAGE_TAG=<release-id>
+export GMONEY_BUILD_REVISION="$(git rev-parse HEAD)"
+test "${#GMONEY_BUILD_REVISION}" -eq 40
 export GMONEY_DATA_ROOT=/home/ubuntu/gmoneyv2-runtime
 export GMONEY_MODEL_ROOT=/home/ubuntu/gmoneyv2-runtime/model-cache
 export GMONEY_PROFILE_ROOT=/home/ubuntu/gmoneyv2-runtime/profiles
@@ -45,6 +47,11 @@ install -d -o 10001 -g 10001 \
   "$GMONEY_DATA_ROOT/jobs" "$GMONEY_DATA_ROOT/config" "$GMONEY_PROFILE_ROOT"
 docker compose -f compose.demo.yaml -f compose.gpu.yaml up -d --build
 ```
+
+`GMONEY_BUILD_REVISION` is baked into every application image and its
+`org.opencontainers.image.revision` label. The GPU overlay refuses to start the
+API or worker when the image contains an unknown or malformed revision. Do not
+override this value through container runtime environment settings.
 
 The base demo always binds host port `3100`. If the cloud firewall only admits
 standard HTTP, set `GMONEY_PUBLIC_HTTP_PORT=80` to add a second binding while
@@ -72,6 +79,11 @@ docker compose -f compose.demo.yaml -f compose.gpu.yaml --profile admin \
 docker compose -f compose.demo.yaml -f compose.gpu.yaml --profile admin \
   run --rm profile-admin validate
 ```
+
+These preflights are inspection-only with respect to registries, reviews, and
+pending journals. `validate` reports whether recovery or migration is required;
+it does not perform either operation. `check-access` creates and removes only
+temporary permission probes and acquires the configured locks.
 
 Run mutating commands through the same service. Registry, alias, jobs, and lock
 paths come from the service environment and must not be overridden:
@@ -101,6 +113,10 @@ command. The API and worker retain read-only profile mounts.
 - `/api/v2/health/ready` reports ready with one worker lane, the public UI and
   health path return HTTP 200 on port 3100, and ports 8100/8111 are unreachable
   remotely while remaining healthy through loopback.
+- `/api/v2/health/ready` and `/build.json` report the same full release SHA;
+  readiness also reports a fresh worker heartbeat and `release_consistent=true`.
+- `docker image inspect` reports that same SHA in the
+  `org.opencontainers.image.revision` label for API, frontend, and GPU worker.
 - A real PDF upload reaches `complete`, produces grounded rows and page evidence,
   survives a Compose restart, and records `gpu:0`/`cuda:0` in newly written
   inference cache model specifications.

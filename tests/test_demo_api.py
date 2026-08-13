@@ -8,6 +8,7 @@ import threading
 import time
 import zipfile
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 
 import fitz
@@ -2575,6 +2576,46 @@ def test_profile_registry_outages_return_structured_503(
     )
     assert response.status_code == 503
     assert response.json()["detail"] == {"code": "profile_registry_unavailable"}
+
+
+def test_readiness_attests_live_worker_release(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _ = client_for(tmp_path, monkeypatch)
+    revision = "a" * 40
+    status_path = tmp_path / "worker-status.json"
+    status_path.write_text(
+        json.dumps(
+            {
+                "status_version": "worker_status_v1",
+                "status": "running",
+                "release_revision": revision,
+                "started_at": "2026-08-13T00:00:00Z",
+                "updated_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                "pid": 123,
+                "paddle_device": "gpu:0",
+                "concurrency": 1,
+            }
+        )
+    )
+    monkeypatch.setattr(api, "RELEASE_REVISION", revision)
+    monkeypatch.setattr(api, "WORKER_STATUS_PATH", status_path)
+
+    ready = client.get("/api/v2/health/ready")
+
+    assert ready.status_code == 200
+    assert ready.json()["release_revision"] == revision
+    assert ready.json()["worker_release_revision"] == revision
+    assert ready.json()["release_consistent"] is True
+
+    worker_status = json.loads(status_path.read_text())
+    worker_status["release_revision"] = "b" * 40
+    status_path.write_text(json.dumps(worker_status))
+    mismatch = client.get("/api/v2/health/ready")
+    assert mismatch.status_code == 503
+    assert mismatch.json()["status"] == "unready"
+    assert mismatch.json()["release_consistent"] is False
 
 
 def test_hospital_link_locked_profile_failure_returns_structured_503(

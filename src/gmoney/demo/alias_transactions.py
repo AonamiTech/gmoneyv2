@@ -4,6 +4,8 @@ import hashlib
 import json
 import shutil
 from collections.abc import Callable
+from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, TypeVar
@@ -17,6 +19,7 @@ from gmoney.demo.store import (
     utc_now,
 )
 from gmoney.profiles.aliases import (
+    ALIAS_REGISTRY_VERSION,
     AliasRegistryFormatError,
     AliasRegistryRevisionConflict,
     AliasRegistryUnavailable,
@@ -46,6 +49,16 @@ ALIAS_STORAGE_ERRORS = (
     json.JSONDecodeError,
     AliasRegistryFormatError,
 )
+
+
+@dataclass(frozen=True)
+class AliasRegistryProjection:
+    persisted: dict[str, Any]
+    projected: dict[str, Any]
+    pending_journal_count: int
+    recovery_required: bool
+    migration_required: bool
+    journal_paths: tuple[Path, ...]
 
 
 def _digest(payload: dict[str, Any]) -> str:
@@ -139,6 +152,75 @@ class AliasTransactionCoordinator:
         except ALIAS_STORAGE_ERRORS as error:
             raise AliasRegistryUnavailable("alias operation recovery failed") from error
 
+    def _project_unlocked(self, journal_path: Path, registry: dict[str, Any]) -> dict[str, Any]:
+        """Validate one journal and return its target without writing any file."""
+        job_id = journal_path.parent.name
+        try:
+            journal = json.loads(journal_path.read_text())
+            if journal.get("version") != ALIAS_JOURNAL_VERSION or journal.get("job_id") != job_id:
+                raise AliasRegistryUnavailable("unsupported alias operation journal")
+            base_review = self._assert_image(journal, "base_review")
+            target_review = self._assert_image(journal, "target_review")
+            base_registry = self._assert_image(journal, "base_registry")
+            target_registry = self._assert_image(journal, "target_registry")
+            self.repository._validate_supported(base_registry)
+            self.repository._validate_supported(target_registry)
+            if target_review.get("revision") != base_review.get("revision", -1) + 1:
+                raise AliasRegistryUnavailable("invalid review revision in alias journal")
+            if target_registry.get("revision") != base_registry.get("revision", -1) + 1:
+                raise AliasRegistryUnavailable("invalid registry revision in alias journal")
+
+            review_path = journal_path.parent / "review.json"
+            current_review = (
+                self.store._read_review_unlocked(job_id)
+                if review_path.is_file()
+                else base_review
+            )
+            if _digest(current_review) not in {_digest(base_review), _digest(target_review)}:
+                raise AliasRegistryUnavailable("newer review state blocks alias recovery")
+            if _digest(registry) not in {_digest(base_registry), _digest(target_registry)}:
+                raise AliasRegistryUnavailable("newer registry state blocks alias recovery")
+            return json.loads(json.dumps(target_registry))
+        except AliasRegistryUnavailable:
+            raise
+        except ALIAS_STORAGE_ERRORS as error:
+            raise AliasRegistryUnavailable("alias operation projection failed") from error
+
+    @contextmanager
+    def _projection_unlocked(self, *, exclusive: bool = False) -> Any:
+        """Hold every affected job lock and expose a read-only recovered projection."""
+        journals = sorted(self.store.jobs_root.glob(f"*/{ALIAS_JOURNAL}"))
+        with ExitStack() as locks:
+            for journal_path in journals:
+                locks.enter_context(
+                    self.store.job_lock(journal_path.parent.name, exclusive=exclusive)
+                )
+            persisted = self.repository._read_supported_unlocked()
+            projected = json.loads(json.dumps(persisted))
+            registry_exists = self.repository.path.is_file()
+            for journal_path in journals:
+                journal = json.loads(journal_path.read_text())
+                base_registry = self._assert_image(journal, "base_registry")
+                if (
+                    not registry_exists
+                    and self._is_empty_registry_image(base_registry)
+                    and self._is_empty_registry_image(projected)
+                ):
+                    projected = json.loads(json.dumps(base_registry))
+                projected = self._project_unlocked(journal_path, projected)
+                registry_exists = True
+            migration_required = projected.get("registry_version") != ALIAS_REGISTRY_VERSION
+            if migration_required:
+                projected = self.repository._migrate_image(projected)
+            yield AliasRegistryProjection(
+                persisted=json.loads(json.dumps(persisted)),
+                projected=json.loads(json.dumps(projected)),
+                pending_journal_count=len(journals),
+                recovery_required=bool(journals),
+                migration_required=migration_required,
+                journal_paths=tuple(journals),
+            )
+
     def recover_job(self, job_id: str) -> None:
         try:
             with self.repository.lock(exclusive=True):
@@ -191,6 +273,36 @@ class AliasTransactionCoordinator:
                 json.loads(json.dumps(identities)),
             )
 
+    def inspect_identity_snapshots(
+        self,
+        profile_repository: JsonProfileRepository,
+    ) -> tuple[
+        ProfileRegistrySnapshot,
+        AliasRegistryProjection,
+        dict[str, dict[str, Any]],
+    ]:
+        """Validate the projected runtime identity view without recovery or migration."""
+        try:
+            with (
+                profile_repository.lock(exclusive=False),
+                self.repository.lock(exclusive=False),
+                self._projection_unlocked() as projection,
+            ):
+                profiles = profile_repository._load_unlocked()
+                identities = active_hospital_identities(profiles)
+                validate_combined_hospital_identities(identities, projection.projected)
+                return (
+                    profiles.model_copy(deep=True),
+                    projection,
+                    json.loads(json.dumps(identities)),
+                )
+        except (AliasRegistryUnavailable, ProfileRegistryUnavailable):
+            raise
+        except (*PROFILE_STORAGE_ERRORS, ProfileRegistryFormatError) as error:
+            raise ProfileRegistryUnavailable("profile registry is unavailable") from error
+        except ALIAS_STORAGE_ERRORS as error:
+            raise AliasRegistryUnavailable("alias registry inspection failed") from error
+
     def mutate_profile_registry(
         self,
         profile_repository: JsonProfileRepository,
@@ -202,14 +314,6 @@ class AliasTransactionCoordinator:
             profile_repository.lock(exclusive=True),
             self.repository.lock(exclusive=True),
         ):
-            self._storage(
-                self._recover_all_unlocked,
-                "alias registry recovery failed",
-            )
-            aliases = self._storage(
-                self.repository._read_unlocked,
-                "alias registry read failed",
-            )
             try:
                 current = profile_repository._load_unlocked()
             except ProfileRegistryUnavailable:
@@ -228,6 +332,15 @@ class AliasTransactionCoordinator:
                 mutation,
             )
             identities = active_hospital_identities(updated)
+            with self._projection_unlocked(exclusive=True) as projection:
+                validate_combined_hospital_identities(identities, projection.projected)
+                for journal_path in projection.journal_paths:
+                    self._storage(
+                        lambda path=journal_path: self._recover_unlocked(path.parent.name),
+                        "alias registry recovery failed",
+                    )
+                self._storage(self.repository._migrate_unlocked, "alias registry migration failed")
+            aliases = self._storage(self.repository._read_unlocked, "alias registry read failed")
             validate_combined_hospital_identities(identities, aliases)
             profile_repository._write_unlocked(updated)
             return updated.model_copy(deep=True)

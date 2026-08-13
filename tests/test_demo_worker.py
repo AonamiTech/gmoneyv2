@@ -209,6 +209,28 @@ def _controlled_worker_job(
     return {"row_count": 1, "hospital_name": "Test Hospital"}
 
 
+def _record_captured_process_snapshot(
+    root_value: str,
+    job_id: str,
+    vl_url: str,
+    identity_snapshot: worker_module.RuntimeIdentitySnapshot,
+) -> dict[str, Any]:
+    assert vl_url == "http://vl.test"
+    assert identity_snapshot.profiles is not None
+    assert identity_snapshot.aliases is not None
+    Path(root_value, "captured-process-snapshot.json").write_text(
+        json.dumps(
+            {
+                "profile_revision": identity_snapshot.profiles.revision,
+                "profile_name": identity_snapshot.profiles.profiles[0].hospital_name,
+                "alias_revision": identity_snapshot.aliases["revision"],
+                "job_id": job_id,
+            }
+        )
+    )
+    return {"row_count": 1, "hospital_name": "Original Hospital"}
+
+
 def _run_controlled_worker_loop(
     root_value: str,
     registry_value: str,
@@ -781,7 +803,108 @@ def test_claimed_job_uses_captured_identity_snapshot_after_profile_rename(
     published = json.loads((store.job_dir(job_id) / "result.json").read_text())
     assert published["profile_registry_revision"] == 1
     assert published["alias_registry_revision"] == 0
+    assert published["worker_release_revision"] == "unknown"
     assert repository.snapshot().revision == 2
+
+
+def test_worker_publishes_release_heartbeat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    revision = "c" * 40
+    monkeypatch.setenv("GMONEY_BUILD_REVISION", revision)
+    status_path = tmp_path / "worker-status.json"
+    current_time = 0.0
+
+    def sleeper(seconds: float) -> None:
+        nonlocal current_time
+        current_time += seconds
+
+    worker_module.run_worker_loop(
+        root=tmp_path,
+        vl_url="http://vl.test",
+        paddle_device="cpu",
+        concurrency=1,
+        retention_hours=720,
+        alias_registry=None,
+        stop_requested=lambda: current_time > 0.5,
+        executor_factory=ThreadPoolExecutor,
+        clock=lambda: current_time,
+        sleeper=sleeper,
+        worker_status_path=status_path,
+    )
+
+    heartbeat = json.loads(status_path.read_text())
+    assert heartbeat["status"] == "stopped"
+    assert heartbeat["release_revision"] == revision
+    assert heartbeat["paddle_device"] == "cpu"
+    assert heartbeat["concurrency"] == 1
+
+
+def test_spawned_gpu_process_receives_snapshot_captured_before_profile_mutation(
+    tmp_path: Path,
+) -> None:
+    store = JobStore(tmp_path)
+    job_id = _create_worker_job(store, "Spawn snapshot bill.pdf")
+    profile_path = tmp_path / "profiles.json"
+    repository = JsonProfileRepository(profile_path)
+    original = LayoutProfile(
+        contract_version="layout_profile_v1",
+        profile_key="spawn-profile",
+        profile_version=1,
+        lifecycle=ProfileLifecycle.ACTIVE,
+        hospital_id="hospital-1",
+        hospital_name="Original Hospital",
+        page_type=PageType.ITEMIZED_CHARGES,
+        table_type=TableType.ITEM_LEDGER,
+        page_aspect_ratio=0.7,
+        table_box=(0.05, 0.15, 0.95, 0.9),
+        supported_fields=("description", "amount"),
+        construction_dataset_ids=("training",),
+    )
+    repository.add_profile(original)
+    alias_path = tmp_path / "aliases.json"
+    coordinator = worker_module.AliasTransactionCoordinator(store, alias_path)
+    mutation_count = 0
+
+    def mutate_after_capture(snapshot: worker_module.RuntimeIdentitySnapshot) -> None:
+        nonlocal mutation_count
+        assert snapshot.profiles is not None
+        assert snapshot.profiles.revision == 1
+        mutation_count += 1
+        coordinator.mutate_profile_registry(
+            repository,
+            1,
+            lambda current: repository.replace_in_snapshot(
+                current,
+                (original.model_copy(update={"hospital_name": "Renamed Hospital"}),),
+            ),
+        )
+
+    worker_module.run_worker_loop(
+        root=tmp_path,
+        vl_url="http://vl.test",
+        paddle_device="gpu:0",
+        concurrency=1,
+        retention_hours=720,
+        alias_registry=alias_path,
+        profile_registry=profile_path,
+        stop_requested=lambda: store.read(job_id)["status"] == "complete",
+        job_runner=_record_captured_process_snapshot,
+        identity_captured=mutate_after_capture,
+    )
+
+    captured = json.loads((tmp_path / "captured-process-snapshot.json").read_text())
+    assert captured == {
+        "profile_revision": 1,
+        "profile_name": "Original Hospital",
+        "alias_revision": 0,
+        "job_id": job_id,
+    }
+    assert mutation_count == 1
+    assert repository.snapshot().revision == 2
+    assert repository.snapshot().profiles[0].hospital_name == "Renamed Hospital"
+    assert store.read(job_id)["status"] == "complete"
 
 
 def test_worker_fails_queued_bill_on_combined_hospital_identity_conflict(

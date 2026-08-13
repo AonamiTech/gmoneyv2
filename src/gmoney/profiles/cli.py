@@ -397,13 +397,21 @@ def validate_registries(
     ],
 ) -> None:
     repository, coordinator = _writer(registry, alias_registry, jobs_root)
-    profiles, aliases, identities = coordinator.identity_snapshots(repository)
+    profiles, projection, identities = coordinator.inspect_identity_snapshots(repository)
     typer.echo(
         json.dumps(
             {
                 "status": "valid",
                 "profile_revision": profiles.revision,
-                "alias_registry_revision": aliases["revision"],
+                "alias_registry_version": projection.persisted["registry_version"],
+                "alias_registry_revision": projection.persisted["revision"],
+                "projected_alias_registry_version": projection.projected[
+                    "registry_version"
+                ],
+                "projected_alias_registry_revision": projection.projected["revision"],
+                "pending_journal_count": projection.pending_journal_count,
+                "recovery_required": projection.recovery_required,
+                "migration_required": projection.migration_required,
                 "active_hospital_count": len(identities),
             },
             sort_keys=True,
@@ -437,7 +445,8 @@ def check_access(
         finally:
             os.close(descriptor)
             Path(probe).unlink(missing_ok=True)
-    coordinator.identity_snapshots(repository)
+    with repository.lock(exclusive=True), coordinator.repository.lock(exclusive=True):
+        pass
     typer.echo("profile administration paths and locks are writable")
 
 

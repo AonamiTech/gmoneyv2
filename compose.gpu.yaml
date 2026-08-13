@@ -45,6 +45,11 @@ services:
   api:
     environment:
       GMONEY_WORKER_CAPACITY: "${GMONEY_GPU_WORKER_CONCURRENCY:-1}"
+      GMONEY_REQUIRE_BUILD_REVISION: "1"
+
+  profile-admin:
+    environment:
+      GMONEY_REQUIRE_BUILD_REVISION: "1"
 
   worker:
     image: gmoney-v2-worker-gpu:${GMONEY_IMAGE_TAG:-local}
@@ -58,6 +63,7 @@ services:
       OMP_NUM_THREADS: "4"
       MKL_NUM_THREADS: "4"
       FLAGS_paddle_num_threads: "4"
+      GMONEY_REQUIRE_BUILD_REVISION: "1"
     volumes:
       - ${GMONEY_MODEL_ROOT:-/home/ubuntu/gmoneyv2-runtime/model-cache}:/home/modelworker/.paddlex
     deploy:

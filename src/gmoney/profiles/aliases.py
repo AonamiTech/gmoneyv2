@@ -317,6 +317,15 @@ class JsonAliasRepository:
         current = self._read_supported_unlocked()
         if current["registry_version"] == ALIAS_REGISTRY_VERSION:
             return current
+        migrated = self._migrate_image(current)
+        self._write_unlocked(migrated)
+        return migrated
+
+    def _migrate_image(self, current: dict[str, Any]) -> dict[str, Any]:
+        """Return the strict registry image without changing persisted state."""
+        self._validate_supported(current)
+        if current["registry_version"] == ALIAS_REGISTRY_VERSION:
+            return json.loads(json.dumps(current))
         migrated = json.loads(json.dumps(current))
         for event in migrated["events"]:
             event.setdefault("reviewer", "legacy-unknown")
@@ -332,8 +341,7 @@ class JsonAliasRepository:
                 "created_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
             }
         )
-        self._write_unlocked(migrated)
-        return migrated
+        return self._validate(migrated)
 
     @contextmanager
     def lock(self, *, exclusive: bool) -> Iterator[None]:

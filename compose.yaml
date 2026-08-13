@@ -56,6 +56,8 @@ services:
     build:
       context: .
       dockerfile: infra/docker/api.Dockerfile
+      args:
+        GMONEY_BUILD_REVISION: "${GMONEY_BUILD_REVISION:-unknown}"
     depends_on:
       postgres:
         condition: service_healthy
@@ -78,4 +80,3 @@ services:
 volumes:
   postgres-data:
   minio-data:
-
