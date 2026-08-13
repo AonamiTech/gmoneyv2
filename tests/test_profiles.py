@@ -589,6 +589,52 @@ def test_profile_mutation_translates_malformed_pending_journal(
     assert not alias_path.exists()
 
 
+@pytest.mark.parametrize("journal_kind", ("directory", "symlink"))
+def test_recovery_and_projection_reject_non_regular_journals(
+    tmp_path: Path,
+    journal_kind: str,
+) -> None:
+    store = JobStore(tmp_path)
+    state = store.create("invalid-journal.pdf")
+    journal_path = store.job_dir(str(state["id"])) / ".alias-operation.json"
+    if journal_kind == "directory":
+        journal_path.mkdir()
+    else:
+        journal_path.symlink_to(tmp_path / "missing-journal.json")
+    coordinator = AliasTransactionCoordinator(store, tmp_path / "aliases.json")
+
+    with (
+        pytest.raises(AliasRegistryUnavailable, match="not a regular file"),
+        coordinator.repository.lock(exclusive=False),
+        coordinator._projection_unlocked(),
+    ):
+        pass
+    with pytest.raises(AliasRegistryUnavailable, match="not a regular file"):
+        coordinator.recover_all()
+
+
+@pytest.mark.parametrize("registry_kind", ("directory", "broken_symlink"))
+def test_alias_registry_rejects_non_regular_filesystem_objects(
+    tmp_path: Path,
+    registry_kind: str,
+) -> None:
+    registry_path = tmp_path / "aliases.json"
+    if registry_kind == "directory":
+        registry_path.mkdir()
+    else:
+        registry_path.symlink_to(tmp_path / "missing-aliases.json")
+    coordinator = AliasTransactionCoordinator(JobStore(tmp_path / "jobs"), registry_path)
+
+    with (
+        pytest.raises(AliasRegistryUnavailable, match="not a regular file"),
+        coordinator.repository.lock(exclusive=False),
+        coordinator._projection_unlocked(),
+    ):
+        pass
+    with pytest.raises(AliasRegistryUnavailable, match="not a regular file"):
+        coordinator.recover_all()
+
+
 def test_profile_repository_rejects_stale_writes(tmp_path) -> None:
     repo = JsonProfileRepository(tmp_path / "profiles.json")
     item = profile()

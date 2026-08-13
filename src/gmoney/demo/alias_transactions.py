@@ -26,6 +26,7 @@ from gmoney.profiles.aliases import (
     JsonAliasRepository,
     durable_json_replace,
     durable_unlink,
+    persisted_regular_file_exists,
 )
 from gmoney.profiles.repository import (
     PROFILE_STORAGE_ERRORS,
@@ -104,28 +105,23 @@ class AliasTransactionCoordinator:
 
     def _recover_unlocked(self, job_id: str) -> None:
         journal_path = self.journal_path(job_id)
-        if not journal_path.is_file():
+        journal = self._load_journal_unlocked(journal_path, missing_ok=True)
+        if journal is None:
             return
         try:
-            journal = json.loads(journal_path.read_text())
-            if journal.get("version") != ALIAS_JOURNAL_VERSION or journal.get("job_id") != job_id:
-                raise AliasRegistryUnavailable("unsupported alias operation journal")
-            base_review = self._assert_image(journal, "base_review")
-            target_review = self._assert_image(journal, "target_review")
-            base_registry = self._assert_image(journal, "base_registry")
-            target_registry = self._assert_image(journal, "target_registry")
-            self.repository._validate_supported(base_registry)
-            self.repository._validate_supported(target_registry)
-            if target_review.get("revision") != base_review.get("revision", -1) + 1:
-                raise AliasRegistryUnavailable("invalid review revision in alias journal")
-            if target_registry.get("revision") != base_registry.get("revision", -1) + 1:
-                raise AliasRegistryUnavailable("invalid registry revision in alias journal")
+            base_review = journal["base_review"]
+            target_review = journal["target_review"]
+            base_registry = journal["base_registry"]
+            target_registry = journal["target_registry"]
 
             review_path = self.store.job_dir(job_id) / "review.json"
             current_review = (
                 self.store._read_review_unlocked(job_id) if review_path.is_file() else base_review
             )
-            if self.repository.path.is_file():
+            if persisted_regular_file_exists(
+                self.repository.path,
+                context="hospital alias registry",
+            ):
                 current_registry = self.repository._read_supported_unlocked()
             elif self._is_empty_registry_image(base_registry):
                 current_registry = json.loads(json.dumps(base_registry))
@@ -157,6 +153,8 @@ class AliasTransactionCoordinator:
         """Validate one journal and return its target without writing any file."""
         job_id = journal_path.parent.name
         journal = self._load_journal_unlocked(journal_path)
+        if journal is None:  # Defensive: projection never permits a missing journal.
+            raise AliasRegistryUnavailable("alias operation journal is missing")
         base_review = journal["base_review"]
         target_review = journal["target_review"]
         base_registry = journal["base_registry"]
@@ -178,10 +176,22 @@ class AliasTransactionCoordinator:
         except ALIAS_STORAGE_ERRORS as error:
             raise AliasRegistryUnavailable("alias operation projection failed") from error
 
-    def _load_journal_unlocked(self, journal_path: Path) -> dict[str, Any]:
+    def _load_journal_unlocked(
+        self,
+        journal_path: Path,
+        *,
+        missing_ok: bool = False,
+    ) -> dict[str, Any] | None:
         """Read and validate a persisted journal behind one storage error boundary."""
         job_id = journal_path.parent.name
         try:
+            if not persisted_regular_file_exists(
+                journal_path,
+                context="alias operation journal",
+            ):
+                if missing_ok:
+                    return None
+                raise AliasRegistryUnavailable("alias operation journal is missing")
             journal = json.loads(journal_path.read_text())
             if (
                 not isinstance(journal, dict)
@@ -218,7 +228,10 @@ class AliasTransactionCoordinator:
                             exclusive=exclusive,
                         )
                     )
-                persisted_exists = self.repository.path.is_file()
+                persisted_exists = persisted_regular_file_exists(
+                    self.repository.path,
+                    context="hospital alias registry",
+                )
                 persisted = self.repository._read_supported_unlocked()
                 projected = json.loads(json.dumps(persisted))
                 registry_exists = persisted_exists

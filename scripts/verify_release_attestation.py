@@ -52,7 +52,46 @@ def _require_revision(value: str) -> str:
     return value
 
 
-def verify(args: argparse.Namespace) -> dict[str, Any]:
+def _worker_heartbeat(
+    readiness: dict[str, Any],
+    *,
+    now: datetime | None = None,
+) -> dict[str, float | int]:
+    timestamp = readiness.get("worker_status_updated_at")
+    max_age = readiness.get("worker_status_max_age_seconds")
+    future_skew = readiness.get("worker_status_future_skew_seconds")
+    if not isinstance(timestamp, str):
+        raise RuntimeError("worker heartbeat timestamp is missing")
+    if type(max_age) is not int or max_age <= 0:
+        raise RuntimeError("worker heartbeat maximum age is invalid")
+    if type(future_skew) is not int or future_skew < 0:
+        raise RuntimeError("worker heartbeat future skew is invalid")
+    try:
+        updated_at = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise RuntimeError("worker heartbeat timestamp is invalid") from error
+    if updated_at.tzinfo is None:
+        raise RuntimeError("worker heartbeat timestamp must include a timezone")
+    checked_at = now or datetime.now(UTC)
+    if checked_at.tzinfo is None:
+        raise RuntimeError("attestation clock must include a timezone")
+    age = (checked_at.astimezone(UTC) - updated_at.astimezone(UTC)).total_seconds()
+    if age > max_age:
+        raise RuntimeError("worker heartbeat is stale")
+    if age < -future_skew:
+        raise RuntimeError("worker heartbeat is too far in the future")
+    return {
+        "age_seconds": age,
+        "max_age_seconds": max_age,
+        "future_skew_seconds": future_skew,
+    }
+
+
+def verify(
+    args: argparse.Namespace,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
     compose = ["docker", "compose"]
     for path in args.compose_file:
         compose.extend(("-f", str(path)))
@@ -92,6 +131,7 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError("service-reported revisions do not match the expected revision")
     if readiness.get("status") != "ready" or readiness.get("release_consistent") is not True:
         raise RuntimeError("release readiness is not consistent")
+    heartbeat = _worker_heartbeat(readiness, now=now)
 
     return {
         "attestation_version": "gmoney_release_attestation_v1",
@@ -100,6 +140,9 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
         "services": services,
         "reported_revisions": reported,
         "worker_status_updated_at": readiness.get("worker_status_updated_at"),
+        "worker_status_age_seconds": heartbeat["age_seconds"],
+        "worker_status_max_age_seconds": heartbeat["max_age_seconds"],
+        "worker_status_future_skew_seconds": heartbeat["future_skew_seconds"],
         "profile_revision": readiness.get("profile_revision"),
         "alias_registry_revision": readiness.get("alias_registry_revision"),
         "release_consistent": True,

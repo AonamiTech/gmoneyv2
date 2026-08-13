@@ -70,6 +70,11 @@ This fails unless each running image label, each container's immutable release
 manifest, API readiness, the worker heartbeat, and frontend `/build.json` all
 report the exact expected commit.
 
+The verifier independently parses the worker timestamp and compares its age with
+the maximum age and future-skew limits reported by readiness. A response that
+merely claims `ready` cannot attest a stale, timezone-naive, malformed, or
+future-dated heartbeat.
+
 The base demo always binds host port `3100`. If the cloud firewall only admits
 standard HTTP, set `GMONEY_PUBLIC_HTTP_PORT=80` to add a second binding while
 retaining port `3100`. This does not change the loopback-only API and VLM ports.
@@ -131,7 +136,8 @@ command. The API and worker retain read-only profile mounts.
   health path return HTTP 200 on port 3100, and ports 8100/8111 are unreachable
   remotely while remaining healthy through loopback.
 - `/api/v2/health/ready` and `/build.json` report the same full release SHA;
-  readiness also reports a fresh worker heartbeat and `release_consistent=true`.
+  readiness also reports a fresh worker heartbeat, its accepted freshness limits,
+  and `release_consistent=true`.
 - `docker image inspect` reports that same SHA in the
   `org.opencontainers.image.revision` label for API, frontend, and GPU worker.
 - `scripts/verify_release_attestation.py` succeeds and its record is retained

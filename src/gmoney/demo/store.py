@@ -305,7 +305,8 @@ class JobStore:
     def _require_stable_workspace(self, job_id: str) -> None:
         if (self.job_dir(job_id) / ".cutover.json").is_file():
             raise JobTransactionError("job_cutover_recovery_required")
-        if (self.job_dir(job_id) / ".alias-operation.json").is_file():
+        alias_journal = self.job_dir(job_id) / ".alias-operation.json"
+        if alias_journal.exists() or alias_journal.is_symlink():
             raise JobTransactionError("alias_operation_recovery_required")
 
     def read_review(self, job_id: str) -> dict[str, Any]:

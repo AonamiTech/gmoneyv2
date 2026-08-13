@@ -2608,6 +2608,8 @@ def test_readiness_attests_live_worker_release(
     assert ready.json()["release_revision"] == revision
     assert ready.json()["worker_release_revision"] == revision
     assert ready.json()["release_consistent"] is True
+    assert ready.json()["worker_status_max_age_seconds"] == 30
+    assert ready.json()["worker_status_future_skew_seconds"] == 5
 
     worker_status = json.loads(status_path.read_text())
     worker_status["release_revision"] = "b" * 40

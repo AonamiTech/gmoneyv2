@@ -76,6 +76,13 @@ RELEASE_REVISION = build_revision()
 WORKER_STATUS_MAX_AGE_SECONDS = int(
     os.environ.get("GMONEY_WORKER_STATUS_MAX_AGE_SECONDS", "30")
 )
+WORKER_STATUS_FUTURE_SKEW_SECONDS = int(
+    os.environ.get("GMONEY_WORKER_STATUS_FUTURE_SKEW_SECONDS", "5")
+)
+if WORKER_STATUS_MAX_AGE_SECONDS <= 0:
+    raise RuntimeError("GMONEY_WORKER_STATUS_MAX_AGE_SECONDS must be positive")
+if WORKER_STATUS_FUTURE_SKEW_SECONDS < 0:
+    raise RuntimeError("GMONEY_WORKER_STATUS_FUTURE_SKEW_SECONDS cannot be negative")
 DEMO_ROOT = Path(os.environ.get("GMONEY_DEMO_ROOT", "/tmp/gmoney-v2-demo"))
 PROFILE_REGISTRY = Path(
     os.environ.get("GMONEY_PROFILE_REGISTRY", str(DEMO_ROOT / "profile-registry.json"))
@@ -714,7 +721,9 @@ def ready(response: Response) -> dict[str, Any]:
             worker_ready = (
                 worker_status.get("status") == "running"
                 and updated_at.tzinfo is not None
-                and -5 <= age <= WORKER_STATUS_MAX_AGE_SECONDS
+                and -WORKER_STATUS_FUTURE_SKEW_SECONDS
+                <= age
+                <= WORKER_STATUS_MAX_AGE_SECONDS
             )
             release_consistent = worker_release_revision == RELEASE_REVISION
         except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
@@ -728,6 +737,8 @@ def ready(response: Response) -> dict[str, Any]:
         "release_revision": RELEASE_REVISION,
         "worker_release_revision": worker_release_revision,
         "worker_status_updated_at": worker_status_updated_at,
+        "worker_status_max_age_seconds": WORKER_STATUS_MAX_AGE_SECONDS,
+        "worker_status_future_skew_seconds": WORKER_STATUS_FUTURE_SKEW_SECONDS,
         "release_consistent": release_consistent,
         "profile_revision": profiles.revision,
         "alias_registry_revision": aliases["revision"],

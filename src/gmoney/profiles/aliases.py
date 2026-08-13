@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -109,6 +110,19 @@ class AliasRegistryUnavailable(RuntimeError):
 
 class AliasRegistryFormatError(ValueError):
     """Persisted alias registry content does not satisfy a supported schema."""
+
+
+def persisted_regular_file_exists(path: Path, *, context: str) -> bool:
+    """Return false only for genuine absence; reject every other filesystem type."""
+    try:
+        status = path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise AliasRegistryUnavailable(f"{context} is unavailable") from error
+    if not stat.S_ISREG(status.st_mode):
+        raise AliasRegistryUnavailable(f"{context} is not a regular file")
+    return True
 
 
 def _required_text(payload: dict[str, Any], field: str, context: str) -> str:
@@ -294,12 +308,18 @@ class JsonAliasRepository:
         raise AliasRegistryFormatError("unsupported hospital alias registry")
 
     def _read_supported_unlocked(self) -> dict[str, Any]:
-        if not self.path.is_file():
+        if not persisted_regular_file_exists(
+            self.path,
+            context="hospital alias registry",
+        ):
             return empty_alias_registry()
         return self._validate_supported(json.loads(self.path.read_text()))
 
     def _read_unlocked(self) -> dict[str, Any]:
-        if not self.path.is_file():
+        if not persisted_regular_file_exists(
+            self.path,
+            context="hospital alias registry",
+        ):
             return empty_alias_registry()
         return self._validate(json.loads(self.path.read_text()))
 
