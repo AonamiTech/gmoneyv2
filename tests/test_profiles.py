@@ -24,6 +24,7 @@ from gmoney.demo.alias_transactions import (
 from gmoney.demo.store import JobStore
 from gmoney.profiles.aliases import (
     LEGACY_ALIAS_REGISTRY_VERSION,
+    AliasRegistryUnavailable,
     JsonAliasRepository,
     empty_alias_registry,
 )
@@ -559,6 +560,33 @@ def test_profile_conflict_in_pending_recovery_projection_changes_no_file(
         )
 
     assert {path: path.read_bytes() for path in tracked} == before
+
+
+def test_profile_mutation_translates_malformed_pending_journal(
+    tmp_path: Path,
+) -> None:
+    profile_path = tmp_path / "profiles.json"
+    repository = JsonProfileRepository(profile_path)
+    repository.add_profile(profile(lifecycle=ProfileLifecycle.ACTIVE))
+    store = JobStore(tmp_path)
+    state = store.create("malformed-journal.pdf")
+    journal_path = store.job_dir(str(state["id"])) / ".alias-operation.json"
+    journal_path.write_text("{not-json")
+    alias_path = tmp_path / "aliases.json"
+    tracked = (profile_path, journal_path)
+    before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in tracked}
+
+    with pytest.raises(AliasRegistryUnavailable):
+        AliasTransactionCoordinator(store, alias_path).mutate_profile_registry(
+            repository,
+            1,
+            lambda snapshot: snapshot,
+        )
+
+    assert {
+        path: (path.read_bytes(), path.stat().st_mtime_ns) for path in tracked
+    } == before
+    assert not alias_path.exists()
 
 
 def test_profile_repository_rejects_stale_writes(tmp_path) -> None:

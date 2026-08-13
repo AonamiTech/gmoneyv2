@@ -43,6 +43,7 @@ services:
       dockerfile: infra/docker/api.Dockerfile
       args:
         GMONEY_BUILD_REVISION: "${GMONEY_BUILD_REVISION:-unknown}"
+        GMONEY_REQUIRE_BUILD_REVISION: "${GMONEY_REQUIRE_BUILD_REVISION:-0}"
     command: ["uvicorn", "gmoney.demo.api:app", "--host", "0.0.0.0", "--port", "8000"]
     user: "10001:10001"
     environment:
@@ -56,7 +57,6 @@ services:
       GMONEY_PROFILE_REGISTRY: /profiles/registry.json
       GMONEY_PROFILE_REGISTRY_LOCK: /runtime-config/profile-registry.lock
       GMONEY_ALIAS_REGISTRY: /runtime-config/alias-registry.json
-      GMONEY_REQUIRE_BUILD_REVISION: "${GMONEY_REQUIRE_BUILD_REVISION:-0}"
       GMONEY_WORKER_STATUS_PATH: /runtime-config/worker-status.json
     volumes:
       - ${GMONEY_DATA_ROOT:-/home/azureuser/gmoneyv2-runtime}/jobs:/runtime/jobs
@@ -79,6 +79,7 @@ services:
       dockerfile: infra/docker/api.Dockerfile
       args:
         GMONEY_BUILD_REVISION: "${GMONEY_BUILD_REVISION:-unknown}"
+        GMONEY_REQUIRE_BUILD_REVISION: "${GMONEY_REQUIRE_BUILD_REVISION:-0}"
     entrypoint: ["gmoney-profiles"]
     user: "10001:10001"
     environment:
@@ -86,7 +87,6 @@ services:
       GMONEY_PROFILE_REGISTRY_LOCK: /runtime-config/profile-registry.lock
       GMONEY_ALIAS_REGISTRY: /runtime-config/alias-registry.json
       GMONEY_JOBS_ROOT: /runtime/jobs
-      GMONEY_REQUIRE_BUILD_REVISION: "${GMONEY_REQUIRE_BUILD_REVISION:-0}"
     volumes:
       - ${GMONEY_DATA_ROOT:-/home/azureuser/gmoneyv2-runtime}/jobs:/runtime/jobs
       - ${GMONEY_PROFILE_ROOT:-/home/azureuser/gmoneyv2-runtime/profiles}:/profiles
@@ -99,6 +99,7 @@ services:
       dockerfile: infra/docker/inference-cpu.Dockerfile
       args:
         GMONEY_BUILD_REVISION: "${GMONEY_BUILD_REVISION:-unknown}"
+        GMONEY_REQUIRE_BUILD_REVISION: "${GMONEY_REQUIRE_BUILD_REVISION:-0}"
     entrypoint: ["python", "-m", "gmoney.demo.worker"]
     user: "10001:10001"
     depends_on:
@@ -118,7 +119,6 @@ services:
       GMONEY_PROFILE_REGISTRY: /profiles/registry.json
       GMONEY_PROFILE_REGISTRY_LOCK: /runtime-config/profile-registry.lock
       GMONEY_ALIAS_REGISTRY: /runtime-config/alias-registry.json
-      GMONEY_REQUIRE_BUILD_REVISION: "${GMONEY_REQUIRE_BUILD_REVISION:-0}"
       GMONEY_WORKER_STATUS_PATH: /runtime-config/worker-status.json
     volumes:
       - ${GMONEY_DATA_ROOT:-/home/azureuser/gmoneyv2-runtime}/jobs:/runtime/jobs
@@ -139,6 +139,7 @@ services:
       dockerfile: infra/docker/frontend.Dockerfile
       args:
         GMONEY_BUILD_REVISION: "${GMONEY_BUILD_REVISION:-unknown}"
+        GMONEY_REQUIRE_BUILD_REVISION: "${GMONEY_REQUIRE_BUILD_REVISION:-0}"
     restart: unless-stopped
 
   nginx:

@@ -49,9 +49,26 @@ docker compose -f compose.demo.yaml -f compose.gpu.yaml up -d --build
 ```
 
 `GMONEY_BUILD_REVISION` is baked into every application image and its
-`org.opencontainers.image.revision` label. The GPU overlay refuses to start the
-API or worker when the image contains an unknown or malformed revision. Do not
-override this value through container runtime environment settings.
+`org.opencontainers.image.revision` label. The same value and the production
+enforcement policy are stored read-only in `/etc/gmoney/release.json`. The GPU
+overlay refuses to build the API, profile-admin, frontend, or worker with an
+unknown or malformed revision. Runtime environment overrides are ignored when
+the baked manifest exists.
+
+After the services become healthy, attest the actual running containers and
+write the sanitized release record:
+
+```bash
+python3 scripts/verify_release_attestation.py \
+  --expected-revision "$GMONEY_BUILD_REVISION" \
+  --compose-file compose.demo.yaml \
+  --compose-file compose.gpu.yaml \
+  --output "/home/ubuntu/gmoneyv2-releases/$GMONEY_IMAGE_TAG/release-attestation.json"
+```
+
+This fails unless each running image label, each container's immutable release
+manifest, API readiness, the worker heartbeat, and frontend `/build.json` all
+report the exact expected commit.
 
 The base demo always binds host port `3100`. If the cloud firewall only admits
 standard HTTP, set `GMONEY_PUBLIC_HTTP_PORT=80` to add a second binding while
@@ -117,6 +134,8 @@ command. The API and worker retain read-only profile mounts.
   readiness also reports a fresh worker heartbeat and `release_consistent=true`.
 - `docker image inspect` reports that same SHA in the
   `org.opencontainers.image.revision` label for API, frontend, and GPU worker.
+- `scripts/verify_release_attestation.py` succeeds and its record is retained
+  beside the release without bill contents or other PHI.
 - A real PDF upload reaches `complete`, produces grounded rows and page evidence,
   survives a Compose restart, and records `gpu:0`/`cuda:0` in newly written
   inference cache model specifications.

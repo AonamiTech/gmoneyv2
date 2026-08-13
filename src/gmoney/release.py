@@ -1,18 +1,80 @@
 from __future__ import annotations
 
+import json
 import os
 import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 UNKNOWN_BUILD_REVISION = "unknown"
+RELEASE_MANIFEST_PATH = Path("/etc/gmoney/release.json")
+RELEASE_MANIFEST_VERSION = "gmoney_release_v1"
 _COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 
 
-def build_revision(*, required: bool | None = None) -> str:
-    revision = os.environ.get("GMONEY_BUILD_REVISION", UNKNOWN_BUILD_REVISION)
-    if required is None:
-        required = os.environ.get("GMONEY_REQUIRE_BUILD_REVISION", "0") == "1"
-    if revision != UNKNOWN_BUILD_REVISION and not _COMMIT_PATTERN.fullmatch(revision):
-        raise RuntimeError("GMONEY_BUILD_REVISION must be a full 40-character Git SHA")
+@dataclass(frozen=True)
+class ReleaseManifest:
+    revision: str
+    revision_required: bool
+    baked: bool
+
+
+def _validated_manifest(payload: Any, *, baked: bool) -> ReleaseManifest:
+    if not isinstance(payload, dict):
+        raise RuntimeError("GMoney release manifest is not an object")
+    if payload.get("manifest_version") != RELEASE_MANIFEST_VERSION:
+        raise RuntimeError("GMoney release manifest version is unsupported")
+    revision = payload.get("revision")
+    required = payload.get("revision_required")
+    if not isinstance(revision, str) or (
+        revision != UNKNOWN_BUILD_REVISION and not _COMMIT_PATTERN.fullmatch(revision)
+    ):
+        raise RuntimeError("GMoney release revision is invalid")
+    if type(required) is not bool:
+        raise RuntimeError("GMoney release revision policy is invalid")
     if required and revision == UNKNOWN_BUILD_REVISION:
-        raise RuntimeError("GMONEY_BUILD_REVISION is required in production")
-    return revision
+        raise RuntimeError("GMoney release revision is required in production")
+    return ReleaseManifest(revision=revision, revision_required=required, baked=baked)
+
+
+def release_manifest(
+    *,
+    manifest_path: Path | None = None,
+    required: bool | None = None,
+) -> ReleaseManifest:
+    path = manifest_path or RELEASE_MANIFEST_PATH
+    if path.is_file():
+        try:
+            manifest = _validated_manifest(json.loads(path.read_text()), baked=True)
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise RuntimeError("GMoney release manifest is unavailable") from error
+        if required is True and manifest.revision == UNKNOWN_BUILD_REVISION:
+            raise RuntimeError("GMoney release revision is required in production")
+        return manifest
+
+    revision = os.environ.get("GMONEY_BUILD_REVISION", UNKNOWN_BUILD_REVISION)
+    environment_required = os.environ.get("GMONEY_REQUIRE_BUILD_REVISION", "0")
+    if environment_required not in {"0", "1"}:
+        raise RuntimeError("GMONEY_REQUIRE_BUILD_REVISION must be 0 or 1")
+    return _validated_manifest(
+        {
+            "manifest_version": RELEASE_MANIFEST_VERSION,
+            "revision": revision,
+            "revision_required": (
+                required if required is not None else environment_required == "1"
+            ),
+        },
+        baked=False,
+    )
+
+
+def build_revision(
+    *,
+    required: bool | None = None,
+    manifest_path: Path | None = None,
+) -> str:
+    return release_manifest(
+        manifest_path=manifest_path,
+        required=required,
+    ).revision

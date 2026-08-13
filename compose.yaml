@@ -58,6 +58,7 @@ services:
       dockerfile: infra/docker/api.Dockerfile
       args:
         GMONEY_BUILD_REVISION: "${GMONEY_BUILD_REVISION:-unknown}"
+        GMONEY_REQUIRE_BUILD_REVISION: "${GMONEY_REQUIRE_BUILD_REVISION:-0}"
     depends_on:
       postgres:
         condition: service_healthy

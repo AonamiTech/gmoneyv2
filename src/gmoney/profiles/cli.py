@@ -22,12 +22,23 @@ from gmoney.contracts.phase3 import (
 )
 from gmoney.demo.alias_transactions import AliasTransactionCoordinator
 from gmoney.demo.store import JobStore
+from gmoney.profiles.aliases import AliasRegistryUnavailable
 from gmoney.profiles.construction import build_profile
 from gmoney.profiles.lifecycle import evaluate_drift, rollback_profile, transition_profile
 from gmoney.profiles.matching import match_profile
-from gmoney.profiles.repository import JsonProfileRepository
+from gmoney.profiles.repository import (
+    HospitalIdentityConflict,
+    JsonProfileRepository,
+    ProfileRegistryUnavailable,
+)
+from gmoney.release import build_revision
 
 app = typer.Typer(no_args_is_help=True)
+
+
+@app.callback()
+def validate_release_manifest() -> None:
+    build_revision()
 
 
 def _writer(
@@ -397,12 +408,36 @@ def validate_registries(
     ],
 ) -> None:
     repository, coordinator = _writer(registry, alias_registry, jobs_root)
-    profiles, projection, identities = coordinator.inspect_identity_snapshots(repository)
+    try:
+        profiles, projection, identities = coordinator.inspect_identity_snapshots(
+            repository
+        )
+    except AliasRegistryUnavailable:
+        typer.echo(json.dumps({"status": "invalid", "code": "alias_registry_unavailable"}))
+        raise typer.Exit(1) from None
+    except ProfileRegistryUnavailable:
+        typer.echo(
+            json.dumps({"status": "invalid", "code": "profile_registry_unavailable"})
+        )
+        raise typer.Exit(1) from None
+    except HospitalIdentityConflict as error:
+        typer.echo(
+            json.dumps(
+                {
+                    "status": "invalid",
+                    "code": "hospital_identity_conflict",
+                    "owner_ids": error.owner_ids,
+                },
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1) from None
     typer.echo(
         json.dumps(
             {
                 "status": "valid",
                 "profile_revision": profiles.revision,
+                "alias_registry_persisted_exists": projection.persisted_exists,
                 "alias_registry_version": projection.persisted["registry_version"],
                 "alias_registry_revision": projection.persisted["revision"],
                 "projected_alias_registry_version": projection.projected[

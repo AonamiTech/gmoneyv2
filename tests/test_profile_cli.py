@@ -60,6 +60,7 @@ def test_admin_cli_add_validate_and_access_check_share_runtime_paths(
     assert validated.exit_code == 0, validated.output
     assert json.loads(validated.output) == {
         "active_hospital_count": 1,
+        "alias_registry_persisted_exists": False,
         "alias_registry_revision": 0,
         "alias_registry_version": "hospital_alias_registry_v3",
         "migration_required": False,
@@ -128,6 +129,7 @@ def test_validate_and_check_access_do_not_recover_or_migrate(
     assert validated.exit_code == 0, validated.output
     payload = json.loads(validated.output)
     assert payload["alias_registry_version"] == LEGACY_ALIAS_REGISTRY_VERSION
+    assert payload["alias_registry_persisted_exists"] is True
     assert payload["alias_registry_revision"] == 0
     assert payload["projected_alias_registry_version"] == "hospital_alias_registry_v3"
     assert payload["projected_alias_registry_revision"] == 2
@@ -139,3 +141,39 @@ def test_validate_and_check_access_do_not_recover_or_migrate(
         path: (path.read_bytes(), path.stat().st_mtime_ns) for path in tracked
     } == before
     assert not list(tmp_path.rglob(".gmoney-access-*"))
+
+
+def test_validate_distinguishes_missing_alias_registry(
+    tmp_path: Path,
+) -> None:
+    environment = admin_environment(tmp_path)
+    runner = CliRunner()
+
+    validated = runner.invoke(app, ["validate"], env=environment)
+
+    assert validated.exit_code == 0, validated.output
+    payload = json.loads(validated.output)
+    assert payload["alias_registry_persisted_exists"] is False
+    assert payload["alias_registry_revision"] == 0
+    assert payload["projected_alias_registry_revision"] == 0
+    assert not Path(environment["GMONEY_ALIAS_REGISTRY"]).exists()
+
+
+def test_validate_reports_malformed_journal_without_changing_it(
+    tmp_path: Path,
+) -> None:
+    environment = admin_environment(tmp_path)
+    store = JobStore(tmp_path)
+    state = store.create("malformed-journal.pdf")
+    journal = store.job_dir(str(state["id"])) / ".alias-operation.json"
+    journal.write_text("{not-json")
+    before = (journal.read_bytes(), journal.stat().st_mtime_ns)
+
+    validated = CliRunner().invoke(app, ["validate"], env=environment)
+
+    assert validated.exit_code == 1
+    assert json.loads(validated.output) == {
+        "status": "invalid",
+        "code": "alias_registry_unavailable",
+    }
+    assert (journal.read_bytes(), journal.stat().st_mtime_ns) == before
