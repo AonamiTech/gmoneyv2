@@ -15,7 +15,6 @@ from threading import Lock
 from typing import Annotated, Any, TextIO
 
 import typer
-from pydantic import ValidationError
 
 from gmoney.contracts.extraction import SourceTable
 from gmoney.demo.review import structural_issues
@@ -30,6 +29,7 @@ from gmoney.extraction.typed_values import (
 )
 from gmoney.extraction.validation import (
     ValidationReport,
+    ValidationSeverity,
     ValidationStatus,
     validate_extraction_result,
 )
@@ -1191,335 +1191,26 @@ def validate_result(
     new_result: dict[str, Any],
     artifact_root: Path,
 ) -> None:
-    if new_result.get("document_id") != old_result.get("document_id"):
-        raise ValueError("document identity changed")
-    if new_result.get("source_sha256") != _file_digest(source):
-        raise ValueError("source hash changed")
-    if int(new_result.get("pages") or 0) != int(old_result.get("pages") or 0):
-        raise ValueError("page count changed")
-    assets = new_result.get("page_assets", [])
-    if len(assets) != int(new_result.get("pages") or 0):
-        raise ValueError("page inventory is incomplete")
-    page_numbers = [
-        asset.get("page_number") if isinstance(asset, dict) else None
-        for asset in assets
+    """Compatibility wrapper around the authoritative collecting validator."""
+    report = validate_extraction_result(source, new_result, artifact_root)
+    transition_errors = []
+    if old_result.get("document_id") != new_result.get("document_id"):
+        transition_errors.append("document identity changed")
+    if old_result.get("source_sha256") != new_result.get("source_sha256"):
+        transition_errors.append("source identity changed")
+    blocking = [
+        issue for issue in report.issues
+        if issue.severity in {ValidationSeverity.FATAL, ValidationSeverity.BLOCKING}
     ]
-    if (
-        any(type(page_number) is not int for page_number in page_numbers)
-        or page_numbers != list(range(1, int(new_result.get("pages") or 0) + 1))
-    ):
-        raise ValueError("page inventory has invalid page numbers")
-    for asset in assets:
-        path = (artifact_root / str(asset["relative_path"])).resolve()
-        if artifact_root.resolve() not in path.parents or not path.is_file():
-            raise ValueError(f"page artifact is missing: {asset['relative_path']}")
-        if _file_digest(path) != str(asset["artifact_sha256"]):
-            raise ValueError(f"page artifact hash changed: {asset['relative_path']}")
-    for row in new_result.get("rows", []):
-        fields = row.get("field_evidence") or {}
-        if not row.get("description") or "description" not in fields:
-            raise ValueError(f"row lacks grounded description: {row.get('id')}")
-        if row.get("role") == "informational":
-            if row.get("net_amount") is not None:
-                raise ValueError(f"informational row has an amount: {row.get('id')}")
-            if not {"service_date", "request_no", "service_code", "hsn_code"}.intersection(
-                fields
-            ):
-                raise ValueError(f"informational row lacks typed evidence: {row.get('id')}")
-        elif row.get("role") in {"detail", "refund", "category_rollup"}:
-            if row.get("net_amount") is None or "amount" not in fields:
-                raise ValueError(f"billable row lacks grounded amount: {row.get('id')}")
-
-    source_payload = new_result.get("source_tables")
-    if new_result.get("rows") and not source_payload:
-        raise ValueError("canonical rows require validated source tables")
-    try:
-        source_tables = tuple(
-            SourceTable.model_validate(table) for table in source_payload or []
-        )
-    except ValidationError as error:
-        raise ValueError(f"source tables failed grounding validation: {error}") from error
-
-    canonical_rows = {
-        str(row["id"]): row for row in new_result.get("rows", [])
-    }
-
-    def grounded_service_date_exists(
-        canonical: dict[str, Any],
-        token_ids: set[str],
-    ) -> bool:
-        if not token_ids or not canonical.get("service_date_iso"):
-            return False
-        for source_table in source_tables:
-            if (
-                source_table.page_number != canonical.get("page_number")
-                or source_table.table_id != canonical.get("table_id")
-            ):
-                continue
-            for source_row in source_table.rows:
-                for cell in source_row.cells:
-                    cell_token_ids = {
-                        token_id
-                        for item in cell.evidence
-                        for token_id in item.token_ids
-                    }
-                    if (
-                        token_ids.issubset(cell_token_ids)
-                        and cell.raw_value
-                        and _printed_service_date_iso(
-                            cell.raw_value,
-                            canonical.get("description"),
-                        )
-                        == canonical.get("service_date_iso")
-                    ):
-                        return True
-        return False
-
-    linked_ids: set[str] = set()
-    evidence_fields = {
-        "description": "description",
-        "service_date_raw": "service_date",
-        "request_no": "request_no",
-        "service_code": "service_code",
-        "hsn_code": "hsn_code",
-        "quantity": "quantity",
-        "unit_price": "rate",
-        "gross_amount": "gross_amount",
-        "discount": "discount",
-        "net_amount": "amount",
-    }
-    numeric_fields = {
-        "quantity",
-        "unit_price",
-        "gross_amount",
-        "discount",
-        "net_amount",
-    }
-    for table in source_tables:
-        for source_row in table.rows:
-            cells = {cell.column_id: cell for cell in source_row.cells}
-            if source_row.canonical_row_id is None:
-                financial_values = tuple(
-                    (str(column.canonical_field), parsed)
-                    for column in table.columns
-                    if column.canonical_field in {"net_amount", "gross_amount"}
-                    and (raw_value := cells[column.id].raw_value)
-                    and raw_value.strip()
-                    and (parsed := parse_decimal(raw_value)) is not None
-                )
-                if financial_values and not _unlinked_financial_row_is_explained(
-                    table=table,
-                    source_tables=source_tables,
-                    source_row=source_row,
-                    cells=cells,
-                    financial_values=financial_values,
-                    canonical_rows=canonical_rows,
-                    result=new_result,
-                ):
-                    raise ValueError(
-                        "unlinked source row contains a mapped financial value: "
-                        f"{source_row.id}"
-                    )
-                continue
-            canonical = canonical_rows.get(source_row.canonical_row_id)
-            if canonical is None:
-                raise ValueError(
-                    f"source row links unknown canonical row: {source_row.canonical_row_id}"
-                )
-            if source_row.canonical_row_id in linked_ids:
-                raise ValueError(
-                    f"canonical row has multiple source links: {source_row.canonical_row_id}"
-                )
-            linked_ids.add(source_row.canonical_row_id)
-            for column in table.columns:
-                field = column.canonical_field
-                if field is None:
-                    continue
-                cell = cells[column.id]
-                canonical_value = canonical.get(field)
-                printed_present = bool(cell.raw_value and cell.raw_value.strip())
-                canonical_present = canonical_value is not None and (
-                    not isinstance(canonical_value, str) or bool(canonical_value.strip())
-                )
-                evidence_field = evidence_fields[field]
-                field_token_ids = {
-                    str(token_id)
-                    for item in (canonical.get("field_evidence") or {}).get(
-                        evidence_field, []
-                    )
-                    for token_id in item.get("token_ids") or []
-                }
-                canonical_numeric_value = (
-                    parse_decimal(str(canonical_value))
-                    if field in numeric_fields and canonical_present
-                    else None
-                )
-                canonical_rate = parse_decimal(
-                    str(canonical.get("unit_price"))
-                )
-                canonical_amount = parse_decimal(
-                    str(canonical.get("net_amount"))
-                )
-                canonical_discount = (
-                    parse_decimal(str(canonical.get("discount")))
-                    or Decimal("0")
-                )
-                derived_quantity_is_proven = bool(
-                    field == "quantity"
-                    and "quantity_derived_from_rate_amount"
-                    in (canonical.get("validation_flags") or [])
-                    and canonical_numeric_value is not None
-                    and canonical_numeric_value > 0
-                    and canonical_numeric_value
-                    == canonical_numeric_value.to_integral_value()
-                    and canonical_rate is not None
-                    and canonical_rate > 0
-                    and canonical_amount is not None
-                    and canonical_numeric_value * canonical_rate
-                    == abs(canonical_amount) + canonical_discount
-                )
-                if printed_present and not canonical_present:
-                    raise ValueError(
-                        f"{field} has a printed value but is missing canonical value "
-                        f"for canonical row {source_row.canonical_row_id}"
-                    )
-                if canonical_present and not printed_present:
-                    unmapped_service_date_is_grounded = bool(
-                        field == "service_date_raw"
-                        and {
-                            "service_date_corrected_from_source_cell",
-                            "service_date_inherited_from_group",
-                            "service_date_recovered_from_source_cell",
-                        }.intersection(canonical.get("validation_flags") or [])
-                        and grounded_service_date_exists(
-                            canonical,
-                            field_token_ids,
-                        )
-                    )
-                    if unmapped_service_date_is_grounded:
-                        continue
-                    derived_quantity_has_grounded_operands = bool(
-                        derived_quantity_is_proven
-                        and field_token_ids
-                        and field_token_ids.issubset(
-                            {
-                                token_id
-                                for supporting_column in table.columns
-                                if supporting_column.canonical_field
-                                in {"unit_price", "net_amount"}
-                                for item in cells[supporting_column.id].evidence
-                                for token_id in item.token_ids
-                            }
-                        )
-                    )
-                    if derived_quantity_has_grounded_operands:
-                        continue
-                    serial_description_is_grounded = bool(
-                        field == "description"
-                        and "missing_printed_description"
-                        in (canonical.get("validation_flags") or [])
-                        and re.fullmatch(r"\d+[.)]?", str(canonical_value).strip())
-                        and field_token_ids
-                        and any(
-                            column_candidate.canonical_field is None
-                            and _normalized(column_candidate.label)
-                            in {"#", "s no", "serial no", "sr n", "sr no"}
-                            and (serial_cell := cells[column_candidate.id]).raw_value
-                            and serial_cell.raw_value.strip()
-                            == str(canonical_value).strip()
-                            and field_token_ids.issubset(
-                                {
-                                    token_id
-                                    for item in serial_cell.evidence
-                                    for token_id in item.token_ids
-                                }
-                            )
-                            for column_candidate in table.columns
-                        )
-                    )
-                    if serial_description_is_grounded:
-                        continue
-                    raise ValueError(
-                        f"{field} has a canonical value but is missing printed value "
-                        f"for canonical row {source_row.canonical_row_id}"
-                    )
-                if not printed_present:
-                    continue
-                cell_token_ids = {
-                    token_id
-                    for item in cell.evidence
-                    for token_id in item.token_ids
-                }
-                evidence_matches = field_token_ids.issubset(cell_token_ids)
-                if not field_token_ids or not evidence_matches:
-                    raise ValueError(
-                        f"{field} evidence is not in its mapped source cell "
-                        f"for canonical row {source_row.canonical_row_id}"
-                    )
-                if field in numeric_fields:
-                    printed_value = (
-                        parse_quantity(cell.raw_value or "")
-                        if field == "quantity"
-                        else parse_decimal(cell.raw_value or "")
-                    )
-                    if derived_quantity_is_proven and printed_value is None:
-                        continue
-                    if (
-                        printed_value is None
-                        or printed_value != canonical_numeric_value
-                    ):
-                        raise ValueError(
-                            f"{field} value does not match its mapped source cell "
-                            f"for canonical row {source_row.canonical_row_id}"
-                        )
-                elif field != "description":
-                    value_matches = _normalized(cell.raw_value) == _normalized(
-                        canonical_value
-                    )
-                    if field == "service_date_raw":
-                        printed_date_iso = _printed_service_date_iso(
-                            cell.raw_value or "",
-                            canonical.get("description"),
-                        )
-                        value_matches = value_matches or bool(
-                            canonical.get("service_date_iso")
-                            and printed_date_iso == canonical.get("service_date_iso")
-                        )
-                    if not value_matches:
-                        raise ValueError(
-                            f"{field} value does not match its mapped source cell "
-                            f"for canonical row {source_row.canonical_row_id}"
-                        )
-    for row_id, row_payload in canonical_rows.items():
-        if (
-            row_payload.get("service_date_raw")
-            and {
-                "service_date_corrected_from_source_cell",
-                "service_date_inherited_from_group",
-                "service_date_recovered_from_source_cell",
-            }.intersection(row_payload.get("validation_flags") or [])
-        ):
-            service_date_token_ids = {
-                str(token_id)
-                for item in (row_payload.get("field_evidence") or {}).get(
-                    "service_date", []
-                )
-                for token_id in item.get("token_ids") or []
-            }
-            if not grounded_service_date_exists(
-                row_payload,
-                service_date_token_ids,
-            ):
-                raise ValueError(
-                    "service_date_raw lacks matching grounded source evidence "
-                    f"for canonical row {row_id}"
-                )
-        if (
-            "ocr_spatial_graph" in (row_payload.get("source_routes") or [])
-            and row_id not in linked_ids
-        ):
-            raise ValueError(f"canonical OCR row lacks a source-table link: {row_id}")
-
+    if transition_errors or blocking:
+        messages = [
+            *transition_errors,
+            *(
+                issue.message[:1].lower() + issue.message[1:]
+                for issue in blocking
+            ),
+        ]
+        raise ValueError("; ".join(messages))
 
 # Kept for compatibility with existing callers while the public validator is
 # shared by normal worker publication and controlled reprocessing.
@@ -1551,9 +1242,10 @@ def _snapshot_job(
     source = job_dir / "source.pdf"
     result_path = job_dir / "result.json"
     artifact_root = job_dir / "artifacts"
-    with store.job_lock(job_id, exclusive=False):
+    with store.job_lock(job_id, exclusive=True):
+        store._recover_publication_unlocked(job_id)
         store._require_stable_workspace(job_id)
-        state = store.read(job_id)
+        state = store._read_state_unlocked(job_id)
         if state.get("status") not in {"complete", "needs_review"}:
             raise ValueError("only complete or needs-review jobs can be reprocessed")
         if not source.is_file() or not result_path.is_file() or not artifact_root.is_dir():
@@ -1629,7 +1321,11 @@ def _prepare_source_group(
             representative.source,
             representative_stage / "artifacts",
             recovery_targets=report.recovery_targets,
+            baseline_result=extracted_result,
+            allow_gemini=False,
         )
+        if int((extracted_result.get("provider_usage") or {}).get("gemini_calls") or 0):
+            raise ValueError("targeted recovery invoked Gemini")
         report = _staged_validation_report(
             representative.source,
             extracted_result,
@@ -1739,22 +1435,28 @@ def _cutover_job(
             if validation.status is ValidationStatus.PASSED
             else "needs_review"
         )
-        store.update(
-            prepared.job_id,
-            status=terminal_status,
-            page=int(prepared.new_result.get("pages") or 0),
-            pages=int(prepared.new_result.get("pages") or 0),
-            row_count=len(prepared.new_result.get("rows", [])),
-            hospital_name=hospital.get("name"),
-            hospital_confidence=hospital.get("confidence"),
-            validation_status=validation.status.value,
-            validation_issue_count=len(validation.issues),
-            validation_issue_codes=list(
-                dict.fromkeys(issue.code for issue in validation.issues)
-            ),
-            error=None,
-            reprocessed_at=utc_now(),
+        # The batch coordinator already holds this job's exclusive lock.  Use
+        # the raw state primitives so cutover cannot recursively flock the
+        # same lock file and deadlock.
+        state = store._read_state_unlocked(prepared.job_id)
+        state.update(
+            {
+                "status": terminal_status,
+                "page": int(prepared.new_result.get("pages") or 0),
+                "pages": int(prepared.new_result.get("pages") or 0),
+                "row_count": len(prepared.new_result.get("rows", [])),
+                "hospital_name": hospital.get("name"),
+                "hospital_confidence": hospital.get("confidence"),
+                "validation_status": validation.status.value,
+                "validation_issue_count": len(validation.issues),
+                "validation_issue_codes": list(
+                    dict.fromkeys(issue.code for issue in validation.issues)
+                ),
+                "error": None,
+                "reprocessed_at": utc_now(),
+            }
         )
+        store._write_state_unlocked(prepared.job_id, state)
     except BaseException:
         try:
             restore_path("result.json")

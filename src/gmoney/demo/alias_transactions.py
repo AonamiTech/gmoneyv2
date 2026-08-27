@@ -454,6 +454,7 @@ class AliasTransactionCoordinator:
                 "alias registry recovery failed",
             )
             with self.store.job_lock(job_id, exclusive=True):
+                self.store._recover_publication_unlocked(job_id)
                 self.store._require_stable_workspace(job_id)
                 registry = self._storage(
                     self.repository._read_unlocked,
@@ -553,7 +554,8 @@ class AliasTransactionCoordinator:
             with self.repository.lock(exclusive=True):
                 self._recover_all_unlocked()
                 with self.store.job_lock(job_id, exclusive=True):
-                    state = self.store.read(job_id)
+                    self.store._recover_publication_unlocked(job_id)
+                    state = self.store._read_state_unlocked(job_id)
                     if state.get("status") in ACTIVE_STATUSES:
                         raise RuntimeError("active_job")
                     shutil.rmtree(self.store.job_dir(job_id))
@@ -574,7 +576,8 @@ class AliasTransactionCoordinator:
                     job_id = str(observed["id"])
                     with self.store.job_lock(job_id, exclusive=True):
                         try:
-                            state = self.store.read(job_id)
+                            self.store._recover_publication_unlocked(job_id)
+                            state = self.store._read_state_unlocked(job_id)
                         except KeyError:
                             continue
                         if state.get("status") in ACTIVE_STATUSES:

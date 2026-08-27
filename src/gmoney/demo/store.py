@@ -111,21 +111,31 @@ class JobStore:
             "hospital_confidence": None,
             "error": None,
         }
-        self.write(job_id, state)
+        self._write_state_unlocked(job_id, state)
         return state
 
-    def read(self, job_id: str) -> dict[str, Any]:
+    def _read_state_unlocked(self, job_id: str) -> dict[str, Any]:
         path = self.job_dir(job_id) / "state.json"
         if not path.is_file():
             raise KeyError(job_id)
         return json.loads(path.read_text())
 
-    def write(self, job_id: str, state: dict[str, Any]) -> None:
+    def read(self, job_id: str) -> dict[str, Any]:
+        with self.job_lock(job_id, exclusive=True):
+            self._recover_publication_unlocked(job_id)
+            return self._read_state_unlocked(job_id)
+
+    def _write_state_unlocked(self, job_id: str, state: dict[str, Any]) -> None:
         directory = self.job_dir(job_id)
         state = {**state, "updated_at": utc_now()}
         temporary = directory / f"state.{os.getpid()}.tmp"
         temporary.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
         temporary.replace(directory / "state.json")
+
+    def write(self, job_id: str, state: dict[str, Any]) -> None:
+        with self.job_lock(job_id, exclusive=True):
+            self._recover_publication_unlocked(job_id)
+            self._write_state_unlocked(job_id, state)
 
     @staticmethod
     def _durable_bytes(path: Path, payload: bytes) -> None:
@@ -161,28 +171,34 @@ class JobStore:
         """Crash-injection boundary used by process-level transaction tests."""
 
     def update(self, job_id: str, **changes: Any) -> dict[str, Any]:
-        state = self.read(job_id)
-        state.update(changes)
-        self.write(job_id, state)
-        return state
+        with self.job_lock(job_id, exclusive=True):
+            self._recover_publication_unlocked(job_id)
+            state = self._read_state_unlocked(job_id)
+            state.update(changes)
+            self._write_state_unlocked(job_id, state)
+            return state
 
     @property
     def abort_marker_name(self) -> str:
         return ".abort-requested"
 
     def abort_requested(self, job_id: str) -> bool:
-        directory = self.job_dir(job_id)
-        if (directory / self.abort_marker_name).is_file():
-            return True
         try:
-            return self.read(job_id).get("status") == CANCELLING_STATUS
-        except KeyError:
+            with self.job_lock(job_id, exclusive=True):
+                self._recover_publication_unlocked(job_id)
+                directory = self.job_dir(job_id)
+                return bool(
+                    (directory / self.abort_marker_name).is_file()
+                    or self._read_state_unlocked(job_id).get("status")
+                    == CANCELLING_STATUS
+                )
+        except (FileNotFoundError, KeyError):
             return True
 
     def request_abort(self, job_id: str) -> dict[str, Any]:
         with self.job_lock(job_id, exclusive=True):
             self._recover_publication_unlocked(job_id)
-            state = self.read(job_id)
+            state = self._read_state_unlocked(job_id)
             current = state.get("status")
             if current == CANCELLING_STATUS:
                 return state
@@ -191,7 +207,7 @@ class JobStore:
             marker = self.job_dir(job_id) / self.abort_marker_name
             marker.touch(mode=0o600, exist_ok=True)
             state.update(status=CANCELLING_STATUS, error=None)
-            self.write(job_id, state)
+            self._write_state_unlocked(job_id, state)
             return state
 
     def claim_queued(
@@ -199,29 +215,32 @@ class JobStore:
         job_id: str,
         cancel_requested: Callable[[], bool] | None = None,
     ) -> dict[str, Any] | None:
+        if cancel_requested is not None and cancel_requested():
+            return None
         with self.job_lock(job_id, exclusive=True):
-            state = self.read(job_id)
+            self._recover_publication_unlocked(job_id)
+            state = self._read_state_unlocked(job_id)
             if (
                 state.get("status") != "queued"
                 or (self.job_dir(job_id) / self.abort_marker_name).is_file()
-                or (cancel_requested is not None and cancel_requested())
             ):
                 return None
             state.update(status="processing", page=0, error=None)
-            self.write(job_id, state)
+            self._write_state_unlocked(job_id, state)
             return state
 
     def requeue_claimed(self, job_id: str) -> bool:
         """Return a claimed job to the queue before it is submitted to a runner."""
         with self.job_lock(job_id, exclusive=True):
-            state = self.read(job_id)
+            self._recover_publication_unlocked(job_id)
+            state = self._read_state_unlocked(job_id)
             if (
                 state.get("status") != "processing"
                 or (self.job_dir(job_id) / self.abort_marker_name).is_file()
             ):
                 return False
             state.update(status="queued", page=0, error=None)
-            self.write(job_id, state)
+            self._write_state_unlocked(job_id, state)
             return True
 
     def fail_queued(
@@ -231,26 +250,28 @@ class JobStore:
         cancel_requested: Callable[[], bool] | None = None,
     ) -> bool:
         """Fail a queued job without exposing a transient processing state."""
+        if cancel_requested is not None and cancel_requested():
+            return False
         with self.job_lock(job_id, exclusive=True):
-            state = self.read(job_id)
-            if state.get("status") != "queued" or (
-                cancel_requested is not None and cancel_requested()
-            ):
+            self._recover_publication_unlocked(job_id)
+            state = self._read_state_unlocked(job_id)
+            if state.get("status") != "queued":
                 return False
             state.update(status="failed", error=error)
-            self.write(job_id, state)
+            self._write_state_unlocked(job_id, state)
             return True
 
     def update_processing_progress(self, job_id: str, page: int, pages: int) -> bool:
         with self.job_lock(job_id, exclusive=True):
-            state = self.read(job_id)
+            self._recover_publication_unlocked(job_id)
+            state = self._read_state_unlocked(job_id)
             if (
                 state.get("status") != "processing"
                 or (self.job_dir(job_id) / self.abort_marker_name).is_file()
             ):
                 return False
             state.update(page=page, pages=pages)
-            self.write(job_id, state)
+            self._write_state_unlocked(job_id, state)
             return True
 
     def publish_processing_outcome(
@@ -265,7 +286,8 @@ class JobStore:
         if status not in {"complete", "needs_review"}:
             raise ValueError("processing outcome must be complete or needs_review")
         with self.job_lock(job_id, exclusive=True):
-            state = self.read(job_id)
+            self._recover_publication_unlocked(job_id)
+            state = self._read_state_unlocked(job_id)
             directory = self.job_dir(job_id)
             if (
                 state.get("status") != "processing"
@@ -288,13 +310,21 @@ class JobStore:
                 **changes,
                 "updated_at": utc_now(),
             }
+            self._publication_checkpoint("before_target_result_staged")
             self._durable_json(paths["target_result"], result)
+            self._publication_checkpoint("after_target_result_staged")
+            self._publication_checkpoint("before_target_state_staged")
             self._durable_json(paths["target_state"], target_state)
+            self._publication_checkpoint("after_target_state_staged")
+            self._publication_checkpoint("before_base_state_staged")
             self._durable_bytes(paths["base_state"], (directory / "state.json").read_bytes())
+            self._publication_checkpoint("after_base_state_staged")
             live_result = directory / "result.json"
             base_result_exists = live_result.is_file()
             if base_result_exists:
+                self._publication_checkpoint("before_base_result_staged")
                 self._durable_bytes(paths["base_result"], live_result.read_bytes())
+                self._publication_checkpoint("after_base_result_staged")
             journal = {
                 "version": "job_publication_v1",
                 "job_id": job_id,
@@ -303,14 +333,20 @@ class JobStore:
                 "target_state_sha256": self._file_sha256(paths["target_state"]),
                 "created_at": utc_now(),
             }
+            self._publication_checkpoint("before_journal_staged")
             self._durable_json(paths["journal"], journal)
             self._fsync_directory(directory)
+            self._publication_checkpoint("after_journal_staged")
             self._publication_checkpoint("journal_persisted")
+            self._publication_checkpoint("before_result_replaced")
             paths["target_result"].replace(live_result)
             self._fsync_directory(directory)
+            self._publication_checkpoint("after_result_replaced")
             self._publication_checkpoint("result_replaced")
+            self._publication_checkpoint("before_state_replaced")
             paths["target_state"].replace(directory / "state.json")
             self._fsync_directory(directory)
+            self._publication_checkpoint("after_state_replaced")
             self._publication_checkpoint("state_replaced")
             self._cleanup_publication_unlocked(directory)
             return True
@@ -318,14 +354,14 @@ class JobStore:
     def fail_processing(self, job_id: str, error: str) -> bool:
         with self.job_lock(job_id, exclusive=True):
             self._recover_publication_unlocked(job_id)
-            state = self.read(job_id)
+            state = self._read_state_unlocked(job_id)
             if (
                 state.get("status") != "processing"
                 or (self.job_dir(job_id) / self.abort_marker_name).is_file()
             ):
                 return False
             state.update(status="failed", error=error)
-            self.write(job_id, state)
+            self._write_state_unlocked(job_id, state)
             return True
 
     def finalize_abort(self, job_id: str) -> bool:
@@ -334,7 +370,8 @@ class JobStore:
             return False
         tombstone = self.jobs_root / f".{job_id}.aborted-{uuid4()}"
         with self.job_lock(job_id, exclusive=True):
-            state = self.read(job_id)
+            self._recover_publication_unlocked(job_id)
+            state = self._read_state_unlocked(job_id)
             if state.get("status") != CANCELLING_STATUS:
                 return False
             directory.replace(tombstone)
@@ -375,8 +412,12 @@ class JobStore:
                 flock(lock.fileno(), LOCK_UN)
 
     def _require_stable_workspace(self, job_id: str) -> None:
-        publication_journal = self.job_dir(job_id) / ".publish-operation.json"
-        if publication_journal.exists() or publication_journal.is_symlink():
+        directory = self.job_dir(job_id)
+        publication_artifacts = (
+            directory / ".publish-operation.json",
+            *self._publication_stage_paths(directory),
+        )
+        if any(path.exists() or path.is_symlink() for path in publication_artifacts):
             raise JobTransactionError("publication_recovery_required")
         if (self.job_dir(job_id) / ".cutover.json").is_file():
             raise JobTransactionError("job_cutover_recovery_required")
@@ -393,16 +434,60 @@ class JobStore:
         ):
             path = directory / name
             if path.is_file():
+                self._publication_checkpoint(f"before_cleanup:{name}")
                 path.unlink()
+                self._fsync_directory(directory)
+                self._publication_checkpoint(f"after_cleanup:{name}")
         journal = directory / ".publish-operation.json"
         if journal.is_file():
+            self._publication_checkpoint("before_cleanup:.publish-operation.json")
             journal.unlink()
-        self._fsync_directory(directory)
+            self._fsync_directory(directory)
+            self._publication_checkpoint("after_cleanup:.publish-operation.json")
+
+    @staticmethod
+    def _publication_stage_paths(directory: Path) -> tuple[Path, ...]:
+        return tuple(
+            directory / name
+            for name in (
+                ".publish-result.json",
+                ".publish-state.json",
+                ".publish-base-result.json",
+                ".publish-base-state.json",
+            )
+        )
+
+    def _discard_orphan_publication_stages_unlocked(self, directory: Path) -> None:
+        stages = tuple(
+            path
+            for path in self._publication_stage_paths(directory)
+            if path.exists() or path.is_symlink()
+        )
+        if not stages:
+            return
+        if any(not path.is_file() or path.is_symlink() for path in stages):
+            raise JobTransactionError("invalid_publication_stage")
+        base_state = directory / ".publish-base-state.json"
+        live_state = directory / "state.json"
+        if base_state.is_file() and (
+            not live_state.is_file()
+            or self._file_sha256(base_state) != self._file_sha256(live_state)
+        ):
+            raise JobTransactionError("orphan_publication_base_mismatch")
+        # The protocol never replaces a live file before the journal is
+        # durable. With no journal and an unchanged staged base, these files
+        # are an uncommitted operation and are safe to discard.
+        for path in stages:
+            self._publication_checkpoint(f"before_orphan_cleanup:{path.name}")
+            path.unlink()
+            self._fsync_directory(directory)
+            self._publication_checkpoint(f"after_orphan_cleanup:{path.name}")
 
     def _recover_publication_unlocked(self, job_id: str) -> None:
         directory = self.job_dir(job_id)
         journal_path = directory / ".publish-operation.json"
         if not journal_path.exists() and not journal_path.is_symlink():
+            self._discard_orphan_publication_stages_unlocked(directory)
             return
         if not journal_path.is_file():
             raise JobTransactionError("invalid_publication_journal")
@@ -439,7 +524,7 @@ class JobStore:
                 base_result.replace(live_result)
             elif matches(live_result, result_digest):
                 live_result.unlink()
-            current_state = self.read(job_id)
+            current_state = self._read_state_unlocked(job_id)
             if current_state.get("status") != CANCELLING_STATUS:
                 base_state = directory / ".publish-base-state.json"
                 if not base_state.is_file():
@@ -461,12 +546,14 @@ class JobStore:
         self._cleanup_publication_unlocked(directory)
 
     def read_review(self, job_id: str) -> dict[str, Any]:
-        with self.job_lock(job_id, exclusive=False):
+        with self.job_lock(job_id, exclusive=True):
+            self._recover_publication_unlocked(job_id)
             self._require_stable_workspace(job_id)
             return self._read_review_unlocked(job_id)
 
     def read_result(self, job_id: str) -> dict[str, Any]:
-        with self.job_lock(job_id, exclusive=False):
+        with self.job_lock(job_id, exclusive=True):
+            self._recover_publication_unlocked(job_id)
             self._require_stable_workspace(job_id)
             path = self.job_dir(job_id) / "result.json"
             if not path.is_file():
@@ -477,9 +564,10 @@ class JobStore:
     def locked_workspace(
         self, job_id: str
     ) -> Iterator[tuple[dict[str, Any], dict[str, Any], dict[str, Any]]]:
-        with self.job_lock(job_id, exclusive=False):
+        with self.job_lock(job_id, exclusive=True):
+            self._recover_publication_unlocked(job_id)
             self._require_stable_workspace(job_id)
-            state = self.read(job_id)
+            state = self._read_state_unlocked(job_id)
             result_path = self.job_dir(job_id) / "result.json"
             if not result_path.is_file():
                 raise JobTransactionError("extraction_result_unavailable")
@@ -496,9 +584,10 @@ class JobStore:
     def read_page_bytes(
         self, job_id: str, page_number: int
     ) -> tuple[dict[str, Any], bytes]:
-        with self.job_lock(job_id, exclusive=False):
+        with self.job_lock(job_id, exclusive=True):
+            self._recover_publication_unlocked(job_id)
             self._require_stable_workspace(job_id)
-            state = self.read(job_id)
+            state = self._read_state_unlocked(job_id)
             result_path = self.job_dir(job_id) / "result.json"
             if not result_path.is_file():
                 raise JobTransactionError("extraction_result_unavailable")
@@ -526,6 +615,7 @@ class JobStore:
         mutation: Callable[[dict[str, Any]], dict[str, Any]],
     ) -> dict[str, Any]:
         with self.job_lock(job_id, exclusive=True):
+            self._recover_publication_unlocked(job_id)
             self._require_stable_workspace(job_id)
             current = self._read_review_unlocked(job_id)
             if current["revision"] != expected_revision:
@@ -687,10 +777,21 @@ class JobStore:
 
     def states(self) -> list[dict[str, Any]]:
         states: list[dict[str, Any]] = []
-        for state_path in self.jobs_root.glob("*/state.json"):
+        for directory in self.jobs_root.iterdir():
+            if not directory.is_dir() or directory.name.startswith("."):
+                continue
             try:
-                states.append(json.loads(state_path.read_text()))
-            except (OSError, json.JSONDecodeError):
+                job_id = str(UUID(directory.name))
+                with self.job_lock(job_id, exclusive=True):
+                    self._recover_publication_unlocked(job_id)
+                    states.append(self._read_state_unlocked(job_id))
+            except (
+                KeyError,
+                OSError,
+                ValueError,
+                json.JSONDecodeError,
+                JobTransactionError,
+            ):
                 continue
         return states
 
@@ -704,8 +805,18 @@ class JobStore:
         )
 
     def recover(self) -> None:
-        for journal_path in self.jobs_root.glob("*/.publish-operation.json"):
-            job_id = journal_path.parent.name
+        for directory in self.jobs_root.iterdir():
+            if not directory.is_dir() or directory.name.startswith("."):
+                continue
+            if not any(
+                path.exists() or path.is_symlink()
+                for path in (
+                    directory / ".publish-operation.json",
+                    *self._publication_stage_paths(directory),
+                )
+            ):
+                continue
+            job_id = directory.name
             with self.job_lock(job_id, exclusive=True):
                 self._recover_publication_unlocked(job_id)
         rollback_batches: dict[
@@ -729,8 +840,12 @@ class JobStore:
                 self.finalize_abort(state["id"])
                 continue
             if state.get("status") == "processing":
-                state.update(status="queued", error=None, page=0)
-                self.write(state["id"], state)
+                with self.job_lock(state["id"], exclusive=True):
+                    self._recover_publication_unlocked(state["id"])
+                    current = self._read_state_unlocked(state["id"])
+                    if current.get("status") == "processing":
+                        current.update(status="queued", error=None, page=0)
+                        self._write_state_unlocked(state["id"], current)
 
     def last_activity(self, job_id: str, state: dict[str, Any] | None = None) -> datetime:
         current = state or self.read(job_id)
@@ -757,8 +872,9 @@ class JobStore:
 
     def delete(self, job_id: str) -> None:
         with self.job_lock(job_id, exclusive=True):
+            self._recover_publication_unlocked(job_id)
             self._require_stable_workspace(job_id)
-            state = self.read(job_id)
+            state = self._read_state_unlocked(job_id)
             if state.get("status") in ACTIVE_STATUSES:
                 raise RuntimeError("active_job")
             shutil.rmtree(self.job_dir(job_id))
@@ -772,10 +888,11 @@ class JobStore:
             try:
                 with self.job_lock(state["id"], exclusive=True):
                     try:
+                        self._recover_publication_unlocked(state["id"])
                         self._require_stable_workspace(state["id"])
                     except JobTransactionError:
                         continue
-                    current = self.read(state["id"])
+                    current = self._read_state_unlocked(state["id"])
                     if current.get("status") in ACTIVE_STATUSES:
                         continue
                     updated = self.last_activity(state["id"], current)

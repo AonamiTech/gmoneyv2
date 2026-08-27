@@ -7,6 +7,11 @@ from gmoney.extraction.typed_values import parse_service_date
 DATE_FRAGMENT = re.compile(
     r"(?<!\d)(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}[/-]\d{1,2}[/-]\d{1,2})(?!\d)"
 )
+PRINTED_DATE_REQUEST_SUFFIX = re.compile(
+    r"\s*[-:]?\s*[A-Z][A-Z0-9-]{2,}/[A-Z0-9-]+"
+    r"(?:\s+(?P<bleed>[A-Z]{1,2}))?\s*$",
+    re.IGNORECASE,
+)
 
 _NON_SERVICE_MARKERS = (
     "admission date",
@@ -57,17 +62,51 @@ def service_date_from_context(
     description: object = None,
 ) -> tuple[str, str] | None:
     raw = re.sub(r"\s+", " ", str(raw_value or "")).strip()
+    normalized_label = normalized_date_context(column_label)
+    direct = parse_service_date(raw)
+    if direct is not None and normalized_label in {
+        "date",
+        "date time",
+        "service date",
+        "service date time",
+        "service dt",
+    }:
+        # A date-only value in an explicitly mapped service-date lane is local
+        # evidence. Product words elsewhere in the row must not turn it into an
+        # expiry/batch date; those markers still apply to embedded dates.
+        return raw, direct
     if not raw or not is_service_date_context(
         raw,
         column_label=column_label,
         description=description,
     ):
         return None
-    direct = parse_service_date(raw)
     if direct is not None:
         return raw, direct
+    request_suffix = PRINTED_DATE_REQUEST_SUFFIX.search(raw)
+    if request_suffix is not None:
+        parsed_prefix = parse_service_date(raw[: request_suffix.start()])
+        bleed = normalized_date_context(request_suffix.group("bleed"))
+        first_description_word = next(
+            iter(normalized_date_context(description).split()), ""
+        )
+        if parsed_prefix is not None and (
+            not bleed
+            or first_description_word.startswith(bleed)
+            or first_description_word.endswith(bleed)
+        ):
+            date_match = DATE_FRAGMENT.search(raw)
+            return (
+                date_match.group(0) if date_match is not None else raw,
+                parsed_prefix,
+            )
+        return None
     matches = tuple(DATE_FRAGMENT.finditer(raw))
     if len(matches) != 1:
         return None
-    parsed = parse_service_date(matches[0].group(0))
+    match = matches[0]
+    suffix = raw[match.end() :].strip(" ()[]{}:;,-")
+    if suffix:
+        return None
+    parsed = parse_service_date(match.group(0))
     return (matches[0].group(0), parsed) if parsed is not None else None

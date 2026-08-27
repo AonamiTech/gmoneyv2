@@ -20,6 +20,8 @@ from gmoney.demo import worker as worker_module
 from gmoney.demo.store import JobStore, JobTransactionError
 from gmoney.extraction.offline import ExtractionAborted
 from gmoney.extraction.validation import (
+    RecoveryScope,
+    ValidationCategory,
     ValidationIssue,
     ValidationReport,
     ValidationSeverity,
@@ -1128,6 +1130,7 @@ def test_reviewable_result_runs_exactly_one_scoped_recovery_pass(
     job_id = _create_worker_job(store, "Recover once.pdf")
     assert store.claim_queued(job_id) is not None
     calls: list[tuple[tuple[int, str | None], ...]] = []
+    recovery_controls: list[tuple[bool, bool]] = []
 
     class RecoveringExtractor:
         def extract(
@@ -1138,12 +1141,19 @@ def test_reviewable_result_runs_exactly_one_scoped_recovery_pass(
             *,
             should_abort: Any,
             recovery_targets: tuple[tuple[int, str | None], ...] = (),
+            baseline_result: dict[str, Any] | None = None,
+            allow_gemini: bool = True,
         ) -> dict[str, Any]:
             calls.append(recovery_targets)
+            if recovery_targets:
+                recovery_controls.append(
+                    (baseline_result is not None, allow_gemini)
+                )
             return {
                 "output_version": "offline_accuracy_spine_v3",
                 "rows": [],
                 "hospital": None,
+                "provider_usage": {"gemini_calls": 0},
             }
 
     issue = ValidationIssue(
@@ -1154,6 +1164,8 @@ def test_reviewable_result_runs_exactly_one_scoped_recovery_pass(
         page_number=2,
         table_id="p2-t3",
         source_row_id="p2-t3-s1-r4",
+        category=ValidationCategory.LINKING,
+        recovery_scope=RecoveryScope.TABLE,
     )
     reports = iter(
         (
@@ -1177,6 +1189,7 @@ def test_reviewable_result_runs_exactly_one_scoped_recovery_pass(
     )
 
     assert calls == [(), ((2, "p2-t3"),)]
+    assert recovery_controls == [(True, False)]
     state = store.read(job_id)
     assert state["status"] == "complete"
     result = json.loads((store.job_dir(job_id) / "result.json").read_text())
@@ -1221,6 +1234,82 @@ def test_validated_publication_recovers_each_crash_boundary(
     assert recovered.read(job_id)["row_count"] == 1
     assert recovered.read_result(job_id)["rows"][0]["id"] == "validated-row"
     assert not (recovered.job_dir(job_id) / ".publish-operation.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("phase", "expected_status"),
+    (
+        ("before_target_result_staged", "queued"),
+        ("after_target_result_staged", "queued"),
+        ("before_target_state_staged", "queued"),
+        ("after_target_state_staged", "queued"),
+        ("before_base_state_staged", "queued"),
+        ("after_base_state_staged", "queued"),
+        ("before_journal_staged", "queued"),
+        ("after_journal_staged", "complete"),
+        ("before_result_replaced", "complete"),
+        ("after_result_replaced", "complete"),
+        ("before_state_replaced", "complete"),
+        ("after_state_replaced", "complete"),
+        ("before_cleanup:.publish-base-state.json", "complete"),
+        ("after_cleanup:.publish-base-state.json", "complete"),
+        ("before_cleanup:.publish-operation.json", "complete"),
+        ("after_cleanup:.publish-operation.json", "complete"),
+    ),
+)
+def test_publication_crash_matrix_including_prejournal_orphans(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+    expected_status: str,
+) -> None:
+    root = tmp_path / phase.replace(":", "-")
+    store = JobStore(root)
+    job_id = _create_worker_job(store, "publication-crash.pdf")
+    assert store.claim_queued(job_id) is not None
+
+    def crash(current: str) -> None:
+        if current == phase:
+            raise RuntimeError(f"crash:{phase}")
+
+    monkeypatch.setattr(store, "_publication_checkpoint", crash)
+    with pytest.raises(RuntimeError, match="crash:"):
+        store.publish_processing_outcome(
+            job_id,
+            {"rows": [{"id": "validated-row"}]},
+            status="complete",
+            row_count=1,
+            validation_status="passed",
+            validation_issue_count=0,
+            validation_issue_codes=[],
+        )
+
+    recovered = JobStore(root)
+    recovered.recover()
+
+    assert recovered.read(job_id)["status"] == expected_status
+    if expected_status == "complete":
+        assert recovered.read_result(job_id)["rows"][0]["id"] == "validated-row"
+    else:
+        assert not (recovered.job_dir(job_id) / "result.json").exists()
+    assert not any(
+        path.exists() or path.is_symlink()
+        for path in (
+            recovered.job_dir(job_id) / ".publish-operation.json",
+            *recovered._publication_stage_paths(recovered.job_dir(job_id)),
+        )
+    )
+
+
+def test_malformed_publication_journal_fails_stable_reads_closed(
+    tmp_path: Path,
+) -> None:
+    store = JobStore(tmp_path)
+    job_id = _create_worker_job(store, "malformed-journal.pdf")
+    (store.job_dir(job_id) / ".publish-operation.json").write_text("{")
+
+    with pytest.raises(JobTransactionError, match="invalid_publication_journal"):
+        store.read(job_id)
 
 
 def test_worker_recovery_deletes_interrupted_abort(tmp_path: Path) -> None:

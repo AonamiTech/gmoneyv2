@@ -104,9 +104,13 @@ def _extract_and_publish(
                 progress,
                 **extraction_options,
                 recovery_targets=report.recovery_targets,
+                baseline_result=result,
+                allow_gemini=False,
             )
         except ExtractionAborted:
             return None
+        if int((result.get("provider_usage") or {}).get("gemini_calls") or 0) != 0:
+            raise RuntimeError("targeted_recovery_invoked_gemini")
         report = validate_extraction_result(source, result, directory / "artifacts")
     if report.fatal:
         raise ExtractionIntegrityError(report)

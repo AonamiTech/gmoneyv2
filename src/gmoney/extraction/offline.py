@@ -22,6 +22,7 @@ from gmoney.contracts.extraction import (
     DocumentTotal,
     EvidenceRef,
     PageType,
+    ReceiptSourceMetadata,
     RowRole,
     SourceCell,
     SourceColumn,
@@ -47,6 +48,7 @@ from gmoney.extraction.document_total import (
     DOCUMENT_TOTAL_VERSION,
     DOCUMENT_TOTALS_VERSION,
     DocumentTotalCandidate,
+    assign_document_total_contexts,
     extract_document_total_candidates,
     select_document_total,
     select_document_totals,
@@ -237,9 +239,14 @@ def _needs_full_page_financial_recovery(tokens: tuple[OcrToken, ...]) -> bool:
     ).strip()
     if not text:
         return False
-    receipt_context = any(
+    local_labels = any(
         marker in text
         for marker in (
+            "amount",
+            "bill no",
+            "date",
+            "invoice no",
+            "payment",
             "receipt no",
             "receipt book",
             "reservation receipt",
@@ -248,24 +255,13 @@ def _needs_full_page_financial_recovery(tokens: tuple[OcrToken, ...]) -> bool:
             "payment received",
         )
     )
-    financial_context = any(
-        marker in text
-        for marker in (
-            "amount",
-            "charges",
-            "payment",
-            "rs ",
-            "rs.",
-            "₹",
-        )
-    )
     money_like = bool(
         re.search(
             r"(?:₹|\brs\.?\s*)?\d[\d,]*(?:\.\d{1,2})?(?:\s*/-)?",
             text,
         )
     )
-    return receipt_context and financial_context and money_like
+    return local_labels and money_like
 
 
 def _assess_no_table_page(
@@ -275,9 +271,12 @@ def _assess_no_table_page(
     """Classify a detector-empty page without trusting baseline OCR alone."""
     image = cv2.imread(str(page_path), cv2.IMREAD_GRAYSCALE)
     if image is None:
+        evidence = tuple(token.token_id for token in tokens)
         return {
             "demonstrably_blank": False,
             "financial_form_suspected": _needs_full_page_financial_recovery(tokens),
+            "financial_form_classification": "unresolved",
+            "financial_form_classification_evidence": evidence,
             "form_signals": ("image_unreadable",),
         }
 
@@ -329,9 +328,75 @@ def _assess_no_table_page(
     if line_count >= 3 and foreground_ratio >= 0.002:
         signals.append("form_line_structure")
 
+    reference_present = bool(
+        re.search(r"\b(?:receipt|invoice|bill|reference|ref)\s*(?:no|number|#)", normalized_text)
+    )
+    date_present = bool(DATE_SPAN.search(normalized_text))
+    amount_present = bool(
+        re.search(r"(?:₹|\brs\.?\s*)\d|\d[\d,]*\.\d{2}\b", normalized_text)
+    )
+    billable_language = any(
+        marker in normalized_text
+        for marker in ("charge", "charges towards", "invoice", "bill amount")
+    )
+    nonbillable_language = any(
+        marker in normalized_text
+        for marker in (
+            "advance received",
+            "deposit received",
+            "payment mode",
+            "payment received",
+            "settlement",
+        )
+    )
+    suspected = bool(
+        not demonstrably_blank
+        and (
+            (
+                amount_present
+                and (signals or reference_present or date_present)
+            )
+            or "form_line_structure" in signals
+        )
+    )
+    classification = (
+        "blank"
+        if demonstrably_blank
+        else (
+            "recognized_nonbillable"
+            if suspected and nonbillable_language and not billable_language
+            else ("unresolved" if suspected else "nonfinancial")
+        )
+    )
+    classification_ids = tuple(
+        token.token_id
+        for token in tokens
+        if token.text.strip()
+        and (
+            parse_decimal(token.text) is not None
+            or any(
+                marker in token.text.casefold()
+                for marker in (
+                    "amount",
+                    "bill",
+                    "charge",
+                    "date",
+                    "deposit",
+                    "invoice",
+                    "payment",
+                    "receipt",
+                    "reference",
+                    "settlement",
+                )
+            )
+        )
+    )
+
     return {
         "demonstrably_blank": demonstrably_blank,
-        "financial_form_suspected": bool(signals) and not demonstrably_blank,
+        "financial_form_suspected": suspected,
+        "financial_form_classification": classification,
+        "financial_form_classification_evidence": classification_ids,
         "form_signals": tuple(dict.fromkeys(signals)),
         "foreground_ratio": round(foreground_ratio, 6),
         "form_line_count": line_count,
@@ -2524,7 +2589,7 @@ def _link_source_tables(
     tables: tuple[SourceTable, ...] | list[SourceTable],
     canonical_rows: tuple[CanonicalRow, ...] | list[CanonicalRow],
 ) -> tuple[SourceTable, ...]:
-    """Link printed rows only when OCR field evidence identifies one canonical row."""
+    """Link only strict, unique mutual-best source/canonical pairs."""
 
     def evidence_ids(items: object) -> set[str]:
         return {
@@ -2533,47 +2598,86 @@ def _link_source_tables(
             for token_id in getattr(item, "token_ids", ())
         }
 
-    linked_tables: list[SourceTable] = []
-    claimed_canonical_ids: set[str] = set()
+    def evidence_bounds(items: object) -> tuple[float, float, float, float] | None:
+        points = tuple(
+            point
+            for item in items or ()
+            for point in getattr(getattr(item, "polygon", None), "points", ())
+        )
+        if not points:
+            return None
+        return (
+            min(point.x for point in points),
+            min(point.y for point in points),
+            max(point.x for point in points),
+            max(point.y for point in points),
+        )
+
+    def geometry_score(
+        source_items: object,
+        candidate_items: object,
+    ) -> tuple[int, int, int]:
+        source = evidence_bounds(source_items)
+        candidate = evidence_bounds(candidate_items)
+        if source is None or candidate is None:
+            return (0, -10**9, -10**9)
+        vertical_overlap = max(0.0, min(source[3], candidate[3]) - max(source[1], candidate[1]))
+        minimum_height = max(1.0, min(source[3] - source[1], candidate[3] - candidate[1]))
+        vertical_ratio = round(vertical_overlap / minimum_height * 1000)
+        vertical_distance = round(
+            abs((source[1] + source[3]) / 2 - (candidate[1] + candidate[3]) / 2)
+        )
+        horizontal_distance = round(
+            abs((source[0] + source[2]) / 2 - (candidate[0] + candidate[2]) / 2)
+        )
+        return (vertical_ratio, -vertical_distance, -horizontal_distance)
+
+    candidates_by_table: dict[tuple[int, str | None], tuple[CanonicalRow, ...]] = {}
     for table in tables:
-        candidates = tuple(
+        candidates_by_table[(table.page_number, table.table_id)] = tuple(
             row
             for row in canonical_rows
             if row.page_number == table.page_number and row.table_id == table.table_id
         )
-        linked_rows = []
-        previous_linked_order: int | None = None
+
+    scores: dict[tuple[str, str], tuple[int, ...]] = {}
+    source_rows: dict[str, tuple[SourceTable, SourceRow]] = {}
+    canonical_by_id = {str(row.id): row for row in canonical_rows}
+    for table in tables:
+        description_column = next(
+            (column for column in table.columns if column.canonical_field == "description"),
+            None,
+        )
+        amount_column_ids = {
+            column.id
+            for column in table.columns
+            if column.canonical_field in {"gross_amount", "net_amount"}
+        }
         for source_row in table.rows:
-            source_ids = {
-                token_id
+            source_key = f"{table.id}:{source_row.id}"
+            source_rows[source_key] = (table, source_row)
+            source_evidence = tuple(
+                evidence for cell in source_row.cells for evidence in cell.evidence
+            )
+            amount_evidence = tuple(
+                evidence
                 for cell in source_row.cells
+                if cell.column_id in amount_column_ids
                 for evidence in cell.evidence
-                for token_id in evidence.token_ids
-            }
-            description_column = next(
+            )
+            source_ids = evidence_ids(source_evidence)
+            printed_description = next(
                 (
-                    column
-                    for column in table.columns
-                    if column.canonical_field == "description"
+                    cell.raw_value or ""
+                    for cell in source_row.cells
+                    if description_column is not None
+                    and cell.column_id == description_column.id
                 ),
-                None,
+                "",
             )
-            printed_description = (
-                next(
-                    (
-                        cell.raw_value
-                        for cell in source_row.cells
-                        if description_column is not None
-                        and cell.column_id == description_column.id
-                    ),
-                    None,
-                )
-                or ""
-            )
-            scored: list[tuple[tuple[int, int, int, int, int, int], CanonicalRow]] = []
-            for candidate_index, candidate in enumerate(candidates):
-                if str(candidate.id) in claimed_canonical_ids:
-                    continue
+            for candidate in candidates_by_table.get(
+                (table.page_number, table.table_id), ()
+            ):
                 description_ids = evidence_ids(
                     candidate.field_evidence.get("description", ())
                 )
@@ -2582,73 +2686,92 @@ def _link_source_tables(
                     RowRole.REFUND,
                     RowRole.CATEGORY_ROLLUP,
                 }:
-                    anchor_ids = evidence_ids(candidate.field_evidence.get("amount", ()))
+                    anchor_evidence = candidate.field_evidence.get("amount", ())
                 elif candidate.role is RowRole.INFORMATIONAL:
-                    anchor_ids = set().union(
-                        *(
-                            evidence_ids(candidate.field_evidence.get(field, ()))
-                            for field in (
-                                "service_date",
-                                "request_no",
-                                "service_code",
-                                "hsn_code",
-                            )
-                        )
+                    anchor_evidence = tuple(
+                        evidence
+                        for field in ("service_date", "request_no", "service_code", "hsn_code")
+                        for evidence in candidate.field_evidence.get(field, ())
                     )
                 else:
-                    anchor_ids = description_ids
+                    anchor_evidence = candidate.field_evidence.get("description", ())
+                anchor_ids = evidence_ids(anchor_evidence)
                 anchor_overlap = len(anchor_ids & source_ids)
                 if anchor_overlap == 0:
                     continue
-                all_ids = evidence_ids(candidate.evidence)
-                description_similarity = round(
+                similarity = round(
                     SequenceMatcher(
                         None,
                         re.sub(r"\s+", " ", printed_description.casefold()).strip(),
-                        re.sub(
-                            r"\s+",
-                            " ",
-                            (candidate.description or "").casefold(),
-                        ).strip(),
+                        re.sub(r"\s+", " ", (candidate.description or "").casefold()).strip(),
                     ).ratio()
                     * 1000
                 )
-                scored.append(
-                    (
-                        (
-                            anchor_overlap,
-                            len(description_ids & source_ids),
-                            description_similarity,
-                            int(
-                                previous_linked_order is not None
-                                and candidate.row_order == previous_linked_order + 1
-                            ),
-                            -abs(candidate_index - source_row.order),
-                            len(all_ids & source_ids),
-                        ),
-                        candidate,
-                    )
+                source_anchor = amount_evidence or source_evidence
+                scores[(source_key, str(candidate.id))] = (
+                    anchor_overlap,
+                    len(description_ids & source_ids),
+                    similarity,
+                    *geometry_score(source_anchor, anchor_evidence),
+                    len(evidence_ids(candidate.evidence) & source_ids),
+                    -abs(source_row.order - candidate.row_order),
                 )
-            scored.sort(key=lambda item: item[0], reverse=True)
-            canonical_row_id = None
-            flags = source_row.validation_flags
-            if scored and (len(scored) == 1 or scored[0][0] != scored[1][0]):
-                matched = scored[0][1]
-                canonical_row_id = str(matched.id)
-                claimed_canonical_ids.add(canonical_row_id)
-                previous_linked_order = matched.row_order
-            elif scored:
+
+    def unique_best(
+        values: list[tuple[tuple[int, ...], str]],
+    ) -> str | None:
+        values.sort(key=lambda item: item[0], reverse=True)
+        if not values or (len(values) > 1 and values[0][0] == values[1][0]):
+            return None
+        return values[0][1]
+
+    source_best: dict[str, str | None] = {}
+    for source_key in source_rows:
+        source_best[source_key] = unique_best(
+            [
+                (score, canonical_id)
+                for (candidate_source, canonical_id), score in scores.items()
+                if candidate_source == source_key
+            ]
+        )
+    canonical_best: dict[str, str | None] = {}
+    for canonical_id in canonical_by_id:
+        canonical_best[canonical_id] = unique_best(
+            [
+                (score, source_key)
+                for (source_key, candidate_canonical), score in scores.items()
+                if candidate_canonical == canonical_id
+            ]
+        )
+
+    linked: list[SourceTable] = []
+    for table in tables:
+        rows: list[SourceRow] = []
+        for source_row in table.rows:
+            source_key = f"{table.id}:{source_row.id}"
+            canonical_id = source_best.get(source_key)
+            accepted = bool(
+                canonical_id is not None
+                and canonical_best.get(canonical_id) == source_key
+            )
+            flags = tuple(
+                flag
+                for flag in source_row.validation_flags
+                if flag != "canonical_link_ambiguous"
+            )
+            if not accepted and any(key[0] == source_key for key in scores):
                 flags = tuple(dict.fromkeys((*flags, "canonical_link_ambiguous")))
-            linked_rows.append(
+            rows.append(
                 source_row.model_copy(
                     update={
-                        "canonical_row_id": canonical_row_id,
+                        "canonical_row_id": canonical_id if accepted else None,
                         "validation_flags": flags,
                     }
                 )
             )
-        linked_tables.append(table.model_copy(update={"rows": tuple(linked_rows)}))
-    return tuple(linked_tables)
+        linked.append(table.model_copy(update={"rows": tuple(rows)}))
+    return tuple(linked)
+
 
 
 def _finalize_linked_source_cells(
@@ -2828,8 +2951,19 @@ def _flag_possible_supporting_receipt_duplicates(
         for source_row in table.rows
         if source_row.canonical_row_id
     }
+    source_by_canonical = {
+        source_row.canonical_row_id: source_row
+        for table in source_tables
+        for source_row in table.rows
+        if source_row.canonical_row_id
+    }
 
     def issuer_context(row: CanonicalRow) -> str:
+        source_row = source_by_canonical.get(str(row.id))
+        if source_row is not None and source_row.receipt_metadata is not None:
+            issuer = normalized(source_row.receipt_metadata.issuer_normalized)
+            if issuer:
+                return issuer
         section = normalized(row.section)
         if section and section not in {"supporting receipt", "receipt", "charges"}:
             return section
@@ -2856,9 +2990,14 @@ def _flag_possible_supporting_receipt_duplicates(
             pair_key = tuple(sorted((receipt.id, other.id)))
             if pair_key in seen_pairs:
                 continue
+            issuers_compatible = bool(
+                issuer_context(receipt)
+                and issuer_context(receipt) == issuer_context(other)
+            )
             reference_match = bool(
                 normalized(receipt.request_no)
                 and normalized(receipt.request_no) == normalized(other.request_no)
+                and issuers_compatible
             )
             descriptions_match = (
                 SequenceMatcher(
@@ -2866,11 +3005,7 @@ def _flag_possible_supporting_receipt_duplicates(
                     receipt_description,
                     normalized(other.description),
                 ).ratio()
-                >= 0.82
-            )
-            issuer_matches = bool(
-                issuer_context(receipt)
-                and issuer_context(receipt) == issuer_context(other)
+                >= 0.80
             )
             dated_amount_match = bool(
                 receipt.net_amount is not None
@@ -2878,7 +3013,7 @@ def _flag_possible_supporting_receipt_duplicates(
                 and receipt.service_date_iso
                 and receipt.service_date_iso == other.service_date_iso
                 and descriptions_match
-                and issuer_matches
+                and issuers_compatible
                 and abs(receipt.page_number - other.page_number) <= 1
             )
             if not (reference_match or dated_amount_match):
@@ -2920,6 +3055,56 @@ def _flag_possible_supporting_receipt_duplicates(
                 }
             )
     return output, duplicate_pairs
+
+
+def _attach_receipt_source_metadata(
+    tables: tuple[SourceTable, ...],
+    canonical_rows: list[CanonicalRow],
+) -> tuple[SourceTable, ...]:
+    canonical = {str(row.id): row for row in canonical_rows}
+    generic = re.compile(
+        r"\b(?:amount|bill|charge|charges|collection|receipt|towards)\b",
+        re.IGNORECASE,
+    )
+    output: list[SourceTable] = []
+    for table in tables:
+        rows: list[SourceRow] = []
+        for source_row in table.rows:
+            row = canonical.get(source_row.canonical_row_id or "")
+            if row is None or not (
+                "supporting_receipt_charge" in row.validation_flags
+                or "receipt_form" in row.source_routes
+            ):
+                rows.append(source_row)
+                continue
+            issuer_raw = (
+                row.section
+                if row.section
+                and row.section.casefold() not in {"supporting receipt", "receipt", "charges"}
+                else generic.sub(" ", row.description or "")
+            )
+            issuer_raw = re.sub(r"\s+", " ", issuer_raw or "").strip()
+            reference_raw = (row.request_no or "").strip()
+            rows.append(
+                source_row.model_copy(
+                    update={
+                        "receipt_metadata": ReceiptSourceMetadata(
+                            issuer_raw=issuer_raw or None,
+                            issuer_normalized=re.sub(
+                                r"[^a-z0-9]+", " ", issuer_raw.casefold()
+                            ).strip()
+                            or None,
+                            reference_raw=reference_raw or None,
+                            reference_normalized=re.sub(
+                                r"[^a-z0-9]+", " ", reference_raw.casefold()
+                            ).strip()
+                            or None,
+                        )
+                    }
+                )
+            )
+        output.append(table.model_copy(update={"rows": tuple(rows)}))
+    return tuple(output)
 
 
 def _apply_profile_constraints(reconstruction, profile):
@@ -3680,6 +3865,8 @@ class OfflineExtractor:
         profiles: tuple[LayoutProfile, ...] | None = None,
         profile_registry_revision: int | None = None,
         recovery_targets: tuple[tuple[int, str | None], ...] = (),
+        baseline_result: dict[str, Any] | None = None,
+        allow_gemini: bool = True,
     ) -> dict[str, Any]:
         set_header_aliases({})
         if self.alias_registry is not None and alias_snapshot is None:
@@ -3687,6 +3874,10 @@ class OfflineExtractor:
         resolved_hospital_id = self.hospital_id
         job_profiles = self.profiles if profiles is None else profiles
         recovery_target_set = set(recovery_targets)
+        if baseline_result is None and recovery_target_set:
+            raise ValueError("targeted recovery requires a baseline result")
+        if baseline_result is not None and not recovery_target_set:
+            raise ValueError("baseline result requires targeted recovery locations")
 
         def abort_checkpoint() -> None:
             if should_abort is not None and should_abort():
@@ -3708,12 +3899,86 @@ class OfflineExtractor:
         document_total_candidates: list[DocumentTotalCandidate] = []
         diagnostics: list[dict[str, Any]] = []
         schema_states: list[TableSchemaState] = []
-        hospital = None
+        baseline_rows = tuple(
+            CanonicalRow.model_validate(row)
+            for row in (baseline_result or {}).get("rows", ())
+        )
+        baseline_tables = tuple(
+            SourceTable.model_validate(table)
+            for table in (baseline_result or {}).get("source_tables", ())
+        )
+        baseline_diagnostics = tuple(
+            diagnostic
+            for diagnostic in (baseline_result or {}).get("diagnostics", ())
+            if isinstance(diagnostic, dict)
+        )
+        hospital = (baseline_result or {}).get("hospital")
+        if baseline_result is not None:
+            resolved_hospital_id = baseline_result.get("hospital_id")
+            if alias_snapshot is not None and resolved_hospital_id is not None:
+                active_aliases = JsonAliasRepository.active_aliases(
+                    alias_snapshot, resolved_hospital_id
+                )
+                set_header_aliases(
+                    {
+                        alias["normalized_label"]: CANONICAL_TO_HEADER_ROLE[
+                            alias["canonical_field"]
+                        ]
+                        for alias in active_aliases
+                        if alias["canonical_field"] in CANONICAL_TO_HEADER_ROLE
+                    },
+                    {
+                        alias["normalized_label"]: alias["alias_id"]
+                        for alias in active_aliases
+                        if alias["canonical_field"] in CANONICAL_TO_HEADER_ROLE
+                    },
+                )
         gemini_calls = 0
         gemini_cost = Decimal("0")
         gemini_provider_disabled_reason: str | None = None
         for page_asset in manifest.pages:
             abort_checkpoint()
+            page_targets = {
+                table_id
+                for page_number, table_id in recovery_target_set
+                if page_number == page_asset.page_number
+            }
+            if baseline_result is not None and not page_targets:
+                all_rows.extend(
+                    row for row in baseline_rows if row.page_number == page_asset.page_number
+                )
+                all_source_tables.extend(
+                    table
+                    for table in baseline_tables
+                    if table.page_number == page_asset.page_number
+                )
+                diagnostics.extend(
+                    diagnostic
+                    for diagnostic in baseline_diagnostics
+                    if diagnostic.get("page_number") == page_asset.page_number
+                )
+                if progress:
+                    progress(page_asset.page_number, len(manifest.pages))
+                continue
+            if baseline_result is not None and None not in page_targets:
+                all_rows.extend(
+                    row
+                    for row in baseline_rows
+                    if row.page_number == page_asset.page_number
+                    and row.table_id not in page_targets
+                )
+                all_source_tables.extend(
+                    table
+                    for table in baseline_tables
+                    if table.page_number == page_asset.page_number
+                    and table.table_id not in page_targets
+                )
+                diagnostics.extend(
+                    diagnostic
+                    for diagnostic in baseline_diagnostics
+                    if diagnostic.get("page_number") == page_asset.page_number
+                    and diagnostic.get("table_id") not in page_targets
+                )
             page_path = artifact_root / "pages" / page_asset.relative_path
             ocr_request = InferenceRequest(
                 request_id=str(uuid4()),
@@ -3798,8 +4063,30 @@ class OfflineExtractor:
             no_table_assessment: dict[str, Any] | None = None
 
             table_work: list[TableWork] = []
-            for table_index, box in enumerate(boxes):
-                table_id = f"p{page_asset.page_number}-t{table_index + 1}"
+            work_boxes: list[tuple[str, tuple[int, int, int, int]]] = []
+            if baseline_result is not None and None not in page_targets:
+                for table_id in sorted(str(value) for value in page_targets):
+                    diagnostic = next(
+                        (
+                            item
+                            for item in baseline_diagnostics
+                            if item.get("page_number") == page_asset.page_number
+                            and item.get("table_id") == table_id
+                            and isinstance(item.get("box"), (list, tuple))
+                            and len(item["box"]) == 4
+                        ),
+                        None,
+                    )
+                    if diagnostic is not None:
+                        work_boxes.append(
+                            (table_id, tuple(int(value) for value in diagnostic["box"]))
+                        )
+            else:
+                work_boxes.extend(
+                    (f"p{page_asset.page_number}-t{table_index + 1}", box)
+                    for table_index, box in enumerate(boxes)
+                )
+            for table_id, box in work_boxes:
                 safe_box = _safe_box(box, page_asset.width, page_asset.height)
                 crop = crop_region(
                     page_path,
@@ -3824,10 +4111,13 @@ class OfflineExtractor:
                     )
                 )
 
-            if not table_work:
+            specific_table_recovery = bool(
+                baseline_result is not None and None not in page_targets
+            )
+            if not table_work and not specific_table_recovery:
                 no_table_assessment = _assess_no_table_page(page_path, tokens)
 
-            if not table_work and (
+            if not table_work and not specific_table_recovery and (
                 not no_table_assessment["demonstrably_blank"]
                 or (page_asset.page_number, None) in recovery_target_set
             ):
@@ -3865,7 +4155,12 @@ class OfflineExtractor:
                         "layout_latency_ms": layout_response.latency_ms,
                         "layout_cache_hit": layout_cache_hit,
                         "table_count": 0,
-                        "status": "no_table_detected",
+                        "status": (
+                            "recovery_target_not_located"
+                            if specific_table_recovery
+                            else "no_table_detected"
+                        ),
+                        "financial_form_suspected": specific_table_recovery,
                         **(no_table_assessment or {}),
                     }
                 )
@@ -4221,7 +4516,11 @@ class OfflineExtractor:
                     and (not parsed_rows or is_implausibly_low_yield(reconstruction))
                 )
                 gemini_block_reason: str | None = None
-                if needs_gemini_recovery and self.gemini_mode is not GeminiMode.OFF:
+                if (
+                    needs_gemini_recovery
+                    and allow_gemini
+                    and self.gemini_mode is not GeminiMode.OFF
+                ):
                     if self.gemini is None:
                         gemini_block_reason = "adapter_unavailable"
                     elif gemini_provider_disabled_reason:
@@ -4234,6 +4533,7 @@ class OfflineExtractor:
                         gemini_block_reason = "cost_budget_exhausted"
                 eligible_for_gemini = bool(
                     needs_gemini_recovery
+                    and allow_gemini
                     and self.gemini_mode is not GeminiMode.OFF
                     and gemini_block_reason is None
                 )
@@ -4379,6 +4679,7 @@ class OfflineExtractor:
                             )
                 elif (
                     needs_gemini_recovery
+                    and allow_gemini
                     and self.gemini_mode is not GeminiMode.OFF
                     and gemini_block_reason
                 ):
@@ -4445,6 +4746,7 @@ class OfflineExtractor:
                             attempt.model_dump(mode="json") for attempt in recovery_attempts
                         ],
                         "gemini_mode": self.gemini_mode.value,
+                        "gemini_allowed": allow_gemini,
                         "gemini_invoked": gemini_invoked,
                         "gemini_cache_hit": gemini_cache_hit,
                         "gemini_grounded_rows": gemini_grounded_rows,
@@ -4474,19 +4776,46 @@ class OfflineExtractor:
         )
         rows = _apply_document_role_policy(_deduplicate(selected_rows))
         source_tables = _link_source_tables(selected_source_tables, rows)
-        source_tables = _finalize_linked_source_cells(source_tables, rows)
+        canonical_by_id = {str(row.id): row for row in rows}
+        source_tables = tuple(
+            _promote_grounded_date_column(
+                table,
+                tuple(
+                    canonical_by_id[source_row.canonical_row_id]
+                    for source_row in table.rows
+                    if source_row.canonical_row_id in canonical_by_id
+                    and canonical_by_id[source_row.canonical_row_id].role
+                    in {RowRole.DETAIL, RowRole.REFUND, RowRole.CATEGORY_ROLLUP}
+                ),
+            )
+            for table in source_tables
+        )
         rows = _recover_grounded_service_dates(
             source_tables,
             rows,
             already_linked=True,
         )
-        source_tables = _finalize_linked_service_dates(source_tables, rows)
+        source_tables = _attach_receipt_source_metadata(source_tables, rows)
         rows, receipt_duplicate_pairs = _flag_possible_supporting_receipt_duplicates(
             rows,
             source_tables,
         )
-        document_totals = select_document_totals(document_total_candidates)
-        document_total: DocumentTotal | None = select_document_total(document_total_candidates)
+        if baseline_result is not None:
+            document_totals = tuple(
+                DocumentTotal.model_validate(total)
+                for total in baseline_result.get("document_totals", ())
+            )
+            document_total = (
+                DocumentTotal.model_validate(baseline_result["document_total"])
+                if baseline_result.get("document_total") is not None
+                else None
+            )
+        else:
+            document_total_candidates = list(
+                assign_document_total_contexts(document_total_candidates, diagnostics)
+            )
+            document_totals = select_document_totals(document_total_candidates)
+            document_total = select_document_total(document_total_candidates)
         abort_checkpoint()
         return {
             "output_version": "offline_accuracy_spine_v3",
@@ -4534,12 +4863,21 @@ class OfflineExtractor:
             "diagnostics": diagnostics,
             "provider_usage": {
                 "gemini_mode": self.gemini_mode.value,
+                "gemini_allowed": allow_gemini,
                 "gemini_calls": gemini_calls,
                 "gemini_measured_cost_usd": str(gemini_cost),
                 "gemini_provider_disabled_reason": gemini_provider_disabled_reason,
                 "gemini_promotion_manifest_sha256": (
                     self.gemini_promotion.frozen_manifest_sha256 if self.gemini_promotion else None
                 ),
+                "targeted_recovery": baseline_result is not None,
+                "recovery_targets": [
+                    {"page_number": page_number, "table_id": table_id}
+                    for page_number, table_id in sorted(
+                        recovery_target_set,
+                        key=lambda item: (item[0], item[1] or ""),
+                    )
+                ],
             },
         }
 

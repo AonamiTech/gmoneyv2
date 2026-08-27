@@ -181,3 +181,22 @@ def test_four_pharmacy_section_totals_never_produce_a_primary() -> None:
     assert len(candidates) == 4
     assert {candidate.total.scope.value for candidate in candidates} == {"section"}
     assert select_document_total(candidates) is None
+
+
+def test_receipt_and_category_grand_totals_never_produce_a_primary() -> None:
+    for title, expected_context in (
+        ("Receipt", "receipt"),
+        ("Category Summary", "category"),
+    ):
+        candidates = extract_document_total_candidates(
+            (
+                token(0, title, (100, 20, 350, 40)),
+                token(1, "Grand Total", (100, 100, 300, 120)),
+                token(2, "1,000.00", (800, 100, 930, 120)),
+            )
+        )
+
+        assert len(candidates) == 1
+        assert candidates[0].total.scope.value == "section"
+        assert candidates[0].total.context_kind == expected_context
+        assert select_document_total(candidates) is None

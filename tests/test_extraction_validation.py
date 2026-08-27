@@ -133,7 +133,8 @@ def test_validation_returns_a_complete_structured_report(tmp_path: Path) -> None
     report = validate_extraction_result(source, result, artifact_root)
 
     assert report.status == "passed"
-    assert report.issues == ()
+    assert [issue.code for issue in report.issues] == ["document_total_unavailable"]
+    assert report.issues[0].severity == "warning"
 
     del result["output_version"]
     result["diagnostics"] = [
@@ -144,6 +145,7 @@ def test_validation_returns_a_complete_structured_report(tmp_path: Path) -> None
     assert {issue.code for issue in failed.issues} == {
         "unsupported_output_contract",
         "financial_form_unresolved",
+        "document_total_unavailable",
     }
     assert all(issue.id and issue.severity for issue in failed.issues)
     assert failed.status == "failed"
@@ -180,6 +182,22 @@ def test_linked_unmapped_financial_lane_is_not_invisible(tmp_path: Path) -> None
     assert issue.source_row_id == "p1-t1-s1-r1"
     assert issue.canonical_row_id == table.rows[0].canonical_row_id
     assert issue.field == "copay"
+
+
+def test_informational_row_cannot_publish_money(tmp_path: Path) -> None:
+    source, artifact_root, result = _fixture(tmp_path)
+    published_payload = dict(result["rows"][0])
+    published_payload["role"] = "informational"
+    published = CanonicalRow.model_validate(published_payload)
+    result["rows"] = [published.model_dump(mode="json")]
+
+    report = validate_extraction_result(source, result, artifact_root)
+
+    issue = next(
+        item for item in report.issues if item.code == "informational_row_has_money"
+    )
+    assert issue.canonical_row_id == str(published.id)
+    assert issue.field == "net_amount"
 
 
 def test_receipt_duplicate_pairs_remain_individual_structured_issues(

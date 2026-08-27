@@ -247,6 +247,7 @@ class DocumentTotalCandidate:
     total: DocumentTotal
     label_priority: int
     vertical_position: float
+    local_context: str = ""
 
     @property
     def rank(self) -> tuple[int, int, Decimal, float, int, float]:
@@ -333,6 +334,26 @@ def _label(
             or pharmacy_table_context
         ):
             scope = DocumentTotalScope.SECTION
+        if any(
+            marker in local_text
+            for marker in (
+                "receipt no",
+                "receipt number",
+                "charges towards",
+                "payment receipt",
+            )
+        ):
+            scope = DocumentTotalScope.SECTION
+        if any(
+            marker in local_text
+            for marker in (
+                "category summary",
+                "package summary",
+                "charge summary",
+                "department summary",
+            )
+        ):
+            scope = DocumentTotalScope.SECTION
     return display, priority, kind, scope, requires_summary
 
 
@@ -394,8 +415,8 @@ def extract_document_total_candidates(
     line_height = median(_height(token) for token in tokens)
     candidates: list[DocumentTotalCandidate] = []
     for index, line in enumerate(lines):
-        context_start = max(0, index - 10)
-        context_end = min(len(lines), index + 5)
+        context_start = max(0, index - 5)
+        context_end = min(len(lines), index + 4)
         local_text = _normalize(
             " ".join(candidate.text for candidate in lines[context_start:context_end])
         )
@@ -420,13 +441,38 @@ def extract_document_total_candidates(
             continue
         amount_token, amount_raw, amount = max(values, key=lambda value: _center_x(value[0]))
         evidence, confidence = _evidence(line, amount_line, amount_token)
+        if label == "Grand Total" and any(
+            marker in local_text
+            for marker in (
+                "receipt",
+                "charges towards",
+                "collection",
+                "category summary",
+                "charge summary",
+                "package summary",
+            )
+        ):
+            scope = DocumentTotalScope.SECTION
         context_kind = {
             DocumentTotalScope.DOCUMENT: "document_final",
             DocumentTotalScope.SECTION: "section",
             DocumentTotalScope.SETTLEMENT: "settlement",
             DocumentTotalScope.PAYMENT: "payment",
         }[scope]
-        context_id = f"p{amount_token.page_number}:{context_kind}:{round(line.center_y)}"
+        if scope is DocumentTotalScope.SECTION:
+            if any(
+                marker in local_text
+                for marker in ("pharmacy", "medicine", "drug", "batch", "expiry", "mrp")
+            ):
+                context_kind = "pharmacy"
+            elif any(
+                marker in local_text
+                for marker in ("receipt", "charges towards", "collection")
+            ):
+                context_kind = "receipt"
+            else:
+                context_kind = "category"
+        context_id = f"p{amount_token.page_number}:page-summary:{context_kind}:o1"
         total = DocumentTotal(
             amount_raw=amount_raw,
             amount=amount,
@@ -444,31 +490,90 @@ def extract_document_total_candidates(
                 total=total,
                 label_priority=priority,
                 vertical_position=amount_line.center_y,
+                local_context=local_text,
             )
         )
-    grouped: list[DocumentTotalCandidate] = []
-    context_state: dict[tuple[int, str | None], tuple[float, int]] = {}
-    for candidate in candidates:
-        context_key = (candidate.total.page_number, candidate.total.context_kind)
-        previous_position, context_anchor = context_state.get(
-            context_key,
-            (float("-inf"), 0),
+    return tuple(candidates)
+
+
+def assign_document_total_contexts(
+    candidates: tuple[DocumentTotalCandidate, ...] | list[DocumentTotalCandidate],
+    diagnostics: tuple[dict[str, object], ...] | list[dict[str, object]],
+) -> tuple[DocumentTotalCandidate, ...]:
+    """Attach stable table/invoice context identities after layout is known."""
+    regions = tuple(
+        diagnostic
+        for diagnostic in diagnostics
+        if diagnostic.get("table_id")
+        and isinstance(diagnostic.get("box"), (tuple, list))
+        and len(diagnostic["box"]) == 4
+    )
+    classified: list[tuple[DocumentTotalCandidate, str, str]] = []
+    for candidate in sorted(
+        candidates,
+        key=lambda item: (item.total.page_number, item.vertical_position),
+    ):
+        points = candidate.total.evidence.polygon.points
+        center_x = sum(point.x for point in points) / len(points)
+        center_y = sum(point.y for point in points) / len(points)
+        region = next(
+            (
+                diagnostic
+                for diagnostic in regions
+                if diagnostic.get("page_number") == candidate.total.page_number
+                and float(diagnostic["box"][0]) <= center_x <= float(diagnostic["box"][2])
+                and float(diagnostic["box"][1]) <= center_y <= float(diagnostic["box"][3])
+            ),
+            None,
         )
-        if candidate.vertical_position - previous_position > line_height * 8:
-            context_anchor = round(candidate.vertical_position)
-        context_id = (
-            f"p{candidate.total.page_number}:{candidate.total.context_kind}:"
-            f"{context_anchor}"
-        )
-        grouped.append(
+        identity = str((region or {}).get("table_id") or "page-summary")
+        table_type = str((region or {}).get("table_type") or "")
+        context = _normalize(candidate.local_context)
+        if table_type == "pharmacy" or any(
+            marker in context
+            for marker in ("pharmacy", "medicine", "drug", "batch", "expiry", "mrp")
+        ):
+            kind = "pharmacy"
+        elif any(marker in context for marker in ("receipt", "charges towards", "collection")):
+            kind = "receipt"
+        elif table_type in {"category_summary", "package_summary"} or any(
+            marker in context
+            for marker in ("category summary", "package summary", "charge summary")
+        ):
+            kind = "category"
+        elif candidate.total.scope is DocumentTotalScope.SETTLEMENT:
+            kind = "settlement"
+        elif candidate.total.scope is DocumentTotalScope.PAYMENT:
+            kind = "payment"
+        else:
+            kind = "document_final"
+        classified.append((candidate, identity, kind))
+
+    ordinals: dict[tuple[int, str, str], int] = {}
+    output: list[DocumentTotalCandidate] = []
+    for candidate, identity, kind in classified:
+        key = (candidate.total.page_number, identity, kind)
+        ordinal = ordinals.setdefault(key, 1)
+        scope = candidate.total.scope
+        if kind in {"category", "pharmacy", "receipt"}:
+            scope = DocumentTotalScope.SECTION
+        output.append(
             DocumentTotalCandidate(
-                total=candidate.total.model_copy(update={"context_id": context_id}),
+                total=candidate.total.model_copy(
+                    update={
+                        "scope": scope,
+                        "context_kind": kind,
+                        "context_id": (
+                            f"p{candidate.total.page_number}:{identity}:{kind}:o{ordinal}"
+                        ),
+                    }
+                ),
                 label_priority=candidate.label_priority,
                 vertical_position=candidate.vertical_position,
+                local_context=candidate.local_context,
             )
         )
-        context_state[context_key] = (candidate.vertical_position, context_anchor)
-    return tuple(grouped)
+    return tuple(output)
 
 
 def select_document_total(

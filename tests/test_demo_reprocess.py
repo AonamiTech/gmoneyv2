@@ -849,9 +849,9 @@ def test_reprocess_validation_accepts_grounded_recovered_unmapped_service_date(
         0,
         {
             "column_id": "mapped-date",
-            "raw_value": None,
-            "evidence": [],
-            "validation_flags": ["empty_cell"],
+            "raw_value": "15/07/2026",
+            "evidence": [evidence(page_sha, "service-date-token")],
+            "validation_flags": ["recovered_from_source_fragment"],
         },
     )
     printed[0]["rows"][0]["cells"].insert(
@@ -876,7 +876,7 @@ def test_reprocess_validation_accepts_grounded_recovered_unmapped_service_date(
         store.job_dir(job_id) / "artifacts",
     )
 
-    printed[0]["rows"][0]["cells"][1]["raw_value"] = "16/07/2026"
+    printed[0]["rows"][0]["cells"][0]["raw_value"] = "16/07/2026"
     with pytest.raises(ValueError, match="service_date_raw"):
         _validate_result(
             store.job_dir(job_id) / "source.pdf",
@@ -1202,7 +1202,7 @@ def test_labeled_subtotal_matches_grounded_section_heading(
 ) -> None:
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
-    new_rows = [row("pharmacy-row", page_sha)]
+    new_rows = [row(fixture_row_id("pharmacy-row"), page_sha)]
     new_rows[0]["description"] = "Pharmacy sales bill"
     new_rows[0]["section"] = "pharmacy"
     printed = source_tables(new_rows, page_sha)
@@ -1286,7 +1286,7 @@ def test_reprocess_validation_accepts_only_matching_internal_bill_total(
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
     new_rows = [
         row(fixture_row_id("first-row"), page_sha, amount="100.00"),
-        row("following-row", page_sha, amount="50.00"),
+        row(fixture_row_id("following-row"), page_sha, amount="50.00"),
     ]
     first_description_evidence = evidence(
         page_sha,
@@ -1399,6 +1399,16 @@ def test_internal_bill_total_can_continue_across_compatible_page_tables(
     accepted: bool,
 ) -> None:
     store, job_id, old_result = setup_job(tmp_path)
+    document = fitz.open()
+    for page_number in range(2):
+        page = document.new_page(width=100, height=200)
+        page.insert_text((10, 20), f"page {page_number + 1}")
+    source_payload = document.tobytes()
+    document.close()
+    (store.job_dir(job_id) / "source.pdf").write_bytes(source_payload)
+    source_sha = digest(source_payload)
+    old_result["document_id"] = source_sha
+    old_result["source_sha256"] = source_sha
     first_page_sha = old_result["page_assets"][0]["artifact_sha256"]
     second_page = b"Second PNG fixture"
     second_page_path = store.job_dir(job_id) / "artifacts" / "pages" / "page-2.png"
@@ -1416,14 +1426,15 @@ def test_internal_bill_total_can_continue_across_compatible_page_tables(
     )
 
     preceding_rows = [
-        row("preceding-first", first_page_sha, amount="40.00"),
-        row("preceding-second", first_page_sha, amount="60.00"),
+        row(fixture_row_id("preceding-first"), first_page_sha, amount="40.00"),
+        row(fixture_row_id("preceding-second"), first_page_sha, amount="60.00"),
     ]
     current_rows = [
-        row("current-first", second_page_sha, amount="50.00"),
-        row("following-row", second_page_sha, amount="25.00"),
+        row(fixture_row_id("current-first"), second_page_sha, amount="50.00"),
+        row(fixture_row_id("following-row"), second_page_sha, amount="25.00"),
     ]
     for canonical in current_rows:
+        canonical["document_id"] = source_sha
         canonical["page_number"] = 2
         canonical["table_id"] = "p2-t1"
         for evidence_items in canonical["field_evidence"].values():
@@ -1434,6 +1445,9 @@ def test_internal_bill_total_can_continue_across_compatible_page_tables(
             item["page_number"] = 2
             item["table_id"] = "p2-t1"
 
+    for canonical in preceding_rows:
+        canonical["document_id"] = source_sha
+
     first_tables = [source_tables([canonical], first_page_sha)[0] for canonical in preceding_rows]
     first_tables[1]["id"] = "p1-t1-s2"
     first_tables[1]["rows"][0]["id"] = "p1-t1-s2-r1"
@@ -1441,6 +1455,7 @@ def test_internal_bill_total_can_continue_across_compatible_page_tables(
     second_table["id"] = "p2-t1-s1"
     second_table["page_number"] = 2
     second_table["table_id"] = "p2-t1"
+    second_table["rows"][0]["id"] = "p2-t1-s1-r1"
     for column in second_table["columns"]:
         for item in column["evidence"]:
             item["page_number"] = 2
@@ -1527,9 +1542,9 @@ def test_pharmacy_summary_requires_exact_positive_or_return_arithmetic(
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
     new_rows = [
-        row("first-charge", page_sha, amount="100.00"),
-        row("second-charge", page_sha, amount="200.00"),
-        row("returned-charge", page_sha, amount="-50.00"),
+        row(fixture_row_id("first-charge"), page_sha, amount="100.00"),
+        row(fixture_row_id("second-charge"), page_sha, amount="200.00"),
+        row(fixture_row_id("returned-charge"), page_sha, amount="-50.00"),
     ]
     for order, canonical in enumerate(new_rows):
         canonical["row_order"] = order
@@ -1588,8 +1603,8 @@ def test_separate_pharmacy_tables_validate_their_own_tail_summaries(
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
     new_rows = [
-        row("first-pharmacy-charge", page_sha, amount="100.00"),
-        row("second-pharmacy-charge", page_sha, amount="50.00"),
+        row(fixture_row_id("first-pharmacy-charge"), page_sha, amount="100.00"),
+        row(fixture_row_id("second-pharmacy-charge"), page_sha, amount="50.00"),
     ]
     for order, canonical in enumerate(new_rows):
         canonical["row_order"] = order
@@ -1671,7 +1686,7 @@ def test_internal_bill_total_spans_intervening_text_within_prior_row_envelope(
     new_rows = [
         row(fixture_row_id("first-row"), page_sha, amount="100.00"),
         row(fixture_row_id("second-row"), page_sha, amount="50.00"),
-        row("following-row", page_sha, amount="25.00"),
+        row(fixture_row_id("following-row"), page_sha, amount="25.00"),
     ]
     first_description_evidence = evidence(
         page_sha,
@@ -1794,9 +1809,9 @@ def test_internal_bill_total_does_not_cross_an_unlinked_section_heading(
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
     new_rows = [
-        row("first-section-row", page_sha, amount="100.00"),
-        row("second-section-row", page_sha, amount="50.00"),
-        row("following-row", page_sha, amount="25.00"),
+        row(fixture_row_id("first-section-row"), page_sha, amount="100.00"),
+        row(fixture_row_id("second-section-row"), page_sha, amount="50.00"),
+        row(fixture_row_id("following-row"), page_sha, amount="25.00"),
     ]
     first_description_evidence = evidence(
         page_sha,
@@ -1920,7 +1935,7 @@ def test_internal_bill_total_ignores_non_section_structured_overlay_fragments(
     new_rows = [
         row(fixture_row_id("first-row"), page_sha, amount="100.00"),
         row(fixture_row_id("second-row"), page_sha, amount="50.00"),
-        row("following-row", page_sha, amount="25.00"),
+        row(fixture_row_id("following-row"), page_sha, amount="25.00"),
     ]
     for order, canonical in enumerate(new_rows):
         canonical["row_order"] = order
@@ -2066,8 +2081,8 @@ def test_reprocess_validation_accepts_matching_total_across_header_segments(
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
     new_rows = [
-        row("first-segment-row", page_sha, amount="16000.00"),
-        row("second-segment-row", page_sha, amount="52230.96"),
+        row(fixture_row_id("first-segment-row"), page_sha, amount="16000.00"),
+        row(fixture_row_id("second-segment-row"), page_sha, amount="52230.96"),
     ]
     new_rows[1]["row_order"] = 1
     printed = source_tables(new_rows, page_sha)[0]
@@ -2133,8 +2148,8 @@ def test_reprocess_validation_only_accepts_matching_total_in_structured_lane(
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
     new_rows = [
-        row("first-segment-row", page_sha, amount="16000.00"),
-        row("second-segment-row", page_sha, amount="52230.96"),
+        row(fixture_row_id("first-segment-row"), page_sha, amount="16000.00"),
+        row(fixture_row_id("second-segment-row"), page_sha, amount="52230.96"),
     ]
     new_rows[1]["row_order"] = 1
     printed = source_tables(new_rows, page_sha)[0]
@@ -2315,20 +2330,25 @@ def test_reprocess_validation_resets_subtotal_at_financial_boundary(
             "evidence": [evidence(page_sha, "metadata-value")],
             "validation_flags": [],
         }
+    primary_total = {
+        "total_version": "document_total_v3",
+        "amount_raw": "40.00",
+        "amount": "40.00",
+        "label": "Grand Total",
+        "kind": "bill_total",
+        "scope": "document",
+        "page_number": 1,
+        "evidence": evidence(page_sha, "grand-total-amount"),
+        "confidence": 0.99,
+        "source_route": "page_ocr_final_total",
+        "context_id": "p1:p1-t1:document_final:o1",
+        "context_kind": "document_final",
+    }
     new_result = {
         **old_result,
-        "document_total": {
-            "total_version": "document_total_v2",
-            "amount_raw": "40.00",
-            "amount": "40.00",
-            "label": "Grand Total",
-            "kind": "bill_total",
-            "scope": "document",
-            "page_number": 1,
-            "evidence": evidence(page_sha, "grand-total-amount"),
-            "confidence": 0.99,
-            "source_route": "page_ocr_final_total",
-        },
+        "document_total": primary_total,
+        "document_totals_version": "document_totals_v2",
+        "document_totals": [primary_total],
         "rows": new_rows,
         "source_tables": printed,
     }
@@ -2485,24 +2505,27 @@ def test_reprocess_validation_accepts_verified_total_and_settlement_source_rows(
             "validation_flags": [],
         }
     )
+    primary_total = {
+        "total_version": "document_total_v3",
+        "amount_raw": "100.00",
+        "amount": "100.00",
+        "label": "Total Bill Amount",
+        "kind": "bill_total",
+        "scope": "document",
+        "page_number": 1,
+        "evidence": {
+            **evidence(page_sha, "total-description"),
+            "token_ids": ["total-description", "total-amount"],
+        },
+        "confidence": 0.99,
+        "source_route": "page_ocr_final_total",
+        "context_id": "p1:p1-t1:document_final:o1",
+        "context_kind": "document_final",
+    }
     new_result = {
         **old_result,
-        "document_total": {
-            "total_version": "document_total_v2",
-            "amount_raw": "100.00",
-            "amount": "100.00",
-            "label": "Total Bill Amount",
-            "kind": "bill_total",
-            "scope": "document",
-            "page_number": 1,
-            "evidence": {
-                **evidence(page_sha, "total-description"),
-                "token_ids": ["total-description", "total-amount"],
-            },
-            "confidence": 0.99,
-            "source_route": "page_ocr_final_total",
-        },
-        "document_totals": [],
+        "document_total": primary_total,
+        "document_totals": [primary_total],
         "rows": new_rows,
         "source_tables": printed,
     }
@@ -2588,8 +2611,8 @@ def test_reprocess_validation_accepts_only_exact_repeated_detail_summary(
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
     new_rows = [
-        row("first-detail", page_sha),
-        row("second-detail", page_sha),
+        row(fixture_row_id("first-detail"), page_sha),
+        row(fixture_row_id("second-detail"), page_sha),
     ]
     for order, canonical in enumerate(new_rows):
         canonical["row_order"] = order
@@ -3425,10 +3448,15 @@ def test_manual_rollback_final_review_compare_and_swap(tmp_path: Path, monkeypat
     current_result = json.loads((store.job_dir(job_id) / "result.json").read_text())
     original_job_lock = JobStore.job_lock
     injected = False
+    exclusive_count = 0
 
     def racing_job_lock(self: JobStore, locked_job_id: str, *, exclusive: bool) -> Any:
-        nonlocal injected
-        if exclusive and not injected:
+        nonlocal exclusive_count, injected
+        if exclusive:
+            exclusive_count += 1
+        # The first exclusive acquisition is the stable preflight read. Inject
+        # only at the final rollback CAS acquisition.
+        if exclusive and exclusive_count == 2 and not injected:
             injected = True
             review_path = self.job_dir(locked_job_id) / "review.json"
             review = json.loads(review_path.read_text())

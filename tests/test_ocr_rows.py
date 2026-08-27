@@ -1,5 +1,6 @@
 from decimal import Decimal
 from pathlib import Path
+from uuid import uuid4
 
 import cv2
 import numpy as np
@@ -7,12 +8,14 @@ import pytest
 
 from gmoney.contracts.evidence import OcrToken, Point, Polygon
 from gmoney.contracts.extraction import (
+    ReceiptSourceMetadata,
     RowRole,
     SourceCell,
     SourceColumn,
     TableType,
 )
 from gmoney.extraction.canonicalize import canonicalize_rows
+from gmoney.extraction.date_context import service_date_from_context
 from gmoney.extraction.ocr_rows import (
     _clean_description,
     fuse_provider_descriptions,
@@ -23,6 +26,7 @@ from gmoney.extraction.offline import (
     _assess_no_table_page,
     _finalize_linked_service_dates,
     _finalize_linked_source_cells,
+    _flag_possible_supporting_receipt_duplicates,
     _needs_full_page_financial_recovery,
     _populate_grounded_service_date_cell,
     _recover_grounded_service_dates,
@@ -70,6 +74,113 @@ def test_clean_description_collapses_an_exact_ocr_phrase_echo() -> None:
     assert description == "Emeset 2 Ml Inj"
     assert service_date is None
     assert request_no is None
+
+
+def test_same_receipt_reference_with_incompatible_issuers_is_not_a_duplicate() -> None:
+    reconstructed = reconstruct_ocr_rows(
+        (
+            token(0, "Description", (100, 30, 300, 45)),
+            token(1, "Amount", (800, 30, 900, 45)),
+            token(2, "Consultation", (100, 70, 300, 85)),
+            token(3, "100.00", (800, 70, 900, 85)),
+            token(4, "Consultation", (100, 100, 300, 115)),
+            token(5, "100.00", (800, 100, 900, 115)),
+        ),
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 20, 920, 130),
+    )
+    canonical = list(
+        canonicalize_rows(
+            "d" * 64,
+            1,
+            "p1-t1",
+            "a" * 64,
+            reconstructed.rows,
+        )
+    )
+    canonical[0] = canonical[0].model_copy(
+        update={
+            "request_no": "R-123",
+            "service_date_iso": "2026-07-10",
+            "source_routes": ("receipt_form",),
+            "validation_flags": ("supporting_receipt_charge",),
+        }
+    )
+    canonical[1] = canonical[1].model_copy(
+        update={
+            "request_no": "R-123",
+            "service_date_iso": "2026-07-10",
+        }
+    )
+    linked = _link_source_tables_once(reconstructed.source_tables, canonical)
+    issuers = ("Alpha Hospital", "Beta Hospital")
+    table = linked[0].model_copy(
+        update={
+            "rows": tuple(
+                source_row.model_copy(
+                    update={
+                        "receipt_metadata": ReceiptSourceMetadata(
+                            issuer_raw=issuer,
+                            issuer_normalized=issuer.casefold(),
+                            reference_raw="R-123",
+                            reference_normalized="r 123",
+                        )
+                    }
+                )
+                for source_row, issuer in zip(linked[0].rows, issuers, strict=True)
+            )
+        }
+    )
+
+    _, pairs = _flag_possible_supporting_receipt_duplicates(canonical, (table,))
+
+    assert pairs == []
+
+
+def test_mutual_best_linking_does_not_let_early_weak_row_steal_match() -> None:
+    reconstructed = reconstruct_ocr_rows(
+        (
+            token(0, "Description", (100, 30, 300, 45)),
+            token(1, "Amount", (800, 30, 900, 45)),
+            token(2, "Cardiac Consultation", (100, 70, 300, 85)),
+            token(3, "100.00", (800, 70, 900, 85)),
+        ),
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 20, 920, 100),
+    )
+    strong = canonicalize_rows(
+        "d" * 64,
+        1,
+        "p1-t1",
+        "a" * 64,
+        reconstructed.rows,
+    )[0].model_copy(update={"row_order": 1})
+    weak = strong.model_copy(
+        update={
+            "id": uuid4(),
+            "row_order": 0,
+            "description": "Unrelated Service",
+        }
+    )
+
+    linked = _link_source_tables_once(reconstructed.source_tables, (weak, strong))
+
+    assert linked[0].rows[0].canonical_row_id == str(strong.id)
+
+
+def test_explicit_date_column_accepts_medicine_row_but_not_expiry_text() -> None:
+    assert service_date_from_context(
+        "10/07/2026",
+        column_label="Date",
+        description="Medicine batch ABC",
+    ) == ("10/07/2026", "2026-07-10")
+    assert service_date_from_context(
+        "ExpDate 10/07/2026",
+        column_label="ProductName",
+        description="Medicine batch ABC",
+    ) is None
 
 
 def test_hospital_header_alias_maps_an_exact_unseen_column() -> None:
@@ -1772,10 +1883,8 @@ def test_request_prefix_in_date_lane_is_preserved_while_description_is_split(
         if column.canonical_field is not None
     }
     assert cells_by_field["service_date_raw"].raw_value == "14/07/2026"
-    assert (
-        cells_by_field["description"].raw_value
-        == "MNEIPI/123 NORMAL DELIVERY"
-    )
+    assert cells_by_field["request_no"].raw_value == "MNEIPI/123"
+    assert cells_by_field["description"].raw_value == "NORMAL DELIVERY"
     assert {
         token_id
         for evidence in cells_by_field["description"].evidence
@@ -3772,7 +3881,9 @@ def test_linked_source_row_splits_grounded_date_from_cross_column_ocr_token() ->
     assert date_cell.raw_value == "15/07/2026 11:31:00"
     assert date_cell.evidence
     assert "split_from_merged_ocr_token" in date_cell.validation_flags
-    assert description_cell.raw_value == "MNEIPI/265586 BED BATH ADULT WIPES GINNI"
+    request_cell = cells[columns["request_no"].id]
+    assert request_cell.raw_value == "MNEIPI/265586"
+    assert description_cell.raw_value == "BED BATH ADULT WIPES GINNI"
     assert description_cell.evidence
     assert "split_from_merged_ocr_token" in description_cell.validation_flags
 
@@ -3814,7 +3925,18 @@ def test_wide_date_cell_extracts_grounded_date_and_request_prefix() -> None:
         for cell in result.source_tables[0].rows[0].cells
         if cell.column_id == date_column.id
     )
-    assert date_cell.raw_value == "15/07/2026 14:51:00 - MNEIPI/265604"
+    request_column = next(
+        column
+        for column in result.source_tables[0].columns
+        if column.canonical_field == "request_no"
+    )
+    request_cell = next(
+        cell
+        for cell in result.source_tables[0].rows[0].cells
+        if cell.column_id == request_column.id
+    )
+    assert date_cell.raw_value == "15/07/2026 14:51:00"
+    assert request_cell.raw_value == "MNEIPI/265604"
     assert date_cell.evidence
 
 
@@ -3852,20 +3974,46 @@ def test_printed_table_synthesizes_repeated_unlabeled_numeric_column() -> None:
     table = result.source_tables[0]
     assert [column.canonical_field for column in table.columns] == [
         "service_date_raw",
+        "request_no",
         "description",
         "unit_price",
         "quantity",
         None,
         "net_amount",
     ]
-    assert table.columns[4].label == "Column 5"
-    assert "synthetic_header" in table.columns[4].validation_flags
-    assert "inferred_financial_lane" in table.columns[4].validation_flags
+    assert table.columns[5].label == "Column 5"
+    assert "synthetic_header" in table.columns[5].validation_flags
+    assert "inferred_financial_lane" in table.columns[5].validation_flags
     for row in table.rows:
         cells = {cell.column_id: cell for cell in row.cells}
-        assert cells[table.columns[3].id].raw_value == "1.00"
-        assert cells[table.columns[4].id].raw_value == "0.00"
-        assert cells[table.columns[5].id].raw_value == "570.00"
+        assert cells[table.columns[4].id].raw_value == "1.00"
+        assert cells[table.columns[5].id].raw_value == "0.00"
+        assert cells[table.columns[6].id].raw_value == "570.00"
+
+
+def test_repeated_identifier_lane_is_not_inferred_as_financial() -> None:
+    result = reconstruct_ocr_rows(
+        (
+            token(0, "Description", (100, 30, 250, 45)),
+            token(1, "Mystery", (580, 30, 690, 45)),
+            token(2, "Amount", (900, 30, 970, 45)),
+            token(3, "Consultation", (100, 70, 250, 85)),
+            token(4, "998311", (600, 70, 680, 85)),
+            token(5, "100.00", (900, 70, 970, 85)),
+            token(6, "X Ray", (100, 100, 250, 115)),
+            token(7, "998312", (600, 100, 680, 115)),
+            token(8, "200.00", (900, 100, 970, 115)),
+        ),
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 20, 980, 130),
+    )
+
+    mystery = next(
+        column for column in result.source_tables[0].columns if column.label == "Mystery"
+    )
+    assert mystery.canonical_field is None
+    assert "inferred_financial_lane" not in mystery.validation_flags
 
 
 def test_printed_summary_synthesizes_all_repeated_unlabeled_amount_lanes() -> None:

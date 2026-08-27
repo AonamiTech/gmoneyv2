@@ -119,12 +119,20 @@ class SourceCell(ContractModel):
         return self
 
 
+class ReceiptSourceMetadata(ContractModel):
+    issuer_raw: str | None = None
+    issuer_normalized: str | None = None
+    reference_raw: str | None = None
+    reference_normalized: str | None = None
+
+
 class SourceRow(ContractModel):
     id: str
     order: int = Field(ge=0)
     canonical_row_id: str | None = None
     cells: tuple[SourceCell, ...]
     validation_flags: tuple[str, ...] = ()
+    receipt_metadata: ReceiptSourceMetadata | None = None
 
 
 class SourceTable(ContractModel):
