@@ -7,6 +7,7 @@ from collections.abc import Callable, Collection
 from dataclasses import asdict, dataclass, replace
 from datetime import date
 from decimal import Decimal
+from difflib import SequenceMatcher
 from pathlib import Path
 from statistics import median
 from typing import Annotated, Any
@@ -224,6 +225,46 @@ def _layout_boxes(output: dict[str, Any]) -> list[tuple[int, int, int, int]]:
         for box in boxes
         if box.get("label") == "table" and float(box.get("score") or 0) >= 0.3
     ]
+
+
+def _needs_full_page_financial_recovery(tokens: tuple[OcrToken, ...]) -> bool:
+    """Identify financially relevant forms when neither table detector fires."""
+    text = re.sub(
+        r"[^a-z0-9₹./:-]+",
+        " ",
+        " ".join(token.text for token in tokens).casefold(),
+    ).strip()
+    if not text:
+        return False
+    receipt_context = any(
+        marker in text
+        for marker in (
+            "receipt no",
+            "receipt book",
+            "reservation receipt",
+            "distribution receipt",
+            "charges towards",
+            "payment received",
+        )
+    )
+    financial_context = any(
+        marker in text
+        for marker in (
+            "amount",
+            "charges",
+            "payment",
+            "rs ",
+            "rs.",
+            "₹",
+        )
+    )
+    money_like = bool(
+        re.search(
+            r"(?:₹|\brs\.?\s*)?\d[\d,]*(?:\.\d{1,2})?(?:\s*/-)?",
+            text,
+        )
+    )
+    return receipt_context and financial_context and money_like
 
 
 def _safe_box(
@@ -1582,6 +1623,94 @@ def _split_grounded_merged_numeric_cells(
             }
         )
 
+    financial_evidence_fields = {
+        "quantity": "quantity",
+        "unit_price": "rate",
+        "gross_amount": "gross_amount",
+        "discount": "discount",
+        "net_amount": "amount",
+    }
+    financial_columns = tuple(
+        column
+        for column in sorted(columns, key=lambda item: item.order)
+        if column.canonical_field in financial_evidence_fields
+    )
+    for merged_cell in tuple(cells_by_id.values()):
+        raw_value = re.sub(r"\s+", " ", merged_cell.raw_value or "").strip()
+        fragments = tuple(
+            match.group(0)
+            for match in re.finditer(
+                r"[+-]?(?:\d[\d,]*)(?:\.\d{1,4})?",
+                raw_value,
+            )
+        )
+        residual = re.sub(
+            r"[+-]?(?:\d[\d,]*)(?:\.\d{1,4})?",
+            "",
+            raw_value,
+        ).strip()
+        if len(fragments) < 2 or residual:
+            continue
+        parsed_fragments = tuple(parse_decimal(fragment) for fragment in fragments)
+        if any(value is None for value in parsed_fragments):
+            continue
+        matches: list[tuple[SourceColumn, ...]] = []
+        for start in range(len(financial_columns) - len(fragments) + 1):
+            window = financial_columns[start : start + len(fragments)]
+            expected = tuple(
+                parse_decimal(str(getattr(canonical, column.canonical_field)))
+                if getattr(canonical, column.canonical_field) is not None
+                else None
+                for column in window
+            )
+            if expected != parsed_fragments:
+                continue
+            if any(
+                cells_by_id[column.id] is not merged_cell
+                and cells_by_id[column.id].raw_value
+                for column in window
+            ):
+                continue
+            matches.append(window)
+        if len(matches) != 1:
+            continue
+        window = matches[0]
+        merged_ids = {
+            token_id
+            for item in merged_cell.evidence
+            for token_id in item.token_ids
+        }
+        evidence_by_column = {
+            column.id: field_token_ids(
+                financial_evidence_fields[str(column.canonical_field)]
+            )
+            for column in window
+        }
+        if any(
+            not token_ids or not token_ids.issubset(merged_ids)
+            for token_ids in evidence_by_column.values()
+        ):
+            continue
+        if merged_cell.column_id not in {column.id for column in window}:
+            cells_by_id[merged_cell.column_id] = merged_cell.model_copy(
+                update={
+                    "raw_value": None,
+                    "evidence": (),
+                    "validation_flags": tuple(
+                        dict.fromkeys((*merged_cell.validation_flags, split_flag))
+                    ),
+                }
+            )
+        for column, fragment in zip(window, fragments, strict=True):
+            cells_by_id[column.id] = populated_cell(
+                cells_by_id[column.id],
+                fragment,
+                _filter_evidence_token_ids(
+                    merged_cell.evidence,
+                    evidence_by_column[column.id],
+                ),
+            )
+
     quantity_column = columns_by_field.get("quantity")
     amount_column = (
         columns_by_field.get("net_amount")
@@ -2138,6 +2267,10 @@ _NON_SERVICE_DATE_MARKERS = (
     "discharge date",
     "dob",
     "expiry",
+    "exp date",
+    "expdate",
+    "manufacturing date",
+    "mfg date",
     "print date",
     "print time",
     "receipt date",
@@ -2156,9 +2289,14 @@ def _source_cell_service_date(
         return None
     normalized_label = normalized(column.label)
     normalized_raw = normalized(raw)
+    expiry_abbreviation = re.search(
+        r"(?:^|\s)(?:exp|mfg)(?:\s|$|date\b)",
+        normalized_raw,
+    )
     if (
         "expiry" in normalized_label
-        or normalized_label in {"exp", "exp date"}
+        or normalized_label in {"exp", "exp date", "expdate", "mfg", "mfg date"}
+        or expiry_abbreviation is not None
         or any(marker in normalized_raw for marker in _NON_SERVICE_DATE_MARKERS)
     ):
         return None
@@ -2596,17 +2734,23 @@ def _promote_grounded_date_column(
     if selected.canonical_field not in {None, "service_date_raw"}:
         return table
 
-    linked_values = tuple(
+    supported_values = tuple(
         cell.raw_value.strip()
         for row in table.rows
-        if row.canonical_row_id is not None
         for cell in row.cells
         if cell.column_id == selected_id
         and cell.raw_value
         and cell.raw_value.strip()
+        and date_evidence_ids.intersection(
+            {
+                token_id
+                for item in cell.evidence
+                for token_id in item.token_ids
+            }
+        )
     )
-    if linked_values and any(
-        DATE_SPAN.search(value) is None for value in linked_values
+    if not supported_values or any(
+        DATE_SPAN.search(value) is None for value in supported_values
     ):
         return table
 
@@ -2824,6 +2968,73 @@ def _apply_document_role_policy(rows: list[CanonicalRow]) -> list[CanonicalRow]:
     # Exact duplicate overlays are removed earlier only after pixel and
     # full-evidence containment checks; preserve every remaining occurrence.
     return [row.model_copy(update={"row_order": order}) for order, row in enumerate(selected)]
+
+
+def _flag_possible_supporting_receipt_duplicates(
+    rows: list[CanonicalRow],
+) -> list[CanonicalRow]:
+    """Keep billable receipts visible while making possible duplicates reviewable."""
+    output = list(rows)
+    generic_words = {
+        "amount",
+        "bill",
+        "charge",
+        "charges",
+        "collection",
+        "receipt",
+        "towards",
+    }
+
+    def normalized(value: str | None) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", (value or "").casefold()).strip()
+
+    for index, receipt in enumerate(output):
+        if not (
+            "supporting_receipt_charge" in receipt.validation_flags
+            or "receipt_form" in receipt.source_routes
+        ):
+            continue
+        receipt_description = normalized(receipt.description)
+        receipt_words = set(receipt_description.split()) - generic_words
+        possible_duplicate = any(
+            other_index != index
+            and "receipt_form" not in other.source_routes
+            and other.page_number != receipt.page_number
+            and other.net_amount == receipt.net_amount
+            and (
+                SequenceMatcher(
+                    None,
+                    receipt_description,
+                    normalized(other.description),
+                ).ratio()
+                >= 0.72
+                or (
+                    bool(
+                        receipt_words
+                        & (set(normalized(other.description).split()) - generic_words)
+                    )
+                    and bool(
+                        receipt.service_date_iso
+                        and receipt.service_date_iso == other.service_date_iso
+                    )
+                )
+            )
+            for other_index, other in enumerate(output)
+        )
+        if possible_duplicate:
+            output[index] = receipt.model_copy(
+                update={
+                    "validation_flags": tuple(
+                        dict.fromkeys(
+                            (
+                                *receipt.validation_flags,
+                                "possible_duplicate_supporting_charge",
+                            )
+                        )
+                    )
+                }
+            )
+    return output
 
 
 def _apply_profile_constraints(reconstruction, profile):
@@ -3725,6 +3936,31 @@ class OfflineExtractor:
                     )
                 )
 
+            if not table_work and _needs_full_page_financial_recovery(tokens):
+                table_id = f"p{page_asset.page_number}-t1"
+                safe_box = (0, 0, page_asset.width, page_asset.height)
+                crop = crop_region(
+                    page_path,
+                    artifact_root / "crops" / f"{table_id}.png",
+                    page_asset.page_number,
+                    safe_box,
+                )
+                source_table_crop_paths[(page_asset.page_number, table_id)] = (
+                    crop.output_path
+                )
+                source_table_crop_boxes[(page_asset.page_number, table_id)] = safe_box
+                table_work.append(
+                    TableWork(
+                        table_id=table_id,
+                        page_number=page_asset.page_number,
+                        page_artifact_sha256=page_asset.artifact_sha256,
+                        crop_path=crop.output_path,
+                        crop_sha256=crop.artifact_sha256,
+                        box=safe_box,
+                    )
+                )
+                route = "full_page_financial_recovery"
+
             if not table_work:
                 diagnostics.append(
                     {
@@ -4334,6 +4570,7 @@ class OfflineExtractor:
         )
         rows = _apply_document_role_policy(_deduplicate(selected_rows))
         rows = _recover_grounded_service_dates(selected_source_tables, rows)
+        rows = _flag_possible_supporting_receipt_duplicates(rows)
         source_tables = _link_source_tables(selected_source_tables, rows)
         document_totals = select_document_totals(document_total_candidates)
         document_total: DocumentTotal | None = select_document_total(document_total_candidates)

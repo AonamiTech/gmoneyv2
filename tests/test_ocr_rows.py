@@ -18,6 +18,7 @@ from gmoney.extraction.ocr_rows import (
 )
 from gmoney.extraction.offline import (
     _link_source_tables,
+    _needs_full_page_financial_recovery,
     _populate_grounded_service_date_cell,
     _recover_grounded_service_dates,
     _recovery_prior_schemas,
@@ -1218,8 +1219,8 @@ def test_source_tables_restart_at_arbitrary_header_after_preamble() -> None:
         box=(60, 0, 1000, 160),
     )
 
-    assert len(result.source_tables) == 2
-    ledger = result.source_tables[1]
+    assert len(result.source_tables) == 1
+    ledger = result.source_tables[0]
     assert [column.label for column in ledger.columns] == [
         "SR. ISSUE NO",
         "ISSUE DATE",
@@ -2306,6 +2307,141 @@ def test_source_table_skips_title_before_headerless_rows() -> None:
     ]
 
 
+def test_alphanumeric_first_data_line_is_not_promoted_to_header() -> None:
+    tokens = (
+        token(0, "MKDIPI/2616051", (70, 30, 210, 45)),
+        token(1, "Medicine A [ExpDate:-30/11/2027]", (260, 30, 620, 45)),
+        token(2, "1.00", (700, 30, 750, 45)),
+        token(3, "364.21", (860, 30, 940, 45)),
+        token(4, "MKDIPI/2616052", (70, 70, 210, 85)),
+        token(5, "Medicine B [ExpDate:-31/01/2029]", (260, 70, 620, 85)),
+        token(6, "1.00", (700, 70, 750, 85)),
+        token(7, "12.72", (860, 70, 940, 85)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(40, 20, 980, 110),
+    )
+
+    assert all(
+        column.validation_flags == ("synthetic_header",)
+        for column in result.source_tables[0].columns
+    )
+    assert result.source_tables[0].rows[0].cells[0].raw_value == (
+        "MKDIPI/2616051"
+    )
+
+
+def test_expdate_in_product_cell_is_not_recovered_as_service_date() -> None:
+    tokens = (
+        token(0, "Description", (100, 20, 500, 35)),
+        token(1, "Amount", (850, 20, 950, 35)),
+        token(2, "Medicine [ExpDate:-30/11/2027]", (100, 60, 600, 75)),
+        token(3, "364.21", (860, 60, 940, 75)),
+    )
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(60, 0, 980, 100),
+    )
+    canonical = canonicalize_rows(
+        "d" * 64,
+        1,
+        "p1-t1",
+        "a" * 64,
+        result.rows,
+    )
+
+    recovered = _recover_grounded_service_dates(result.source_tables, canonical)
+
+    assert recovered[0].service_date_iso is None
+
+
+def test_standalone_financial_receipt_is_billable_and_requests_full_page_recovery() -> None:
+    tokens = (
+        token(0, "Distribution Receipt Book", (100, 20, 500, 35)),
+        token(1, "Receipt No 9658", (100, 50, 300, 65)),
+        token(2, "Charges towards Blood Collection", (100, 90, 600, 105)),
+        token(3, "Rs. 1500.00", (820, 90, 950, 105)),
+    )
+
+    assert _needs_full_page_financial_recovery(tokens)
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(0, 0, 1000, 150),
+    )
+
+    assert len(result.rows) == 1
+    assert result.rows[0].candidate.role is RowRole.DETAIL
+    assert result.rows[0].candidate.section == "Supporting receipt"
+    assert result.rows[0].candidate.amount == Decimal("1500.00")
+    assert result.rows[0].candidate.source_route == "receipt_form"
+
+
+def test_merged_date_description_is_recovered_even_when_ocr_box_stays_in_date_lane() -> None:
+    tokens = (
+        token(0, "Date", (80, 20, 160, 35)),
+        token(1, "Particulars", (350, 20, 550, 35)),
+        token(2, "Net Amount", (850, 20, 950, 35)),
+        token(3, "15/08/2026 URINE ANALYSIS", (80, 60, 195, 75)),
+        token(4, "200.00", (860, 60, 940, 75)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(60, 0, 980, 100),
+    )
+
+    assert len(result.rows) == 1
+    assert result.rows[0].candidate.description == "URINE ANALYSIS"
+    assert result.rows[0].candidate.service_date == "15/08/2026"
+    assert result.rows[0].candidate.amount == Decimal("200.00")
+
+
+def test_merged_discount_and_net_values_are_split_before_validation() -> None:
+    tokens = (
+        token(0, "Description", (100, 20, 450, 35)),
+        token(1, "Disc Amt", (700, 20, 790, 35)),
+        token(2, "Net Amt", (850, 20, 950, 35)),
+        token(3, "Consultation", (100, 60, 400, 75)),
+        token(4, "0.00 1000.00", (700, 60, 950, 75)),
+    )
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(60, 0, 980, 100),
+    )
+    canonical = canonicalize_rows(
+        "d" * 64,
+        1,
+        "p1-t1",
+        "a" * 64,
+        result.rows,
+    )
+
+    linked = _link_source_tables(result.source_tables, canonical)
+    columns = {
+        column.canonical_field: column
+        for column in linked[0].columns
+        if column.canonical_field is not None
+    }
+    cells = {cell.column_id: cell for cell in linked[0].rows[0].cells}
+
+    assert canonical[0].discount == Decimal("0.00")
+    assert canonical[0].net_amount == Decimal("1000.00")
+    assert cells[columns["discount"].id].raw_value == "0.00"
+    assert cells[columns["net_amount"].id].raw_value == "1000.00"
+
+
 def test_repeated_shifted_headers_reassign_rate_and_quantity_lanes() -> None:
     tokens = (
         token(0, "Description", (100, 30, 300, 45)),
@@ -2437,6 +2573,16 @@ def test_header_does_not_absorb_redundant_adjacent_bill_date_metadata() -> None:
         "Service Amt",
         "Disc Amt",
         "Net Amt",
+    ]
+    assert [
+        column.canonical_field for column in result.source_tables[0].columns
+    ] == [
+        "service_date_raw",
+        "description",
+        "quantity",
+        "gross_amount",
+        "discount",
+        "net_amount",
     ]
     assert result.source_tables[0].columns[0].canonical_field == (
         "service_date_raw"

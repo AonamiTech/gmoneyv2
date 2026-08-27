@@ -403,6 +403,34 @@ def totals_summary(
 def structural_issues(result: dict[str, Any], review: dict[str, Any]) -> list[dict[str, Any]]:
     issues: list[dict[str, Any]] = []
     overrides = review.get("issue_overrides", {})
+    semantic = result.get("semantic_validation") or {}
+    for item in semantic.get("issues") or []:
+        code = str(item.get("code") or "semantic_validation_failed")
+        message = str(item.get("message") or code)
+        location = re.search(r"\bp(?P<page>\d+)-t(?P<table>\d+)", message)
+        page_number = int(location.group("page")) if location else 1
+        table_id = (
+            f"p{location.group('page')}-t{location.group('table')}"
+            if location
+            else "semantic-validation"
+        )
+        issue_id = hashlib.sha256(
+            f"semantic:{code}:{message}".encode()
+        ).hexdigest()[:20]
+        override = overrides.get(issue_id, {})
+        issues.append(
+            {
+                "id": issue_id,
+                "page_number": page_number,
+                "table_id": table_id,
+                "table_type": "semantic_validation",
+                "reason_codes": [code],
+                "message": message,
+                "status": override.get("status", "open"),
+                "resolution_reason": override.get("reason"),
+                "updated_at": override.get("updated_at"),
+            }
+        )
     for diagnostic in result.get("diagnostics", []):
         pending = [
             attempt
@@ -435,6 +463,7 @@ def structural_issues(result: dict[str, Any], review: dict[str, Any]) -> list[di
         "missing_labeled_quantity",
         "missing_labeled_unit_price",
         "line_arithmetic_mismatch",
+        "possible_duplicate_supporting_charge",
     }
     flagged_tables: dict[tuple[int, str], set[str]] = {}
     for row in result.get("rows", []):

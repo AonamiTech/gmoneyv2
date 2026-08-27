@@ -1180,7 +1180,7 @@ def _migrate_review(
     return migrated
 
 
-def _validate_result(
+def validate_result(
     source: Path,
     old_result: dict[str, Any],
     new_result: dict[str, Any],
@@ -1516,6 +1516,11 @@ def _validate_result(
             raise ValueError(f"canonical OCR row lacks a source-table link: {row_id}")
 
 
+# Kept for compatibility with existing callers while the public validator is
+# shared by normal worker publication and controlled reprocessing.
+_validate_result = validate_result
+
+
 def _snapshot_job(
     *,
     store: JobStore,
@@ -1528,8 +1533,8 @@ def _snapshot_job(
     with store.job_lock(job_id, exclusive=False):
         store._require_stable_workspace(job_id)
         state = store.read(job_id)
-        if state.get("status") != "complete":
-            raise ValueError("only complete jobs can be reprocessed")
+        if state.get("status") not in {"complete", "needs_review"}:
+            raise ValueError("only complete or needs-review jobs can be reprocessed")
         if not source.is_file() or not result_path.is_file() or not artifact_root.is_dir():
             raise ValueError("source, result, or artifacts are missing")
         old_result = json.loads(result_path.read_text())
@@ -1771,7 +1776,9 @@ def reprocess_jobs(
 ) -> dict[str, Any]:
     store = JobStore(root)
     selected = job_ids or [
-        str(state["id"]) for state in store.states() if state.get("status") == "complete"
+        str(state["id"])
+        for state in store.states()
+        if state.get("status") in {"complete", "needs_review"}
     ]
     selected = sorted(set(selected))
     summary: dict[str, Any] = {
@@ -1783,8 +1790,8 @@ def reprocess_jobs(
     }
     for job_id in selected:
         state = store.read(job_id)
-        if state.get("status") != "complete":
-            raise ValueError(f"job is not complete: {job_id}")
+        if state.get("status") not in {"complete", "needs_review"}:
+            raise ValueError(f"job is not reviewable: {job_id}")
         summary["documents"].append(
             {
                 "job_id": job_id,
@@ -1861,7 +1868,7 @@ def _stage_reprocess_jobs(
             or [
                 str(state["id"])
                 for state in store.states()
-                if state.get("status") == "complete"
+                if state.get("status") in {"complete", "needs_review"}
             ]
         )
     )

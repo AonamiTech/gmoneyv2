@@ -1028,6 +1028,63 @@ def test_processing_abort_prevents_result_publication(tmp_path: Path) -> None:
     assert store.finalize_abort(job_id)
 
 
+def test_semantically_invalid_result_is_published_as_needs_review(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = JobStore(tmp_path)
+    job_id = _create_worker_job(store, "Needs review.pdf")
+    assert store.claim_queued(job_id) is not None
+
+    class InvalidExtractor:
+        def extract(
+            self,
+            source: Path,
+            artifact_root: Path,
+            progress: Any,
+            *,
+            should_abort: Any,
+        ) -> dict[str, Any]:
+            return {
+                "output_version": "offline_accuracy_spine_v3",
+                "rows": [{"id": "machine-row"}],
+                "hospital": None,
+            }
+
+    monkeypatch.setattr(
+        worker_module,
+        "_semantic_validation",
+        lambda source, artifacts, result: (
+            "needs_review",
+            {
+                "validation_version": "semantic_result_validation_v1",
+                "status": "needs_review",
+                "issues": [
+                    {
+                        "code": "unlinked_financial_row",
+                        "message": "unlinked financial row p1-t1-s1-r2",
+                        "severity": "error",
+                    }
+                ],
+            },
+        ),
+    )
+
+    summary = worker_module._extract_and_publish(
+        store=store,
+        job_id=job_id,
+        extractor=InvalidExtractor(),
+    )
+
+    assert summary is not None
+    state = store.read(job_id)
+    assert state["status"] == "needs_review"
+    assert state["validation_issue_count"] == 1
+    assert state["validation_issue_codes"] == ["unlinked_financial_row"]
+    result = json.loads((store.job_dir(job_id) / "result.json").read_text())
+    assert result["semantic_validation"]["status"] == "needs_review"
+
+
 def test_worker_recovery_deletes_interrupted_abort(tmp_path: Path) -> None:
     store = JobStore(tmp_path)
     job_id = _create_worker_job(store, "Interrupted abort.pdf")

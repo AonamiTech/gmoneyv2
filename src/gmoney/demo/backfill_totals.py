@@ -58,7 +58,7 @@ def backfill_totals(*, root: Path, apply: bool = False) -> dict[str, Any]:
         "failures": [],
     }
     for state in store.states():
-        if state.get("status") != "complete":
+        if state.get("status") not in {"complete", "needs_review"}:
             continue
         job_id = str(state["id"])
         result_path = store.job_dir(job_id) / "result.json"

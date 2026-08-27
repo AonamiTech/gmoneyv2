@@ -95,3 +95,13 @@ def test_backfill_leaves_result_unchanged_when_cache_hash_differs(tmp_path: Path
     assert summary["failed"] == 1
     assert "hash differs" in summary["failures"][0]["error"]
     assert result_path.read_bytes() == original
+
+
+def test_backfill_includes_needs_review_results(tmp_path: Path) -> None:
+    store, job_id, result_path = completed_cached_job(tmp_path)
+    store.update(job_id, status="needs_review")
+
+    summary = backfill_totals(root=tmp_path, apply=True)
+
+    assert summary["updated"] == 1
+    assert json.loads(result_path.read_text())["document_total"]["amount"] == "1234.50"

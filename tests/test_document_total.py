@@ -149,3 +149,17 @@ def test_pharmacy_grand_total_is_section_scoped() -> None:
     )
     assert len(candidates) == 1
     assert candidates[0].total.scope.value == "section"
+
+
+def test_pharmacy_invoice_grand_total_is_section_scoped_without_exact_title() -> None:
+    candidates = extract_document_total_candidates(
+        (
+            token(0, "Tax Invoice", (100, 20, 250, 40)),
+            token(1, "Product Batch MRP CGST SGST", (100, 50, 500, 70)),
+            token(2, "Grand Total", (100, 100, 300, 120)),
+            token(3, "8,568.00", (800, 100, 930, 120)),
+        )
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].total.scope.value == "section"

@@ -1606,6 +1606,49 @@ def completed_job(
     return job_id, result
 
 
+def test_needs_review_result_remains_visible_and_blocks_approval(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    client, store = client_for(tmp_path, monkeypatch)
+    job_id, result = completed_job(store)
+    result["semantic_validation"] = {
+        "validation_version": "semantic_result_validation_v1",
+        "status": "needs_review",
+        "issues": [
+            {
+                "code": "unlinked_financial_row",
+                "message": "unlinked financial row p1-t1-s1-r2",
+                "severity": "error",
+            }
+        ],
+    }
+    (store.job_dir(job_id) / "result.json").write_text(json.dumps(result))
+    store.update(
+        job_id,
+        status="needs_review",
+        validation_status="needs_review",
+        validation_issue_count=1,
+        validation_issue_codes=["unlinked_financial_row"],
+    )
+
+    rows = client.get(f"/api/v2/documents/{job_id}/rows")
+
+    assert rows.status_code == 200
+    review = client.get(f"/api/v2/documents/{job_id}/review")
+    assert review.status_code == 200
+    assert review.json()["issues_open"] == 1
+    listing = client.get("/api/v2/documents", params={"status": "needs_review"})
+    assert listing.status_code == 200
+    assert listing.json()["documents"][0]["validation_issue_count"] == 1
+    approval = client.post(
+        f"/api/v2/documents/{job_id}/approval",
+        headers={"If-Match": "0"},
+    )
+    assert approval.status_code == 422
+    assert "open_structural_issues" in str(approval.json())
+
+
 def test_review_updates_are_revisioned_and_machine_output_is_immutable(
     tmp_path: Path, monkeypatch
 ) -> None:

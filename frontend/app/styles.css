@@ -101,6 +101,7 @@ main::after { content: none; }
 .job-state { position: absolute; width: 6px; height: 6px; left: 13px; top: 18px; border-radius: 50%; background: #a28e72; }
 .job-state.processing { background: var(--signal); box-shadow: 0 0 0 5px rgba(237,91,50,.15); animation: pulse 1.4s infinite; }
 .job-state.complete { background: #3d9a68; }
+.job-state.needs_review { background: #c47a16; }
 .job-state.failed { background: #b63434; }
 .job-index { font: 18px/1 var(--serif); color: var(--signal); }
 .job-copy { min-width: 0; }
@@ -450,6 +451,7 @@ footer { display: flex; justify-content: space-between; border-top: 1px solid va
 .job-state { width: 8px; height: 8px; left: 18px; top: 21px; background: var(--muted-light); }
 .job-state.processing, .job-state.queued { background: var(--blue); box-shadow: 0 0 0 5px rgba(14,50,232,.1); }
 .job-state.complete { background: var(--success); }
+.job-state.needs_review { background: #c47a16; }
 .job-state.failed { background: var(--danger); }
 .job-index { color: var(--muted-light); font: 600 19px/1 var(--mono); }
 .job-copy b { font: 600 18px/1.15 var(--serif); white-space: normal; }

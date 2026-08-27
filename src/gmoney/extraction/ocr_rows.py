@@ -65,12 +65,14 @@ HEADER_TERMS: dict[str, tuple[str, ...]] = {
         "unitprice",
         "unit rate",
         "unitrate",
+        "price",
         "rate",
     ),
     "gross_amount": ("gross amount", "service amount", "service amt"),
     "discount": ("discount", "disc amt", "disc"),
     "amount": (
         "net amount",
+        "net amt",
         "total amount",
         "line total",
         "amount",
@@ -110,9 +112,11 @@ RAW_HEADER_TERMS = frozenset(
         "balance",
         "bill",
         "charge",
+        "cash",
         "code",
         "company",
         "copay",
+        "credit",
         "date",
         "description",
         "discount",
@@ -135,6 +139,7 @@ RAW_HEADER_TERMS = frozenset(
         "serial",
         "service",
         "sr",
+        "summary",
         "total",
         "type",
         "value",
@@ -1551,21 +1556,25 @@ def _raw_source_headers(
             )
             >= max(2, len(signature) - 1)
         )
+        header_word_count = len(
+            {
+                word
+                for word in normalized_words
+                if word in RAW_HEADER_TERMS
+                or word.removesuffix("s") in RAW_HEADER_TERMS
+            }
+        )
+        is_explicit_header = bool(
+            not any(character.isdigit() for character in line.text)
+            and header_word_count >= min(2, len(header_tokens))
+        )
         is_dense_explicit_restart = (
             not any(character.isdigit() for character in line.text)
             and len(header_tokens) >= 4
-            and len(
-                {
-                    word
-                    for word in normalized_words
-                    if word in RAW_HEADER_TERMS
-                    or word.removesuffix("s") in RAW_HEADER_TERMS
-                }
-            )
-            >= min(5, len(header_tokens))
+            and header_word_count >= min(5, len(header_tokens))
         )
         if aligned >= 2 and (
-            not output
+            (not output and is_explicit_header)
             or is_repeated_signature
             or is_dense_explicit_restart
         ):
@@ -3641,21 +3650,9 @@ def reconstruct_ocr_rows(
                 merged_description = merged_description[
                     len(grounded_request) :
                 ].lstrip(" -:")
-            token_left, _, token_right, _ = _bounds(token)
-            relative_left = (token_left - left) / width
-            relative_right = (token_right - left) / width
-            overlaps_description_cell = bool(
-                description_cell_min is not None
-                and relative_right > description_cell_min
-                and (
-                    description_cell_max is None
-                    or relative_left < description_cell_max
-                )
-            )
             if (
                 merged_description
                 and embedded_date
-                and overlaps_description_cell
                 and _is_admissible_merged_date_description(merged_description)
             ):
                 line_description_tokens.append(
@@ -4172,8 +4169,22 @@ def reconstruct_ocr_rows(
                 quantity_derived_from_rate_amount = True
 
         normalized_description = _normalize(description)
+        billable_receipt_charge = bool(
+            any(
+                marker in normalized_description
+                for marker in (
+                    "charges towards",
+                    "charge towards",
+                    "blood collection",
+                    "blood component reservation charges",
+                )
+            )
+            and amount is not None
+        )
         if _is_metadata_description(description):
             role = RowRole.UNRESOLVED
+        elif billable_receipt_charge:
+            role = RowRole.DETAIL
         elif (
             table_type is TableType.PAYMENT
             or normalized_description
@@ -4209,6 +4220,8 @@ def reconstruct_ocr_rows(
             validation_flags.append("missing_printed_description")
         if quantity_derived_from_rate_amount:
             validation_flags.append("quantity_derived_from_rate_amount")
+        if billable_receipt_charge:
+            validation_flags.append("supporting_receipt_charge")
         if "quantity" in column_centers and values["quantity"] is None:
             validation_flags.append("missing_labeled_quantity")
         if "rate" in column_centers and values["rate"] is None:
@@ -4239,7 +4252,11 @@ def reconstruct_ocr_rows(
             source_row=source_row,
             role=role,
             cells=tuple(token.text for token in line.tokens),
-            section=structured_values.get("section") or current_section,
+            section=(
+                "Supporting receipt"
+                if billable_receipt_charge
+                else structured_values.get("section") or current_section
+            ),
             description=description,
             service_date=service_date,
             request_no=request_no,
@@ -4255,7 +4272,9 @@ def reconstruct_ocr_rows(
                 row_category(description, table_type)
                 or row_category(current_section or "", table_type)
             ),
-            source_route="ocr_spatial_graph",
+            source_route=(
+                "receipt_form" if billable_receipt_charge else "ocr_spatial_graph"
+            ),
             validation_flags=tuple(validation_flags),
         )
         append_aligned(

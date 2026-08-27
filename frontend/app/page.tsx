@@ -17,7 +17,7 @@ import type {
 
 type Job = {
   id: string;
-  status: "uploading" | "queued" | "processing" | "complete" | "failed";
+  status: "uploading" | "queued" | "processing" | "complete" | "needs_review" | "failed";
   original_name: string;
   page: number;
   pages: number | null;
@@ -25,6 +25,9 @@ type Job = {
   hospital_name: string | null;
   hospital_confidence: number | null;
   hospital_name_source: "machine" | "reviewer" | null;
+  validation_status?: "passed" | "needs_review" | "not_applicable" | null;
+  validation_issue_count?: number | null;
+  validation_issue_codes?: string[] | null;
   error: string | null;
   created_at: string;
   updated_at: string;
@@ -642,7 +645,7 @@ export default function Home() {
   }, [activeJobs, refreshHistoryJobs]);
 
   const loadWorkspace = useCallback(async () => {
-    if (!selectedJob || selectedJob.status !== "complete") return;
+    if (!selectedJob || !["complete", "needs_review"].includes(selectedJob.status)) return;
     const params = new URLSearchParams({ offset: String(offset), limit: String(PAGE_SIZE) });
     const sourceParams = new URLSearchParams({
       offset: String(offset),
@@ -1225,7 +1228,7 @@ export default function Home() {
   };
 
   const progress = (job: Job) => {
-    if (job.status === "complete") return 100;
+    if (job.status === "complete" || job.status === "needs_review") return 100;
     if (!job.pages) return job.status === "queued" ? 8 : 14;
     return Math.max(14, Math.round((job.page / job.pages) * 94));
   };
@@ -1396,7 +1399,7 @@ export default function Home() {
                     {jobs.slice(0, 5).map((job) => (
                       <button key={job.id} onClick={() => openJob(job)}>
                         <span className={`job-state ${job.status}`} />
-                        <span><b>{job.hospital_name ?? (job.status === "complete" ? "Hospital not identified" : "Identifying hospital…")}</b><small>{job.original_name}</small></span>
+                        <span><b>{job.hospital_name ?? (["complete", "needs_review"].includes(job.status) ? "Hospital not identified" : "Identifying hospital…")}</b><small>{job.original_name}</small></span>
                         <span className="recent-meta">{job.status === "processing" ? `${progress(job)}%` : job.row_count !== null ? `${job.row_count} rows` : job.status}<Icon name="chevron-right" size={15} /></span>
                       </button>
                     ))}
@@ -1441,14 +1444,14 @@ export default function Home() {
                     <span className={`job-state ${job.status}`} />
                     <span className="job-index">{String(index + 1).padStart(2, "0")}</span>
                     <span className="job-copy">
-                      <b>{job.hospital_name ?? (job.status === "complete" ? "Hospital not identified" : "Identifying hospital…")}</b>
+                      <b>{job.hospital_name ?? (["complete", "needs_review"].includes(job.status) ? "Hospital not identified" : "Identifying hospital…")}</b>
                       <small className="job-file">{job.original_name}</small>
                       <small>
                         {job.status === "processing" ? `page ${job.page} of ${job.pages ?? "?"}` : job.status}
                         {job.row_count !== null ? ` · ${job.row_count} rows` : ""}
                       </small>
                       <small className="job-time">
-                        {job.status === "complete"
+                        {["complete", "needs_review"].includes(job.status)
                           ? `updated ${dateTime(job.last_activity_at)} · expires ${dateTime(job.expires_at)}`
                           : `received ${dateTime(job.created_at)}`}
                       </small>
@@ -1505,7 +1508,7 @@ export default function Home() {
               </section>
             )}
 
-            {appView === "review" && selectedJob && selectedJob.status !== "complete" && (
+            {appView === "review" && selectedJob && !["complete", "needs_review"].includes(selectedJob.status) && (
               <section className="processing-card compact-processing">
                 <div className="processing-meta"><p className="folio">02 / Reconstruction</p><span>{selectedJob.original_name}</span></div>
                 <div className="processing-number">{String(progress(selectedJob)).padStart(2, "0")}<sup>%</sup></div>
@@ -1524,8 +1527,13 @@ export default function Home() {
               </section>
             )}
 
-            {appView === "review" && selectedJob?.status === "complete" && rowsResult && review && (
+            {appView === "review" && selectedJob && ["complete", "needs_review"].includes(selectedJob.status) && rowsResult && review && (
               <section className="workspace">
+                {selectedJob.status === "needs_review" && (
+                  <p className="error-note" role="alert">
+                    Extraction needs review · {selectedJob.validation_issue_count ?? review.issues_open} semantic issue{(selectedJob.validation_issue_count ?? review.issues_open) === 1 ? "" : "s"}. {review.approval ? "The reviewer resolved the evidence and sealed this document." : "Approval and export remain blocked until the evidence is resolved."}
+                  </p>
+                )}
                 <div className="workspace-head">
                   <div className="hospital-heading">
                     <p className="folio">03 / Evidence ledger</p>

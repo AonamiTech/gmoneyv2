@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import signal
 import threading
 import time
@@ -15,7 +16,7 @@ from typing import Any, TextIO
 
 from gmoney.contracts.phase3 import ProfileRegistrySnapshot
 from gmoney.demo.alias_transactions import AliasTransactionCoordinator
-from gmoney.demo.store import JobStore, is_gpu_device
+from gmoney.demo.store import TERMINAL_STATUSES, JobStore, is_gpu_device
 from gmoney.profiles.aliases import AliasRegistryUnavailable, durable_json_replace
 from gmoney.profiles.repository import (
     HospitalIdentityConflict,
@@ -30,6 +31,78 @@ _gpu_inference_lock: TextIO | None = None
 ALIAS_REGISTRY_RETRY_SECONDS = 5.0
 WORKER_STATUS_INTERVAL_SECONDS = 10.0
 logger = logging.getLogger(__name__)
+SEMANTIC_VALIDATION_VERSION = "semantic_result_validation_v1"
+
+
+def _validation_issue(error: ValueError) -> dict[str, Any]:
+    message = re.sub(r"\s+", " ", str(error)).strip() or "semantic validation failed"
+    stable_codes = (
+        ("document identity changed", "document_identity_changed"),
+        ("source hash changed", "source_hash_changed"),
+        ("page count changed", "page_count_changed"),
+        ("page inventory is incomplete", "page_inventory_incomplete"),
+        ("page inventory has invalid", "page_inventory_invalid"),
+        ("page artifact is missing", "page_artifact_missing"),
+        ("page artifact hash changed", "page_artifact_hash_changed"),
+        ("row lacks grounded description", "ungrounded_description"),
+        ("informational row has an amount", "informational_row_has_amount"),
+        ("informational row lacks typed evidence", "informational_row_untyped"),
+        ("billable row lacks grounded amount", "ungrounded_billable_amount"),
+        ("canonical rows require validated source tables", "source_tables_missing"),
+        ("source tables failed grounding validation", "source_tables_ungrounded"),
+        ("unlinked source row contains a mapped financial value", "unlinked_financial_source_row"),
+        ("source row links unknown canonical row", "unknown_canonical_source_link"),
+        ("canonical row has multiple source links", "duplicate_canonical_source_link"),
+        ("has a printed value but is missing canonical value", "printed_value_missing_canonical"),
+        ("has a canonical value but is missing printed value", "canonical_value_missing_printed"),
+        ("evidence is not in its mapped source cell", "mapped_cell_evidence_mismatch"),
+        ("value does not match its mapped source cell", "mapped_cell_value_mismatch"),
+        (
+            "service_date_raw lacks matching grounded source evidence",
+            "service_date_evidence_mismatch",
+        ),
+        ("canonical OCR row lacks a source-table link", "canonical_source_link_missing"),
+    )
+    normalized = message.casefold()
+    code = next(
+        (candidate for marker, candidate in stable_codes if marker.casefold() in normalized),
+        "semantic_validation_failed",
+    )
+    return {
+        "code": code,
+        "message": message,
+        "severity": "error",
+    }
+
+
+def _semantic_validation(
+    source: Path,
+    artifact_root: Path,
+    result: dict[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    # Lightweight worker fakes and legacy imports do not emit the offline
+    # extraction contract. Production OfflineExtractor results always do.
+    if not result.get("output_version"):
+        return "complete", {
+            "validation_version": SEMANTIC_VALIDATION_VERSION,
+            "status": "not_applicable",
+            "issues": [],
+        }
+    from gmoney.demo.reprocess import validate_result
+
+    try:
+        validate_result(source, result, result, artifact_root)
+    except ValueError as error:
+        return "needs_review", {
+            "validation_version": SEMANTIC_VALIDATION_VERSION,
+            "status": "needs_review",
+            "issues": [_validation_issue(error)],
+        }
+    return "complete", {
+        "validation_version": SEMANTIC_VALIDATION_VERSION,
+        "status": "passed",
+        "issues": [],
+    }
 
 
 @dataclass(frozen=True)
@@ -89,14 +162,34 @@ def _extract_and_publish(
         return None
     result["source_name"] = state["original_name"]
     result["worker_release_revision"] = build_revision()
-    if not store.publish_processing_result(job_id, result):
-        return None
+    outcome, validation = _semantic_validation(
+        directory / "source.pdf",
+        directory / "artifacts",
+        result,
+    )
+    result["semantic_validation"] = validation
     hospital = result.get("hospital") or {}
-    return {
+    summary = {
         "row_count": len(result["rows"]),
         "hospital_name": hospital.get("name"),
         "hospital_confidence": hospital.get("confidence"),
     }
+    if validation["status"] != "not_applicable":
+        summary.update(
+            validation_status=validation["status"],
+            validation_issue_count=len(validation["issues"]),
+            validation_issue_codes=[
+                issue["code"] for issue in validation["issues"]
+            ],
+        )
+    if not store.publish_processing_outcome(
+        job_id,
+        result,
+        status=outcome,
+        **summary,
+    ):
+        return None
+    return summary
 
 
 def _run_job(
@@ -385,7 +478,11 @@ def run_worker_loop(
                     continue
                 try:
                     summary = future.result()
-                    if summary is None or not store.finish_processing(job_id, **summary):
+                    current_status = store.read(job_id).get("status")
+                    if summary is None or (
+                        current_status not in TERMINAL_STATUSES
+                        and not store.finish_processing(job_id, **summary)
+                    ):
                         store.finalize_abort(job_id)
                 except Exception as error:  # noqa: BLE001 - boundary records sanitized failure
                     try:

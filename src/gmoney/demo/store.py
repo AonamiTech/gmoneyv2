@@ -13,7 +13,7 @@ from typing import Any, TextIO
 from uuid import UUID, uuid4
 
 ACTIVE_STATUSES = {"uploading", "queued", "processing"}
-TERMINAL_STATUSES = {"complete", "failed"}
+TERMINAL_STATUSES = {"complete", "needs_review", "failed"}
 ABORTABLE_STATUSES = {"queued", "processing"}
 CANCELLING_STATUS = "cancelling"
 
@@ -230,6 +230,33 @@ class JobStore:
             temporary = path.with_name(f"result.{os.getpid()}.tmp")
             temporary.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
             temporary.replace(path)
+            return True
+
+    def publish_processing_outcome(
+        self,
+        job_id: str,
+        result: dict[str, Any],
+        *,
+        status: str,
+        **changes: Any,
+    ) -> bool:
+        """Publish a result and terminal state while holding one job lock."""
+        if status not in {"complete", "needs_review"}:
+            raise ValueError("processing outcome must be complete or needs_review")
+        with self.job_lock(job_id, exclusive=True):
+            state = self.read(job_id)
+            directory = self.job_dir(job_id)
+            if (
+                state.get("status") != "processing"
+                or (directory / self.abort_marker_name).is_file()
+            ):
+                return False
+            path = directory / "result.json"
+            temporary = path.with_name(f"result.{os.getpid()}.tmp")
+            temporary.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+            temporary.replace(path)
+            state.update(status=status, error=None, **changes)
+            self.write(job_id, state)
             return True
 
     def finish_processing(self, job_id: str, **changes: Any) -> bool:

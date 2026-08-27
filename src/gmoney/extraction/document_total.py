@@ -311,8 +311,28 @@ def _label(
     if detected is None or any(term in normalized for term in EXCLUDED_LABEL_TERMS):
         return None
     term, display, priority, kind, scope, requires_summary = detected
-    if term == "grand total" and "pharmacy detailed bill" in page_text:
-        scope = DocumentTotalScope.SECTION
+    if term == "grand total":
+        pharmacy_markers = {
+            "pharmacy",
+            "medicine",
+            "drug",
+            "batch",
+            "expiry",
+            "mrp",
+            "cgst",
+            "sgst",
+        }
+        pharmacy_marker_count = len(
+            pharmacy_markers.intersection(page_text.split())
+        )
+        invoice_context = "invoice" in page_text and pharmacy_marker_count >= 2
+        pharmacy_table_context = pharmacy_marker_count >= 3
+        if (
+            "pharmacy detailed bill" in page_text
+            or invoice_context
+            or pharmacy_table_context
+        ):
+            scope = DocumentTotalScope.SECTION
     return display, priority, kind, scope, requires_summary
 
 

@@ -236,11 +236,14 @@ def _public_state(state: dict[str, Any]) -> dict[str, Any]:
             "row_count",
             "hospital_name",
             "hospital_confidence",
+            "validation_status",
+            "validation_issue_count",
+            "validation_issue_codes",
             "error",
         )
     }
     public["hospital_name_source"] = "machine" if state.get("hospital_name") else None
-    if state.get("status") == "complete":
+    if state.get("status") in {"complete", "needs_review"}:
         try:
             hospital_override = (
                 _alias_coordinator()
@@ -282,7 +285,7 @@ def _complete_result(job_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
             status_code=503,
             detail={"code": "alias_registry_unavailable"},
         ) from error
-    if state.get("status") != "complete":
+    if state.get("status") not in {"complete", "needs_review"}:
         raise HTTPException(status_code=409, detail="Extraction is not complete")
     return result, review
 
@@ -866,7 +869,15 @@ def list_documents(
     scope: Annotated[Literal["active", "history", "all"], Query()] = "all",
     query: Annotated[str | None, Query(max_length=200)] = None,
     document_status: Annotated[
-        Literal["uploading", "queued", "processing", "complete", "failed"] | None,
+        Literal[
+            "uploading",
+            "queued",
+            "processing",
+            "complete",
+            "needs_review",
+            "failed",
+        ]
+        | None,
         Query(alias="status"),
     ] = None,
 ) -> dict[str, Any]:
@@ -2030,7 +2041,7 @@ def export_document(job_id: str, export_format: Literal["csv", "json", "evidence
 
         def build_evidence_export() -> tuple[str, Path]:
             with store.locked_workspace(job_id) as (state, result, review):
-                if state.get("status") != "complete":
+                if state.get("status") not in {"complete", "needs_review"}:
                     raise HTTPException(
                         status_code=409,
                         detail="Extraction is not complete",
@@ -2100,7 +2111,7 @@ def get_page(job_id: str, page_number: int) -> Response:
         raise HTTPException(
             status_code=503, detail={"code": "alias_registry_unavailable"}
         ) from error
-    if state.get("status") not in {"processing", "complete"}:
+    if state.get("status") not in {"processing", "complete", "needs_review"}:
         raise HTTPException(status_code=409, detail="Page is not available")
     return Response(content=page, media_type="image/png")
 
