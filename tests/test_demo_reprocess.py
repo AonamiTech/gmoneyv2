@@ -11,7 +11,9 @@ from contextlib import suppress
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
+from uuid import NAMESPACE_URL, uuid5
 
+import fitz
 import pytest
 
 from gmoney.contracts.evidence import OcrToken, Point, Polygon
@@ -27,6 +29,12 @@ from gmoney.demo.store import JobStore, JobTransactionError, ReviewRevisionConfl
 from gmoney.extraction.canonicalize import canonicalize_rows
 from gmoney.extraction.ocr_rows import reconstruct_ocr_rows
 from gmoney.extraction.offline import _link_source_tables
+from gmoney.extraction.validation import (
+    ValidationIssue,
+    ValidationReport,
+    ValidationSeverity,
+    ValidationStatus,
+)
 
 VISUAL_AUDIT_CHECKS = {
     "hospital_identity",
@@ -38,6 +46,26 @@ VISUAL_AUDIT_CHECKS = {
 }
 
 
+def fixture_row_id(label: str) -> str:
+    return str(uuid5(NAMESPACE_URL, f"gmoney-reprocess-fixture:{label}"))
+
+
+_FIXTURE_PDFS: dict[bytes, bytes] = {}
+
+
+def fixture_pdf(seed: bytes) -> bytes:
+    cached = _FIXTURE_PDFS.get(seed)
+    if cached is not None:
+        return cached
+    document = fitz.open()
+    page_document = document.new_page(width=100, height=200)
+    page_document.insert_text((10, 20), seed.decode(errors="replace"))
+    payload = document.tobytes()
+    document.close()
+    _FIXTURE_PDFS[seed] = payload
+    return payload
+
+
 def _run_default_gpu_stage_then_wait(
     root_value: str,
     job_id: str,
@@ -46,7 +74,7 @@ def _run_default_gpu_stage_then_wait(
     sender: Any,
 ) -> None:
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
-    new_rows = [row("new-row", page_sha)]
+    new_rows = [row(fixture_row_id("new-row"), page_sha)]
 
     class ProcessGpuExtractor:
         def __init__(
@@ -103,7 +131,7 @@ def _run_default_gpu_stage_then_fork_competing_stage(
     child_sender: Any,
 ) -> None:
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
-    new_rows = [row("new-row", page_sha)]
+    new_rows = [row(fixture_row_id("new-row"), page_sha)]
 
     class ProcessGpuExtractor:
         def __init__(
@@ -161,7 +189,7 @@ def _run_default_gpu_stage_then_fork_survivor(
     sender: Any,
 ) -> None:
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
-    new_rows = [row("new-row", page_sha)]
+    new_rows = [row(fixture_row_id("new-row"), page_sha)]
 
     class ProcessGpuExtractor:
         def __init__(
@@ -360,6 +388,12 @@ def setup_job(
     source_name: str = "Bill 12.pdf",
     source: bytes = b"%PDF-fixture",
 ) -> tuple[JobStore, str, dict[str, Any]]:
+    try:
+        with fitz.open(stream=source, filetype="pdf") as candidate:
+            if candidate.page_count < 1:
+                raise ValueError("empty fixture PDF")
+    except (ValueError, RuntimeError, fitz.FileDataError):
+        source = fixture_pdf(source)
     store = JobStore(tmp_path)
     state = store.create(source_name)
     job_id = state["id"]
@@ -372,7 +406,7 @@ def setup_job(
     page_sha = digest(page)
     result = {
         "output_version": "offline_accuracy_spine_v3",
-        "document_id": "d" * 64,
+        "document_id": digest(source),
         "document_total": None,
         "source_sha256": digest(source),
         "source_name": source_name,
@@ -387,7 +421,7 @@ def setup_job(
                 "relative_path": "pages/page-1.png",
             }
         ],
-        "rows": [row("old-row", page_sha)],
+        "rows": [row(fixture_row_id("old-row"), page_sha)],
         "diagnostics": [],
     }
     (job_dir / "result.json").write_text(json.dumps(result))
@@ -395,7 +429,7 @@ def setup_job(
     review.update(
         revision=1,
         row_overrides={
-            "old-row": {
+            fixture_row_id("old-row"): {
                 "changes": {"description": "Reviewer package charge"},
                 "reason": "Checked source",
             }
@@ -432,9 +466,7 @@ def write_passing_visual_audit(staging_root: Path) -> dict[str, Any]:
                     {"page_number": page_number, "status": "pass", "notes": ""}
                     for page_number in range(1, source["page_count"] + 1)
                 ],
-                "checks": {
-                    check: "pass" for check in sorted(VISUAL_AUDIT_CHECKS)
-                },
+                "checks": {check: "pass" for check in sorted(VISUAL_AUDIT_CHECKS)},
             }
             for source in manifest["sources"]
         ],
@@ -478,7 +510,7 @@ def test_reprocess_validation_requires_exact_page_asset_numbers(
 ) -> None:
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
-    new_rows = [row("new-row", page_sha)]
+    new_rows = [row(fixture_row_id("new-row"), page_sha)]
     new_result = {
         **old_result,
         "page_assets": [{**old_result["page_assets"][0], "page_number": 2}],
@@ -500,7 +532,7 @@ def test_reprocess_validation_rejects_mapped_field_in_the_wrong_source_cell(
 ) -> None:
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
-    new_rows = [row("new-row", page_sha)]
+    new_rows = [row(fixture_row_id("new-row"), page_sha)]
     new_result = {
         **old_result,
         "rows": new_rows,
@@ -525,14 +557,10 @@ def test_reprocess_validation_requires_all_description_tokens_in_printed_cell(
 ) -> None:
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
-    new_rows = [row("new-row", page_sha)]
-    new_rows[0]["field_evidence"]["description"].append(
-        evidence(page_sha, "coverage-token")
-    )
+    new_rows = [row(fixture_row_id("new-row"), page_sha)]
+    new_rows[0]["field_evidence"]["description"].append(evidence(page_sha, "coverage-token"))
     printed = source_tables(new_rows, page_sha)
-    printed[0]["rows"][0]["cells"][0]["evidence"] = [
-        evidence(page_sha, "description-token")
-    ]
+    printed[0]["rows"][0]["cells"][0]["evidence"] = [evidence(page_sha, "description-token")]
     new_result = {
         **old_result,
         "rows": new_rows,
@@ -648,12 +676,10 @@ def test_reprocess_validation_compares_grounded_printed_time_by_canonical_date(
 ) -> None:
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
-    new_rows = [row("new-row", page_sha)]
+    new_rows = [row(fixture_row_id("new-row"), page_sha)]
     new_rows[0]["service_date_raw"] = "15/07/2026"
     new_rows[0]["service_date_iso"] = "2026-07-15"
-    new_rows[0]["field_evidence"]["service_date"] = [
-        evidence(page_sha, "service-date-token")
-    ]
+    new_rows[0]["field_evidence"]["service_date"] = [evidence(page_sha, "service-date-token")]
     printed = source_tables(new_rows, page_sha)
     printed[0]["columns"].insert(
         0,
@@ -705,15 +731,11 @@ def test_reprocess_validation_accepts_grounded_group_service_date(
 ) -> None:
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
-    new_rows = [row("new-row", page_sha)]
+    new_rows = [row(fixture_row_id("new-row"), page_sha)]
     new_rows[0]["service_date_raw"] = "15/07/2026"
     new_rows[0]["service_date_iso"] = "2026-07-15"
-    new_rows[0]["field_evidence"]["service_date"] = [
-        evidence(page_sha, "service-date-token")
-    ]
-    new_rows[0]["validation_flags"] = [
-        "service_date_inherited_from_group"
-    ]
+    new_rows[0]["field_evidence"]["service_date"] = [evidence(page_sha, "service-date-token")]
+    new_rows[0]["validation_flags"] = ["service_date_inherited_from_group"]
     printed = source_tables(new_rows, page_sha)
     printed[0]["columns"].insert(
         0,
@@ -793,15 +815,11 @@ def test_reprocess_validation_accepts_grounded_recovered_unmapped_service_date(
 ) -> None:
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
-    new_rows = [row("new-row", page_sha)]
+    new_rows = [row(fixture_row_id("new-row"), page_sha)]
     new_rows[0]["service_date_raw"] = "15/07/2026"
     new_rows[0]["service_date_iso"] = "2026-07-15"
-    new_rows[0]["field_evidence"]["service_date"] = [
-        evidence(page_sha, "service-date-token")
-    ]
-    new_rows[0]["validation_flags"] = [
-        "service_date_recovered_from_source_cell"
-    ]
+    new_rows[0]["field_evidence"]["service_date"] = [evidence(page_sha, "service-date-token")]
+    new_rows[0]["validation_flags"] = ["service_date_recovered_from_source_cell"]
     printed = source_tables(new_rows, page_sha)
     printed[0]["columns"].insert(
         0,
@@ -873,7 +891,7 @@ def test_reprocess_validation_rejects_printed_value_missing_from_canonical_row(
 ) -> None:
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
-    new_rows = [row("new-row", page_sha)]
+    new_rows = [row(fixture_row_id("new-row"), page_sha)]
     printed = source_tables(new_rows, page_sha)
     printed[0]["columns"].insert(
         1,
@@ -916,12 +934,10 @@ def test_reprocess_validation_accepts_grounded_day_quantity(
 ) -> None:
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
-    new_rows = [row("new-row", page_sha)]
+    new_rows = [row(fixture_row_id("new-row"), page_sha)]
     new_rows[0]["quantity_raw"] = "2"
     new_rows[0]["quantity"] = "2"
-    new_rows[0]["field_evidence"]["quantity"] = [
-        evidence(page_sha, "quantity-token")
-    ]
+    new_rows[0]["field_evidence"]["quantity"] = [evidence(page_sha, "quantity-token")]
     printed = source_tables(new_rows, page_sha)
     printed[0]["columns"].insert(
         1,
@@ -968,7 +984,7 @@ def test_reprocess_validation_accepts_only_proven_derived_quantity(
 ) -> None:
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
-    new_rows = [row("new-row", page_sha, amount=amount)]
+    new_rows = [row(fixture_row_id("new-row"), page_sha, amount=amount)]
     canonical = new_rows[0]
     canonical["quantity_raw"] = "2"
     canonical["quantity"] = "2"
@@ -982,12 +998,8 @@ def test_reprocess_validation_accepts_only_proven_derived_quantity(
             evidence(page_sha, "amount-token"),
         ]
     )
-    canonical["field_evidence"]["rate"] = [
-        evidence(page_sha, "rate-token")
-    ]
-    canonical["validation_flags"] = [
-        "quantity_derived_from_rate_amount"
-    ]
+    canonical["field_evidence"]["rate"] = [evidence(page_sha, "rate-token")]
+    canonical["validation_flags"] = ["quantity_derived_from_rate_amount"]
     printed = source_tables(new_rows, page_sha)
     printed[0]["columns"].insert(
         1,
@@ -1031,9 +1043,7 @@ def test_reprocess_validation_accepts_only_proven_derived_quantity(
                 if printed_quantity is not None
                 else []
             ),
-            "validation_flags": (
-                [] if printed_quantity is not None else ["empty_cell"]
-            ),
+            "validation_flags": ([] if printed_quantity is not None else ["empty_cell"]),
         },
     )
     new_result = {
@@ -1069,13 +1079,11 @@ def test_reprocess_validation_rejects_unlinked_printed_financial_total(
 ) -> None:
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
-    new_rows = [row("new-row", page_sha)]
+    new_rows = [row(fixture_row_id("new-row"), page_sha)]
     if canonical_field == "gross_amount":
         new_rows[0]["gross_amount_raw"] = "100.00"
         new_rows[0]["gross_amount"] = "100.00"
-        new_rows[0]["field_evidence"]["gross_amount"] = [
-            evidence(page_sha, "amount-token")
-        ]
+        new_rows[0]["field_evidence"]["gross_amount"] = [evidence(page_sha, "amount-token")]
     printed = source_tables(new_rows, page_sha)
     printed[0]["columns"][1]["canonical_field"] = canonical_field
     printed[0]["rows"].append(
@@ -1133,7 +1141,7 @@ def test_reprocess_validation_accepts_only_matching_section_subtotal(
 ) -> None:
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
-    new_rows = [row("new-row", page_sha, role="category_rollup")]
+    new_rows = [row(fixture_row_id("new-row"), page_sha, role="category_rollup")]
     new_rows[0]["description"] = "Registration"
     new_rows[0]["section"] = "registration"
     printed = source_tables(new_rows, page_sha)
@@ -1277,7 +1285,7 @@ def test_reprocess_validation_accepts_only_matching_internal_bill_total(
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
     new_rows = [
-        row("first-row", page_sha, amount="100.00"),
+        row(fixture_row_id("first-row"), page_sha, amount="100.00"),
         row("following-row", page_sha, amount="50.00"),
     ]
     first_description_evidence = evidence(
@@ -1393,9 +1401,7 @@ def test_internal_bill_total_can_continue_across_compatible_page_tables(
     store, job_id, old_result = setup_job(tmp_path)
     first_page_sha = old_result["page_assets"][0]["artifact_sha256"]
     second_page = b"Second PNG fixture"
-    second_page_path = (
-        store.job_dir(job_id) / "artifacts" / "pages" / "page-2.png"
-    )
+    second_page_path = store.job_dir(job_id) / "artifacts" / "pages" / "page-2.png"
     second_page_path.write_bytes(second_page)
     second_page_sha = digest(second_page)
     old_result["pages"] = 2
@@ -1428,10 +1434,7 @@ def test_internal_bill_total_can_continue_across_compatible_page_tables(
             item["page_number"] = 2
             item["table_id"] = "p2-t1"
 
-    first_tables = [
-        source_tables([canonical], first_page_sha)[0]
-        for canonical in preceding_rows
-    ]
+    first_tables = [source_tables([canonical], first_page_sha)[0] for canonical in preceding_rows]
     first_tables[1]["id"] = "p1-t1-s2"
     first_tables[1]["rows"][0]["id"] = "p1-t1-s2-r1"
     second_table = source_tables(current_rows, second_page_sha)[0]
@@ -1598,10 +1601,7 @@ def test_separate_pharmacy_tables_validate_their_own_tail_summaries(
     for item in new_rows[1]["evidence"]:
         item["table_id"] = "p1-t2"
 
-    printed = [
-        source_tables([canonical], page_sha)[0]
-        for canonical in new_rows
-    ]
+    printed = [source_tables([canonical], page_sha)[0] for canonical in new_rows]
     printed[1]["id"] = "p1-t2-s1"
     printed[1]["table_id"] = "p1-t2"
     for column in printed[1]["columns"]:
@@ -1669,8 +1669,8 @@ def test_internal_bill_total_spans_intervening_text_within_prior_row_envelope(
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
     new_rows = [
-        row("first-row", page_sha, amount="100.00"),
-        row("second-row", page_sha, amount="50.00"),
+        row(fixture_row_id("first-row"), page_sha, amount="100.00"),
+        row(fixture_row_id("second-row"), page_sha, amount="50.00"),
         row("following-row", page_sha, amount="25.00"),
     ]
     first_description_evidence = evidence(
@@ -1918,8 +1918,8 @@ def test_internal_bill_total_ignores_non_section_structured_overlay_fragments(
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
     new_rows = [
-        row("first-row", page_sha, amount="100.00"),
-        row("second-row", page_sha, amount="50.00"),
+        row(fixture_row_id("first-row"), page_sha, amount="100.00"),
+        row(fixture_row_id("second-row"), page_sha, amount="50.00"),
         row("following-row", page_sha, amount="25.00"),
     ]
     for order, canonical in enumerate(new_rows):
@@ -1993,9 +1993,7 @@ def test_internal_bill_total_ignores_non_section_structured_overlay_fragments(
                 {
                     "column_id": "request-number",
                     "raw_value": "P:044-42649097/90052",
-                    "evidence": [
-                        evidence(page_sha, "rotated-phone-overlay-fragment")
-                    ],
+                    "evidence": [evidence(page_sha, "rotated-phone-overlay-fragment")],
                     "validation_flags": ["all_text_rotated"],
                 },
                 {
@@ -2234,8 +2232,8 @@ def test_reprocess_validation_resets_subtotal_at_financial_boundary(
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
     new_rows = [
-        row("first-row", page_sha, role="category_rollup", amount="40.00"),
-        row("second-row", page_sha, role="category_rollup", amount="60.00"),
+        row(fixture_row_id("first-row"), page_sha, role="category_rollup", amount="40.00"),
+        row(fixture_row_id("second-row"), page_sha, role="category_rollup", amount="60.00"),
     ]
     printed = source_tables(new_rows, page_sha)
     printed[0]["table_type"] = "category_summary"
@@ -2357,7 +2355,7 @@ def test_reprocess_validation_accepts_verified_total_and_settlement_source_rows(
 ) -> None:
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
-    new_rows = [row("new-row", page_sha)]
+    new_rows = [row(fixture_row_id("new-row"), page_sha)]
     printed = source_tables(new_rows, page_sha)
     printed[0]["rows"].extend(
         [
@@ -2522,7 +2520,7 @@ def test_reprocess_validation_accepts_unique_repeated_grounded_summary(
 ) -> None:
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
-    new_rows = [row("new-row", page_sha, role="category_rollup")]
+    new_rows = [row(fixture_row_id("new-row"), page_sha, role="category_rollup")]
     new_rows[0]["description"] = "Package Name: Coronary Angiography (CAG)"
     printed = source_tables(new_rows, page_sha)
     printed[0]["table_type"] = "category_summary"
@@ -2598,9 +2596,7 @@ def test_reprocess_validation_accepts_only_exact_repeated_detail_summary(
         canonical["description"] = "CONSULTING CHARGES PAR DAY"
         canonical["quantity_raw"] = "2"
         canonical["quantity"] = "2"
-        canonical["field_evidence"]["quantity"] = [
-            evidence(page_sha, f"quantity-{order}")
-        ]
+        canonical["field_evidence"]["quantity"] = [evidence(page_sha, f"quantity-{order}")]
     printed = source_tables(new_rows, page_sha)
     printed[0]["table_type"] = "category_summary"
     printed[0]["columns"][1]["order"] = 2
@@ -2724,7 +2720,7 @@ def test_reprocess_validation_does_not_misclassify_billable_description_as_foote
 ) -> None:
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
-    new_rows = [row("new-row", page_sha)]
+    new_rows = [row(fixture_row_id("new-row"), page_sha)]
     printed = source_tables(new_rows, page_sha)
     printed[0]["rows"].append(
         {
@@ -2796,7 +2792,7 @@ def test_reprocess_validation_only_accepts_unambiguous_settlement_rows(
 ) -> None:
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
-    new_rows = [row("new-row", page_sha)]
+    new_rows = [row(fixture_row_id("new-row"), page_sha)]
     printed = source_tables(new_rows, page_sha)
     for column in printed[0]["columns"]:
         column["order"] += 1
@@ -2857,13 +2853,9 @@ def test_reprocess_validation_only_accepts_unambiguous_settlement_rows(
                     "column_id": "description",
                     "raw_value": printed_description,
                     "evidence": (
-                        [evidence(page_sha, "billable-description")]
-                        if printed_description
-                        else []
+                        [evidence(page_sha, "billable-description")] if printed_description else []
                     ),
-                    "validation_flags": (
-                        [] if printed_description else ["empty_cell"]
-                    ),
+                    "validation_flags": ([] if printed_description else ["empty_cell"]),
                 },
                 {
                     "column_id": "settlement-label",
@@ -2909,11 +2901,7 @@ def test_reprocess_validation_only_accepts_unambiguous_settlement_rows(
                 "raw_value": (
                     "100.00"
                     if canonical_field == "net_amount"
-                    else (
-                        "Package charge"
-                        if canonical_field == "description"
-                        else None
-                    )
+                    else ("Package charge" if canonical_field == "description" else None)
                 ),
                 "evidence": (
                     [evidence(page_sha, "amount-token")]
@@ -2925,9 +2913,7 @@ def test_reprocess_validation_only_accepts_unambiguous_settlement_rows(
                     )
                 ),
                 "validation_flags": (
-                    []
-                    if canonical_field in {"net_amount", "description"}
-                    else ["empty_cell"]
+                    [] if canonical_field in {"net_amount", "description"} else ["empty_cell"]
                 ),
             },
         )
@@ -3005,7 +2991,7 @@ def test_reprocess_validation_rejects_weak_one_word_summary_match(
 ) -> None:
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
-    new_rows = [row("new-row", page_sha, role="category_rollup")]
+    new_rows = [row(fixture_row_id("new-row"), page_sha, role="category_rollup")]
     new_rows[0]["description"] = canonical_description
     printed = source_tables(new_rows, page_sha)
     printed[0]["table_type"] = "category_summary"
@@ -3051,7 +3037,7 @@ def test_reprocess_validation_allows_unlinked_non_ledger_text_without_amount(
 ) -> None:
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
-    new_rows = [row("new-row", page_sha)]
+    new_rows = [row(fixture_row_id("new-row"), page_sha)]
     printed = source_tables(new_rows, page_sha)
     printed[0]["rows"].append(
         {
@@ -3093,8 +3079,8 @@ def test_reprocess_preserves_job_and_review_with_backup(tmp_path: Path) -> None:
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
     new_rows = [
-        row("new-row", page_sha),
-        row("information-row", page_sha, role="informational", amount=None),
+        row(fixture_row_id("new-row"), page_sha),
+        row(fixture_row_id("information-row"), page_sha, role="informational", amount=None),
     ]
     new_result = {
         **old_result,
@@ -3113,11 +3099,14 @@ def test_reprocess_preserves_job_and_review_with_backup(tmp_path: Path) -> None:
     assert summary["reprocessed"] == 1
     assert store.read(job_id)["row_count"] == 2
     current = json.loads((store.job_dir(job_id) / "result.json").read_text())
-    assert [item["id"] for item in current["rows"]] == ["new-row", "information-row"]
+    assert [item["id"] for item in current["rows"]] == [
+        fixture_row_id("new-row"),
+        fixture_row_id("information-row"),
+    ]
     review = store.read_review(job_id)
     assert review["revision"] == 2
     assert review["approval"] is None
-    assert set(review["row_overrides"]) == {"new-row"}
+    assert set(review["row_overrides"]) == {fixture_row_id("new-row")}
     assert review["events"][-1]["action"] == "document_reprocessed"
     backup = Path(summary["documents"][0]["backup"])
     assert json.loads((backup / "result.json").read_text()) == old_result
@@ -3138,22 +3127,60 @@ def test_reprocess_preserves_job_and_review_with_backup(tmp_path: Path) -> None:
     assert not (store.job_dir(job_id) / ".cutover.json").exists()
 
 
+def test_reprocess_publishes_fresh_needs_review_quality_fields(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, job_id, old_result = setup_job(tmp_path)
+    page_sha = old_result["page_assets"][0]["artifact_sha256"]
+    new_rows = [row(fixture_row_id("new-row"), page_sha)]
+    issue = ValidationIssue(
+        id="ambiguous-total",
+        code="ambiguous_primary_total",
+        severity=ValidationSeverity.BLOCKING,
+        message="No unique final bill total context",
+        field="document_total",
+    )
+    report = ValidationReport(
+        status=ValidationStatus.NEEDS_REVIEW,
+        issues=(issue,),
+    )
+    monkeypatch.setattr(
+        reprocess_module,
+        "validate_extraction_result",
+        lambda *_: report,
+    )
+
+    stage_and_apply(
+        root=tmp_path,
+        job_ids=[job_id],
+        extractor=FakeExtractor(
+            {
+                **old_result,
+                "rows": new_rows,
+                "source_tables": source_tables(new_rows, page_sha),
+            }
+        ),
+    )
+
+    state = store.read(job_id)
+    assert state["status"] == "needs_review"
+    assert state["validation_status"] == "needs_review"
+    assert state["validation_issue_codes"] == ["ambiguous_primary_total"]
+    current = json.loads((store.job_dir(job_id) / "result.json").read_text())
+    assert current["semantic_validation"] == report.model_dump(mode="json")
+
+
 def test_review_migration_preserves_weaker_colliding_fragment_override() -> None:
     page_sha = "a" * 64
     main = row("old-main", page_sha)
     main["description"] = "Mupimet Ointment"
-    main["field_evidence"]["description"] = [
-        evidence(page_sha, "main-description")
-    ]
+    main["field_evidence"]["description"] = [evidence(page_sha, "main-description")]
     main["field_evidence"]["amount"] = [evidence(page_sha, "main-amount")]
     fragment = row("old-fragment", page_sha)
     fragment["description"] = "5Gm"
-    fragment["field_evidence"]["description"] = [
-        evidence(page_sha, "fragment-description")
-    ]
-    fragment["field_evidence"]["amount"] = [
-        evidence(page_sha, "fragment-total")
-    ]
+    fragment["field_evidence"]["description"] = [evidence(page_sha, "fragment-description")]
+    fragment["field_evidence"]["amount"] = [evidence(page_sha, "fragment-total")]
     combined = row("new-combined", page_sha)
     combined["description"] = "Mupimet Ointment 5Gm"
     combined["field_evidence"]["description"] = [
@@ -3205,22 +3232,20 @@ def test_review_migration_preserves_weaker_colliding_fragment_override() -> None
     assert preserved["description"] == "5Gm"
     assert preserved["review_disposition"] == "rejected"
     assert "reviewer_preserved" in preserved["validation_flags"]
-    assert migrated["events"][-1]["changes"][
-        "preserved_unmapped_row_overrides"
-    ] == ["old-fragment"]
+    assert migrated["events"][-1]["changes"]["preserved_unmapped_row_overrides"] == ["old-fragment"]
 
 
 def test_review_migration_does_not_reapply_unchanged_machine_fields() -> None:
     page_sha = "a" * 64
-    old = row("old-row", page_sha)
+    old = row(fixture_row_id("old-row"), page_sha)
     old["description"] = "07/2026 PI123 Truncated Product"
-    upgraded = row("new-row", page_sha)
+    upgraded = row(fixture_row_id("new-row"), page_sha)
     upgraded["description"] = "Complete Product Name"
     upgraded["field_evidence"] = deepcopy(old["field_evidence"])
     review = {
         "revision": 1,
         "row_overrides": {
-            "old-row": {
+            fixture_row_id("old-row"): {
                 "changes": {
                     "description": old["description"],
                     "net_amount_raw": old["net_amount_raw"],
@@ -3245,7 +3270,7 @@ def test_review_migration_does_not_reapply_unchanged_machine_fields() -> None:
         review,
     )
 
-    assert migrated["row_overrides"]["new-row"]["changes"] == {
+    assert migrated["row_overrides"][fixture_row_id("new-row")]["changes"] == {
         "quantity_raw": "2",
         "quantity": "2",
     }
@@ -3253,11 +3278,11 @@ def test_review_migration_does_not_reapply_unchanged_machine_fields() -> None:
 
 def test_review_migration_maps_unique_grounded_financial_row_when_token_ids_change() -> None:
     page_sha = "a" * 64
-    old = row("old-row", page_sha, amount="30.69")
+    old = row(fixture_row_id("old-row"), page_sha, amount="30.69")
     old["description"] = "Dispovan 5Ml"
     old["quantity_raw"] = "3"
     old["quantity"] = "3"
-    upgraded = row("new-row", page_sha, amount="30.69")
+    upgraded = row(fixture_row_id("new-row"), page_sha, amount="30.69")
     upgraded["description"] = "Dispovan 5Ml Syringe"
     upgraded["quantity_raw"] = "3"
     upgraded["quantity"] = "3"
@@ -3268,7 +3293,7 @@ def test_review_migration_maps_unique_grounded_financial_row_when_token_ids_chan
     review = {
         "revision": 1,
         "row_overrides": {
-            "old-row": {
+            fixture_row_id("old-row"): {
                 "changes": {
                     "quantity_raw": "3",
                     "quantity": "3",
@@ -3289,8 +3314,8 @@ def test_review_migration_maps_unique_grounded_financial_row_when_token_ids_chan
     )
 
     assert migrated["row_overrides"] == {
-        "new-row": {
-            **review["row_overrides"]["old-row"],
+        fixture_row_id("new-row"): {
+            **review["row_overrides"][fixture_row_id("old-row")],
             "changes": {},
         }
     }
@@ -3307,7 +3332,7 @@ def test_review_migration_subsumes_identical_colliding_corrections() -> None:
         "description": [evidence(page_sha, "fragment-description")],
         "amount": [evidence(page_sha, "fragment-amount")],
     }
-    upgraded = row("new-row", page_sha, amount="60")
+    upgraded = row(fixture_row_id("new-row"), page_sha, amount="60")
     upgraded["description"] = "Gauze Swabs 7.5 x 7.5"
     upgraded["quantity_raw"] = "1"
     upgraded["quantity"] = "1"
@@ -3341,20 +3366,18 @@ def test_review_migration_subsumes_identical_colliding_corrections() -> None:
     )
 
     assert migrated["row_overrides"] == {
-        "new-row": {
+        fixture_row_id("new-row"): {
             **correction,
         }
     }
     assert migrated["added_rows"] == {}
-    assert migrated["events"][-1]["changes"][
-        "subsumed_row_overrides"
-    ] == ["old-fragment"]
+    assert migrated["events"][-1]["changes"]["subsumed_row_overrides"] == ["old-fragment"]
 
 
 def test_manual_rollback_rejects_review_created_after_deployment(tmp_path: Path) -> None:
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
-    new_rows = [row("new-row", page_sha)]
+    new_rows = [row(fixture_row_id("new-row"), page_sha)]
     applied = stage_and_apply(
         root=tmp_path,
         job_ids=[job_id],
@@ -3384,12 +3407,10 @@ def test_manual_rollback_rejects_review_created_after_deployment(tmp_path: Path)
     assert store.read_review(job_id)["events"][-1]["action"] == "post-deployment-review"
 
 
-def test_manual_rollback_final_review_compare_and_swap(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_manual_rollback_final_review_compare_and_swap(tmp_path: Path, monkeypatch) -> None:
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
-    new_rows = [row("new-row", page_sha)]
+    new_rows = [row(fixture_row_id("new-row"), page_sha)]
     applied = stage_and_apply(
         root=tmp_path,
         job_ids=[job_id],
@@ -3405,9 +3426,7 @@ def test_manual_rollback_final_review_compare_and_swap(
     original_job_lock = JobStore.job_lock
     injected = False
 
-    def racing_job_lock(
-        self: JobStore, locked_job_id: str, *, exclusive: bool
-    ) -> Any:
+    def racing_job_lock(self: JobStore, locked_job_id: str, *, exclusive: bool) -> Any:
         nonlocal injected
         if exclusive and not injected:
             injected = True
@@ -3434,7 +3453,7 @@ def test_manual_rollback_batch_failure_restores_live_and_backup_batches(
     store, first_id, first_old = setup_job(tmp_path)
     _, second_id, second_old = setup_job(tmp_path)
     page_sha = first_old["page_assets"][0]["artifact_sha256"]
-    new_rows = [row("new-row", page_sha)]
+    new_rows = [row(fixture_row_id("new-row"), page_sha)]
     applied = stage_and_apply(
         root=tmp_path,
         job_ids=[first_id, second_id],
@@ -3470,8 +3489,9 @@ def test_manual_rollback_batch_failure_restores_live_and_backup_batches(
         rollback_jobs(root=tmp_path, backup_batch=backup_batch)
 
     for job_id, old_result in ((first_id, first_old), (second_id, second_old)):
-        assert json.loads((store.job_dir(job_id) / "result.json").read_text()) == (
-            current_results[job_id]
+        assert (
+            json.loads((store.job_dir(job_id) / "result.json").read_text())
+            == (current_results[job_id])
         )
         assert store.read_review(job_id)["revision"] == 2
         assert json.loads((backup_batch / job_id / "result.json").read_text()) == old_result
@@ -3482,7 +3502,7 @@ def test_manual_rollback_batch_failure_restores_live_and_backup_batches(
 def test_store_recovery_restores_interrupted_manual_rollback(tmp_path: Path) -> None:
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
-    new_rows = [row("new-row", page_sha)]
+    new_rows = [row(fixture_row_id("new-row"), page_sha)]
     applied = stage_and_apply(
         root=tmp_path,
         job_ids=[job_id],
@@ -3498,9 +3518,7 @@ def test_store_recovery_restores_interrupted_manual_rollback(tmp_path: Path) -> 
     job_dir = store.job_dir(job_id)
     current_result = json.loads((job_dir / "result.json").read_text())
     current_review = store.read_review(job_id)
-    displaced_root = (
-        store.jobs_root / ".reprocess-rollback-current" / "interrupted"
-    )
+    displaced_root = store.jobs_root / ".reprocess-rollback-current" / "interrupted"
     displaced = displaced_root / job_id
     displaced.mkdir(parents=True)
     shutil.copy2(job_dir / "state.json", displaced / "state.json")
@@ -3571,7 +3589,7 @@ def test_direct_apply_requires_the_two_phase_visual_audit_workflow(
 ) -> None:
     _, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
-    new_rows = [row("new-row", page_sha)]
+    new_rows = [row(fixture_row_id("new-row"), page_sha)]
     extractor = FakeExtractor(
         {
             **old_result,
@@ -3594,7 +3612,7 @@ def test_direct_apply_requires_the_two_phase_visual_audit_workflow(
 def test_stage_and_apply_are_separate_review_checked_phases(tmp_path: Path) -> None:
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
-    new_rows = [row("new-row", page_sha)]
+    new_rows = [row(fixture_row_id("new-row"), page_sha)]
     new_result = {
         **old_result,
         "rows": new_rows,
@@ -3617,7 +3635,7 @@ def test_stage_and_apply_are_separate_review_checked_phases(tmp_path: Path) -> N
     assert applied["reprocessed"] == 1
     assert json.loads((store.job_dir(job_id) / "result.json").read_text())["rows"][0][
         "id"
-    ] == "new-row"
+    ] == fixture_row_id("new-row")
 
 
 def test_stage_extracts_identical_sources_once_and_preserves_per_job_reviews(
@@ -3633,12 +3651,12 @@ def test_stage_extracts_identical_sources_once_and_preserves_per_job_reviews(
     )
     second_review = store.read_review(second_id)
     second_review["revision"] = 7
-    second_review["row_overrides"]["old-row"]["changes"]["description"] = (
+    second_review["row_overrides"][fixture_row_id("old-row")]["changes"]["description"] = (
         "Second reviewer correction"
     )
     (store.job_dir(second_id) / "review.json").write_text(json.dumps(second_review))
     page_sha = first_old["page_assets"][0]["artifact_sha256"]
-    new_rows = [row("new-row", page_sha)]
+    new_rows = [row(fixture_row_id("new-row"), page_sha)]
     extractor = FakeExtractor(
         {
             **first_old,
@@ -3669,10 +3687,7 @@ def test_stage_extracts_identical_sources_once_and_preserves_per_job_reviews(
     assert source_group["page_count"] == 1
     assert source_group["source_names"] == ["First copy.pdf", "Second copy.pdf"]
     assert len(source_group["extraction_sha256"]) == 64
-    assert all(
-        len(document["staged_payload_sha256"]) == 64
-        for document in manifest["documents"]
-    )
+    assert all(len(document["staged_payload_sha256"]) == 64 for document in manifest["documents"])
     for job_id, old_result in (
         (first_id, first_old),
         (second_id, second_old),
@@ -3682,17 +3697,16 @@ def test_stage_extracts_identical_sources_once_and_preserves_per_job_reviews(
         assert (staging_root / job_id / "artifacts" / "pages" / "page-1.png").is_file()
 
     first_review = json.loads((staging_root / first_id / "review.json").read_text())
-    second_staged_review = json.loads(
-        (staging_root / second_id / "review.json").read_text()
-    )
+    second_staged_review = json.loads((staging_root / second_id / "review.json").read_text())
     assert first_review["revision"] == 2
     assert second_staged_review["revision"] == 8
-    assert first_review["row_overrides"]["new-row"]["changes"]["description"] == (
+    assert first_review["row_overrides"][fixture_row_id("new-row")]["changes"]["description"] == (
         "Reviewer package charge"
     )
-    assert second_staged_review["row_overrides"]["new-row"]["changes"][
-        "description"
-    ] == "Second reviewer correction"
+    assert (
+        second_staged_review["row_overrides"][fixture_row_id("new-row")]["changes"]["description"]
+        == "Second reviewer correction"
+    )
     assert first_review["events"][-1]["target_id"] == first_id
     assert second_staged_review["events"][-1]["target_id"] == second_id
 
@@ -3712,7 +3726,7 @@ def test_default_gpu_stage_holds_shared_lock_for_every_source_extraction(
         source=b"%PDF-second-source",
     )
     page_sha = first_old["page_assets"][0]["artifact_sha256"]
-    new_rows = [row("new-row", page_sha)]
+    new_rows = [row(fixture_row_id("new-row"), page_sha)]
     events: list[tuple[str, Any]] = []
 
     class TrackingLock:
@@ -3750,9 +3764,11 @@ def test_default_gpu_stage_holds_shared_lock_for_every_source_extraction(
         ) -> dict[str, Any]:
             assert not tracking_lock.closed
             events.append(("extract", source))
+            source_sha = digest(source.read_bytes())
             return {
                 **deepcopy(first_old),
-                "source_sha256": digest(source.read_bytes()),
+                "source_sha256": source_sha,
+                "document_id": source_sha,
                 "rows": deepcopy(new_rows),
                 "source_tables": source_tables(new_rows, page_sha),
             }
@@ -3778,9 +3794,7 @@ def test_default_gpu_stage_holds_shared_lock_for_every_source_extraction(
             "constructed",
             ("http://127.0.0.1:8111", "gpu:0", "cuda:0"),
         )
-        assert {
-            event[1] for event in events if event[0] == "extract"
-        } == {
+        assert {event[1] for event in events if event[0] == "extract"} == {
             store.job_dir(first_id) / "source.pdf",
             store.job_dir(second_id) / "source.pdf",
         }
@@ -3798,7 +3812,7 @@ def test_repeated_default_gpu_stages_reuse_the_process_lifetime_lock(
 ) -> None:
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
-    new_rows = [row("new-row", page_sha)]
+    new_rows = [row(fixture_row_id("new-row"), page_sha)]
     acquire_calls: list[Path] = []
     original_acquire = JobStore.acquire_inference_lock
 
@@ -4037,12 +4051,11 @@ def test_injected_reprocess_extractor_does_not_acquire_gpu_lock(
 ) -> None:
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
-    new_rows = [row("new-row", page_sha)]
+    new_rows = [row(fixture_row_id("new-row"), page_sha)]
 
     def fail_if_locked(locked_store: JobStore) -> Any:
         raise AssertionError(
-            "injected extractor unexpectedly locked "
-            f"{locked_store.inference_lock_path}"
+            f"injected extractor unexpectedly locked {locked_store.inference_lock_path}"
         )
 
     monkeypatch.setattr(JobStore, "acquire_inference_lock", fail_if_locked)
@@ -4069,7 +4082,7 @@ def test_falsey_injected_reprocess_extractor_remains_dependency_free(
 ) -> None:
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
-    new_rows = [row("new-row", page_sha)]
+    new_rows = [row(fixture_row_id("new-row"), page_sha)]
 
     class FalseyExtractor(FakeExtractor):
         def __bool__(self) -> bool:
@@ -4109,7 +4122,7 @@ def test_duplicate_review_change_during_staging_aborts_the_group(
     page_sha = first_old["page_assets"][0]["artifact_sha256"]
     extracted_result = {
         **first_old,
-        "rows": [row("new-row", page_sha)],
+        "rows": [row(fixture_row_id("new-row"), page_sha)],
     }
     extracted_result["source_tables"] = source_tables(
         extracted_result["rows"],
@@ -4134,9 +4147,7 @@ def test_duplicate_review_change_during_staging_aborts_the_group(
         )
 
     assert json.loads((store.job_dir(first_id) / "result.json").read_text()) == first_old
-    assert json.loads((store.job_dir(second_id) / "result.json").read_text()) == (
-        second_old
-    )
+    assert json.loads((store.job_dir(second_id) / "result.json").read_text()) == (second_old)
 
 
 def test_duplicate_review_change_before_apply_aborts_without_any_cutover(
@@ -4145,7 +4156,7 @@ def test_duplicate_review_change_before_apply_aborts_without_any_cutover(
     store, first_id, first_old = setup_job(tmp_path, source_name="First copy.pdf")
     _, second_id, second_old = setup_job(tmp_path, source_name="Second copy.pdf")
     page_sha = first_old["page_assets"][0]["artifact_sha256"]
-    new_rows = [row("new-row", page_sha)]
+    new_rows = [row(fixture_row_id("new-row"), page_sha)]
     staged = stage_reprocess_jobs(
         root=tmp_path,
         job_ids=[first_id, second_id],
@@ -4182,9 +4193,7 @@ def test_duplicate_review_change_before_apply_aborts_without_any_cutover(
     assert (staging_root / second_id / "result.json").is_file()
     assert not list(staging_root.glob(".apply-*"))
     assert json.loads((store.job_dir(first_id) / "result.json").read_text()) == first_old
-    assert json.loads((store.job_dir(second_id) / "result.json").read_text()) == (
-        second_old
-    )
+    assert json.loads((store.job_dir(second_id) / "result.json").read_text()) == (second_old)
 
 
 def test_apply_rejects_swapped_duplicate_reviews(
@@ -4194,12 +4203,12 @@ def test_apply_rejects_swapped_duplicate_reviews(
     _, second_id, second_old = setup_job(tmp_path, source_name="Second copy.pdf")
     second_review = store.read_review(second_id)
     second_review["revision"] = 4
-    second_review["row_overrides"]["old-row"]["changes"]["description"] = (
+    second_review["row_overrides"][fixture_row_id("old-row")]["changes"]["description"] = (
         "Second correction"
     )
     (store.job_dir(second_id) / "review.json").write_text(json.dumps(second_review))
     page_sha = first_old["page_assets"][0]["artifact_sha256"]
-    new_rows = [row("new-row", page_sha)]
+    new_rows = [row(fixture_row_id("new-row"), page_sha)]
     staged = stage_reprocess_jobs(
         root=tmp_path,
         job_ids=[first_id, second_id],
@@ -4238,9 +4247,7 @@ def test_apply_rejects_swapped_duplicate_reviews(
     assert (staging_root / second_id / "result.json").is_file()
     assert not list(staging_root.glob(".apply-*"))
     assert json.loads((store.job_dir(first_id) / "result.json").read_text()) == first_old
-    assert json.loads((store.job_dir(second_id) / "result.json").read_text()) == (
-        second_old
-    )
+    assert json.loads((store.job_dir(second_id) / "result.json").read_text()) == (second_old)
 
 
 def test_apply_rejects_staged_result_changed_after_visual_audit(
@@ -4248,7 +4255,7 @@ def test_apply_rejects_staged_result_changed_after_visual_audit(
 ) -> None:
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
-    new_rows = [row("new-row", page_sha)]
+    new_rows = [row(fixture_row_id("new-row"), page_sha)]
 
     staged = stage_reprocess_jobs(
         root=tmp_path,
@@ -4286,7 +4293,7 @@ def test_apply_revalidates_staged_payload_after_acquiring_locks(
 ) -> None:
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
-    new_rows = [row("new-row", page_sha)]
+    new_rows = [row(fixture_row_id("new-row"), page_sha)]
     staged = stage_reprocess_jobs(
         root=tmp_path,
         job_ids=[job_id],
@@ -4304,9 +4311,7 @@ def test_apply_revalidates_staged_payload_after_acquiring_locks(
     original_job_lock = JobStore.job_lock
     injected = False
 
-    def racing_job_lock(
-        self: JobStore, locked_job_id: str, *, exclusive: bool
-    ) -> Any:
+    def racing_job_lock(self: JobStore, locked_job_id: str, *, exclusive: bool) -> Any:
         nonlocal injected
         if exclusive and not injected:
             injected = True
@@ -4335,7 +4340,7 @@ def test_apply_atomically_claims_the_staged_payload_before_cutover(
 ) -> None:
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
-    new_rows = [row("new-row", page_sha)]
+    new_rows = [row(fixture_row_id("new-row"), page_sha)]
     staged = stage_reprocess_jobs(
         root=tmp_path,
         job_ids=[job_id],
@@ -4374,7 +4379,7 @@ def test_apply_atomically_claims_the_staged_payload_before_cutover(
 def test_apply_rejects_a_symlinked_staged_payload_root(tmp_path: Path) -> None:
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
-    new_rows = [row("new-row", page_sha)]
+    new_rows = [row(fixture_row_id("new-row"), page_sha)]
     staged = stage_reprocess_jobs(
         root=tmp_path,
         job_ids=[job_id],
@@ -4410,7 +4415,7 @@ def test_apply_cleanup_never_follows_a_symlinked_claim_root(
 ) -> None:
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
-    new_rows = [row("new-row", page_sha)]
+    new_rows = [row(fixture_row_id("new-row"), page_sha)]
     staged = stage_reprocess_jobs(
         root=tmp_path,
         job_ids=[job_id],
@@ -4443,7 +4448,7 @@ def test_apply_rejects_an_existing_cutover_journal_without_overwriting_it(
 ) -> None:
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
-    new_rows = [row("new-row", page_sha)]
+    new_rows = [row(fixture_row_id("new-row"), page_sha)]
     staged = stage_reprocess_jobs(
         root=tmp_path,
         job_ids=[job_id],
@@ -4485,7 +4490,7 @@ def test_apply_preserves_claimed_payload_when_cutover_requires_recovery(
 ) -> None:
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
-    new_rows = [row("new-row", page_sha)]
+    new_rows = [row(fixture_row_id("new-row"), page_sha)]
     staged = stage_reprocess_jobs(
         root=tmp_path,
         job_ids=[job_id],
@@ -4539,7 +4544,7 @@ def test_apply_restores_mixed_preexisting_claims_when_validation_aborts(
     store, first_id, first_old = setup_job(tmp_path)
     _, second_id, second_old = setup_job(tmp_path)
     page_sha = first_old["page_assets"][0]["artifact_sha256"]
-    new_rows = [row("new-row", page_sha)]
+    new_rows = [row(fixture_row_id("new-row"), page_sha)]
     staged = stage_reprocess_jobs(
         root=tmp_path,
         job_ids=[first_id, second_id],
@@ -4565,9 +4570,7 @@ def test_apply_restores_mixed_preexisting_claims_when_validation_aborts(
     original_job_lock = JobStore.job_lock
     exclusive_locks: list[str] = []
 
-    def tracking_job_lock(
-        self: JobStore, locked_job_id: str, *, exclusive: bool
-    ) -> Any:
+    def tracking_job_lock(self: JobStore, locked_job_id: str, *, exclusive: bool) -> Any:
         if exclusive:
             exclusive_locks.append(locked_job_id)
         return original_job_lock(self, locked_job_id, exclusive=exclusive)
@@ -4582,9 +4585,7 @@ def test_apply_restores_mixed_preexisting_claims_when_validation_aborts(
     assert (staging_root / second_id).is_dir()
     assert not claimed_root.exists()
     assert json.loads((store.job_dir(first_id) / "result.json").read_text()) == first_old
-    assert json.loads((store.job_dir(second_id) / "result.json").read_text()) == (
-        second_old
-    )
+    assert json.loads((store.job_dir(second_id) / "result.json").read_text()) == (second_old)
 
 
 def test_apply_rejects_visual_audit_replayed_for_a_new_extraction(
@@ -4592,7 +4593,7 @@ def test_apply_rejects_visual_audit_replayed_for_a_new_extraction(
 ) -> None:
     _, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
-    first_rows = [row("first-new-row", page_sha)]
+    first_rows = [row(fixture_row_id("first-new-row"), page_sha)]
     first_stage = stage_reprocess_jobs(
         root=tmp_path,
         job_ids=[job_id],
@@ -4609,7 +4610,7 @@ def test_apply_rejects_visual_audit_replayed_for_a_new_extraction(
     write_passing_visual_audit(first_staging_root)
     old_audit = (first_staging_root / "visual-audit.json").read_text()
 
-    second_rows = [row("second-new-row", page_sha)]
+    second_rows = [row(fixture_row_id("second-new-row"), page_sha)]
     second_stage = stage_reprocess_jobs(
         root=tmp_path,
         job_ids=[job_id],
@@ -4660,7 +4661,7 @@ def test_apply_rejects_invalid_visual_audit_before_creating_backups(
 ) -> None:
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
-    new_rows = [row("new-row", page_sha)]
+    new_rows = [row(fixture_row_id("new-row"), page_sha)]
     staged = stage_reprocess_jobs(
         root=tmp_path,
         job_ids=[job_id],
@@ -4722,7 +4723,7 @@ def test_apply_rejects_each_failed_source_level_visual_check(
 ) -> None:
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
-    new_rows = [row("new-row", page_sha)]
+    new_rows = [row(fixture_row_id("new-row"), page_sha)]
     staged = stage_reprocess_jobs(
         root=tmp_path,
         job_ids=[job_id],
@@ -4754,7 +4755,7 @@ def test_apply_rejects_each_failed_source_level_visual_check(
 def test_unmappable_reviewed_row_is_preserved_as_reviewer_row(tmp_path: Path) -> None:
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
-    replacement = row("unrelated-row", page_sha)
+    replacement = row(fixture_row_id("unrelated-row"), page_sha)
     replacement["description"] = "Unrelated upgraded row"
     replacement["field_evidence"]["description"][0]["token_ids"] = ["different-description"]
     replacement["field_evidence"]["amount"][0]["token_ids"] = ["different-amount"]
@@ -4780,12 +4781,10 @@ def test_unmappable_reviewed_row_is_preserved_as_reviewer_row(tmp_path: Path) ->
     assert review["approval"] is None
 
 
-def test_review_started_during_cutover_is_not_overwritten(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_review_started_during_cutover_is_not_overwritten(tmp_path: Path, monkeypatch) -> None:
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
-    new_rows = [row("new-row", page_sha)]
+    new_rows = [row(fixture_row_id("new-row"), page_sha)]
     staged = stage_reprocess_jobs(
         root=tmp_path,
         job_ids=[job_id],
@@ -4848,12 +4847,10 @@ def test_review_started_during_cutover_is_not_overwritten(
     assert store.read_review(job_id)["revision"] == 2
 
 
-def test_cutover_failure_restores_the_complete_old_workspace(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_cutover_failure_restores_the_complete_old_workspace(tmp_path: Path, monkeypatch) -> None:
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
-    new_rows = [row("new-row", page_sha)]
+    new_rows = [row(fixture_row_id("new-row"), page_sha)]
 
     class NewArtifactExtractor(FakeExtractor):
         def extract(self, source: Path, artifact_root: Path) -> dict[str, Any]:
@@ -4906,7 +4903,7 @@ def test_cutover_failure_restores_the_complete_old_workspace(
 def test_store_recovery_restores_an_interrupted_cutover(tmp_path: Path) -> None:
     store, job_id, old_result = setup_job(tmp_path)
     page_sha = old_result["page_assets"][0]["artifact_sha256"]
-    new_rows = [row("new-row", page_sha)]
+    new_rows = [row(fixture_row_id("new-row"), page_sha)]
     staged = stage_reprocess_jobs(
         root=tmp_path,
         job_ids=[job_id],
@@ -4947,13 +4944,11 @@ def test_store_recovery_restores_an_interrupted_cutover(tmp_path: Path) -> None:
     assert not (job_dir / ".cutover.json").exists()
 
 
-def test_batch_failure_rolls_back_jobs_already_cut_over(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_batch_failure_rolls_back_jobs_already_cut_over(tmp_path: Path, monkeypatch) -> None:
     first_store, first_id, first_old = setup_job(tmp_path)
     _, second_id, second_old = setup_job(tmp_path)
     page_sha = first_old["page_assets"][0]["artifact_sha256"]
-    new_rows = [row("new-row", page_sha)]
+    new_rows = [row(fixture_row_id("new-row"), page_sha)]
     new_result = {
         **first_old,
         "rows": new_rows,
@@ -4966,9 +4961,7 @@ def test_batch_failure_rolls_back_jobs_already_cut_over(
     )
     staging_root = Path(staged["staging_root"])
     manifest = json.loads((staging_root / "manifest.json").read_text())
-    assert [source["job_ids"] for source in manifest["sources"]] == [
-        sorted((first_id, second_id))
-    ]
+    assert [source["job_ids"] for source in manifest["sources"]] == [sorted((first_id, second_id))]
     write_passing_visual_audit(staging_root)
     ordered_ids = sorted((first_id, second_id))
     failed_id = ordered_ids[1]
@@ -4996,11 +4989,7 @@ def test_batch_failure_rolls_back_jobs_already_cut_over(
             stage_batch=Path(staged["staging_root"]),
         )
 
-    assert json.loads(
-        (first_store.job_dir(first_id) / "result.json").read_text()
-    ) == first_old
-    assert json.loads(
-        (first_store.job_dir(second_id) / "result.json").read_text()
-    ) == second_old
+    assert json.loads((first_store.job_dir(first_id) / "result.json").read_text()) == first_old
+    assert json.loads((first_store.job_dir(second_id) / "result.json").read_text()) == second_old
     assert first_store.read_review(first_id)["revision"] == 1
     assert first_store.read_review(second_id)["revision"] == 1

@@ -1450,6 +1450,15 @@ def test_source_table_pagination_returns_global_ordinals_across_tables(
         "p1-t2-s1-r1",
     ]
 
+    anchored = client.get(
+        f"/api/v2/documents/{job_id}/source-tables",
+        params={"anchor_row_id": "p1-t2-s1-r1", "limit": 2},
+    )
+
+    assert anchored.status_code == 200
+    assert anchored.json()["offset"] == 2
+    assert anchored.json()["tables"][0]["rows"][0]["id"] == "p1-t2-s1-r1"
+
 
 def test_source_table_endpoint_rejects_ungrounded_stored_values(
     tmp_path: Path, monkeypatch
@@ -1613,13 +1622,16 @@ def test_needs_review_result_remains_visible_and_blocks_approval(
     client, store = client_for(tmp_path, monkeypatch)
     job_id, result = completed_job(store)
     result["semantic_validation"] = {
-        "validation_version": "semantic_result_validation_v1",
+        "validation_version": "extraction_validation_v2",
         "status": "needs_review",
         "issues": [
             {
                 "code": "unlinked_financial_row",
                 "message": "unlinked financial row p1-t1-s1-r2",
-                "severity": "error",
+                "severity": "blocking",
+                "page_number": 1,
+                "table_id": "p1-t1",
+                "source_row_id": "p1-t1-s1-r2",
             }
         ],
     }

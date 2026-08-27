@@ -944,6 +944,7 @@ def get_rows(
     query: Annotated[str | None, Query(max_length=200)] = None,
     disposition: Annotated[str | None, Query()] = None,
     source_page: Annotated[int | None, Query(ge=1)] = None,
+    anchor_row_id: Annotated[str | None, Query(max_length=100)] = None,
 ) -> dict[str, Any]:
     result, review = _complete_result(job_id)
     rows = project_rows(result, review)
@@ -966,6 +967,14 @@ def get_rows(
     if source_page:
         rows = [row for row in rows if row.get("page_number") == source_page]
     total = len(rows)
+    if anchor_row_id is not None:
+        anchor_index = next(
+            (index for index, row in enumerate(rows) if str(row.get("id")) == anchor_row_id),
+            None,
+        )
+        if anchor_index is None:
+            raise HTTPException(status_code=404, detail="Canonical issue row not found")
+        offset = (anchor_index // limit) * limit
     populated_fields = [
         field
         for field in (
@@ -999,6 +1008,7 @@ def get_source_tables(
     limit: Annotated[int, Query(ge=1, le=500)] = 200,
     query: Annotated[str | None, Query(max_length=200)] = None,
     source_page: Annotated[int | None, Query(ge=1)] = None,
+    anchor_row_id: Annotated[str | None, Query(max_length=100)] = None,
 ) -> dict[str, Any]:
     result, review = _complete_result(job_id)
     source_payload = result.get("source_tables")
@@ -1049,6 +1059,18 @@ def get_source_tables(
             selected_rows.append((table_index, row))
 
     total = len(selected_rows)
+    if anchor_row_id is not None:
+        anchor_index = next(
+            (
+                index
+                for index, (_, row) in enumerate(selected_rows)
+                if str(row.id) == anchor_row_id
+            ),
+            None,
+        )
+        if anchor_index is None:
+            raise HTTPException(status_code=404, detail="Printed issue row not found")
+        offset = (anchor_index // limit) * limit
     window = list(enumerate(selected_rows, start=1))[offset : offset + limit]
     rows_by_table: dict[int, list[tuple[Any, int]]] = {}
     for ordinal, (table_index, row) in window:

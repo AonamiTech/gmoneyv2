@@ -17,6 +17,10 @@ from gmoney.contracts.extraction import (
     SourceTable,
     TableType,
 )
+from gmoney.extraction.date_context import (
+    is_service_date_context,
+    service_date_from_context,
+)
 from gmoney.extraction.rows import CandidateLedgerRow
 from gmoney.extraction.spatial import AlignedLedgerRow
 from gmoney.extraction.typed_values import (
@@ -1520,15 +1524,27 @@ def _raw_source_headers(
             parse_decimal(token.text) is not None for token in header_tokens
         ):
             continue
+        roles = _header_roles(line)
+        recognized_roles = {
+            SOURCE_CANONICAL_FIELDS[role]
+            for role in roles
+            if role in SOURCE_CANONICAL_FIELDS
+        }
+        explicit_receipt_header = bool(
+            len(recognized_roles) >= 2
+            and len(header_tokens) >= 4
+            and {"receipt", "payment", "advance"}
+            & set(_normalize(line.text).split())
+        )
         following = lines[index + 1 : min(len(lines), index + 4)]
         candidates = [
             candidate
             for candidate in following
             if len(candidate.tokens) >= 2 and len(_numeric_tokens(candidate)) >= 1
         ]
-        if not candidates:
+        if len(candidates) < (1 if explicit_receipt_header else 2):
             continue
-        aligned = max(
+        aligned_by_row = tuple(
             sum(
                 min(abs(_center_x(header) - _center_x(value)) for value in candidate.tokens)
                 <= width * 0.08
@@ -1536,6 +1552,8 @@ def _raw_source_headers(
             )
             for candidate in candidates
         )
+        aligned = max(aligned_by_row)
+        aligned_data_rows = sum(value >= 2 for value in aligned_by_row)
         normalized_words = set(_normalize(line.text).split())
         signature = tuple(
             re.sub(r"\s+", " ", token.text.casefold()).strip()
@@ -1556,29 +1574,25 @@ def _raw_source_headers(
             )
             >= max(2, len(signature) - 1)
         )
-        header_word_count = len(
-            {
-                word
-                for word in normalized_words
-                if word in RAW_HEADER_TERMS
-                or word.removesuffix("s") in RAW_HEADER_TERMS
-            }
-        )
+        header_word_count = len(normalized_words & RAW_HEADER_TERMS)
         is_explicit_header = bool(
             not any(character.isdigit() for character in line.text)
-            and header_word_count >= min(2, len(header_tokens))
+            and len(recognized_roles) >= 2
+            and aligned_data_rows >= (1 if explicit_receipt_header else 2)
         )
         is_dense_explicit_restart = (
             not any(character.isdigit() for character in line.text)
             and len(header_tokens) >= 4
-            and header_word_count >= min(5, len(header_tokens))
+            and len(recognized_roles) >= 2
+            and header_word_count >= min(3, len(header_tokens))
+            and aligned_data_rows >= (1 if explicit_receipt_header else 2)
         )
         if aligned >= 2 and (
             (not output and is_explicit_header)
             or is_repeated_signature
             or is_dense_explicit_restart
         ):
-            output.append(HeaderBlock(start=index, end=index, roles={}))
+            output.append(HeaderBlock(start=index, end=index, roles=roles))
             if not primary_signature:
                 primary_signature = signature
     return tuple(output)
@@ -1605,6 +1619,10 @@ def _synthetic_source_table(
         and (
             _numeric_tokens(line)
             or any(DATE_SPAN.search(token.text) for token in line.tokens)
+            or any(
+                re.search(r"(?<!\d)\d[\d,]*\.\d{1,4}(?!\d)", token.text)
+                for token in line.tokens
+            )
         )
     )
     if not candidate_lines:
@@ -1672,6 +1690,300 @@ def _synthetic_source_table(
             rows=rows,
             validation_flags=("synthetic_headers", "unmapped_columns"),
         ),
+    )
+
+
+def _prepare_source_table_financial_cells(table: SourceTable) -> SourceTable:
+    """Split numeric lane overlays before canonical rows or links are consulted."""
+    financial_fields = {
+        "quantity",
+        "unit_price",
+        "gross_amount",
+        "discount",
+        "net_amount",
+    }
+    columns = tuple(sorted(table.columns, key=lambda item: item.order))
+    financial = tuple(
+        column for column in columns if column.canonical_field in financial_fields
+    )
+    split_rows: list[SourceRow] = []
+    for row in table.rows:
+        cells = {cell.column_id: cell for cell in row.cells}
+        date_column = next(
+            (
+                column
+                for column in columns
+                if column.canonical_field == "service_date_raw"
+            ),
+            None,
+        )
+        description_column = next(
+            (
+                column
+                for column in columns
+                if column.canonical_field == "description"
+            ),
+            None,
+        )
+        if date_column is not None and description_column is not None:
+            date_cell = cells[date_column.id]
+            description_cell = cells[description_column.id]
+            date_match = DATE_PREFIX.match(date_cell.raw_value or "")
+            printed_date = (
+                (date_cell.raw_value or "")[: date_match.end()].strip(" -:")
+                if date_match is not None
+                else ""
+            )
+            remainder = (
+                (date_cell.raw_value or "")[date_match.end() :].strip(" -:;,|")
+                if date_match is not None
+                else ""
+            )
+            request_column = next(
+                (
+                    column
+                    for column in columns
+                    if column.canonical_field == "request_no"
+                ),
+                None,
+            )
+            request_value = ""
+            if request_column is not None and remainder:
+                request_match = _request_prefix_match(remainder, allow_compact=True)
+                if request_match is not None:
+                    request_value = request_match.group(0).strip()
+                    remainder = remainder[request_match.end() :].strip(" -:;,|")
+            admissible_description = bool(
+                remainder and _is_admissible_merged_date_description(remainder)
+            )
+            if (
+                printed_date
+                and service_date_from_context(
+                    printed_date,
+                    column_label=date_column.label,
+                    description=remainder,
+                )
+                is not None
+                and (
+                    (request_column is not None and request_value)
+                    or (not description_cell.raw_value and admissible_description)
+                )
+            ):
+                split_flag = "split_from_merged_ocr_token"
+                cells[date_column.id] = date_cell.model_copy(
+                    update={
+                        "raw_value": printed_date,
+                        "validation_flags": tuple(
+                            dict.fromkeys((*date_cell.validation_flags, split_flag))
+                        ),
+                    }
+                )
+                if request_column is not None and request_value:
+                    request_cell = cells[request_column.id]
+                    if not request_cell.raw_value:
+                        cells[request_column.id] = request_cell.model_copy(
+                            update={
+                                "raw_value": request_value,
+                                "evidence": date_cell.evidence,
+                                "validation_flags": tuple(
+                                    dict.fromkeys(
+                                        (
+                                            *(
+                                                flag
+                                                for flag in request_cell.validation_flags
+                                                if flag != "empty_cell"
+                                            ),
+                                            split_flag,
+                                        )
+                                    )
+                                ),
+                            }
+                        )
+                if (
+                    admissible_description
+                    and not description_cell.raw_value
+                ):
+                    cells[description_column.id] = description_cell.model_copy(
+                        update={
+                            "raw_value": remainder,
+                            "evidence": date_cell.evidence,
+                            "validation_flags": tuple(
+                                dict.fromkeys(
+                                    (
+                                        *(
+                                            flag
+                                            for flag in description_cell.validation_flags
+                                            if flag != "empty_cell"
+                                        ),
+                                        split_flag,
+                                    )
+                                )
+                            ),
+                        }
+                    )
+
+        for target_column in financial:
+            target_cell = cells[target_column.id]
+            if target_cell.raw_value or target_column.order < 1:
+                continue
+            donor_column = next(
+                (
+                    column
+                    for column in columns
+                    if column.order == target_column.order - 1
+                ),
+                None,
+            )
+            if donor_column is None:
+                continue
+            donor_cell = cells[donor_column.id]
+            expiry_financial = re.fullmatch(
+                r"\s*(?P<expiry>.*?\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)"
+                r"[/-]\d{4})\s*(?P<value>[+-]?\d[\d,]*\.\d{1,4})\s*",
+                donor_cell.raw_value or "",
+                re.IGNORECASE,
+            )
+            if expiry_financial is None:
+                continue
+            split_flag = "split_from_merged_ocr_token"
+            cells[donor_column.id] = donor_cell.model_copy(
+                update={
+                    "raw_value": expiry_financial.group("expiry").strip(),
+                    "validation_flags": tuple(
+                        dict.fromkeys((*donor_cell.validation_flags, split_flag))
+                    ),
+                }
+            )
+            cells[target_column.id] = target_cell.model_copy(
+                update={
+                    "raw_value": expiry_financial.group("value"),
+                    "evidence": donor_cell.evidence,
+                    "validation_flags": tuple(
+                        dict.fromkeys(
+                            (
+                                *(
+                                    flag
+                                    for flag in target_cell.validation_flags
+                                    if flag != "empty_cell"
+                                ),
+                                split_flag,
+                            )
+                        )
+                    ),
+                }
+            )
+        for merged in tuple(cells.values()):
+            raw = re.sub(r"\s+", " ", merged.raw_value or "").strip()
+            fragments = tuple(
+                match.group(0)
+                for match in re.finditer(
+                    r"[+-]?(?:\d[\d,]*)(?:\.\d{1,4})?",
+                    raw,
+                )
+            )
+            residual = re.sub(
+                r"[+-]?(?:\d[\d,]*)(?:\.\d{1,4})?",
+                "",
+                raw,
+            ).strip()
+            if len(fragments) < 2 or residual or len(fragments) > len(financial):
+                continue
+            windows = tuple(
+                financial[start : start + len(fragments)]
+                for start in range(len(financial) - len(fragments) + 1)
+                if all(
+                    not cells[column.id].raw_value or cells[column.id] is merged
+                    for column in financial[start : start + len(fragments)]
+                )
+            )
+            if not windows:
+                continue
+            merged_order = next(
+                column.order for column in columns if column.id == merged.column_id
+            )
+            ranked = sorted(
+                windows,
+                key=lambda window: (
+                    min(abs(column.order - merged_order) for column in window),
+                    abs(
+                        sum(column.order for column in window) / len(window)
+                        - merged_order
+                    ),
+                ),
+            )
+            if len(ranked) > 1 and (
+                min(abs(column.order - merged_order) for column in ranked[0])
+                == min(abs(column.order - merged_order) for column in ranked[1])
+                and abs(
+                    sum(column.order for column in ranked[0]) / len(ranked[0])
+                    - merged_order
+                )
+                == abs(
+                    sum(column.order for column in ranked[1]) / len(ranked[1])
+                    - merged_order
+                )
+            ):
+                continue
+            window = ranked[0]
+            if merged.column_id not in {column.id for column in window}:
+                cells[merged.column_id] = merged.model_copy(
+                    update={"raw_value": None, "evidence": ()}
+                )
+            for column, fragment in zip(window, fragments, strict=True):
+                target = cells[column.id]
+                cells[column.id] = target.model_copy(
+                    update={
+                        "raw_value": fragment,
+                        "evidence": merged.evidence,
+                        "validation_flags": tuple(
+                            dict.fromkeys(
+                                (
+                                    *(
+                                        flag
+                                        for flag in target.validation_flags
+                                        if flag != "empty_cell"
+                                    ),
+                                    "split_from_merged_ocr_token",
+                                )
+                            )
+                        ),
+                    }
+                )
+        split_rows.append(
+            row.model_copy(
+                update={"cells": tuple(cells[column.id] for column in columns)}
+            )
+        )
+
+    numeric_support = {
+        column.id: sum(
+            parse_decimal(cell.raw_value or "") is not None
+            for row in split_rows
+            for cell in row.cells
+            if cell.column_id == column.id
+        )
+        for column in columns
+    }
+    inferred_columns = tuple(
+        column.model_copy(
+            update={
+                "validation_flags": tuple(
+                    dict.fromkeys(
+                        (*column.validation_flags, "inferred_financial_lane")
+                    )
+                )
+            }
+        )
+        if (
+            column.canonical_field is None
+            and column.order >= max(1, len(columns) // 2)
+            and numeric_support[column.id] >= 1
+        )
+        else column
+        for column in columns
+    )
+    return table.model_copy(
+        update={"columns": inferred_columns, "rows": tuple(split_rows)}
     )
 
 
@@ -2413,6 +2725,7 @@ def _is_admissible_merged_date_description(description: str) -> bool:
     )
     if (
         not normalized
+        or not is_service_date_context(description, description=description)
         or parse_decimal(description) is not None
         or DATE_SPAN.fullmatch(description.strip()) is not None
         or re.fullmatch(TIME_VALUE, description.strip(), re.IGNORECASE) is not None
@@ -4365,7 +4678,10 @@ def reconstruct_ocr_rows(
             "column_centers": column_centers,
             "header_segments": 1 + len(repeated_header_indexes) if header_valid else 0,
         },
-        source_tables=(*pre_header_source_tables, *source_tables),
+        source_tables=tuple(
+            _prepare_source_table_financial_cells(table)
+            for table in (*pre_header_source_tables, *source_tables)
+        ),
     )
 
 

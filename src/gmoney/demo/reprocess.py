@@ -28,6 +28,11 @@ from gmoney.extraction.typed_values import (
     parse_quantity,
     parse_service_date,
 )
+from gmoney.extraction.validation import (
+    ValidationReport,
+    ValidationStatus,
+    validate_extraction_result,
+)
 
 app = typer.Typer(add_completion=False, invoke_without_command=True)
 _PRINTED_DATE_REQUEST_SUFFIX = re.compile(
@@ -1521,6 +1526,22 @@ def validate_result(
 _validate_result = validate_result
 
 
+def _staged_validation_report(
+    source: Path,
+    result: dict[str, Any],
+    artifact_root: Path,
+    *,
+    require_attached: bool,
+) -> ValidationReport:
+    report = validate_extraction_result(source, result, artifact_root)
+    if report.fatal:
+        messages = "; ".join(issue.message for issue in report.issues if issue.severity == "fatal")
+        raise ValueError(messages or "staged extraction failed integrity validation")
+    if require_attached and result.get("semantic_validation") != report.model_dump(mode="json"):
+        raise ValueError("staged semantic validation report is stale")
+    return report
+
+
 def _snapshot_job(
     *,
     store: JobStore,
@@ -1595,6 +1616,28 @@ def _prepare_source_group(
         representative.source,
         representative_stage / "artifacts",
     )
+    report = _staged_validation_report(
+        representative.source,
+        extracted_result,
+        representative_stage / "artifacts",
+        require_attached=False,
+    )
+    recovery_attempted = False
+    if report.recovery_targets:
+        recovery_attempted = True
+        extracted_result = extractor.extract(
+            representative.source,
+            representative_stage / "artifacts",
+            recovery_targets=report.recovery_targets,
+        )
+        report = _staged_validation_report(
+            representative.source,
+            extracted_result,
+            representative_stage / "artifacts",
+            require_attached=False,
+        )
+    extracted_result["semantic_validation"] = report.model_dump(mode="json")
+    extracted_result["validation_recovery_attempted"] = recovery_attempted
 
     prepared: list[PreparedJob] = []
     for snapshot in ordered:
@@ -1610,11 +1653,11 @@ def _prepare_source_group(
             )
         new_result = json.loads(json.dumps(extracted_result))
         new_result["source_name"] = snapshot.source_name
-        _validate_result(
+        report = _staged_validation_report(
             snapshot.source,
-            snapshot.old_result,
             new_result,
             stage_dir / "artifacts",
+            require_attached=True,
         )
         migrated_review = _migrate_review(
             snapshot.job_id,
@@ -1688,14 +1731,27 @@ def _cutover_job(
         (prepared.stage_dir / "result.json").replace(job_dir / "result.json")
         _atomic_json(job_dir / "review.json", prepared.migrated_review)
         hospital = prepared.new_result.get("hospital") or {}
+        validation = ValidationReport.model_validate(
+            prepared.new_result["semantic_validation"]
+        )
+        terminal_status = (
+            "complete"
+            if validation.status is ValidationStatus.PASSED
+            else "needs_review"
+        )
         store.update(
             prepared.job_id,
-            status="complete",
+            status=terminal_status,
             page=int(prepared.new_result.get("pages") or 0),
             pages=int(prepared.new_result.get("pages") or 0),
             row_count=len(prepared.new_result.get("rows", [])),
             hospital_name=hospital.get("name"),
             hospital_confidence=hospital.get("confidence"),
+            validation_status=validation.status.value,
+            validation_issue_count=len(validation.issues),
+            validation_issue_codes=list(
+                dict.fromkeys(issue.code for issue in validation.issues)
+            ),
             error=None,
             reprocessed_at=utc_now(),
         )
@@ -2414,11 +2470,11 @@ def apply_staged_jobs(
                         "staged page count does not match source group "
                         f"for {job_id}"
                     )
-                _validate_result(
+                _staged_validation_report(
                     job_dir / "source.pdf",
-                    old_result,
                     new_result,
                     stage_dir / "artifacts",
+                    require_attached=True,
                 )
                 prepared.append(
                     PreparedJob(
@@ -2454,11 +2510,11 @@ def apply_staged_jobs(
                     item.stage_dir,
                     expected_payloads[item.job_id],
                 )
-                _validate_result(
+                _staged_validation_report(
                     store.job_dir(item.job_id) / "source.pdf",
-                    item.old_result,
                     item.new_result,
                     item.stage_dir / "artifacts",
+                    require_attached=True,
                 )
                 verified_prepared.append(
                     _validate_staged_review_migration(

@@ -52,7 +52,7 @@ def test_extracts_explicit_final_total_with_grounded_evidence() -> None:
     assert total.evidence.token_ids == ("p1-token-2", "p1-token-3")
 
 
-def test_specific_bill_label_outranks_later_generic_grand_total() -> None:
+def test_distinct_document_final_contexts_have_no_primary() -> None:
     first = extract_document_total_candidates(
         (
             token(0, "Total Bill Amount", (100, 100, 330, 120)),
@@ -66,9 +66,7 @@ def test_specific_bill_label_outranks_later_generic_grand_total() -> None:
         )
     )
     total = select_document_total((*first, *later))
-    assert total is not None
-    assert total.amount == Decimal("1250.00")
-    assert total.page_number == 1
+    assert total is None
 
 
 def test_net_medical_amount_is_an_explicit_bill_total() -> None:
@@ -91,7 +89,7 @@ def test_net_medical_amount_is_an_explicit_bill_total() -> None:
     assert total.evidence.token_ids == ("p1-token-2", "p1-token-3")
 
 
-def test_later_same_priority_total_wins_and_intermediate_labels_are_rejected() -> None:
+def test_repeated_total_on_distinct_pages_is_ambiguous_without_continuity() -> None:
     excluded = extract_document_total_candidates(
         (
             token(0, "Patient Grand Total", (100, 50, 320, 70)),
@@ -113,9 +111,7 @@ def test_later_same_priority_total_wins_and_intermediate_labels_are_rejected() -
     )
     assert excluded == ()
     total = select_document_total((*first, *second))
-    assert total is not None
-    assert total.amount == Decimal("950.00")
-    assert total.page_number == 2
+    assert total is None
 
 
 def test_retains_all_explicit_totals_with_scope_and_selects_primary() -> None:
@@ -163,3 +159,25 @@ def test_pharmacy_invoice_grand_total_is_section_scoped_without_exact_title() ->
 
     assert len(candidates) == 1
     assert candidates[0].total.scope.value == "section"
+
+
+def test_four_pharmacy_section_totals_never_produce_a_primary() -> None:
+    candidates = tuple(
+        candidate
+        for page, amount in enumerate(
+            ("1,539.00", "2,689.00", "8,568.00", "6,258.00"),
+            start=1,
+        )
+        for candidate in extract_document_total_candidates(
+            (
+                token(0, "Tax Invoice", (100, 20, 250, 40), page=page),
+                token(1, "Product Batch MRP CGST SGST", (100, 50, 500, 70), page=page),
+                token(2, "Grand Total", (100, 100, 300, 120), page=page),
+                token(3, amount, (800, 100, 930, 120), page=page),
+            )
+        )
+    )
+
+    assert len(candidates) == 4
+    assert {candidate.total.scope.value for candidate in candidates} == {"section"}
+    assert select_document_total(candidates) is None

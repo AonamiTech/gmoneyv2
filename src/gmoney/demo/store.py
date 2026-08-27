@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -126,6 +127,39 @@ class JobStore:
         temporary.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
         temporary.replace(directory / "state.json")
 
+    @staticmethod
+    def _durable_bytes(path: Path, payload: bytes) -> None:
+        with path.open("wb") as output:
+            output.write(payload)
+            output.flush()
+            os.fsync(output.fileno())
+
+    @classmethod
+    def _durable_json(cls, path: Path, payload: dict[str, Any]) -> None:
+        cls._durable_bytes(
+            path,
+            (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode(),
+        )
+
+    @staticmethod
+    def _fsync_directory(path: Path) -> None:
+        directory = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+
+    @staticmethod
+    def _file_sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def _publication_checkpoint(self, phase: str) -> None:
+        """Crash-injection boundary used by process-level transaction tests."""
+
     def update(self, job_id: str, **changes: Any) -> dict[str, Any]:
         state = self.read(job_id)
         state.update(changes)
@@ -147,6 +181,7 @@ class JobStore:
 
     def request_abort(self, job_id: str) -> dict[str, Any]:
         with self.job_lock(job_id, exclusive=True):
+            self._recover_publication_unlocked(job_id)
             state = self.read(job_id)
             current = state.get("status")
             if current == CANCELLING_STATUS:
@@ -218,20 +253,6 @@ class JobStore:
             self.write(job_id, state)
             return True
 
-    def publish_processing_result(self, job_id: str, result: dict[str, Any]) -> bool:
-        with self.job_lock(job_id, exclusive=True):
-            state = self.read(job_id)
-            if (
-                state.get("status") != "processing"
-                or (self.job_dir(job_id) / self.abort_marker_name).is_file()
-            ):
-                return False
-            path = self.job_dir(job_id) / "result.json"
-            temporary = path.with_name(f"result.{os.getpid()}.tmp")
-            temporary.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
-            temporary.replace(path)
-            return True
-
     def publish_processing_outcome(
         self,
         job_id: str,
@@ -240,7 +261,7 @@ class JobStore:
         status: str,
         **changes: Any,
     ) -> bool:
-        """Publish a result and terminal state while holding one job lock."""
+        """Journal and publish a validated result/state pair under one job lock."""
         if status not in {"complete", "needs_review"}:
             raise ValueError("processing outcome must be complete or needs_review")
         with self.job_lock(job_id, exclusive=True):
@@ -251,28 +272,52 @@ class JobStore:
                 or (directory / self.abort_marker_name).is_file()
             ):
                 return False
-            path = directory / "result.json"
-            temporary = path.with_name(f"result.{os.getpid()}.tmp")
-            temporary.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
-            temporary.replace(path)
-            state.update(status=status, error=None, **changes)
-            self.write(job_id, state)
-            return True
-
-    def finish_processing(self, job_id: str, **changes: Any) -> bool:
-        with self.job_lock(job_id, exclusive=True):
-            state = self.read(job_id)
-            if (
-                state.get("status") != "processing"
-                or (self.job_dir(job_id) / self.abort_marker_name).is_file()
-            ):
-                return False
-            state.update(status="complete", error=None, **changes)
-            self.write(job_id, state)
+            paths = {
+                "journal": directory / ".publish-operation.json",
+                "target_result": directory / ".publish-result.json",
+                "target_state": directory / ".publish-state.json",
+                "base_result": directory / ".publish-base-result.json",
+                "base_state": directory / ".publish-base-state.json",
+            }
+            if any(path.exists() or path.is_symlink() for path in paths.values()):
+                raise JobTransactionError("publication_recovery_required")
+            target_state = {
+                **state,
+                "status": status,
+                "error": None,
+                **changes,
+                "updated_at": utc_now(),
+            }
+            self._durable_json(paths["target_result"], result)
+            self._durable_json(paths["target_state"], target_state)
+            self._durable_bytes(paths["base_state"], (directory / "state.json").read_bytes())
+            live_result = directory / "result.json"
+            base_result_exists = live_result.is_file()
+            if base_result_exists:
+                self._durable_bytes(paths["base_result"], live_result.read_bytes())
+            journal = {
+                "version": "job_publication_v1",
+                "job_id": job_id,
+                "base_result_exists": base_result_exists,
+                "target_result_sha256": self._file_sha256(paths["target_result"]),
+                "target_state_sha256": self._file_sha256(paths["target_state"]),
+                "created_at": utc_now(),
+            }
+            self._durable_json(paths["journal"], journal)
+            self._fsync_directory(directory)
+            self._publication_checkpoint("journal_persisted")
+            paths["target_result"].replace(live_result)
+            self._fsync_directory(directory)
+            self._publication_checkpoint("result_replaced")
+            paths["target_state"].replace(directory / "state.json")
+            self._fsync_directory(directory)
+            self._publication_checkpoint("state_replaced")
+            self._cleanup_publication_unlocked(directory)
             return True
 
     def fail_processing(self, job_id: str, error: str) -> bool:
         with self.job_lock(job_id, exclusive=True):
+            self._recover_publication_unlocked(job_id)
             state = self.read(job_id)
             if (
                 state.get("status") != "processing"
@@ -330,11 +375,90 @@ class JobStore:
                 flock(lock.fileno(), LOCK_UN)
 
     def _require_stable_workspace(self, job_id: str) -> None:
+        publication_journal = self.job_dir(job_id) / ".publish-operation.json"
+        if publication_journal.exists() or publication_journal.is_symlink():
+            raise JobTransactionError("publication_recovery_required")
         if (self.job_dir(job_id) / ".cutover.json").is_file():
             raise JobTransactionError("job_cutover_recovery_required")
         alias_journal = self.job_dir(job_id) / ".alias-operation.json"
         if alias_journal.exists() or alias_journal.is_symlink():
             raise JobTransactionError("alias_operation_recovery_required")
+
+    def _cleanup_publication_unlocked(self, directory: Path) -> None:
+        for name in (
+            ".publish-result.json",
+            ".publish-state.json",
+            ".publish-base-result.json",
+            ".publish-base-state.json",
+        ):
+            path = directory / name
+            if path.is_file():
+                path.unlink()
+        journal = directory / ".publish-operation.json"
+        if journal.is_file():
+            journal.unlink()
+        self._fsync_directory(directory)
+
+    def _recover_publication_unlocked(self, job_id: str) -> None:
+        directory = self.job_dir(job_id)
+        journal_path = directory / ".publish-operation.json"
+        if not journal_path.exists() and not journal_path.is_symlink():
+            return
+        if not journal_path.is_file():
+            raise JobTransactionError("invalid_publication_journal")
+        try:
+            journal = json.loads(journal_path.read_text())
+        except (OSError, json.JSONDecodeError) as error:
+            raise JobTransactionError("invalid_publication_journal") from error
+        if (
+            journal.get("version") != "job_publication_v1"
+            or journal.get("job_id") != job_id
+            or type(journal.get("base_result_exists")) is not bool
+        ):
+            raise JobTransactionError("unsupported_publication_journal")
+        target_result = directory / ".publish-result.json"
+        target_state = directory / ".publish-state.json"
+        live_result = directory / "result.json"
+        live_state = directory / "state.json"
+
+        def matches(path: Path, expected: object) -> bool:
+            return bool(
+                isinstance(expected, str)
+                and path.is_file()
+                and self._file_sha256(path) == expected
+            )
+
+        result_digest = journal.get("target_result_sha256")
+        state_digest = journal.get("target_state_sha256")
+        aborting = (directory / self.abort_marker_name).is_file()
+        if aborting:
+            base_result = directory / ".publish-base-result.json"
+            if journal["base_result_exists"]:
+                if not base_result.is_file():
+                    raise JobTransactionError("publication_base_result_missing")
+                base_result.replace(live_result)
+            elif matches(live_result, result_digest):
+                live_result.unlink()
+            current_state = self.read(job_id)
+            if current_state.get("status") != CANCELLING_STATUS:
+                base_state = directory / ".publish-base-state.json"
+                if not base_state.is_file():
+                    raise JobTransactionError("publication_base_state_missing")
+                base_state.replace(live_state)
+            self._cleanup_publication_unlocked(directory)
+            return
+
+        if not matches(live_result, result_digest):
+            if not matches(target_result, result_digest):
+                raise JobTransactionError("publication_target_result_missing")
+            target_result.replace(live_result)
+            self._fsync_directory(directory)
+        if not matches(live_state, state_digest):
+            if not matches(target_state, state_digest):
+                raise JobTransactionError("publication_target_state_missing")
+            target_state.replace(live_state)
+            self._fsync_directory(directory)
+        self._cleanup_publication_unlocked(directory)
 
     def read_review(self, job_id: str) -> dict[str, Any]:
         with self.job_lock(job_id, exclusive=False):
@@ -580,6 +704,10 @@ class JobStore:
         )
 
     def recover(self) -> None:
+        for journal_path in self.jobs_root.glob("*/.publish-operation.json"):
+            job_id = journal_path.parent.name
+            with self.job_lock(job_id, exclusive=True):
+                self._recover_publication_unlocked(job_id)
         rollback_batches: dict[
             str, list[tuple[str, Path, dict[str, Any]]]
         ] = {}

@@ -42,6 +42,7 @@ from gmoney.contracts.phase3 import (
 )
 from gmoney.evaluation.corpus import sha256_file
 from gmoney.extraction.canonicalize import canonicalize_rows
+from gmoney.extraction.date_context import service_date_from_context
 from gmoney.extraction.document_total import (
     DOCUMENT_TOTAL_VERSION,
     DOCUMENT_TOTALS_VERSION,
@@ -265,6 +266,76 @@ def _needs_full_page_financial_recovery(tokens: tuple[OcrToken, ...]) -> bool:
         )
     )
     return receipt_context and financial_context and money_like
+
+
+def _assess_no_table_page(
+    page_path: Path,
+    tokens: tuple[OcrToken, ...],
+) -> dict[str, Any]:
+    """Classify a detector-empty page without trusting baseline OCR alone."""
+    image = cv2.imread(str(page_path), cv2.IMREAD_GRAYSCALE)
+    if image is None:
+        return {
+            "demonstrably_blank": False,
+            "financial_form_suspected": _needs_full_page_financial_recovery(tokens),
+            "form_signals": ("image_unreadable",),
+        }
+
+    normalized_text = re.sub(
+        r"[^a-z0-9₹./:-]+",
+        " ",
+        " ".join(token.text for token in tokens).casefold(),
+    ).strip()
+    foreground = cv2.threshold(
+        image,
+        0,
+        255,
+        cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
+    )[1]
+    foreground_ratio = float(cv2.countNonZero(foreground)) / float(foreground.size)
+    demonstrably_blank = bool(
+        not re.search(r"[a-z0-9]", normalized_text)
+        and float(image.std()) < 2.0
+        and foreground_ratio < 0.001
+    )
+
+    signals: list[str] = []
+    if _needs_full_page_financial_recovery(tokens):
+        signals.append("financial_ocr_text")
+    if re.search(r"(?:₹|\brs\.?\s*)\d|\d[\d,]*\.\d{2}\b", normalized_text):
+        signals.append("currency_geometry")
+    receipt_terms = (
+        "receipt",
+        "amount received",
+        "charges towards",
+        "payment received",
+        "bill no",
+        "invoice no",
+    )
+    if any(term in normalized_text for term in receipt_terms):
+        signals.append("financial_form_language")
+
+    edges = cv2.Canny(image, 50, 150, apertureSize=3)
+    minimum_line = max(80, image.shape[1] // 5)
+    lines = cv2.HoughLinesP(
+        edges,
+        1,
+        3.141592653589793 / 180,
+        threshold=60,
+        minLineLength=minimum_line,
+        maxLineGap=12,
+    )
+    line_count = 0 if lines is None else len(lines)
+    if line_count >= 3 and foreground_ratio >= 0.002:
+        signals.append("form_line_structure")
+
+    return {
+        "demonstrably_blank": demonstrably_blank,
+        "financial_form_suspected": bool(signals) and not demonstrably_blank,
+        "form_signals": tuple(dict.fromkeys(signals)),
+        "foreground_ratio": round(foreground_ratio, 6),
+        "form_line_count": line_count,
+    }
 
 
 def _safe_box(
@@ -1579,303 +1650,6 @@ def _redistribute_grounded_description_from_adjacent_cell(
     return tuple(cells_by_id[cell.column_id] for cell in cells)
 
 
-def _split_grounded_merged_numeric_cells(
-    cells: tuple[SourceCell, ...],
-    columns: tuple[SourceColumn, ...],
-    canonical: CanonicalRow,
-) -> tuple[SourceCell, ...]:
-    columns_by_field = {
-        column.canonical_field: column
-        for column in columns
-        if column.canonical_field is not None
-    }
-    cells_by_id = {cell.column_id: cell for cell in cells}
-    split_flag = "split_from_merged_ocr_token"
-
-    def field_token_ids(field: str) -> set[str]:
-        return {
-            token_id
-            for item in canonical.field_evidence.get(field, ())
-            for token_id in item.token_ids
-        }
-
-    def populated_cell(
-        cell: SourceCell,
-        raw_value: str,
-        evidence: tuple[EvidenceRef, ...],
-    ) -> SourceCell:
-        return cell.model_copy(
-            update={
-                "raw_value": raw_value,
-                "evidence": evidence,
-                "validation_flags": tuple(
-                    dict.fromkeys(
-                        (
-                            *(
-                                flag
-                                for flag in cell.validation_flags
-                                if flag != "empty_cell"
-                            ),
-                            split_flag,
-                        )
-                    )
-                ),
-            }
-        )
-
-    financial_evidence_fields = {
-        "quantity": "quantity",
-        "unit_price": "rate",
-        "gross_amount": "gross_amount",
-        "discount": "discount",
-        "net_amount": "amount",
-    }
-    financial_columns = tuple(
-        column
-        for column in sorted(columns, key=lambda item: item.order)
-        if column.canonical_field in financial_evidence_fields
-    )
-    for merged_cell in tuple(cells_by_id.values()):
-        raw_value = re.sub(r"\s+", " ", merged_cell.raw_value or "").strip()
-        fragments = tuple(
-            match.group(0)
-            for match in re.finditer(
-                r"[+-]?(?:\d[\d,]*)(?:\.\d{1,4})?",
-                raw_value,
-            )
-        )
-        residual = re.sub(
-            r"[+-]?(?:\d[\d,]*)(?:\.\d{1,4})?",
-            "",
-            raw_value,
-        ).strip()
-        if len(fragments) < 2 or residual:
-            continue
-        parsed_fragments = tuple(parse_decimal(fragment) for fragment in fragments)
-        if any(value is None for value in parsed_fragments):
-            continue
-        matches: list[tuple[SourceColumn, ...]] = []
-        for start in range(len(financial_columns) - len(fragments) + 1):
-            window = financial_columns[start : start + len(fragments)]
-            expected = tuple(
-                parse_decimal(str(getattr(canonical, column.canonical_field)))
-                if getattr(canonical, column.canonical_field) is not None
-                else None
-                for column in window
-            )
-            if expected != parsed_fragments:
-                continue
-            if any(
-                cells_by_id[column.id] is not merged_cell
-                and cells_by_id[column.id].raw_value
-                for column in window
-            ):
-                continue
-            matches.append(window)
-        if len(matches) != 1:
-            continue
-        window = matches[0]
-        merged_ids = {
-            token_id
-            for item in merged_cell.evidence
-            for token_id in item.token_ids
-        }
-        evidence_by_column = {
-            column.id: field_token_ids(
-                financial_evidence_fields[str(column.canonical_field)]
-            )
-            for column in window
-        }
-        if any(
-            not token_ids or not token_ids.issubset(merged_ids)
-            for token_ids in evidence_by_column.values()
-        ):
-            continue
-        if merged_cell.column_id not in {column.id for column in window}:
-            cells_by_id[merged_cell.column_id] = merged_cell.model_copy(
-                update={
-                    "raw_value": None,
-                    "evidence": (),
-                    "validation_flags": tuple(
-                        dict.fromkeys((*merged_cell.validation_flags, split_flag))
-                    ),
-                }
-            )
-        for column, fragment in zip(window, fragments, strict=True):
-            cells_by_id[column.id] = populated_cell(
-                cells_by_id[column.id],
-                fragment,
-                _filter_evidence_token_ids(
-                    merged_cell.evidence,
-                    evidence_by_column[column.id],
-                ),
-            )
-
-    quantity_column = columns_by_field.get("quantity")
-    amount_column = (
-        columns_by_field.get("net_amount")
-        or columns_by_field.get("gross_amount")
-    )
-    if (
-        quantity_column is not None
-        and canonical.quantity is not None
-        and not cells_by_id[quantity_column.id].raw_value
-    ):
-        adjacent_column = next(
-            (
-                column
-                for column in columns
-                if column.order == quantity_column.order - 1
-            ),
-            None,
-        )
-        if adjacent_column is not None:
-            adjacent_cell = cells_by_id[adjacent_column.id]
-            merged = re.fullmatch(
-                r"\s*(?P<prefix>.*?\b"
-                r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)"
-                r"[/-]\d{4})\s*"
-                r"(?P<quantity>[+-]?\d[\d,]*\.\d{1,4})\s*",
-                adjacent_cell.raw_value or "",
-                re.IGNORECASE,
-            )
-            if (
-                merged is not None
-                and parse_decimal(merged.group("quantity"))
-                == canonical.quantity
-            ):
-                merged_ids = {
-                    token_id
-                    for item in adjacent_cell.evidence
-                    for token_id in item.token_ids
-                }
-                quantity_ids = field_token_ids("quantity")
-                if quantity_ids and quantity_ids.issubset(merged_ids):
-                    cells_by_id[adjacent_column.id] = populated_cell(
-                        adjacent_cell,
-                        merged.group("prefix").strip(),
-                        adjacent_cell.evidence,
-                    )
-                    cells_by_id[quantity_column.id] = populated_cell(
-                        cells_by_id[quantity_column.id],
-                        merged.group("quantity"),
-                        _filter_evidence_token_ids(
-                            adjacent_cell.evidence,
-                            quantity_ids,
-                        ),
-                    )
-
-    if quantity_column is not None and amount_column is not None:
-        quantity_cell = cells_by_id[quantity_column.id]
-        amount_cell = cells_by_id[amount_column.id]
-        merged = (
-            re.fullmatch(
-                r"\s*(?P<quantity>\d+)\s+"
-                r"(?P<amount>\d{1,3}(?:,\d{3})+\.\d{2})\s*",
-                amount_cell.raw_value or "",
-            )
-            if not quantity_cell.raw_value
-            else None
-        )
-        canonical_amount = (
-            canonical.net_amount
-            if amount_column.canonical_field == "net_amount"
-            else canonical.gross_amount
-        )
-        if (
-            merged is not None
-            and canonical.quantity is not None
-            and canonical_amount is not None
-            and parse_decimal(merged.group("quantity"))
-            == canonical.quantity
-            and parse_decimal(merged.group("amount"))
-            == canonical_amount
-        ):
-            merged_ids = {
-                token_id
-                for item in amount_cell.evidence
-                for token_id in item.token_ids
-            }
-            quantity_ids = field_token_ids("quantity")
-            amount_ids = field_token_ids("amount")
-            if (
-                quantity_ids
-                and amount_ids
-                and quantity_ids.issubset(merged_ids)
-                and amount_ids.issubset(merged_ids)
-            ):
-                cells_by_id[quantity_column.id] = populated_cell(
-                    quantity_cell,
-                    merged.group("quantity"),
-                    _filter_evidence_token_ids(
-                        amount_cell.evidence,
-                        quantity_ids,
-                    ),
-                )
-                cells_by_id[amount_column.id] = populated_cell(
-                    amount_cell,
-                    merged.group("amount"),
-                    _filter_evidence_token_ids(
-                        amount_cell.evidence,
-                        amount_ids,
-                    ),
-                )
-
-    rate_column = columns_by_field.get("unit_price")
-    if (
-        rate_column is not None
-        and canonical.unit_price is not None
-        and not cells_by_id[rate_column.id].raw_value
-    ):
-        adjacent_column = next(
-            (
-                column
-                for column in columns
-                if column.order == rate_column.order - 1
-            ),
-            None,
-        )
-        if adjacent_column is not None:
-            adjacent_cell = cells_by_id[adjacent_column.id]
-            merged = re.fullmatch(
-                r"\s*(?P<prefix>.+?)\s+"
-                r"(?P<rate>[+-]?\d[\d,]*\.\d{1,4})\s*",
-                adjacent_cell.raw_value or "",
-            )
-            if (
-                merged is not None
-                and re.search(
-                    r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)"
-                    r"[/-]\d{4}\b",
-                    merged.group("prefix"),
-                    re.IGNORECASE,
-                )
-                and parse_decimal(merged.group("rate"))
-                == canonical.unit_price
-            ):
-                merged_ids = {
-                    token_id
-                    for item in adjacent_cell.evidence
-                    for token_id in item.token_ids
-                }
-                rate_ids = field_token_ids("rate")
-                if rate_ids and rate_ids.issubset(merged_ids):
-                    cells_by_id[adjacent_column.id] = populated_cell(
-                        adjacent_cell,
-                        merged.group("prefix").strip(),
-                        adjacent_cell.evidence,
-                    )
-                    cells_by_id[rate_column.id] = populated_cell(
-                        cells_by_id[rate_column.id],
-                        merged.group("rate"),
-                        _filter_evidence_token_ids(
-                            adjacent_cell.evidence,
-                            rate_ids,
-                        ),
-                    )
-
-    return tuple(cells_by_id[cell.column_id] for cell in cells)
-
 
 def _trim_grounded_duplicate_adjacent_description(
     cells: tuple[SourceCell, ...],
@@ -2258,57 +2032,17 @@ _SERVICE_DATE_TABLE_TYPES = {
     TableType.LABORATORY,
     TableType.PHARMACY,
 }
-_NON_SERVICE_DATE_MARKERS = (
-    "admission date",
-    "bill date",
-    "date of admission",
-    "date of birth",
-    "date of discharge",
-    "discharge date",
-    "dob",
-    "expiry",
-    "exp date",
-    "expdate",
-    "manufacturing date",
-    "mfg date",
-    "print date",
-    "print time",
-    "receipt date",
-)
-
-
 def _source_cell_service_date(
     cell: SourceCell,
     column: SourceColumn,
 ) -> tuple[str, str, tuple[EvidenceRef, ...]] | None:
-    def normalized(value: str) -> str:
-        return re.sub(r"[^a-z0-9]+", " ", value.casefold()).strip()
-
     raw = re.sub(r"\s+", " ", cell.raw_value or "").strip()
     if not raw or not cell.evidence:
         return None
-    normalized_label = normalized(column.label)
-    normalized_raw = normalized(raw)
-    expiry_abbreviation = re.search(
-        r"(?:^|\s)(?:exp|mfg)(?:\s|$|date\b)",
-        normalized_raw,
-    )
-    if (
-        "expiry" in normalized_label
-        or normalized_label in {"exp", "exp date", "expdate", "mfg", "mfg date"}
-        or expiry_abbreviation is not None
-        or any(marker in normalized_raw for marker in _NON_SERVICE_DATE_MARKERS)
-    ):
+    parsed = service_date_from_context(raw, column_label=column.label)
+    if parsed is None:
         return None
-    matches = tuple(DATE_SPAN.finditer(raw))
-    parsed = tuple(
-        (match.group(0).strip(), parse_service_date(match.group(0)))
-        for match in matches
-    )
-    valid = tuple((value, iso) for value, iso in parsed if iso is not None)
-    if len(valid) != 1:
-        return None
-    value, iso = valid[0]
+    value, iso = parsed
     evidence = tuple(item for item in cell.evidence if item.token_ids)
     if not evidence:
         return None
@@ -2391,6 +2125,8 @@ def _with_grounded_service_date(
 def _recover_grounded_service_dates(
     source_tables: tuple[SourceTable, ...] | list[SourceTable],
     canonical_rows: tuple[CanonicalRow, ...] | list[CanonicalRow],
+    *,
+    already_linked: bool = False,
 ) -> list[CanonicalRow]:
     """Recover printed charge dates without borrowing document metadata.
 
@@ -2402,7 +2138,11 @@ def _recover_grounded_service_dates(
 
     rows = list(canonical_rows)
     row_indexes = {str(row.id): index for index, row in enumerate(rows)}
-    initially_linked = _link_source_tables(source_tables, rows)
+    initially_linked = (
+        tuple(source_tables)
+        if already_linked
+        else _link_source_tables(source_tables, rows)
+    )
 
     def parsed_date(iso: str) -> date:
         return date.fromisoformat(iso)
@@ -2727,7 +2467,9 @@ def _promote_grounded_date_column(
     if not support:
         return table
     ordered = support.most_common()
-    if len(ordered) > 1 and ordered[0][1] == ordered[1][1]:
+    if ordered[0][1] < 2 or (
+        len(ordered) > 1 and ordered[0][1] == ordered[1][1]
+    ):
         return table
     selected_id = ordered[0][0]
     selected = next(column for column in table.columns if column.id == selected_id)
@@ -2749,8 +2491,9 @@ def _promote_grounded_date_column(
             }
         )
     )
-    if not supported_values or any(
-        DATE_SPAN.search(value) is None for value in supported_values
+    if len(supported_values) < 2 or any(
+        service_date_from_context(value, column_label=selected.label) is None
+        for value in supported_values
     ):
         return table
 
@@ -2791,14 +2534,15 @@ def _link_source_tables(
         }
 
     linked_tables: list[SourceTable] = []
+    claimed_canonical_ids: set[str] = set()
     for table in tables:
         candidates = tuple(
             row
             for row in canonical_rows
             if row.page_number == table.page_number and row.table_id == table.table_id
         )
-        table = _promote_grounded_date_column(table, candidates)
         linked_rows = []
+        previous_linked_order: int | None = None
         for source_row in table.rows:
             source_ids = {
                 token_id
@@ -2806,8 +2550,30 @@ def _link_source_tables(
                 for evidence in cell.evidence
                 for token_id in evidence.token_ids
             }
-            scored: list[tuple[tuple[int, int, int], CanonicalRow]] = []
-            for candidate in candidates:
+            description_column = next(
+                (
+                    column
+                    for column in table.columns
+                    if column.canonical_field == "description"
+                ),
+                None,
+            )
+            printed_description = (
+                next(
+                    (
+                        cell.raw_value
+                        for cell in source_row.cells
+                        if description_column is not None
+                        and cell.column_id == description_column.id
+                    ),
+                    None,
+                )
+                or ""
+            )
+            scored: list[tuple[tuple[int, int, int, int, int, int], CanonicalRow]] = []
+            for candidate_index, candidate in enumerate(candidates):
+                if str(candidate.id) in claimed_canonical_ids:
+                    continue
                 description_ids = evidence_ids(
                     candidate.field_evidence.get("description", ())
                 )
@@ -2835,11 +2601,29 @@ def _link_source_tables(
                 if anchor_overlap == 0:
                     continue
                 all_ids = evidence_ids(candidate.evidence)
+                description_similarity = round(
+                    SequenceMatcher(
+                        None,
+                        re.sub(r"\s+", " ", printed_description.casefold()).strip(),
+                        re.sub(
+                            r"\s+",
+                            " ",
+                            (candidate.description or "").casefold(),
+                        ).strip(),
+                    ).ratio()
+                    * 1000
+                )
                 scored.append(
                     (
                         (
                             anchor_overlap,
                             len(description_ids & source_ids),
+                            description_similarity,
+                            int(
+                                previous_linked_order is not None
+                                and candidate.row_order == previous_linked_order + 1
+                            ),
+                            -abs(candidate_index - source_row.order),
                             len(all_ids & source_ids),
                         ),
                         candidate,
@@ -2848,85 +2632,133 @@ def _link_source_tables(
             scored.sort(key=lambda item: item[0], reverse=True)
             canonical_row_id = None
             flags = source_row.validation_flags
-            linked_cells = source_row.cells
             if scored and (len(scored) == 1 or scored[0][0] != scored[1][0]):
                 matched = scored[0][1]
                 canonical_row_id = str(matched.id)
-                columns_by_id = {column.id: column for column in table.columns}
-                linked_cells = _split_grounded_date_request_description(
-                    linked_cells,
-                    table.columns,
-                    matched,
-                )
-                linked_cells = _redistribute_grounded_description_from_adjacent_cell(
-                    linked_cells,
-                    table.columns,
-                    matched,
-                )
-                linked_cells = _split_grounded_merged_numeric_cells(
-                    linked_cells,
-                    table.columns,
-                    matched,
-                )
-                linked_cells = _trim_grounded_duplicate_adjacent_description(
-                    linked_cells,
-                    table.columns,
-                    matched,
-                )
-                linked_cells = _split_grounded_date_from_description(
-                    linked_cells,
-                    table.columns,
-                    matched,
-                )
-                linked_cells = _populate_grounded_service_date_cell(
-                    linked_cells,
-                    table.columns,
-                    matched,
-                )
-                linked_cells = tuple(
-                    cell.model_copy(
-                        update={
-                            "raw_value": None,
-                            "evidence": (),
-                            "validation_flags": tuple(
-                                dict.fromkeys(
-                                    (
-                                        *cell.validation_flags,
-                                        "excluded_oversized_overlay",
-                                    )
-                                )
-                            ),
-                        }
-                    )
-                    if _source_cell_is_invalid_structured_overlay(
-                        cell,
-                        columns_by_id[cell.column_id],
-                        table,
-                        source_row,
-                        matched,
-                    )
-                    else cell
-                    for cell in linked_cells
-                )
+                claimed_canonical_ids.add(canonical_row_id)
+                previous_linked_order = matched.row_order
             elif scored:
                 flags = tuple(dict.fromkeys((*flags, "canonical_link_ambiguous")))
             linked_rows.append(
                 source_row.model_copy(
                     update={
                         "canonical_row_id": canonical_row_id,
-                        "cells": linked_cells,
                         "validation_flags": flags,
                     }
                 )
             )
-        linked_table = table.model_copy(update={"rows": tuple(linked_rows)})
-        linked_tables.append(
+        linked_tables.append(table.model_copy(update={"rows": tuple(linked_rows)}))
+    return tuple(linked_tables)
+
+
+def _finalize_linked_source_cells(
+    tables: tuple[SourceTable, ...],
+    canonical_rows: tuple[CanonicalRow, ...] | list[CanonicalRow],
+) -> tuple[SourceTable, ...]:
+    """Apply grounded display cleanup after one-to-one linkage is complete."""
+    canonical = {str(row.id): row for row in canonical_rows}
+    finalized: list[SourceTable] = []
+    for table in tables:
+        columns_by_id = {column.id: column for column in table.columns}
+        rows: list[SourceRow] = []
+        for source_row in table.rows:
+            matched = canonical.get(source_row.canonical_row_id or "")
+            if matched is None:
+                rows.append(source_row)
+                continue
+            cells = _split_grounded_date_request_description(
+                source_row.cells,
+                table.columns,
+                matched,
+            )
+            cells = _redistribute_grounded_description_from_adjacent_cell(
+                cells,
+                table.columns,
+                matched,
+            )
+            cells = _trim_grounded_duplicate_adjacent_description(
+                cells,
+                table.columns,
+                matched,
+            )
+            cells = _split_grounded_date_from_description(
+                cells,
+                table.columns,
+                matched,
+            )
+            cells = _populate_grounded_service_date_cell(
+                cells,
+                table.columns,
+                matched,
+            )
+            cells = tuple(
+                cell.model_copy(
+                    update={
+                        "raw_value": None,
+                        "evidence": (),
+                        "validation_flags": tuple(
+                            dict.fromkeys(
+                                (*cell.validation_flags, "excluded_oversized_overlay")
+                            )
+                        ),
+                    }
+                )
+                if _source_cell_is_invalid_structured_overlay(
+                    cell,
+                    columns_by_id[cell.column_id],
+                    table,
+                    source_row,
+                    matched,
+                )
+                else cell
+                for cell in cells
+            )
+            rows.append(source_row.model_copy(update={"cells": cells}))
+        linked_table = table.model_copy(update={"rows": tuple(rows)})
+        finalized.append(
             _consolidate_grounded_adjacent_descriptions(
                 linked_table,
-                candidates,
+                tuple(
+                    row
+                    for row in canonical_rows
+                    if row.page_number == table.page_number
+                    and row.table_id == table.table_id
+                ),
             )
         )
-    return tuple(linked_tables)
+    return tuple(finalized)
+
+
+def _finalize_linked_service_dates(
+    tables: tuple[SourceTable, ...],
+    canonical_rows: list[CanonicalRow],
+) -> tuple[SourceTable, ...]:
+    canonical = {str(row.id): row for row in canonical_rows}
+    finalized: list[SourceTable] = []
+    for original in tables:
+        candidates = tuple(
+            row
+            for row in canonical_rows
+            if row.page_number == original.page_number
+            and row.table_id == original.table_id
+        )
+        table = _promote_grounded_date_column(original, candidates)
+        rows = tuple(
+            source_row.model_copy(
+                update={
+                    "cells": _populate_grounded_service_date_cell(
+                        source_row.cells,
+                        table.columns,
+                        canonical[source_row.canonical_row_id],
+                    )
+                }
+            )
+            if source_row.canonical_row_id in canonical
+            else source_row
+            for source_row in table.rows
+        )
+        finalized.append(table.model_copy(update={"rows": rows}))
+    return tuple(finalized)
 
 
 def _apply_document_role_policy(rows: list[CanonicalRow]) -> list[CanonicalRow]:
@@ -2972,9 +2804,11 @@ def _apply_document_role_policy(rows: list[CanonicalRow]) -> list[CanonicalRow]:
 
 def _flag_possible_supporting_receipt_duplicates(
     rows: list[CanonicalRow],
-) -> list[CanonicalRow]:
+    source_tables: tuple[SourceTable, ...],
+) -> tuple[list[CanonicalRow], list[dict[str, Any]]]:
     """Keep billable receipts visible while making possible duplicates reviewable."""
     output = list(rows)
+    duplicate_pairs: list[dict[str, Any]] = []
     generic_words = {
         "amount",
         "bill",
@@ -2988,6 +2822,26 @@ def _flag_possible_supporting_receipt_duplicates(
     def normalized(value: str | None) -> str:
         return re.sub(r"[^a-z0-9]+", " ", (value or "").casefold()).strip()
 
+    canonical_to_source = {
+        source_row.canonical_row_id: (table.table_id, source_row.id)
+        for table in source_tables
+        for source_row in table.rows
+        if source_row.canonical_row_id
+    }
+
+    def issuer_context(row: CanonicalRow) -> str:
+        section = normalized(row.section)
+        if section and section not in {"supporting receipt", "receipt", "charges"}:
+            return section
+        words = [
+            word
+            for word in normalized(row.description).split()
+            if word not in generic_words and not word.isdigit()
+        ]
+        return " ".join(words[:3])
+
+    seen_pairs: set[tuple[str, str]] = set()
+
     for index, receipt in enumerate(output):
         if not (
             "supporting_receipt_charge" in receipt.validation_flags
@@ -2995,32 +2849,63 @@ def _flag_possible_supporting_receipt_duplicates(
         ):
             continue
         receipt_description = normalized(receipt.description)
-        receipt_words = set(receipt_description.split()) - generic_words
-        possible_duplicate = any(
-            other_index != index
-            and "receipt_form" not in other.source_routes
-            and other.page_number != receipt.page_number
-            and other.net_amount == receipt.net_amount
-            and (
+        possible_duplicate = False
+        for other_index, other in enumerate(output):
+            if other_index == index:
+                continue
+            pair_key = tuple(sorted((receipt.id, other.id)))
+            if pair_key in seen_pairs:
+                continue
+            reference_match = bool(
+                normalized(receipt.request_no)
+                and normalized(receipt.request_no) == normalized(other.request_no)
+            )
+            descriptions_match = (
                 SequenceMatcher(
                     None,
                     receipt_description,
                     normalized(other.description),
                 ).ratio()
-                >= 0.72
-                or (
-                    bool(
-                        receipt_words
-                        & (set(normalized(other.description).split()) - generic_words)
-                    )
-                    and bool(
-                        receipt.service_date_iso
-                        and receipt.service_date_iso == other.service_date_iso
-                    )
-                )
+                >= 0.82
             )
-            for other_index, other in enumerate(output)
-        )
+            issuer_matches = bool(
+                issuer_context(receipt)
+                and issuer_context(receipt) == issuer_context(other)
+            )
+            dated_amount_match = bool(
+                receipt.net_amount is not None
+                and receipt.net_amount == other.net_amount
+                and receipt.service_date_iso
+                and receipt.service_date_iso == other.service_date_iso
+                and descriptions_match
+                and issuer_matches
+                and abs(receipt.page_number - other.page_number) <= 1
+            )
+            if not (reference_match or dated_amount_match):
+                continue
+            possible_duplicate = True
+            seen_pairs.add(pair_key)
+            source_refs = tuple(
+                reference[1]
+                for row_id in pair_key
+                if (reference := canonical_to_source.get(row_id)) is not None
+            )
+            table_refs = tuple(
+                reference[0]
+                for row_id in pair_key
+                if (reference := canonical_to_source.get(row_id)) is not None
+            )
+            duplicate_pairs.append(
+                {
+                    "canonical_row_ids": pair_key,
+                    "source_row_ids": source_refs,
+                    "page_number": min(receipt.page_number, other.page_number),
+                    "table_id": table_refs[0] if len(set(table_refs)) == 1 else None,
+                    "match_basis": (
+                        "exact_reference" if reference_match else "dated_grounded_charge"
+                    ),
+                }
+            )
         if possible_duplicate:
             output[index] = receipt.model_copy(
                 update={
@@ -3034,7 +2919,7 @@ def _flag_possible_supporting_receipt_duplicates(
                     )
                 }
             )
-    return output
+    return output, duplicate_pairs
 
 
 def _apply_profile_constraints(reconstruction, profile):
@@ -3794,12 +3679,14 @@ class OfflineExtractor:
         profile_identities: dict[str, dict[str, Any]] | None = None,
         profiles: tuple[LayoutProfile, ...] | None = None,
         profile_registry_revision: int | None = None,
+        recovery_targets: tuple[tuple[int, str | None], ...] = (),
     ) -> dict[str, Any]:
         set_header_aliases({})
         if self.alias_registry is not None and alias_snapshot is None:
             raise AliasRegistryUnavailable("coordinated alias snapshot is required")
         resolved_hospital_id = self.hospital_id
         job_profiles = self.profiles if profiles is None else profiles
+        recovery_target_set = set(recovery_targets)
 
         def abort_checkpoint() -> None:
             if should_abort is not None and should_abort():
@@ -3908,6 +3795,7 @@ class OfflineExtractor:
                 if layout_boxes and geometry_boxes
                 else ("layout" if layout_boxes else "ocr_geometry")
             )
+            no_table_assessment: dict[str, Any] | None = None
 
             table_work: list[TableWork] = []
             for table_index, box in enumerate(boxes):
@@ -3936,7 +3824,13 @@ class OfflineExtractor:
                     )
                 )
 
-            if not table_work and _needs_full_page_financial_recovery(tokens):
+            if not table_work:
+                no_table_assessment = _assess_no_table_page(page_path, tokens)
+
+            if not table_work and (
+                not no_table_assessment["demonstrably_blank"]
+                or (page_asset.page_number, None) in recovery_target_set
+            ):
                 table_id = f"p{page_asset.page_number}-t1"
                 safe_box = (0, 0, page_asset.width, page_asset.height)
                 crop = crop_region(
@@ -3959,7 +3853,7 @@ class OfflineExtractor:
                         box=safe_box,
                     )
                 )
-                route = "full_page_financial_recovery"
+                route = "full_page_form_assessment"
 
             if not table_work:
                 diagnostics.append(
@@ -3972,10 +3866,15 @@ class OfflineExtractor:
                         "layout_cache_hit": layout_cache_hit,
                         "table_count": 0,
                         "status": "no_table_detected",
+                        **(no_table_assessment or {}),
                     }
                 )
             for work in table_work:
                 abort_checkpoint()
+                targeted_recovery = bool(
+                    (work.page_number, work.table_id) in recovery_target_set
+                    or (work.page_number, None) in recovery_target_set
+                )
                 reconstruction = reconstruct_ocr_rows(
                     tokens,
                     page_number=work.page_number,
@@ -4062,7 +3961,7 @@ class OfflineExtractor:
                     )
                 )
                 recovery_attempts: list[RecoveryAttempt] = []
-                if _should_attempt_crop_recovery(
+                if targeted_recovery or _should_attempt_crop_recovery(
                     reconstruction,
                     parsed_rows=parsed_rows,
                     table_box=work.box,
@@ -4130,10 +4029,14 @@ class OfflineExtractor:
                 use_vl = bool(
                     advisor_eligible
                     and (
+                        targeted_recovery
+                        or
                         profile_heavy_sample
                         or not (profile_match and profile_match.selected and parsed_rows)
                     )
                     and (
+                        targeted_recovery
+                        or
                         profile_heavy_sample
                         or not parsed_rows
                         or is_implausibly_low_yield(reconstruction)
@@ -4550,6 +4453,7 @@ class OfflineExtractor:
                         "gemini_masked_tokens": gemini_masked_tokens,
                         "gemini_block_reason": gemini_block_reason,
                         "content": content,
+                        **(no_table_assessment or {}),
                         **reconstruction.diagnostics,
                     }
                 )
@@ -4569,9 +4473,18 @@ class OfflineExtractor:
             crop_boxes=source_table_crop_boxes,
         )
         rows = _apply_document_role_policy(_deduplicate(selected_rows))
-        rows = _recover_grounded_service_dates(selected_source_tables, rows)
-        rows = _flag_possible_supporting_receipt_duplicates(rows)
         source_tables = _link_source_tables(selected_source_tables, rows)
+        source_tables = _finalize_linked_source_cells(source_tables, rows)
+        rows = _recover_grounded_service_dates(
+            source_tables,
+            rows,
+            already_linked=True,
+        )
+        source_tables = _finalize_linked_service_dates(source_tables, rows)
+        rows, receipt_duplicate_pairs = _flag_possible_supporting_receipt_duplicates(
+            rows,
+            source_tables,
+        )
         document_totals = select_document_totals(document_total_candidates)
         document_total: DocumentTotal | None = select_document_total(document_total_candidates)
         abort_checkpoint()
@@ -4617,6 +4530,7 @@ class OfflineExtractor:
                 for page_number, table_id in suppressed_source_tables
             ],
             "rows": [row.model_dump(mode="json") for row in rows],
+            "receipt_duplicate_pairs": receipt_duplicate_pairs,
             "diagnostics": diagnostics,
             "provider_usage": {
                 "gemini_mode": self.gemini_mode.value,

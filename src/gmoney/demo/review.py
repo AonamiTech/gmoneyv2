@@ -407,16 +407,11 @@ def structural_issues(result: dict[str, Any], review: dict[str, Any]) -> list[di
     for item in semantic.get("issues") or []:
         code = str(item.get("code") or "semantic_validation_failed")
         message = str(item.get("message") or code)
-        location = re.search(r"\bp(?P<page>\d+)-t(?P<table>\d+)", message)
-        page_number = int(location.group("page")) if location else 1
-        table_id = (
-            f"p{location.group('page')}-t{location.group('table')}"
-            if location
-            else "semantic-validation"
-        )
-        issue_id = hashlib.sha256(
+        page_number = item.get("page_number")
+        table_id = item.get("table_id")
+        issue_id = str(item.get("id") or hashlib.sha256(
             f"semantic:{code}:{message}".encode()
-        ).hexdigest()[:20]
+        ).hexdigest()[:20])
         override = overrides.get(issue_id, {})
         issues.append(
             {
@@ -425,7 +420,14 @@ def structural_issues(result: dict[str, Any], review: dict[str, Any]) -> list[di
                 "table_id": table_id,
                 "table_type": "semantic_validation",
                 "reason_codes": [code],
+                "code": code,
+                "severity": item.get("severity", "blocking"),
                 "message": message,
+                "source_row_id": item.get("source_row_id"),
+                "canonical_row_id": item.get("canonical_row_id"),
+                "field": item.get("field"),
+                "related_source_row_ids": item.get("related_source_row_ids") or [],
+                "related_canonical_row_ids": item.get("related_canonical_row_ids") or [],
                 "status": override.get("status", "open"),
                 "resolution_reason": override.get("reason"),
                 "updated_at": override.get("updated_at"),
@@ -636,7 +638,11 @@ def approval_blockers(
         for row in informational
     ):
         blockers.append("missing_informational_evidence")
-    if any(issue["status"] == "open" for issue in structural_issues(result, review)):
+    if any(
+        issue["status"] == "open"
+        and issue.get("severity", "blocking") in {"fatal", "blocking"}
+        for issue in structural_issues(result, review)
+    ):
         blockers.append("open_structural_issues")
     assets = result.get("page_assets", [])
     if len(assets) != int(result.get("pages") or 0):

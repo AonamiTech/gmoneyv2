@@ -300,7 +300,7 @@ def _money_values(line: _Line) -> list[tuple[OcrToken, str, Decimal]]:
 
 def _label(
     line: _Line,
-    page_text: str,
+    local_text: str,
 ) -> tuple[str, int, DocumentTotalKind, DocumentTotalScope, bool] | None:
     normalized = _normalize(line.text)
     if normalized.startswith(("total for", "sub total", "subtotal")) or normalized.startswith(
@@ -323,12 +323,12 @@ def _label(
             "sgst",
         }
         pharmacy_marker_count = len(
-            pharmacy_markers.intersection(page_text.split())
+            pharmacy_markers.intersection(local_text.split())
         )
-        invoice_context = "invoice" in page_text and pharmacy_marker_count >= 2
+        invoice_context = "invoice" in local_text and pharmacy_marker_count >= 2
         pharmacy_table_context = pharmacy_marker_count >= 3
         if (
-            "pharmacy detailed bill" in page_text
+            "pharmacy detailed bill" in local_text
             or invoice_context
             or pharmacy_table_context
         ):
@@ -391,11 +391,15 @@ def extract_document_total_candidates(
     lines = _lines(tokens)
     if not lines:
         return ()
-    page_text = _normalize(" ".join(line.text for line in lines))
     line_height = median(_height(token) for token in tokens)
     candidates: list[DocumentTotalCandidate] = []
     for index, line in enumerate(lines):
-        detected = _label(line, page_text)
+        context_start = max(0, index - 10)
+        context_end = min(len(lines), index + 5)
+        local_text = _normalize(
+            " ".join(candidate.text for candidate in lines[context_start:context_end])
+        )
+        detected = _label(line, local_text)
         if detected is None:
             continue
         label, priority, kind, scope, requires_summary = detected
@@ -407,7 +411,7 @@ def extract_document_total_candidates(
             following = lines[index + 1]
             if (
                 following.center_y - line.center_y <= line_height * 2.2
-                and _label(following, page_text) is None
+                and _label(following, local_text) is None
                 and _standalone_money_line(following)
             ):
                 amount_line = following
@@ -416,6 +420,13 @@ def extract_document_total_candidates(
             continue
         amount_token, amount_raw, amount = max(values, key=lambda value: _center_x(value[0]))
         evidence, confidence = _evidence(line, amount_line, amount_token)
+        context_kind = {
+            DocumentTotalScope.DOCUMENT: "document_final",
+            DocumentTotalScope.SECTION: "section",
+            DocumentTotalScope.SETTLEMENT: "settlement",
+            DocumentTotalScope.PAYMENT: "payment",
+        }[scope]
+        context_id = f"p{amount_token.page_number}:{context_kind}:{round(line.center_y)}"
         total = DocumentTotal(
             amount_raw=amount_raw,
             amount=amount,
@@ -425,6 +436,8 @@ def extract_document_total_candidates(
             page_number=amount_token.page_number,
             evidence=evidence,
             confidence=confidence,
+            context_id=context_id,
+            context_kind=context_kind,
         )
         candidates.append(
             DocumentTotalCandidate(
@@ -433,13 +446,45 @@ def extract_document_total_candidates(
                 vertical_position=amount_line.center_y,
             )
         )
-    return tuple(candidates)
+    grouped: list[DocumentTotalCandidate] = []
+    context_state: dict[tuple[int, str | None], tuple[float, int]] = {}
+    for candidate in candidates:
+        context_key = (candidate.total.page_number, candidate.total.context_kind)
+        previous_position, context_anchor = context_state.get(
+            context_key,
+            (float("-inf"), 0),
+        )
+        if candidate.vertical_position - previous_position > line_height * 8:
+            context_anchor = round(candidate.vertical_position)
+        context_id = (
+            f"p{candidate.total.page_number}:{candidate.total.context_kind}:"
+            f"{context_anchor}"
+        )
+        grouped.append(
+            DocumentTotalCandidate(
+                total=candidate.total.model_copy(update={"context_id": context_id}),
+                label_priority=candidate.label_priority,
+                vertical_position=candidate.vertical_position,
+            )
+        )
+        context_state[context_key] = (candidate.vertical_position, context_anchor)
+    return tuple(grouped)
 
 
 def select_document_total(
     candidates: tuple[DocumentTotalCandidate, ...] | list[DocumentTotalCandidate],
 ) -> DocumentTotal | None:
-    return max(candidates, key=lambda candidate: candidate.rank).total if candidates else None
+    document_candidates = tuple(
+        candidate
+        for candidate in candidates
+        if candidate.total.scope is DocumentTotalScope.DOCUMENT
+        and candidate.total.context_kind == "document_final"
+        and candidate.total.context_id
+    )
+    contexts = {candidate.total.context_id for candidate in document_candidates}
+    if len(contexts) != 1:
+        return None
+    return max(document_candidates, key=lambda candidate: candidate.rank).total
 
 
 def select_document_totals(

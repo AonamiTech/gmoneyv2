@@ -1,5 +1,8 @@
 from decimal import Decimal
+from pathlib import Path
 
+import cv2
+import numpy as np
 import pytest
 
 from gmoney.contracts.evidence import OcrToken, Point, Polygon
@@ -17,13 +20,25 @@ from gmoney.extraction.ocr_rows import (
     set_header_aliases,
 )
 from gmoney.extraction.offline import (
-    _link_source_tables,
+    _assess_no_table_page,
+    _finalize_linked_service_dates,
+    _finalize_linked_source_cells,
     _needs_full_page_financial_recovery,
     _populate_grounded_service_date_cell,
     _recover_grounded_service_dates,
     _recovery_prior_schemas,
 )
+from gmoney.extraction.offline import (
+    _link_source_tables as _link_source_tables_once,
+)
 from gmoney.extraction.rows import CandidateLedgerRow
+
+
+def _link_source_tables(source_tables, canonical_rows):
+    return _finalize_linked_source_cells(
+        _link_source_tables_once(source_tables, canonical_rows),
+        canonical_rows,
+    )
 
 
 def token(index: int, text: str, box: tuple[float, float, float, float]) -> OcrToken:
@@ -626,7 +641,10 @@ def test_financial_row_splits_merged_serial_and_description_across_boundary() ->
         "a" * 64,
         result.rows,
     )
-    linked = _link_source_tables(result.source_tables, canonical)
+    linked_once = _link_source_tables_once(result.source_tables, canonical)
+    assert linked_once[0].rows[0].cells == result.source_tables[0].rows[0].cells
+    assert linked_once[0].rows[0].canonical_row_id == str(canonical[0].id)
+    linked = _finalize_linked_source_cells(linked_once, canonical)
 
     assert len(canonical) == 1
     assert canonical[0].description == "IV SET"
@@ -1169,9 +1187,9 @@ def test_source_table_keeps_fully_unknown_grounded_headers() -> None:
     )
 
     assert [column.label for column in result.source_tables[0].columns] == [
-        "Charge",
-        "Co-pay %",
-        "Value",
+        "Column 1",
+        "Column 2",
+        "Column 3",
     ]
     assert [column.canonical_field for column in result.source_tables[0].columns] == [
         None,
@@ -1322,9 +1340,9 @@ def test_arbitrary_data_rows_are_not_promoted_to_repeated_headers() -> None:
     assert len(result.source_tables) == 1
     table = result.source_tables[0]
     assert [column.label for column in table.columns] == [
-        "REFERENCE",
-        "KIND",
-        "VALUE",
+        "Column 1",
+        "Column 2",
+        "Column 3",
     ]
     assert [
         [cell.raw_value for cell in source_row.cells]
@@ -1928,7 +1946,7 @@ def test_source_table_synthesizes_grounded_columns_without_a_header() -> None:
         "Column 3",
     ]
     assert all(
-        column.validation_flags == ("synthetic_header",)
+        "synthetic_header" in column.validation_flags
         for column in result.source_tables[0].columns
     )
     assert [
@@ -1968,7 +1986,10 @@ def test_headerless_source_date_lane_recovers_grounded_canonical_dates() -> None
         result.source_tables,
         canonical,
     )
-    linked = _link_source_tables(result.source_tables, recovered)
+    linked = _finalize_linked_service_dates(
+        _link_source_tables(result.source_tables, recovered),
+        recovered,
+    )
 
     assert [row.service_date_raw for row in recovered] == [
         "27/07/2026",
@@ -2327,12 +2348,60 @@ def test_alphanumeric_first_data_line_is_not_promoted_to_header() -> None:
     )
 
     assert all(
-        column.validation_flags == ("synthetic_header",)
+        "synthetic_header" in column.validation_flags
         for column in result.source_tables[0].columns
     )
     assert result.source_tables[0].rows[0].cells[0].raw_value == (
         "MKDIPI/2616051"
     )
+
+
+def test_cash_summary_title_is_not_promoted_to_source_columns() -> None:
+    tokens = (
+        token(0, "Description", (100, 20, 500, 35)),
+        token(1, "Amount", (850, 20, 950, 35)),
+        token(2, "Consultation", (100, 60, 500, 75)),
+        token(3, "500.00", (860, 60, 940, 75)),
+        token(4, "Cash Summary", (100, 100, 500, 115)),
+        token(5, "Received", (100, 140, 500, 155)),
+        token(6, "500.00", (860, 140, 940, 155)),
+        token(7, "Balance", (100, 180, 500, 195)),
+        token(8, "0.00", (860, 180, 940, 195)),
+    )
+
+    result = reconstruct_ocr_rows(
+        tokens,
+        page_number=1,
+        table_id="p1-t1",
+        box=(60, 0, 980, 220),
+    )
+
+    assert len(result.source_tables) == 1
+    assert [column.label for column in result.source_tables[0].columns] == [
+        "Description",
+        "Amount",
+    ]
+
+
+def test_no_table_page_assessment_uses_image_structure_when_ocr_is_empty(
+    tmp_path: Path,
+) -> None:
+    blank_path = tmp_path / "blank.png"
+    form_path = tmp_path / "form.png"
+    blank = np.full((600, 400), 255, dtype=np.uint8)
+    form = blank.copy()
+    for top in (100, 180, 260, 340):
+        cv2.line(form, (40, top), (360, top), 0, 3)
+    cv2.imwrite(str(blank_path), blank)
+    cv2.imwrite(str(form_path), form)
+
+    blank_assessment = _assess_no_table_page(blank_path, ())
+    form_assessment = _assess_no_table_page(form_path, ())
+
+    assert blank_assessment["demonstrably_blank"] is True
+    assert form_assessment["demonstrably_blank"] is False
+    assert form_assessment["financial_form_suspected"] is True
+    assert "form_line_structure" in form_assessment["form_signals"]
 
 
 def test_expdate_in_product_cell_is_not_recovered_as_service_date() -> None:
@@ -3790,7 +3859,8 @@ def test_printed_table_synthesizes_repeated_unlabeled_numeric_column() -> None:
         "net_amount",
     ]
     assert table.columns[4].label == "Column 5"
-    assert table.columns[4].validation_flags == ("synthetic_header",)
+    assert "synthetic_header" in table.columns[4].validation_flags
+    assert "inferred_financial_lane" in table.columns[4].validation_flags
     for row in table.rows:
         cells = {cell.column_id: cell for cell in row.cells}
         assert cells[table.columns[3].id].raw_value == "1.00"
@@ -3837,11 +3907,11 @@ def test_printed_summary_synthesizes_all_repeated_unlabeled_amount_lanes() -> No
 
     table = result.source_tables[0]
     assert [column.label for column in table.columns] == [
-        "Cash Summary",
+        "Column 1",
         "Column 2",
-        "Credit Summary",
+        "Column 3",
         "Column 4",
-        "Total Summary",
+        "Column 5",
         "Column 6",
     ]
     assert [

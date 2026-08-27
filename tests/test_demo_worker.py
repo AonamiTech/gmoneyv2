@@ -19,6 +19,12 @@ from gmoney.contracts.phase3 import LayoutProfile, ProfileLifecycle
 from gmoney.demo import worker as worker_module
 from gmoney.demo.store import JobStore, JobTransactionError
 from gmoney.extraction.offline import ExtractionAborted
+from gmoney.extraction.validation import (
+    ValidationIssue,
+    ValidationReport,
+    ValidationSeverity,
+    ValidationStatus,
+)
 from gmoney.profiles.aliases import (
     AliasRegistryUnavailable,
     JsonAliasRepository,
@@ -31,9 +37,14 @@ from gmoney.profiles.repository import (
 
 
 @pytest.fixture(autouse=True)
-def reset_worker_extractor() -> Iterator[None]:
+def reset_worker_extractor(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     worker_module._extractor = None
     worker_module._gpu_inference_lock = None
+    monkeypatch.setattr(
+        worker_module,
+        "validate_extraction_result",
+        lambda *_: ValidationReport(status=ValidationStatus.PASSED, issues=()),
+    )
     yield
     worker_module._extractor = None
     gpu_lock = worker_module._gpu_inference_lock
@@ -192,6 +203,20 @@ def _create_worker_job(store: JobStore, source_name: str) -> str:
     return str(state["id"])
 
 
+def _publish_test_outcome(
+    root_value: str,
+    job_id: str,
+    summary: dict[str, Any],
+) -> dict[str, Any]:
+    assert JobStore(Path(root_value)).publish_processing_outcome(
+        job_id,
+        {"rows": [], "semantic_validation": {"status": "passed", "issues": []}},
+        status="complete",
+        **summary,
+    )
+    return summary
+
+
 def _controlled_worker_job(
     root_value: str,
     job_id: str,
@@ -206,7 +231,11 @@ def _controlled_worker_job(
     hold = directory / ".test-hold"
     while hold.exists():
         time.sleep(0.02)
-    return {"row_count": 1, "hospital_name": "Test Hospital"}
+    return _publish_test_outcome(
+        root_value,
+        job_id,
+        {"row_count": 1, "hospital_name": "Test Hospital"},
+    )
 
 
 def _record_captured_process_snapshot(
@@ -228,7 +257,11 @@ def _record_captured_process_snapshot(
             }
         )
     )
-    return {"row_count": 1, "hospital_name": "Original Hospital"}
+    return _publish_test_outcome(
+        root_value,
+        job_id,
+        {"row_count": 1, "hospital_name": "Original Hospital"},
+    )
 
 
 def _run_controlled_worker_loop(
@@ -1051,22 +1084,21 @@ def test_semantically_invalid_result_is_published_as_needs_review(
                 "hospital": None,
             }
 
+    issue = ValidationIssue(
+        id="semantic-issue",
+        code="unlinked_financial_row",
+        severity=ValidationSeverity.BLOCKING,
+        message="unlinked financial row",
+        page_number=1,
+        table_id="p1-t1",
+        source_row_id="p1-t1-s1-r2",
+    )
     monkeypatch.setattr(
         worker_module,
-        "_semantic_validation",
-        lambda source, artifacts, result: (
-            "needs_review",
-            {
-                "validation_version": "semantic_result_validation_v1",
-                "status": "needs_review",
-                "issues": [
-                    {
-                        "code": "unlinked_financial_row",
-                        "message": "unlinked financial row p1-t1-s1-r2",
-                        "severity": "error",
-                    }
-                ],
-            },
+        "validate_extraction_result",
+        lambda source, artifacts, result: ValidationReport(
+            status=ValidationStatus.NEEDS_REVIEW,
+            issues=(issue,),
         ),
     )
 
@@ -1083,6 +1115,112 @@ def test_semantically_invalid_result_is_published_as_needs_review(
     assert state["validation_issue_codes"] == ["unlinked_financial_row"]
     result = json.loads((store.job_dir(job_id) / "result.json").read_text())
     assert result["semantic_validation"]["status"] == "needs_review"
+    assert result["semantic_validation"]["issues"][0]["source_row_id"] == (
+        "p1-t1-s1-r2"
+    )
+
+
+def test_reviewable_result_runs_exactly_one_scoped_recovery_pass(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = JobStore(tmp_path)
+    job_id = _create_worker_job(store, "Recover once.pdf")
+    assert store.claim_queued(job_id) is not None
+    calls: list[tuple[tuple[int, str | None], ...]] = []
+
+    class RecoveringExtractor:
+        def extract(
+            self,
+            source: Path,
+            artifact_root: Path,
+            progress: Any,
+            *,
+            should_abort: Any,
+            recovery_targets: tuple[tuple[int, str | None], ...] = (),
+        ) -> dict[str, Any]:
+            calls.append(recovery_targets)
+            return {
+                "output_version": "offline_accuracy_spine_v3",
+                "rows": [],
+                "hospital": None,
+            }
+
+    issue = ValidationIssue(
+        id="recoverable-issue",
+        code="unlinked_financial_source_row",
+        severity=ValidationSeverity.BLOCKING,
+        message="Recover this source row",
+        page_number=2,
+        table_id="p2-t3",
+        source_row_id="p2-t3-s1-r4",
+    )
+    reports = iter(
+        (
+            ValidationReport(
+                status=ValidationStatus.NEEDS_REVIEW,
+                issues=(issue,),
+            ),
+            ValidationReport(status=ValidationStatus.PASSED, issues=()),
+        )
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "validate_extraction_result",
+        lambda *_: next(reports),
+    )
+
+    worker_module._extract_and_publish(
+        store=store,
+        job_id=job_id,
+        extractor=RecoveringExtractor(),
+    )
+
+    assert calls == [(), ((2, "p2-t3"),)]
+    state = store.read(job_id)
+    assert state["status"] == "complete"
+    result = json.loads((store.job_dir(job_id) / "result.json").read_text())
+    assert result["validation_recovery_attempted"] is True
+
+
+@pytest.mark.parametrize(
+    "phase",
+    ("journal_persisted", "result_replaced", "state_replaced"),
+)
+def test_validated_publication_recovers_each_crash_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+) -> None:
+    root = tmp_path / phase
+    store = JobStore(root)
+    job_id = _create_worker_job(store, f"{phase}.pdf")
+    assert store.claim_queued(job_id) is not None
+
+    def crash(current: str) -> None:
+        if current == phase:
+            raise RuntimeError(f"crash:{phase}")
+
+    monkeypatch.setattr(store, "_publication_checkpoint", crash)
+    with pytest.raises(RuntimeError, match=f"crash:{phase}"):
+        store.publish_processing_outcome(
+            job_id,
+            {"rows": [{"id": "validated-row"}]},
+            status="complete",
+            row_count=1,
+            validation_status="passed",
+            validation_issue_count=0,
+            validation_issue_codes=[],
+        )
+
+    assert (store.job_dir(job_id) / ".publish-operation.json").is_file()
+    recovered = JobStore(root)
+    recovered.recover()
+
+    assert recovered.read(job_id)["status"] == "complete"
+    assert recovered.read(job_id)["row_count"] == 1
+    assert recovered.read_result(job_id)["rows"][0]["id"] == "validated-row"
+    assert not (recovered.job_dir(job_id) / ".publish-operation.json").exists()
 
 
 def test_worker_recovery_deletes_interrupted_abort(tmp_path: Path) -> None:
@@ -1328,6 +1466,9 @@ def test_worker_recovers_profile_registry_after_five_seconds(tmp_path: Path) -> 
             profile_path.unlink()
             recovered_id = _create_worker_job(store, "Queued after profile recovery.pdf")
 
+    def runner(root: str, job_id: str, *args: Any) -> dict[str, Any]:
+        return _publish_test_outcome(root, job_id, {"row_count": 3})
+
     worker_module.run_worker_loop(
         root=tmp_path,
         vl_url="http://vl.test",
@@ -1338,7 +1479,7 @@ def test_worker_recovers_profile_registry_after_five_seconds(tmp_path: Path) -> 
         profile_registry=profile_path,
         stop_requested=lambda: current_time > 6.0,
         executor_factory=ThreadPoolExecutor,
-        job_runner=lambda *args: {"row_count": 3},
+        job_runner=runner,
         clock=clock,
         sleeper=sleeper,
     )
@@ -1484,7 +1625,11 @@ def test_submission_failure_drains_previously_submitted_jobs_before_exit(
         identity_snapshot: worker_module.RuntimeIdentitySnapshot,
     ) -> dict[str, Any]:
         completed.append(job_id)
-        return {"row_count": 7, "hospital_name": "Machine Hospital"}
+        return _publish_test_outcome(
+            root_value,
+            job_id,
+            {"row_count": 7, "hospital_name": "Machine Hospital"},
+        )
 
     class PartiallyRejectingExecutor:
         def __init__(self, **options: Any) -> None:

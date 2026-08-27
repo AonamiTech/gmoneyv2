@@ -168,6 +168,8 @@ class DocumentTotal(ContractModel):
     evidence: EvidenceRef
     confidence: float = Field(ge=0, le=1)
     source_route: str = "page_ocr_final_total"
+    context_id: str | None = None
+    context_kind: str | None = None
 
 
 class ProviderCandidate(VersionedContract):

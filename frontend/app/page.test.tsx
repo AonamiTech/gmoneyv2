@@ -200,6 +200,7 @@ describe("evidence page navigation", () => {
   let reviewHospitalId: string | null = null;
   let aliasApplyPayload: Record<string, unknown> | null = null;
   let hospitalLinkPayload: Record<string, unknown> | null = null;
+  let reviewPayload: Record<string, unknown> = structuredClone(review);
   let normalizedRowsPayload = structuredClone(rowsResult);
   let sourcePayload: Omit<typeof sourceTables, "unavailable_reason"> & {
     unavailable_reason: "legacy_result" | "no_source_tables" | null;
@@ -216,6 +217,7 @@ describe("evidence page navigation", () => {
     reviewHospitalId = null;
     aliasApplyPayload = null;
     hospitalLinkPayload = null;
+    reviewPayload = structuredClone(review);
     normalizedRowsPayload = structuredClone(rowsResult);
     sourcePayload = structuredClone(sourceTables);
     vi.stubGlobal(
@@ -327,7 +329,7 @@ describe("evidence page navigation", () => {
         }
         if (url.includes("/rows?")) return json(structuredClone(normalizedRowsPayload));
         if (url.endsWith("/review")) {
-          return json({ ...structuredClone(review), hospital_id: reviewHospitalId });
+          return json({ ...structuredClone(reviewPayload), hospital_id: reviewHospitalId });
         }
         throw new Error(`Unexpected request: ${url}`);
       }),
@@ -423,6 +425,49 @@ describe("evidence page navigation", () => {
 
     expect(screen.getByRole("cell", { name: "150" })).toBeInTheDocument();
     expect(screen.getByRole("cell", { name: "151" })).toBeInTheDocument();
+  });
+
+  test("structured validation issues navigate to their exact printed row", async () => {
+    reviewPayload = {
+      ...structuredClone(review),
+      issues_open: 1,
+      issues: [{
+        id: "issue-1",
+        code: "unlinked_financial_source_row",
+        severity: "blocking",
+        message: "Unmapped financial value needs review",
+        page_number: 1,
+        table_id: "p1-t1",
+        table_type: "semantic_validation",
+        source_row_id: "p1-t1-s1-r1",
+        canonical_row_id: null,
+        field: "net_amount",
+        related_source_row_ids: [],
+        related_canonical_row_ids: [],
+        reason_codes: ["unlinked_financial_source_row"],
+        status: "open" as const,
+        resolution_reason: null,
+      }],
+    };
+
+    render(<Home />);
+    await advance(250);
+    await advance(250);
+    await openBill();
+
+    expect(screen.getByText("Unmapped financial value needs review")).toBeInTheDocument();
+    expect(screen.getByText(/printed p1-t1-s1-r1/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "open" }));
+    await advance(250);
+
+    expect(
+      vi.mocked(fetch).mock.calls.some(([input]) => {
+        const url = new URL(String(input), "http://localhost");
+        return url.pathname.endsWith("/source-tables")
+          && url.searchParams.get("anchor_row_id") === "p1-t1-s1-r1";
+      }),
+    ).toBe(true);
+    expect(screen.getByRole("button", { name: "Printed columns" })).toHaveClass("active");
   });
 
   test("selects visible normalized rows and submits one bulk rejection", async () => {

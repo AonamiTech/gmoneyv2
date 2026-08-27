@@ -179,9 +179,17 @@ type SourceTablesResult = {
 };
 type ReviewIssue = {
   id: string;
-  page_number: number;
-  table_id: string;
-  table_type: string;
+  code?: string;
+  severity?: "fatal" | "blocking" | "warning";
+  message?: string;
+  page_number: number | null;
+  table_id: string | null;
+  table_type?: string | null;
+  source_row_id?: string | null;
+  canonical_row_id?: string | null;
+  field?: string | null;
+  related_source_row_ids?: string[];
+  related_canonical_row_ids?: string[];
   reason_codes: string[];
   status: "open" | "resolved";
   resolution_reason: string | null;
@@ -435,6 +443,10 @@ export default function Home() {
   const [review, setReview] = useState<ReviewSummary | null>(null);
   const [selectedRowId, setSelectedRowId] = useState<string | null>(null);
   const [selectedSourceRowId, setSelectedSourceRowId] = useState<string | null>(null);
+  const [issueAnchor, setIssueAnchor] = useState<{
+    sourceRowId: string | null;
+    canonicalRowId: string | null;
+  } | null>(null);
   const [ledgerMode, setLedgerMode] = useState<"printed" | "normalized">("printed");
   const [health, setHealth] = useState<Health | null>(null);
   const [query, setQuery] = useState("");
@@ -656,6 +668,14 @@ export default function Home() {
     if (disposition) params.set("disposition", disposition);
     if (pageFilter) params.set("source_page", pageFilter);
     if (pageFilter) sourceParams.set("source_page", pageFilter);
+    if (issueAnchor?.canonicalRowId) {
+      params.set("offset", "0");
+      params.set("anchor_row_id", issueAnchor.canonicalRowId);
+    }
+    if (issueAnchor?.sourceRowId) {
+      sourceParams.set("offset", "0");
+      sourceParams.set("anchor_row_id", issueAnchor.sourceRowId);
+    }
     try {
       const [rows, sources, summary] = await Promise.all([
         request<RowsResult>(`/api/v2/documents/${selectedJob.id}/rows?${params}`),
@@ -667,6 +687,18 @@ export default function Home() {
       setRowsResult(rows);
       setSourceTablesResult(sources);
       setReview(summary);
+      if (issueAnchor) {
+        const anchorOffset = issueAnchor.sourceRowId ? sources.offset : rows.offset;
+        if (anchorOffset !== offset) setOffset(anchorOffset);
+        if (issueAnchor.sourceRowId) {
+          setSelectedSourceRowId(issueAnchor.sourceRowId);
+          setLedgerMode("printed");
+        } else if (issueAnchor.canonicalRowId) {
+          setSelectedRowId(issueAnchor.canonicalRowId);
+          setLedgerMode("normalized");
+        }
+        setIssueAnchor(null);
+      }
       setSelectedRowId((current) =>
         current && rows.rows.some((row) => row.id === current)
           ? current
@@ -685,7 +717,7 @@ export default function Home() {
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "The result could not be loaded.");
     }
-  }, [selectedJob, offset, query, disposition, pageFilter]);
+  }, [selectedJob, offset, query, disposition, pageFilter, issueAnchor]);
 
   useEffect(() => {
     setRowsResult(null);
@@ -702,6 +734,7 @@ export default function Home() {
     setDrawMode(null);
     setDraftPolygon(null);
     setSelectedSourceRowId(null);
+    setIssueAnchor(null);
     setLedgerMode("printed");
     setBulkRowIds(new Set());
     setBulkAction(null);
@@ -1075,6 +1108,20 @@ export default function Home() {
       body: JSON.stringify({ status: nextStatus, reason: issueReason }),
     });
     if (updated) setIssueReason("");
+  };
+
+  const focusIssue = (issue: ReviewIssue) => {
+    setQuery("");
+    setDisposition("");
+    setPageFilter("");
+    setOffset(0);
+    if (issue.page_number) setViewPage(issue.page_number);
+    setIssueReason(issue.resolution_reason ?? "");
+    setIssueAnchor({
+      sourceRowId: issue.source_row_id ?? issue.related_source_row_ids?.[0] ?? null,
+      canonicalRowId:
+        issue.canonical_row_id ?? issue.related_canonical_row_ids?.[0] ?? null,
+    });
   };
 
   const approve = async () => {
@@ -2017,8 +2064,13 @@ export default function Home() {
                     <div className="zone-head"><div><p className="folio">05 / Structural review</p><h3>{review.issues.length ? `${review.issues_open} of ${review.issues.length} issues open` : "No structural issues"}</h3></div></div>
                     {review.issues.map((issue) => (
                       <div className={`issue-card ${issue.status}`} key={issue.id}>
-                        <span>p.{issue.page_number}</span><div><b>{issue.table_type.replaceAll("_", " ")}</b><small>{issue.reason_codes.join(" · ").replaceAll("_", " ")}</small></div>
-                        <button onClick={() => { setViewPage(issue.page_number); setIssueReason(issue.resolution_reason ?? ""); }}>{issue.status}</button>
+                        <span>{issue.page_number ? `p.${issue.page_number}` : "doc"}</span><div><b>{issue.message ?? issue.reason_codes.join(" · ").replaceAll("_", " ")}</b><small>{[
+                          issue.table_id,
+                          issue.source_row_id ? `printed ${issue.source_row_id}` : null,
+                          issue.canonical_row_id ? `row ${issue.canonical_row_id}` : null,
+                          issue.field ? `field ${issue.field}` : null,
+                        ].filter(Boolean).join(" · ") || (issue.table_type ?? "document").replaceAll("_", " ")}</small></div>
+                        <button onClick={() => focusIssue(issue)}>{issue.status}</button>
                         <button className="issue-action" onClick={() => void updateIssue(issue)}>{issue.status === "open" ? "Resolve" : "Reopen"}</button>
                       </div>
                     ))}
