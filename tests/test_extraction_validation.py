@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 from pathlib import Path
 from uuid import uuid4
 
@@ -692,6 +693,19 @@ def _as_recovery_candidate(result: dict[str, object]) -> None:
     }
 
 
+def _copy_recovery_artifacts(artifact_root: Path) -> None:
+    recovery_root = artifact_root / "recovery"
+    for child in tuple(artifact_root.iterdir()):
+        if child == recovery_root:
+            continue
+        target = recovery_root / child.name
+        if child.is_dir():
+            shutil.copytree(child, target, dirs_exist_ok=True)
+        elif child.is_file():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(child, target)
+
+
 def test_recover_draft_requires_semantic_improvement_and_preserves_charges(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -708,6 +722,7 @@ def test_recover_draft_requires_semantic_improvement_and_preserves_charges(
     _as_recovery_candidate(candidate_result)
     candidate = _draft_from_result(candidate_result)
     extractor = object.__new__(OfflineExtractor)
+    _copy_recovery_artifacts(artifact_root)
 
     def fake_extract(*args: object, **kwargs: object) -> dict[str, object]:
         sink = kwargs["_draft_sink"]
@@ -739,6 +754,10 @@ def test_recover_draft_requires_semantic_improvement_and_preserves_charges(
 
     assert recovered.result["recovery"]["targets"][0]["selected"] == "candidate"
     assert recovered.page_units[0].token_manifest[0].text == "Consultation"
+    assert recovered.page_units[0].page_asset.relative_path.startswith("recovery/")
+    assert (
+        artifact_root / recovered.page_units[0].page_asset.relative_path
+    ).is_file()
 
     unsafe_result = json.loads(json.dumps(candidate_result))
     unsafe_result["rows"][0]["net_amount"] = "999.99"
@@ -778,6 +797,7 @@ def test_recover_draft_requires_semantic_improvement_and_preserves_charges(
     target = declined.result["recovery"]["targets"][0]
     assert target["selected"] == "baseline"
     assert target["status"] == "recovery_no_safe_improvement"
+    assert not declined.page_units[0].page_asset.relative_path.startswith("recovery/")
 
 
 def test_recovery_cannot_move_a_blocker_to_another_row(
@@ -845,6 +865,7 @@ def test_recovery_cannot_move_a_blocker_to_another_row(
     _as_recovery_candidate(candidate_result)
     candidate = _draft_from_result(candidate_result)
     extractor = object.__new__(OfflineExtractor)
+    _copy_recovery_artifacts(artifact_root)
 
     def fake_extract(*args: object, **kwargs: object) -> dict[str, object]:
         sink = kwargs["_draft_sink"]

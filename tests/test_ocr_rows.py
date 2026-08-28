@@ -1667,6 +1667,34 @@ def test_merged_date_and_description_in_date_lane_is_grounded_and_split() -> Non
         result.source_tables,
         token_lookup,
     )
+    fragment_lookup = {item.token_id: item for item in fragments}
+    token_lookup.update(fragment_lookup)
+    rematerialized, repeated_fragments, repeated_assignments = (
+        _materialize_printed_cell_fragments(materialized_tables, token_lookup)
+    )
+    assert repeated_fragments == ()
+    assert all(
+        "fragment_occurrence_ambiguous" not in cell.validation_flags
+        for table in rematerialized
+        for row in table.rows
+        for cell in row.cells
+    )
+    assert repeated_assignments
+
+    original_canonical = canonicalize_rows(
+        "d" * 64,
+        1,
+        "p1-t1",
+        "a" * 64,
+        result.rows,
+    )
+    lineage_linked = _link_source_tables_once(
+        materialized_tables,
+        original_canonical,
+        token_lookup=token_lookup,
+    )
+    assert lineage_linked[0].rows[0].canonical_row_id == str(original_canonical[0].id)
+
     materialized_rows = _apply_fragment_ids_to_aligned_rows(
         result.rows,
         materialized_tables,
@@ -1675,7 +1703,7 @@ def test_merged_date_and_description_in_date_lane_is_grounded_and_split() -> Non
     date_fragment_id = materialized_rows[0].field_token_ids["service_date"][0]
     description_fragment_id = materialized_rows[0].field_token_ids["description"][0]
     assert date_fragment_id != description_fragment_id
-    fragments_by_id = {item.token_id: item for item in fragments}
+    fragments_by_id = fragment_lookup
     assert fragments_by_id[date_fragment_id].text == "14/07/2026"
     assert fragments_by_id[description_fragment_id].text == "NORMAL DELIVERY"
     assert fragments_by_id[date_fragment_id].parent_token_id == "token-6"

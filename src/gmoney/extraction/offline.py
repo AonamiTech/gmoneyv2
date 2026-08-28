@@ -2605,14 +2605,39 @@ def _promote_grounded_date_column(
 def _link_source_tables(
     tables: tuple[SourceTable, ...] | list[SourceTable],
     canonical_rows: tuple[CanonicalRow, ...] | list[CanonicalRow],
+    *,
+    token_lookup: dict[str, TokenManifestEntry] | None = None,
 ) -> tuple[SourceTable, ...]:
     """Link only strict, unique mutual-best source/canonical pairs."""
 
+    def lineage_roots(token_id: str) -> set[str]:
+        pending = [token_id]
+        roots: set[str] = set()
+        visited: set[str] = set()
+        while pending:
+            current = pending.pop()
+            if current in visited:
+                continue
+            visited.add(current)
+            token = (token_lookup or {}).get(current)
+            if token is None:
+                roots.add(current)
+                continue
+            parents = tuple(token.parent_token_ids) or (
+                (token.parent_token_id,) if token.parent_token_id else ()
+            )
+            if parents:
+                pending.extend(parents)
+            else:
+                roots.add(current)
+        return roots
+
     def evidence_ids(items: object) -> set[str]:
         return {
-            token_id
+            root
             for item in items or ()
             for token_id in getattr(item, "token_ids", ())
+            for root in lineage_roots(token_id)
         }
 
     def evidence_bounds(items: object) -> tuple[float, float, float, float] | None:
@@ -3246,6 +3271,37 @@ def _materialize_printed_cell_fragments(
                     and token_lookup[token_id].parent_token_id is None
                     and not token_lookup[token_id].parent_token_ids
                 )
+                existing_fragment = (
+                    token_lookup.get(parent_ids[0])
+                    if len(parent_ids) == 1
+                    else None
+                )
+                if (
+                    existing_fragment is not None
+                    and (existing_fragment.parent_token_id or existing_fragment.parent_token_ids)
+                    and existing_fragment.fragment_role == aligned_role
+                    and normalized(existing_fragment.text) == normalized(raw)
+                ):
+                    for parent_id in tuple(existing_fragment.parent_token_ids) or (
+                        (existing_fragment.parent_token_id,)
+                        if existing_fragment.parent_token_id
+                        else ()
+                    ):
+                        assignments[(source_row.id, aligned_role, parent_id)] = (
+                            existing_fragment.token_id
+                        )
+                    materialized_cells.append(
+                        cell.model_copy(
+                            update={
+                                "validation_flags": tuple(
+                                    flag
+                                    for flag in cell.validation_flags
+                                    if flag != "fragment_occurrence_ambiguous"
+                                )
+                            }
+                        )
+                    )
+                    continue
                 selected_spans: tuple[tuple[int, int], ...] | None = None
                 selected_parents: tuple[TokenManifestEntry, ...] = ()
                 fragment_polygon: Polygon | None = None
@@ -4011,6 +4067,61 @@ class PageExtractionUnit:
         return _stable_payload_digest(payload)
 
 
+def _prefix_recovery_page_units(
+    units: tuple[PageExtractionUnit, ...],
+    prefix: str,
+) -> tuple[PageExtractionUnit, ...]:
+    """Make recovery artifacts addressable without overwriting baseline files."""
+
+    def relative(value: str | None) -> str | None:
+        return str(Path(prefix) / value) if value else value
+
+    def diagnostic(payload: dict[str, Any]) -> dict[str, Any]:
+        output = deepcopy(payload)
+        if isinstance(output.get("crop_relative_path"), str):
+            output["crop_relative_path"] = relative(output["crop_relative_path"])
+        return output
+
+    output: list[PageExtractionUnit] = []
+    for unit in units:
+        token_manifest = tuple(
+            token.model_copy(
+                update={
+                    "artifact_relative_path": relative(token.artifact_relative_path),
+                    "source_artifact_relative_path": relative(
+                        token.source_artifact_relative_path
+                    ),
+                }
+            )
+            for token in unit.token_manifest
+        )
+        tokens_by_id = {token.token_id: token for token in token_manifest}
+        table_units = tuple(
+            replace(
+                table,
+                crop_relative_path=relative(table.crop_relative_path),
+                diagnostics=tuple(diagnostic(item) for item in table.diagnostics),
+                normalized_fragments=tuple(
+                    tokens_by_id.get(fragment.token_id, fragment)
+                    for fragment in table.normalized_fragments
+                ),
+            )
+            for table in unit.table_units
+        )
+        output.append(
+            replace(
+                unit,
+                page_asset=unit.page_asset.model_copy(
+                    update={"relative_path": relative(unit.page_asset.relative_path)}
+                ),
+                token_manifest=token_manifest,
+                table_units=table_units,
+                diagnostics=tuple(diagnostic(item) for item in unit.diagnostics),
+            )
+        )
+    return tuple(output)
+
+
 @dataclass(frozen=True)
 class ExtractionDraft:
     """Internal OCR draft projected only when a public result is requested."""
@@ -4046,12 +4157,21 @@ def _project_extraction_draft(draft: ExtractionDraft) -> dict[str, Any]:
     source_tables = tuple(
         table for unit in draft.page_units for table in unit.source_tables
     )
+    token_lookup = {
+        token.token_id: token
+        for unit in draft.page_units
+        for token in unit.token_manifest
+    }
     rows = _apply_document_role_policy(
         _deduplicate(
             [row for unit in draft.page_units for row in unit.canonical_rows]
         )
     )
-    source_tables = _link_source_tables(source_tables, rows)
+    source_tables = _link_source_tables(
+        source_tables,
+        rows,
+        token_lookup=token_lookup,
+    )
     canonical_by_id = {str(row.id): row for row in rows}
     source_tables = tuple(
         _promote_grounded_date_column(
@@ -4087,13 +4207,7 @@ def _project_extraction_draft(draft: ExtractionDraft) -> dict[str, Any]:
     raw_total_candidates = tuple(
         _raw_total_candidate(candidate, source_tables) for candidate in total_candidates
     )
-    token_manifest = tuple(
-        {
-            token.token_id: token
-            for unit in draft.page_units
-            for token in unit.token_manifest
-        }.values()
-    )
+    token_manifest = tuple(token_lookup.values())
     diagnostics = [
         deepcopy(item) for unit in draft.page_units for item in unit.diagnostics
     ]
@@ -6217,7 +6331,11 @@ class OfflineExtractor:
         rows = _apply_document_role_policy(_deduplicate(selected_rows))
         draft_source_tables = selected_source_tables
         draft_row_candidates = tuple(rows)
-        source_tables = _link_source_tables(selected_source_tables, rows)
+        source_tables = _link_source_tables(
+            selected_source_tables,
+            rows,
+            token_lookup=token_lookup,
+        )
         canonical_by_id = {str(row.id): row for row in rows}
         source_tables = tuple(
             _promote_grounded_date_column(
@@ -6617,9 +6735,10 @@ class OfflineExtractor:
         options.pop("allow_gemini", None)
         options.pop("baseline_draft", None)
         options.pop("recovery_targets", None)
+        recovery_prefix = "recovery"
         self.extract(
             source,
-            artifact_root,
+            artifact_root / recovery_prefix,
             progress,
             baseline_draft=draft,
             recovery_targets=recovery_targets,
@@ -6627,11 +6746,15 @@ class OfflineExtractor:
             _draft_sink=sink,
             **options,
         )
+        recovered_page_units = _prefix_recovery_page_units(
+            sink["page_units"],
+            recovery_prefix,
+        )
         candidate = ExtractionDraft(
             document_id=sink["document_id"],
             source_sha256=sink["source_sha256"],
             source_name=sink["source_name"],
-            page_units=sink["page_units"],
+            page_units=recovered_page_units,
             provider_usage=sink["provider_usage"],
             hospital=sink["hospital"],
             hospital_id=sink["hospital_id"],
