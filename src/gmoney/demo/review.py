@@ -611,6 +611,11 @@ def approval_blockers(
     store: JobStore, job_id: str, result: dict[str, Any], review: dict[str, Any]
 ) -> list[str]:
     blockers: list[str] = []
+    if (
+        result.get("output_version") != "offline_accuracy_spine_v5"
+        or not isinstance(result.get("semantic_validation"), dict)
+    ):
+        blockers.append("legacy_uncertified")
     rows = project_rows(result, review)
     active = [row for row in rows if row.get("review_disposition") != "rejected"]
     billable = [row for row in active if row.get("role") in ITEM_TOTAL_ROLES]

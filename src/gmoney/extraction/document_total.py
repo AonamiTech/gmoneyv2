@@ -529,7 +529,9 @@ def assign_document_total_contexts(
         identity = str((region or {}).get("table_id") or "page-summary")
         table_type = str((region or {}).get("table_type") or "")
         context = _normalize(candidate.local_context)
-        if table_type == "pharmacy" or any(
+        if table_type == "payment":
+            kind = "payment"
+        elif table_type == "pharmacy" or any(
             marker in context
             for marker in ("pharmacy", "medicine", "drug", "batch", "expiry", "mrp")
         ):
@@ -541,7 +543,9 @@ def assign_document_total_contexts(
             for marker in ("category summary", "package summary", "charge summary")
         ):
             kind = "category"
-        elif candidate.total.scope is DocumentTotalScope.SETTLEMENT:
+        elif candidate.total.scope is DocumentTotalScope.SETTLEMENT or any(
+            marker in context for marker in ("settlement", "claim approved", "tpa amount")
+        ):
             kind = "settlement"
         elif candidate.total.scope is DocumentTotalScope.PAYMENT:
             kind = "payment"
@@ -549,14 +553,30 @@ def assign_document_total_contexts(
             kind = "document_final"
         classified.append((candidate, identity, kind))
 
-    ordinals: dict[tuple[int, str, str], int] = {}
+    ordinal_state: dict[tuple[int, str, str], tuple[int, float, float]] = {}
     output: list[DocumentTotalCandidate] = []
     for candidate, identity, kind in classified:
         key = (candidate.total.page_number, identity, kind)
-        ordinal = ordinals.setdefault(key, 1)
+        points = candidate.total.evidence.polygon.points
+        top = min(point.y for point in points)
+        bottom = max(point.y for point in points)
+        height = max(1.0, bottom - top)
+        previous = ordinal_state.get(key)
+        if previous is None:
+            ordinal = 1
+        else:
+            previous_ordinal, previous_bottom, previous_height = previous
+            ordinal = previous_ordinal + int(
+                top - previous_bottom > max(80.0, previous_height * 4.0, height * 4.0)
+            )
+        ordinal_state[key] = (ordinal, bottom, height)
         scope = candidate.total.scope
         if kind in {"category", "pharmacy", "receipt"}:
             scope = DocumentTotalScope.SECTION
+        elif kind == "payment":
+            scope = DocumentTotalScope.PAYMENT
+        elif kind == "settlement":
+            scope = DocumentTotalScope.SETTLEMENT
         output.append(
             DocumentTotalCandidate(
                 total=candidate.total.model_copy(

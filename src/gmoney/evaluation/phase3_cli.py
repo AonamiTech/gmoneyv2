@@ -35,6 +35,7 @@ def run(
             for row in actual_payload
         )
         provider = actual_document.get("provider_usage", {})
+        aggregate_provider = provider.get("aggregate", provider)
         documents.append(
             Phase3Document(
                 document_id=str(entry["document_id"]),
@@ -45,7 +46,7 @@ def run(
                 actual=actual,
                 accepted_ungrounded_rows=ungrounded,
                 privacy_failures=int(entry.get("privacy_failures") or 0),
-                gemini_calls=int(provider.get("gemini_calls") or 0),
+                gemini_calls=int(aggregate_provider.get("gemini_calls") or 0),
                 ordinary_active=bool(entry.get("ordinary_active")),
             )
         )

@@ -243,6 +243,12 @@ def _public_state(state: dict[str, Any]) -> dict[str, Any]:
         )
     }
     public["hospital_name_source"] = "machine" if state.get("hospital_name") else None
+    public["certification_status"] = (
+        "legacy_uncertified"
+        if state.get("status") in {"complete", "needs_review"}
+        and not state.get("validation_status")
+        else state.get("validation_status")
+    )
     if state.get("status") in {"complete", "needs_review"}:
         try:
             hospital_override = (

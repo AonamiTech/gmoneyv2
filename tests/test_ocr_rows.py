@@ -1,3 +1,4 @@
+import json
 from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
@@ -13,6 +14,7 @@ from gmoney.contracts.extraction import (
     SourceCell,
     SourceColumn,
     TableType,
+    TokenManifestEntry,
 )
 from gmoney.extraction.canonicalize import canonicalize_rows
 from gmoney.extraction.date_context import service_date_from_context
@@ -23,10 +25,12 @@ from gmoney.extraction.ocr_rows import (
     set_header_aliases,
 )
 from gmoney.extraction.offline import (
+    _apply_fragment_ids_to_aligned_rows,
     _assess_no_table_page,
     _finalize_linked_service_dates,
     _finalize_linked_source_cells,
     _flag_possible_supporting_receipt_duplicates,
+    _materialize_printed_cell_fragments,
     _needs_full_page_financial_recovery,
     _populate_grounded_service_date_cell,
     _recover_grounded_service_dates,
@@ -137,6 +141,35 @@ def test_same_receipt_reference_with_incompatible_issuers_is_not_a_duplicate() -
 
     assert pairs == []
 
+    compatible = table.model_copy(
+        update={
+            "rows": tuple(
+                source_row.model_copy(
+                    update={
+                        "receipt_metadata": ReceiptSourceMetadata(
+                            issuer_raw="Alpha Hospital",
+                            issuer_normalized="alpha hospital",
+                            reference_raw="R-123",
+                            reference_normalized="r 123",
+                        )
+                    }
+                )
+                for source_row in table.rows
+            )
+        }
+    )
+    _, positive_pairs = _flag_possible_supporting_receipt_duplicates(
+        canonical,
+        (compatible,),
+    )
+
+    assert len(positive_pairs) == 1
+    assert all(
+        isinstance(row_id, str)
+        for row_id in positive_pairs[0]["canonical_row_ids"]
+    )
+    json.dumps(positive_pairs)
+
 
 def test_mutual_best_linking_does_not_let_early_weak_row_steal_match() -> None:
     reconstructed = reconstruct_ocr_rows(
@@ -179,6 +212,27 @@ def test_explicit_date_column_accepts_medicine_row_but_not_expiry_text() -> None
     assert service_date_from_context(
         "ExpDate 10/07/2026",
         column_label="ProductName",
+        description="Medicine batch ABC",
+    ) is None
+
+
+@pytest.mark.parametrize("printed_alias", ("Date", "Dt.", "DOS", "Service On"))
+def test_canonical_date_mapping_accepts_date_only_values_on_medicine_rows(
+    printed_alias: str,
+) -> None:
+    assert service_date_from_context(
+        "10/07/2026",
+        column_label=printed_alias,
+        canonical_field="service_date_raw",
+        description="Medicine batch ABC",
+    ) == ("10/07/2026", "2026-07-10")
+
+
+def test_canonical_date_mapping_does_not_accept_embedded_expiry_values() -> None:
+    assert service_date_from_context(
+        "Expiry 10/07/2026",
+        column_label="DOS",
+        canonical_field="service_date_raw",
         description="Medicine batch ABC",
     ) is None
 
@@ -1597,14 +1651,44 @@ def test_merged_date_and_description_in_date_lane_is_grounded_and_split() -> Non
     assert result.rows[0].field_token_ids["description"] == ("token-6",)
     assert result.rows[0].field_token_ids["service_date"] == ("token-6",)
 
+    token_lookup = {
+        item.token_id: TokenManifestEntry(
+            token_id=item.token_id,
+            page_number=item.page_number,
+            text=item.text,
+            polygon=item.polygon,
+            artifact_sha256=item.artifact_sha256,
+            artifact_relative_path="pages/page-1.png",
+            confidence=item.confidence,
+        )
+        for item in tokens
+    }
+    materialized_tables, fragments, assignments = _materialize_printed_cell_fragments(
+        result.source_tables,
+        token_lookup,
+    )
+    materialized_rows = _apply_fragment_ids_to_aligned_rows(
+        result.rows,
+        materialized_tables,
+        assignments,
+    )
+    date_fragment_id = materialized_rows[0].field_token_ids["service_date"][0]
+    description_fragment_id = materialized_rows[0].field_token_ids["description"][0]
+    assert date_fragment_id != description_fragment_id
+    fragments_by_id = {item.token_id: item for item in fragments}
+    assert fragments_by_id[date_fragment_id].text == "14/07/2026"
+    assert fragments_by_id[description_fragment_id].text == "NORMAL DELIVERY"
+    assert fragments_by_id[date_fragment_id].parent_token_id == "token-6"
+    assert fragments_by_id[description_fragment_id].parent_token_id == "token-6"
+
     canonical = canonicalize_rows(
         "d" * 64,
         1,
         "p1-t1",
         "a" * 64,
-        result.rows,
+        materialized_rows,
     )
-    linked = _link_source_tables(result.source_tables, canonical)
+    linked = _link_source_tables(materialized_tables, canonical)
     table = linked[0]
     assert table.rows[0].canonical_row_id == str(canonical[0].id)
     cells_by_field = {
@@ -1628,6 +1712,18 @@ def test_merged_date_and_description_in_date_lane_is_grounded_and_split() -> Non
     )
     assert cells_by_field["service_date_raw"].evidence
     assert cells_by_field["description"].evidence
+    assert cells_by_field["service_date_raw"].evidence[0].token_ids == (
+        date_fragment_id,
+    )
+    assert cells_by_field["description"].evidence[0].token_ids == (
+        description_fragment_id,
+    )
+    assert canonical[0].field_evidence["service_date"][0].token_ids == (
+        date_fragment_id,
+    )
+    assert canonical[0].field_evidence["description"][0].token_ids == (
+        description_fragment_id,
+    )
 
 
 def test_slanted_rows_do_not_shift_total_amount_into_prior_charge() -> None:
@@ -2560,6 +2656,46 @@ def test_standalone_financial_receipt_is_billable_and_requests_full_page_recover
     assert result.rows[0].candidate.section == "Supporting receipt"
     assert result.rows[0].candidate.amount == Decimal("1500.00")
     assert result.rows[0].candidate.source_route == "receipt_form"
+
+
+def test_generic_hospital_receipt_is_grounded_as_supporting_charge() -> None:
+    result = reconstruct_ocr_rows(
+        (
+            token(0, "Hospital Receipt", (100, 20, 500, 40)),
+            token(1, "Receipt No R-123", (100, 55, 350, 75)),
+            token(2, "Total Amount", (100, 90, 350, 110)),
+            token(3, "Rs. 1500", (800, 90, 950, 110)),
+        ),
+        page_number=1,
+        table_id="p1-t1",
+        box=(0, 0, 1000, 140),
+    )
+
+    assert len(result.rows) == 1
+    assert result.rows[0].candidate.role is RowRole.DETAIL
+    assert result.rows[0].candidate.request_no == "R-123"
+    assert result.rows[0].candidate.amount == Decimal("1500")
+    receipt_table = result.source_tables[0]
+    values = {cell.column_id: cell.raw_value for cell in receipt_table.rows[0].cells}
+    assert values["issuer"] == "Hospital"
+    assert values["reference"] == "R-123"
+    assert values["amount"] == "Rs. 1500"
+
+
+def test_bare_amount_received_form_remains_unresolved() -> None:
+    result = reconstruct_ocr_rows(
+        (
+            token(0, "Amount Received", (100, 30, 400, 50)),
+            token(1, "Rs. 1500", (800, 30, 950, 50)),
+        ),
+        page_number=1,
+        table_id="p1-t1",
+        box=(0, 0, 1000, 100),
+    )
+
+    assert len(result.rows) == 1
+    assert result.rows[0].candidate.role is RowRole.UNRESOLVED
+    assert result.diagnostics["financial_form_classification"] == "ambiguous_receipt"
 
 
 def test_merged_date_description_is_recovered_even_when_ocr_box_stays_in_date_lane() -> None:

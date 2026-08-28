@@ -1853,6 +1853,7 @@ def _prepare_source_table_financial_cells(table: SourceTable) -> SourceTable:
                 and service_date_from_context(
                     printed_date,
                     column_label=date_column.label,
+                    canonical_field="service_date_raw",
                     description=remainder,
                 )
                 is not None
@@ -2351,6 +2352,238 @@ def _consume_normalized_source_fragments(
             )
         )
     return tuple(output)
+
+
+def _grounded_receipt_form(
+    tokens: tuple[OcrToken, ...],
+    *,
+    original_by_id: dict[str, OcrToken],
+    page_number: int,
+    table_id: str,
+) -> tuple[AlignedLedgerRow, SourceTable, dict[str, object]] | None:
+    """Recognize a receipt from grounded form structure, not a phrase allowlist."""
+
+    ordered = tuple(sorted(tokens, key=lambda item: (_bounds(item)[1], _bounds(item)[0])))
+    normalized = " ".join(_normalize(token.text) for token in ordered)
+    has_receipt_title = any("receipt" in _normalize(token.text) for token in ordered)
+    has_received_label = any(
+        "amount received" in _normalize(token.text) for token in ordered
+    )
+    reference_tokens = tuple(
+        token
+        for token in ordered
+        if re.search(
+            r"\b(?:receipt|reference|ref)\s*(?:no|number|#)?\b",
+            token.text,
+            re.IGNORECASE,
+        )
+    )
+    amount_label_tokens = tuple(
+        token
+        for token in ordered
+        if re.search(
+            r"\b(?:total\s+amount|amount\s+received|amount|total)\b",
+            token.text,
+            re.IGNORECASE,
+        )
+    )
+    amount_tokens = tuple(
+        token
+        for token in ordered
+        if parse_decimal(token.text) is not None
+        and not DATE_SPAN.search(token.text)
+        and not re.search(r"(?:receipt|reference|ref)\s*(?:no|number|#)", token.text, re.I)
+    )
+    description_tokens = tuple(
+        token
+        for token in ordered
+        if token not in reference_tokens
+        and token not in amount_label_tokens
+        and token not in amount_tokens
+        and "receipt" not in _normalize(token.text)
+        and DATE_SPAN.search(token.text) is None
+        and any(character.isalpha() for character in token.text)
+    )
+    if (
+        not (has_receipt_title or has_received_label)
+        or not amount_tokens
+        or not (
+            amount_label_tokens
+            or (has_receipt_title and reference_tokens and description_tokens)
+        )
+    ):
+        return None
+    amount_token = max(
+        amount_tokens,
+        key=lambda token: (
+            bool(re.search(r"(?:₹|\brs\.?\b|\binr\b)", token.text, re.I)),
+            _bounds(token)[1],
+        ),
+    )
+    amount = parse_decimal(amount_token.text)
+    if amount is None:
+        return None
+    explicit_payment = bool(
+        re.search(
+            r"\b(?:mode\s+of\s+payment|payment\s+mode|paid\s+(?:by|against)|advance|deposit|refund|"
+            r"cash|card|upi|cheque|settlement)\b",
+            normalized,
+        )
+    )
+    reference_raw: str | None = None
+    reference_evidence: tuple[OcrToken, ...] = ()
+    for token in reference_tokens:
+        match = re.search(
+            r"\b(?:receipt|reference|ref)\s*(?:no|number|#)?\s*[:#.-]?\s*"
+            r"(?P<value>[a-z0-9][a-z0-9/-]{1,})",
+            token.text,
+            re.IGNORECASE,
+        )
+        if match:
+            reference_raw = match.group("value")
+            reference_evidence = (token,)
+            break
+    title_token = next(
+        (token for token in ordered if "receipt" in _normalize(token.text)),
+        ordered[0],
+    )
+    issuer_raw = (
+        re.sub(r"\breceipt\b", "", title_token.text, flags=re.I).strip(" :-")
+        if has_receipt_title
+        else ""
+    )
+    if has_receipt_title and not issuer_raw:
+        preceding = tuple(
+            token for token in ordered if _bounds(token)[1] < _bounds(title_token)[1]
+        )
+        if preceding:
+            issuer_raw = preceding[-1].text.strip()
+            title_token = preceding[-1]
+    date_token = next(
+        (
+            token
+            for token in ordered
+            if service_date_from_context(
+                token.text,
+                column_label="Date",
+                canonical_field="service_date_raw",
+            )
+            is not None
+        ),
+        None,
+    )
+    ambiguous = not reference_raw and not issuer_raw and not explicit_payment
+    role = RowRole.UNRESOLVED if ambiguous else (
+        RowRole.PAYMENT if explicit_payment else RowRole.DETAIL
+    )
+    description_token = min(
+        description_tokens,
+        key=lambda token: (
+            abs(_center_y(token) - _center_y(amount_token)),
+            abs(_center_x(token) - _center_x(amount_token)),
+        ),
+        default=title_token,
+    )
+    description = description_token.text.strip() or title_token.text.strip() or "Receipt"
+    field_tokens: dict[str, tuple[str, ...]] = {
+        "description": (description_token.token_id,),
+        "amount": (amount_token.token_id,),
+    }
+    if reference_raw:
+        field_tokens["request_no"] = tuple(
+            token.token_id for token in reference_evidence
+        )
+    service_date = date_token.text.strip() if date_token is not None else None
+    if date_token is not None:
+        field_tokens["service_date"] = (date_token.token_id,)
+    evidence_tokens = tuple(
+        dict.fromkeys(token_id for ids in field_tokens.values() for token_id in ids)
+    )
+    evidence_members = tuple(original_by_id[token_id] for token_id in evidence_tokens)
+    evidence_box = (
+        min(_bounds(token)[0] for token in evidence_members),
+        min(_bounds(token)[1] for token in evidence_members),
+        max(_bounds(token)[2] for token in evidence_members),
+        max(_bounds(token)[3] for token in evidence_members),
+    )
+    candidate = CandidateLedgerRow(
+        source_row=0,
+        role=role,
+        cells=tuple(token.text for token in ordered),
+        section="Supporting receipt" if role is RowRole.DETAIL else "Receipt",
+        description=description,
+        service_date=service_date,
+        request_no=reference_raw,
+        amount=amount,
+        table_type=TableType.PAYMENT if role is RowRole.PAYMENT else TableType.ITEM_LEDGER,
+        source_route="receipt_form",
+        validation_flags=("supporting_receipt_charge",) if role is RowRole.DETAIL else (),
+    )
+    aligned = AlignedLedgerRow(
+        candidate=candidate,
+        field_token_ids=field_tokens,
+        evidence_token_ids=evidence_tokens,
+        evidence_box=evidence_box,
+        grounding_ratio=1.0,
+        source_routes=("receipt_form",),
+    )
+    column_specs = (
+        ("issuer", "Issuer", None, issuer_raw, (title_token,)),
+        (
+            "reference",
+            "Receipt Reference",
+            "request_no",
+            reference_raw,
+            reference_evidence,
+        ),
+        ("date", "Date", "service_date_raw", service_date, (date_token,) if date_token else ()),
+        (
+            "description",
+            "Description",
+            "description",
+            description,
+            (description_token,),
+        ),
+        ("amount", "Amount", "net_amount", amount_token.text.strip(), (amount_token,)),
+    )
+    columns = tuple(
+        SourceColumn(
+            id=column_id,
+            label=label,
+            order=index,
+            canonical_field=canonical_field,
+            validation_flags=("synthetic_header",),
+        )
+        for index, (column_id, label, canonical_field, _raw, _tokens) in enumerate(
+            column_specs
+        )
+    )
+    cells = tuple(
+        SourceCell(
+            column_id=column_id,
+            raw_value=raw,
+            evidence=_source_evidence(tuple(cell_tokens), original_by_id, table_id),
+            validation_flags=() if raw else ("empty_cell",),
+        )
+        for column_id, _label, _canonical, raw, cell_tokens in column_specs
+    )
+    source_table = SourceTable(
+        id=f"{table_id}-receipt-s1",
+        page_number=page_number,
+        table_id=table_id,
+        table_type=candidate.table_type,
+        columns=columns,
+        rows=(SourceRow(id=f"{table_id}-receipt-s1-r1", order=0, cells=cells),),
+        validation_flags=("grounded_receipt_form",),
+    )
+    classification = "ambiguous_receipt" if ambiguous else (
+        "payment_receipt" if explicit_payment else "supporting_charge_receipt"
+    )
+    return aligned, source_table, {
+        "financial_form_suspected": True,
+        "financial_form_classification": classification,
+        "financial_form_classification_evidence": evidence_tokens,
+    }
 
 
 def _description_lane(
@@ -4851,22 +5084,8 @@ def reconstruct_ocr_rows(
                 quantity_derived_from_rate_amount = True
 
         normalized_description = _normalize(description)
-        billable_receipt_charge = bool(
-            any(
-                marker in normalized_description
-                for marker in (
-                    "charges towards",
-                    "charge towards",
-                    "blood collection",
-                    "blood component reservation charges",
-                )
-            )
-            and amount is not None
-        )
         if _is_metadata_description(description):
             role = RowRole.UNRESOLVED
-        elif billable_receipt_charge:
-            role = RowRole.DETAIL
         elif (
             table_type is TableType.PAYMENT
             or normalized_description
@@ -4902,8 +5121,6 @@ def reconstruct_ocr_rows(
             validation_flags.append("missing_printed_description")
         if quantity_derived_from_rate_amount:
             validation_flags.append("quantity_derived_from_rate_amount")
-        if billable_receipt_charge:
-            validation_flags.append("supporting_receipt_charge")
         if "quantity" in column_centers and values["quantity"] is None:
             validation_flags.append("missing_labeled_quantity")
         if "rate" in column_centers and values["rate"] is None:
@@ -4934,11 +5151,7 @@ def reconstruct_ocr_rows(
             source_row=source_row,
             role=role,
             cells=tuple(token.text for token in line.tokens),
-            section=(
-                "Supporting receipt"
-                if billable_receipt_charge
-                else structured_values.get("section") or current_section
-            ),
+            section=structured_values.get("section") or current_section,
             description=description,
             service_date=service_date,
             request_no=request_no,
@@ -4954,9 +5167,7 @@ def reconstruct_ocr_rows(
                 row_category(description, table_type)
                 or row_category(current_section or "", table_type)
             ),
-            source_route=(
-                "receipt_form" if billable_receipt_charge else "ocr_spatial_graph"
-            ),
+            source_route="ocr_spatial_graph",
             validation_flags=tuple(validation_flags),
         )
         append_aligned(
@@ -5032,6 +5243,22 @@ def reconstruct_ocr_rows(
         _prepare_source_table_financial_cells(table)
         for table in (*pre_header_source_tables, *source_tables)
     )
+    receipt_diagnostics: dict[str, object] = {}
+    receipt_form = _grounded_receipt_form(
+        scoped,
+        original_by_id=original_by_id,
+        page_number=page_number,
+        table_id=table_id,
+    )
+    existing_billable_ledger = bool(header_valid and "description" in column_centers)
+    if (
+        receipt_form is not None
+        and len(prepared_source_tables) <= 1
+        and not existing_billable_ledger
+    ):
+        receipt_row, receipt_table, receipt_diagnostics = receipt_form
+        aligned = [receipt_row]
+        prepared_source_tables = (receipt_table,)
     normalized_rows = _consume_normalized_source_fragments(
         tuple(aligned),
         prepared_source_tables,
@@ -5054,6 +5281,7 @@ def reconstruct_ocr_rows(
             "table_type": table_type.value,
             "column_centers": column_centers,
             "header_segments": 1 + len(repeated_header_indexes) if header_valid else 0,
+            **receipt_diagnostics,
         },
         source_tables=prepared_source_tables,
     )

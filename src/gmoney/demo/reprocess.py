@@ -1304,10 +1304,18 @@ def _prepare_source_group(
             representative.artifact_root,
             representative_stage / "artifacts",
         )
-    extracted_result = extractor.extract(
-        representative.source,
-        representative_stage / "artifacts",
-    )
+    draft = None
+    if hasattr(extractor, "extract_draft"):
+        draft = extractor.extract_draft(
+            representative.source,
+            representative_stage / "artifacts",
+        )
+        extracted_result = draft.result
+    else:
+        extracted_result = extractor.extract(
+            representative.source,
+            representative_stage / "artifacts",
+        )
     report = _staged_validation_report(
         representative.source,
         extracted_result,
@@ -1317,14 +1325,18 @@ def _prepare_source_group(
     recovery_attempted = False
     if report.recovery_targets:
         recovery_attempted = True
-        extracted_result = extractor.extract(
-            representative.source,
-            representative_stage / "artifacts",
-            recovery_targets=report.recovery_targets,
-            baseline_result=extracted_result,
-            allow_gemini=False,
-        )
-        if int((extracted_result.get("provider_usage") or {}).get("gemini_calls") or 0):
+        if draft is not None and hasattr(extractor, "recover_draft"):
+            draft = extractor.recover_draft(
+                representative.source,
+                representative_stage / "artifacts",
+                draft,
+                report.recovery_targets,
+            )
+            extracted_result = draft.result
+        else:
+            raise ValueError("targeted recovery requires an internal extraction draft")
+        recovery_usage = (extracted_result.get("provider_usage") or {}).get("recovery") or {}
+        if int(recovery_usage.get("gemini_calls") or 0):
             raise ValueError("targeted recovery invoked Gemini")
         report = _staged_validation_report(
             representative.source,

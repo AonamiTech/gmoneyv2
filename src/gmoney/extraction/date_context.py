@@ -47,6 +47,7 @@ def is_service_date_context(
     raw_value: object,
     *,
     column_label: object = None,
+    canonical_field: object = None,
     description: object = None,
 ) -> bool:
     context = normalized_date_context(column_label, raw_value, description)
@@ -59,18 +60,25 @@ def service_date_from_context(
     raw_value: object,
     *,
     column_label: object = None,
+    canonical_field: object = None,
     description: object = None,
 ) -> tuple[str, str] | None:
     raw = re.sub(r"\s+", " ", str(raw_value or "")).strip()
     normalized_label = normalized_date_context(column_label)
     direct = parse_service_date(raw)
-    if direct is not None and normalized_label in {
+    explicitly_mapped = str(canonical_field or "") in {
+        "service_date",
+        "service_date_raw",
+    }
+    if direct is not None and (explicitly_mapped or normalized_label in {
         "date",
         "date time",
+        "dos",
+        "dt",
         "service date",
         "service date time",
         "service dt",
-    }:
+    }):
         # A date-only value in an explicitly mapped service-date lane is local
         # evidence. Product words elsewhere in the row must not turn it into an
         # expiry/batch date; those markers still apply to embedded dates.
@@ -78,6 +86,7 @@ def service_date_from_context(
     if not raw or not is_service_date_context(
         raw,
         column_label=column_label,
+        canonical_field=canonical_field,
         description=description,
     ):
         return None

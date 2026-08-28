@@ -1566,7 +1566,7 @@ def completed_job(
         "validation_flags": [],
     }
     result: dict[str, object] = {
-        "output_version": "offline_accuracy_spine_v3",
+        "output_version": "offline_accuracy_spine_v5",
         "document_total_version": "document_total_v1",
         "document_total": {
             "total_version": "document_total_v1",
@@ -1601,6 +1601,11 @@ def completed_job(
         "rows": [row],
         "diagnostics": diagnostics or [],
         "provider_usage": {"gemini_calls": 0},
+        "semantic_validation": {
+            "validation_version": "extraction_validation_v5",
+            "status": "passed",
+            "issues": [],
+        },
     }
     (store.job_dir(job_id) / "result.json").write_text(json.dumps(result))
     store.update(

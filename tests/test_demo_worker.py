@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import multiprocessing
 import os
@@ -69,6 +70,50 @@ def _hold_inference_lock(root_value: str, sender: Connection) -> None:
         sender.send("entered")
         while True:
             time.sleep(1)
+
+
+def _publish_and_terminate(root_value: str, job_id: str, phase: str) -> None:
+    store = JobStore(Path(root_value))
+
+    def terminate(current: str) -> None:
+        if current == phase:
+            os._exit(73)
+
+    store._publication_checkpoint = terminate
+    store.publish_processing_outcome(
+        job_id,
+        {"rows": [{"id": "validated-row"}]},
+        status="complete",
+        row_count=1,
+        validation_status="passed",
+        validation_issue_count=0,
+        validation_issue_codes=[],
+    )
+
+
+def _maintenance_publish_and_terminate(
+    root_value: str,
+    job_id: str,
+    phase: str,
+    expected_result_sha256: str,
+) -> None:
+    store = JobStore(Path(root_value))
+
+    def terminate(current: str) -> None:
+        if current == phase:
+            os._exit(73)
+
+    store._publication_checkpoint = terminate
+    store.publish_maintenance_result(
+        job_id,
+        {"rows": [{"id": "maintenance-target"}]},
+        expected_result_sha256=expected_result_sha256,
+        status="complete",
+        row_count=1,
+        validation_status="passed",
+        validation_issue_count=0,
+        validation_issue_codes=[],
+    )
 
 
 def _run_gpu_job_then_wait(
@@ -1081,7 +1126,7 @@ def test_semantically_invalid_result_is_published_as_needs_review(
             should_abort: Any,
         ) -> dict[str, Any]:
             return {
-                "output_version": "offline_accuracy_spine_v3",
+                "output_version": "offline_accuracy_spine_v5",
                 "rows": [{"id": "machine-row"}],
                 "hospital": None,
             }
@@ -1133,28 +1178,43 @@ def test_reviewable_result_runs_exactly_one_scoped_recovery_pass(
     recovery_controls: list[tuple[bool, bool]] = []
 
     class RecoveringExtractor:
-        def extract(
+        class Draft:
+            def __init__(self, result: dict[str, Any]) -> None:
+                self.result = result
+
+        def extract_draft(
             self,
             source: Path,
             artifact_root: Path,
             progress: Any,
             *,
             should_abort: Any,
-            recovery_targets: tuple[tuple[int, str | None], ...] = (),
-            baseline_result: dict[str, Any] | None = None,
-            allow_gemini: bool = True,
-        ) -> dict[str, Any]:
-            calls.append(recovery_targets)
-            if recovery_targets:
-                recovery_controls.append(
-                    (baseline_result is not None, allow_gemini)
-                )
-            return {
-                "output_version": "offline_accuracy_spine_v3",
+        ) -> Draft:
+            calls.append(())
+            return self.Draft({
+                "output_version": "offline_accuracy_spine_v5",
                 "rows": [],
                 "hospital": None,
-                "provider_usage": {"gemini_calls": 0},
-            }
+                "provider_usage": {"recovery": {"gemini_calls": 0}},
+            })
+
+        def recover_draft(
+            self,
+            source: Path,
+            artifact_root: Path,
+            draft: Draft,
+            recovery_targets: tuple[tuple[int, str | None], ...],
+            progress: Any,
+            **options: Any,
+        ) -> Draft:
+            calls.append(recovery_targets)
+            recovery_controls.append((draft is not None, "allow_gemini" not in options))
+            return self.Draft({
+                "output_version": "offline_accuracy_spine_v5",
+                "rows": [],
+                "hospital": None,
+                "provider_usage": {"recovery": {"gemini_calls": 0}},
+            })
 
     issue = ValidationIssue(
         id="recoverable-issue",
@@ -1189,7 +1249,7 @@ def test_reviewable_result_runs_exactly_one_scoped_recovery_pass(
     )
 
     assert calls == [(), ((2, "p2-t3"),)]
-    assert recovery_controls == [(True, False)]
+    assert recovery_controls == [(True, True)]
     state = store.read(job_id)
     assert state["status"] == "complete"
     result = json.loads((store.job_dir(job_id) / "result.json").read_text())
@@ -1227,6 +1287,15 @@ def test_validated_publication_recovers_each_crash_boundary(
         )
 
     assert (store.job_dir(job_id) / ".publish-operation.json").is_file()
+    journal = json.loads(
+        (store.job_dir(job_id) / ".publish-operation.json").read_text()
+    )
+    assert journal["version"] == "job_publication_v2"
+    assert len(journal["base_state_sha256"]) == 64
+    assert len(journal["target_state_sha256"]) == 64
+    assert len(journal["target_result_sha256"]) == 64
+    assert journal["base_result_exists"] is False
+    assert journal["base_result_sha256"] is None
     recovered = JobStore(root)
     recovered.recover()
 
@@ -1234,6 +1303,40 @@ def test_validated_publication_recovers_each_crash_boundary(
     assert recovered.read(job_id)["row_count"] == 1
     assert recovered.read_result(job_id)["rows"][0]["id"] == "validated-row"
     assert not (recovered.job_dir(job_id) / ".publish-operation.json").exists()
+
+
+def test_abort_marker_cannot_bypass_live_state_digest_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = JobStore(tmp_path)
+    job_id = _create_worker_job(store, "abort-digest.pdf")
+    assert store.claim_queued(job_id) is not None
+
+    def crash(phase: str) -> None:
+        if phase == "journal_persisted":
+            raise RuntimeError("crash:journal_persisted")
+
+    monkeypatch.setattr(store, "_publication_checkpoint", crash)
+    with pytest.raises(RuntimeError, match="journal_persisted"):
+        store.publish_processing_outcome(
+            job_id,
+            {"rows": [{"id": "validated-row"}]},
+            status="complete",
+        )
+
+    directory = store.job_dir(job_id)
+    (directory / "state.json").write_text(
+        json.dumps({"status": "cancelling", "corrupted": True})
+    )
+    (directory / store.abort_marker_name).touch()
+
+    with pytest.raises(
+        JobTransactionError,
+        match="publication_live_state_digest_mismatch",
+    ):
+        JobStore(tmp_path).read(job_id)
+    assert (directory / ".publish-operation.json").is_file()
 
 
 @pytest.mark.parametrize(
@@ -1299,6 +1402,122 @@ def test_publication_crash_matrix_including_prejournal_orphans(
             *recovered._publication_stage_paths(recovered.job_dir(job_id)),
         )
     )
+
+
+@pytest.mark.parametrize(
+    ("phase", "expected_status"),
+    (
+        ("before_file_fsync:.publish-result.json", "queued"),
+        ("after_file_fsync:.publish-result.json", "queued"),
+        ("after_target_result_staged", "queued"),
+        ("before_file_fsync:.publish-state.json", "queued"),
+        ("after_file_fsync:.publish-state.json", "queued"),
+        ("before_file_fsync:.publish-base-state.json", "queued"),
+        ("after_file_fsync:.publish-base-state.json", "queued"),
+        ("after_base_state_staged", "queued"),
+        ("before_file_fsync:.publish-operation.json", "complete"),
+        ("after_file_fsync:.publish-operation.json", "complete"),
+        ("before_journal_directory_fsync", "complete"),
+        ("after_journal_directory_fsync", "complete"),
+        ("after_journal_staged", "complete"),
+        ("before_result_replace_directory_fsync", "complete"),
+        ("after_result_replace_directory_fsync", "complete"),
+        ("after_result_replaced", "complete"),
+        ("before_state_replace_directory_fsync", "complete"),
+        ("after_state_replace_directory_fsync", "complete"),
+        ("after_state_replaced", "complete"),
+        ("after_cleanup:.publish-base-state.json", "complete"),
+        ("before_cleanup_stage_directory_fsync", "complete"),
+        ("after_cleanup_stage_directory_fsync", "complete"),
+        ("before_cleanup:.publish-operation.json", "complete"),
+        ("before_cleanup_journal_directory_fsync", "complete"),
+        ("after_cleanup_journal_directory_fsync", "complete"),
+        ("after_cleanup:.publish-operation.json", "complete"),
+    ),
+)
+def test_publication_survives_real_process_termination(
+    tmp_path: Path,
+    phase: str,
+    expected_status: str,
+) -> None:
+    root = tmp_path / phase.replace(":", "-")
+    store = JobStore(root)
+    job_id = _create_worker_job(store, "subprocess-crash.pdf")
+    assert store.claim_queued(job_id) is not None
+    process = multiprocessing.get_context("spawn").Process(
+        target=_publish_and_terminate,
+        args=(str(root), job_id, phase),
+    )
+
+    process.start()
+    process.join(timeout=10)
+
+    assert process.exitcode == 73
+    recovered = JobStore(root)
+    recovered.recover()
+    assert recovered.read(job_id)["status"] == expected_status
+    if expected_status == "complete":
+        assert recovered.read_result(job_id)["rows"] == [{"id": "validated-row"}]
+    else:
+        assert not (recovered.job_dir(job_id) / "result.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("phase", "expected_row_id"),
+    (
+        ("before_file_fsync:.publish-base-result.json", "validated-row"),
+        ("after_file_fsync:.publish-base-result.json", "validated-row"),
+        ("after_base_result_staged", "validated-row"),
+        ("before_cleanup:.publish-base-result.json", "maintenance-target"),
+        ("after_cleanup:.publish-base-result.json", "maintenance-target"),
+        ("before_cleanup_stage_directory_fsync", "maintenance-target"),
+        ("after_cleanup_stage_directory_fsync", "maintenance-target"),
+    ),
+)
+def test_maintenance_publication_survives_real_process_termination(
+    tmp_path: Path,
+    phase: str,
+    expected_row_id: str,
+) -> None:
+    root = tmp_path / phase.replace(":", "-")
+    store = JobStore(root)
+    job_id = _create_worker_job(store, "maintenance-crash.pdf")
+    assert store.claim_queued(job_id) is not None
+    assert store.publish_processing_outcome(
+        job_id,
+        {"rows": [{"id": "validated-row"}]},
+        status="complete",
+        row_count=1,
+        validation_status="passed",
+        validation_issue_count=0,
+        validation_issue_codes=[],
+    )
+    result_path = store.job_dir(job_id) / "result.json"
+    expected_digest = hashlib.sha256(result_path.read_bytes()).hexdigest()
+    process = multiprocessing.get_context("spawn").Process(
+        target=_maintenance_publish_and_terminate,
+        args=(str(root), job_id, phase, expected_digest),
+    )
+
+    process.start()
+    process.join(timeout=10)
+
+    assert process.exitcode == 73
+    recovered = JobStore(root)
+    recovered.recover()
+    assert recovered.read(job_id)["status"] == "complete"
+    assert recovered.read_result(job_id)["rows"] == [{"id": expected_row_id}]
+
+
+def test_publication_rejects_symlinked_reserved_artifacts(tmp_path: Path) -> None:
+    store = JobStore(tmp_path)
+    job_id = _create_worker_job(store, "symlinked-journal.pdf")
+    target = tmp_path / "outside.json"
+    target.write_text("{}")
+    (store.job_dir(job_id) / ".publish-operation.json").symlink_to(target)
+
+    with pytest.raises(JobTransactionError, match="invalid_publication_journal"):
+        store.read(job_id)
 
 
 def test_malformed_publication_journal_fails_stable_reads_closed(

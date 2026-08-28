@@ -19,7 +19,6 @@ import pytest
 from gmoney.contracts.evidence import OcrToken, Point, Polygon
 from gmoney.demo import reprocess as reprocess_module
 from gmoney.demo.reprocess import (
-    _validate_result,
     apply_staged_jobs,
     reprocess_jobs,
     rollback_jobs,
@@ -34,6 +33,7 @@ from gmoney.extraction.validation import (
     ValidationReport,
     ValidationSeverity,
     ValidationStatus,
+    validate_extraction_result,
 )
 
 VISUAL_AUDIT_CHECKS = {
@@ -44,6 +44,205 @@ VISUAL_AUDIT_CHECKS = {
     "explicit_totals",
     "non_ledger_exclusion",
 }
+
+
+def _validate_fixture_result(
+    source: Path,
+    old_result: dict[str, Any],
+    new_result: dict[str, Any],
+    artifact_root: Path,
+    *,
+    validate: bool = True,
+) -> None:
+    """Upgrade compact validator fixtures to the production v5 grounding envelope."""
+    new_result["output_version"] = "offline_accuracy_spine_v5"
+    new_result.setdefault("document_total_version", "document_total_v3")
+    new_result.setdefault("document_totals_version", "document_totals_v2")
+    assets = {
+        int(asset["page_number"]): asset
+        for asset in new_result.get("page_assets", [])
+        if isinstance(asset, dict) and type(asset.get("page_number")) is int
+    }
+    for asset in assets.values():
+        asset.setdefault("document_sha256", new_result.get("source_sha256"))
+        asset.setdefault("dpi", 300)
+        asset.setdefault("renderer", "fixture")
+        asset.setdefault("renderer_version", "1")
+
+    def evidence_payloads(value: object):
+        if isinstance(value, dict):
+            if "token_ids" in value and "polygon" in value and "page_number" in value:
+                yield value
+            for nested in value.values():
+                yield from evidence_payloads(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                yield from evidence_payloads(nested)
+
+    manifest: dict[str, dict[str, Any]] = {}
+    seen_evidence_objects: set[int] = set()
+    token_owner_pages: dict[str, int] = {}
+    for item in evidence_payloads(new_result):
+        if id(item) in seen_evidence_objects:
+            continue
+        seen_evidence_objects.add(id(item))
+        page = int(item["page_number"])
+        rewritten = []
+        for token_id_value in item.get("token_ids", []):
+            token_id = str(token_id_value)
+            owner = token_owner_pages.setdefault(token_id, page)
+            rewritten.append(token_id if owner == page else f"p{page}:{token_id}")
+        item["token_ids"] = rewritten
+        asset = assets.get(page)
+        if asset is None:
+            continue
+        points = item["polygon"]["points"]
+        asset["width"] = max(
+            int(asset.get("width") or 0),
+            int(max(point["x"] for point in points)) + 1,
+        )
+        asset["height"] = max(
+            int(asset.get("height") or 0),
+            int(max(point["y"] for point in points)) + 1,
+        )
+        for token_id in rewritten:
+            manifest.setdefault(
+                token_id,
+                {
+                    "token_id": token_id,
+                    "page_number": page,
+                    "table_ids": [],
+                    "text": token_id,
+                    "polygon": item["polygon"],
+                    "artifact_sha256": item["artifact_sha256"],
+                    "artifact_relative_path": asset["relative_path"],
+                    "confidence": 1.0,
+                },
+            )
+    new_result["token_manifest"] = list(manifest.values())
+    token_text: dict[str, list[str]] = {}
+    for table in new_result.get("source_tables", []):
+        if not isinstance(table, dict):
+            continue
+        for row in table.get("rows", []):
+            if not isinstance(row, dict):
+                continue
+            for cell in row.get("cells", []):
+                if not isinstance(cell, dict) or not str(cell.get("raw_value") or "").strip():
+                    continue
+                for evidence in cell.get("evidence", []):
+                    for token_id in evidence.get("token_ids", []):
+                        token_text.setdefault(str(token_id), []).append(str(cell["raw_value"]))
+    canonical_values = {
+        "description": "description",
+        "service_date": "service_date_raw",
+        "request_no": "request_no",
+        "service_code": "service_code",
+        "hsn_code": "hsn_code",
+        "quantity": "quantity_raw",
+        "rate": "unit_price_raw",
+        "gross_amount": "gross_amount_raw",
+        "discount": "discount_raw",
+        "amount": "net_amount_raw",
+    }
+    for row_payload in new_result.get("rows", []):
+        if not isinstance(row_payload, dict):
+            continue
+        for evidence_field, evidence_items in row_payload.get("field_evidence", {}).items():
+            value = row_payload.get(canonical_values.get(evidence_field, evidence_field))
+            if value is None:
+                continue
+            for evidence in evidence_items:
+                for token_id in evidence.get("token_ids", []):
+                    if str(token_id) not in token_text:
+                        token_text[str(token_id)] = [str(value)]
+    for token in new_result["token_manifest"]:
+        values = token_text.get(str(token["token_id"]))
+        if values:
+            token["text"] = " ".join(dict.fromkeys(values))
+    new_result.setdefault("document_totals", [])
+    new_result.setdefault("receipt_duplicate_pairs", [])
+    new_result.setdefault(
+        "provider_usage",
+        {
+            "initial": {"gemini_calls": 0, "gemini_measured_cost_usd": "0"},
+            "recovery": {"gemini_calls": 0, "gemini_measured_cost_usd": "0"},
+            "aggregate": {"gemini_calls": 0, "gemini_measured_cost_usd": "0"},
+        },
+    )
+    new_result.setdefault(
+        "recovery",
+        {"attempted": False, "targets": [], "untargeted_units_sha256": None},
+    )
+    diagnostics = [
+        dict(item)
+        for item in new_result.get("diagnostics", [])
+        if isinstance(item, dict)
+    ]
+    for index, item in enumerate(diagnostics, start=1):
+        item.setdefault("diagnostic_id", f"fixture-diagnostic-{index}")
+        item.setdefault("diagnostic_kind", "table" if item.get("table_id") else "page")
+        if item.get("diagnostic_kind") == "table" and not item.get("source_table_id"):
+            matching = next(
+                (
+                    table
+                    for table in new_result.get("source_tables", [])
+                    if table.get("page_number") == item.get("page_number")
+                    and table.get("table_id") == item.get("table_id")
+                ),
+                None,
+            )
+            if matching is not None:
+                item["source_table_id"] = matching["id"]
+    page_kinds = {
+        int(item["page_number"])
+        for item in diagnostics
+        if item.get("diagnostic_kind") == "page" and item.get("page_number")
+    }
+    for page in assets:
+        if page not in page_kinds:
+            diagnostics.append(
+                {
+                    "diagnostic_id": f"p{page}-page-fixture",
+                    "diagnostic_kind": "page",
+                    "page_number": page,
+                    "page_classification": "financial",
+                }
+            )
+    table_kinds = {
+        (int(item["page_number"]), str(item.get("source_table_id")))
+        for item in diagnostics
+        if item.get("diagnostic_kind") == "table"
+        and item.get("page_number")
+        and item.get("source_table_id")
+    }
+    for table in new_result.get("source_tables", []):
+        identity = (int(table["page_number"]), str(table["id"]))
+        if identity not in table_kinds:
+            diagnostics.append(
+                {
+                    "diagnostic_id": f"p{identity[0]}-{identity[1]}-fixture",
+                    "diagnostic_kind": "table",
+                    "page_number": identity[0],
+                    "table_id": str(table["table_id"]),
+                    "source_table_id": identity[1],
+                }
+            )
+            table_kinds.add(identity)
+    new_result["diagnostics"] = diagnostics
+    if validate:
+        report = validate_extraction_result(source, new_result, artifact_root)
+        messages = [
+            issue.message[:1].lower() + issue.message[1:]
+            for issue in report.issues
+            if issue.severity in {ValidationSeverity.FATAL, ValidationSeverity.BLOCKING}
+        ]
+        if old_result.get("document_id") != new_result.get("document_id"):
+            messages.insert(0, "document identity changed")
+        if old_result.get("source_sha256") != new_result.get("source_sha256"):
+            messages.insert(0, "source identity changed")
+        if messages:
+            raise ValueError("; ".join(messages))
 
 
 def fixture_row_id(label: str) -> str:
@@ -93,11 +292,19 @@ def _run_default_gpu_stage_then_wait(
         ) -> dict[str, Any]:
             if fail:
                 raise RuntimeError("maintenance extraction failed")
-            return {
+            payload = {
                 **deepcopy(old_result),
                 "rows": deepcopy(new_rows),
                 "source_tables": source_tables(new_rows, page_sha),
             }
+            _validate_fixture_result(
+                source,
+                payload,
+                payload,
+                artifact_root,
+                validate=False,
+            )
+            return payload
 
     reprocess_module.OfflineExtractor = ProcessGpuExtractor
     try:
@@ -148,11 +355,19 @@ def _run_default_gpu_stage_then_fork_competing_stage(
             source: Path,
             artifact_root: Path,
         ) -> dict[str, Any]:
-            return {
+            payload = {
                 **deepcopy(old_result),
                 "rows": deepcopy(new_rows),
                 "source_tables": source_tables(new_rows, page_sha),
             }
+            _validate_fixture_result(
+                source,
+                payload,
+                payload,
+                artifact_root,
+                validate=False,
+            )
+            return payload
 
     reprocess_module.OfflineExtractor = ProcessGpuExtractor
     stage_reprocess_jobs(
@@ -206,11 +421,19 @@ def _run_default_gpu_stage_then_fork_survivor(
             source: Path,
             artifact_root: Path,
         ) -> dict[str, Any]:
-            return {
+            payload = {
                 **deepcopy(old_result),
                 "rows": deepcopy(new_rows),
                 "source_tables": source_tables(new_rows, page_sha),
             }
+            _validate_fixture_result(
+                source,
+                payload,
+                payload,
+                artifact_root,
+                validate=False,
+            )
+            return payload
 
     reprocess_module.OfflineExtractor = ProcessGpuExtractor
     stage_reprocess_jobs(
@@ -450,7 +673,15 @@ class FakeExtractor:
         assert source.is_file()
         assert (artifact_root / "pages" / "page-1.png").is_file()
         self.calls.append(source)
-        return json.loads(json.dumps(self.result))
+        payload = json.loads(json.dumps(self.result))
+        _validate_fixture_result(
+            source,
+            payload,
+            payload,
+            artifact_root,
+            validate=False,
+        )
+        return payload
 
 
 def write_passing_visual_audit(staging_root: Path) -> dict[str, Any]:
@@ -496,8 +727,8 @@ def test_reprocess_validation_requires_printed_tables_for_canonical_rows(
 ) -> None:
     store, job_id, old_result = setup_job(tmp_path)
 
-    with pytest.raises(ValueError, match="source tables"):
-        _validate_result(
+    with pytest.raises(ValueError, match="source_tables"):
+        _validate_fixture_result(
             store.job_dir(job_id) / "source.pdf",
             old_result,
             old_result,
@@ -519,7 +750,7 @@ def test_reprocess_validation_requires_exact_page_asset_numbers(
     }
 
     with pytest.raises(ValueError, match="page inventory"):
-        _validate_result(
+        _validate_fixture_result(
             store.job_dir(job_id) / "source.pdf",
             old_result,
             new_result,
@@ -544,7 +775,7 @@ def test_reprocess_validation_rejects_mapped_field_in_the_wrong_source_cell(
     }
 
     with pytest.raises(ValueError, match="net_amount.*source cell"):
-        _validate_result(
+        _validate_fixture_result(
             store.job_dir(job_id) / "source.pdf",
             old_result,
             new_result,
@@ -568,7 +799,7 @@ def test_reprocess_validation_requires_all_description_tokens_in_printed_cell(
     }
 
     with pytest.raises(ValueError, match="description evidence.*source cell"):
-        _validate_result(
+        _validate_fixture_result(
             store.job_dir(job_id) / "source.pdf",
             old_result,
             new_result,
@@ -637,7 +868,7 @@ def test_reprocess_validation_requires_exact_serial_grounding_for_blank_particul
         "rows": [item.model_dump(mode="json") for item in canonical],
         "source_tables": [item.model_dump(mode="json") for item in linked_tables],
     }
-    _validate_result(
+    _validate_fixture_result(
         store.job_dir(job_id) / "source.pdf",
         old_result,
         new_result,
@@ -649,7 +880,7 @@ def test_reprocess_validation_requires_exact_serial_grounding_for_blank_particul
     assert serial_cell["raw_value"] == "0."
     serial_cell["raw_value"] = "0)"
     with pytest.raises(ValueError, match="description.*missing printed value"):
-        _validate_result(
+        _validate_fixture_result(
             store.job_dir(job_id) / "source.pdf",
             old_result,
             mismatched_serial,
@@ -710,7 +941,7 @@ def test_reprocess_validation_compares_grounded_printed_time_by_canonical_date(
     }
 
     if accepted:
-        _validate_result(
+        _validate_fixture_result(
             store.job_dir(job_id) / "source.pdf",
             old_result,
             new_result,
@@ -718,7 +949,7 @@ def test_reprocess_validation_compares_grounded_printed_time_by_canonical_date(
         )
     else:
         with pytest.raises(ValueError, match="service_date_raw.*source cell"):
-            _validate_result(
+            _validate_fixture_result(
                 store.job_dir(job_id) / "source.pdf",
                 old_result,
                 new_result,
@@ -793,7 +1024,7 @@ def test_reprocess_validation_accepts_grounded_group_service_date(
         "source_tables": printed,
     }
 
-    _validate_result(
+    _validate_fixture_result(
         store.job_dir(job_id) / "source.pdf",
         old_result,
         new_result,
@@ -802,7 +1033,7 @@ def test_reprocess_validation_accepts_grounded_group_service_date(
 
     printed[0]["rows"][1]["cells"][0]["raw_value"] = "16/07/2026"
     with pytest.raises(ValueError, match="service_date_raw lacks matching"):
-        _validate_result(
+        _validate_fixture_result(
             store.job_dir(job_id) / "source.pdf",
             old_result,
             new_result,
@@ -869,7 +1100,7 @@ def test_reprocess_validation_accepts_grounded_recovered_unmapped_service_date(
         "source_tables": printed,
     }
 
-    _validate_result(
+    _validate_fixture_result(
         store.job_dir(job_id) / "source.pdf",
         old_result,
         new_result,
@@ -878,7 +1109,7 @@ def test_reprocess_validation_accepts_grounded_recovered_unmapped_service_date(
 
     printed[0]["rows"][0]["cells"][0]["raw_value"] = "16/07/2026"
     with pytest.raises(ValueError, match="service_date_raw"):
-        _validate_result(
+        _validate_fixture_result(
             store.job_dir(job_id) / "source.pdf",
             old_result,
             new_result,
@@ -921,7 +1152,7 @@ def test_reprocess_validation_rejects_printed_value_missing_from_canonical_row(
     }
 
     with pytest.raises(ValueError, match="quantity.*missing canonical value"):
-        _validate_result(
+        _validate_fixture_result(
             store.job_dir(job_id) / "source.pdf",
             old_result,
             new_result,
@@ -966,7 +1197,7 @@ def test_reprocess_validation_accepts_grounded_day_quantity(
         "source_tables": printed,
     }
 
-    _validate_result(
+    _validate_fixture_result(
         store.job_dir(job_id) / "source.pdf",
         old_result,
         new_result,
@@ -1053,7 +1284,7 @@ def test_reprocess_validation_accepts_only_proven_derived_quantity(
     }
 
     if accepted:
-        _validate_result(
+        _validate_fixture_result(
             store.job_dir(job_id) / "source.pdf",
             old_result,
             new_result,
@@ -1064,7 +1295,7 @@ def test_reprocess_validation_accepts_only_proven_derived_quantity(
             ValueError,
             match="quantity.*(?:source cell|printed value)",
         ):
-            _validate_result(
+            _validate_fixture_result(
                 store.job_dir(job_id) / "source.pdf",
                 old_result,
                 new_result,
@@ -1115,7 +1346,7 @@ def test_reprocess_validation_rejects_unlinked_printed_financial_total(
     }
 
     with pytest.raises(ValueError, match="unlinked source row.*financial"):
-        _validate_result(
+        _validate_fixture_result(
             store.job_dir(job_id) / "source.pdf",
             old_result,
             new_result,
@@ -1175,7 +1406,7 @@ def test_reprocess_validation_accepts_only_matching_section_subtotal(
     }
 
     if accepted:
-        _validate_result(
+        _validate_fixture_result(
             store.job_dir(job_id) / "source.pdf",
             old_result,
             new_result,
@@ -1183,7 +1414,7 @@ def test_reprocess_validation_accepts_only_matching_section_subtotal(
         )
     else:
         with pytest.raises(ValueError, match="unlinked source row.*financial"):
-            _validate_result(
+            _validate_fixture_result(
                 store.job_dir(job_id) / "source.pdf",
                 old_result,
                 new_result,
@@ -1260,7 +1491,7 @@ def test_labeled_subtotal_matches_grounded_section_heading(
     }
 
     if accepted:
-        _validate_result(
+        _validate_fixture_result(
             store.job_dir(job_id) / "source.pdf",
             old_result,
             new_result,
@@ -1268,7 +1499,7 @@ def test_labeled_subtotal_matches_grounded_section_heading(
         )
     else:
         with pytest.raises(ValueError, match="unlinked source row.*financial"):
-            _validate_result(
+            _validate_fixture_result(
                 store.job_dir(job_id) / "source.pdf",
                 old_result,
                 new_result,
@@ -1373,7 +1604,7 @@ def test_reprocess_validation_accepts_only_matching_internal_bill_total(
     }
 
     if accepted:
-        _validate_result(
+        _validate_fixture_result(
             store.job_dir(job_id) / "source.pdf",
             old_result,
             new_result,
@@ -1381,7 +1612,7 @@ def test_reprocess_validation_accepts_only_matching_internal_bill_total(
         )
     else:
         with pytest.raises(ValueError, match="unlinked source row.*financial"):
-            _validate_result(
+            _validate_fixture_result(
                 store.job_dir(job_id) / "source.pdf",
                 old_result,
                 new_result,
@@ -1508,7 +1739,7 @@ def test_internal_bill_total_can_continue_across_compatible_page_tables(
     }
 
     if accepted:
-        _validate_result(
+        _validate_fixture_result(
             store.job_dir(job_id) / "source.pdf",
             old_result,
             new_result,
@@ -1516,7 +1747,7 @@ def test_internal_bill_total_can_continue_across_compatible_page_tables(
         )
     else:
         with pytest.raises(ValueError, match="unlinked source row.*financial"):
-            _validate_result(
+            _validate_fixture_result(
                 store.job_dir(job_id) / "source.pdf",
                 old_result,
                 new_result,
@@ -1581,7 +1812,7 @@ def test_pharmacy_summary_requires_exact_positive_or_return_arithmetic(
     }
 
     if accepted:
-        _validate_result(
+        _validate_fixture_result(
             store.job_dir(job_id) / "source.pdf",
             old_result,
             new_result,
@@ -1589,7 +1820,7 @@ def test_pharmacy_summary_requires_exact_positive_or_return_arithmetic(
         )
     else:
         with pytest.raises(ValueError, match="unlinked source row.*financial"):
-            _validate_result(
+            _validate_fixture_result(
                 store.job_dir(job_id) / "source.pdf",
                 old_result,
                 new_result,
@@ -1660,7 +1891,7 @@ def test_separate_pharmacy_tables_validate_their_own_tail_summaries(
             }
         )
 
-    _validate_result(
+    _validate_fixture_result(
         store.job_dir(job_id) / "source.pdf",
         old_result,
         {
@@ -1775,7 +2006,7 @@ def test_internal_bill_total_spans_intervening_text_within_prior_row_envelope(
     }
 
     if accepted:
-        _validate_result(
+        _validate_fixture_result(
             store.job_dir(job_id) / "source.pdf",
             old_result,
             new_result,
@@ -1783,7 +2014,7 @@ def test_internal_bill_total_spans_intervening_text_within_prior_row_envelope(
         )
     else:
         with pytest.raises(ValueError, match="unlinked source row.*financial"):
-            _validate_result(
+            _validate_fixture_result(
                 store.job_dir(job_id) / "source.pdf",
                 old_result,
                 new_result,
@@ -1900,7 +2131,7 @@ def test_internal_bill_total_does_not_cross_an_unlinked_section_heading(
     }
 
     if accepted:
-        _validate_result(
+        _validate_fixture_result(
             store.job_dir(job_id) / "source.pdf",
             old_result,
             new_result,
@@ -1908,7 +2139,7 @@ def test_internal_bill_total_does_not_cross_an_unlinked_section_heading(
         )
     else:
         with pytest.raises(ValueError, match="unlinked source row.*financial"):
-            _validate_result(
+            _validate_fixture_result(
                 store.job_dir(job_id) / "source.pdf",
                 old_result,
                 new_result,
@@ -2059,7 +2290,7 @@ def test_internal_bill_total_ignores_non_section_structured_overlay_fragments(
     }
 
     if accepted:
-        _validate_result(
+        _validate_fixture_result(
             store.job_dir(job_id) / "source.pdf",
             old_result,
             new_result,
@@ -2067,7 +2298,7 @@ def test_internal_bill_total_ignores_non_section_structured_overlay_fragments(
         )
     else:
         with pytest.raises(ValueError, match="unlinked source row.*financial"):
-            _validate_result(
+            _validate_fixture_result(
                 store.job_dir(job_id) / "source.pdf",
                 old_result,
                 new_result,
@@ -2123,7 +2354,7 @@ def test_reprocess_validation_accepts_matching_total_across_header_segments(
         "source_tables": [first_segment, second_segment],
     }
 
-    _validate_result(
+    _validate_fixture_result(
         store.job_dir(job_id) / "source.pdf",
         old_result,
         new_result,
@@ -2211,7 +2442,7 @@ def test_reprocess_validation_only_accepts_matching_total_in_structured_lane(
     }
 
     if accepted:
-        _validate_result(
+        _validate_fixture_result(
             store.job_dir(job_id) / "source.pdf",
             old_result,
             new_result,
@@ -2219,7 +2450,7 @@ def test_reprocess_validation_only_accepts_matching_total_in_structured_lane(
         )
     else:
         with pytest.raises(ValueError, match="unlinked source row.*financial"):
-            _validate_result(
+            _validate_fixture_result(
                 store.job_dir(job_id) / "source.pdf",
                 old_result,
                 new_result,
@@ -2354,7 +2585,7 @@ def test_reprocess_validation_resets_subtotal_at_financial_boundary(
     }
 
     if accepted:
-        _validate_result(
+        _validate_fixture_result(
             store.job_dir(job_id) / "source.pdf",
             old_result,
             new_result,
@@ -2362,7 +2593,7 @@ def test_reprocess_validation_resets_subtotal_at_financial_boundary(
         )
     else:
         with pytest.raises(ValueError, match="unlinked source row.*financial"):
-            _validate_result(
+            _validate_fixture_result(
                 store.job_dir(job_id) / "source.pdf",
                 old_result,
                 new_result,
@@ -2530,7 +2761,7 @@ def test_reprocess_validation_accepts_verified_total_and_settlement_source_rows(
         "source_tables": printed,
     }
 
-    _validate_result(
+    _validate_fixture_result(
         store.job_dir(job_id) / "source.pdf",
         old_result,
         new_result,
@@ -2575,7 +2806,7 @@ def test_reprocess_validation_accepts_unique_repeated_grounded_summary(
         "source_tables": printed,
     }
 
-    _validate_result(
+    _validate_fixture_result(
         store.job_dir(job_id) / "source.pdf",
         old_result,
         new_result,
@@ -2711,7 +2942,7 @@ def test_reprocess_validation_accepts_only_exact_repeated_detail_summary(
     }
 
     if accepted:
-        _validate_result(
+        _validate_fixture_result(
             store.job_dir(job_id) / "source.pdf",
             old_result,
             new_result,
@@ -2719,7 +2950,7 @@ def test_reprocess_validation_accepts_only_exact_repeated_detail_summary(
         )
     else:
         with pytest.raises(ValueError, match="unlinked source row.*financial"):
-            _validate_result(
+            _validate_fixture_result(
                 store.job_dir(job_id) / "source.pdf",
                 old_result,
                 new_result,
@@ -2786,7 +3017,7 @@ def test_reprocess_validation_does_not_misclassify_billable_description_as_foote
     }
 
     with pytest.raises(ValueError, match="unlinked source row.*financial"):
-        _validate_result(
+        _validate_fixture_result(
             store.job_dir(job_id) / "source.pdf",
             old_result,
             new_result,
@@ -2979,7 +3210,7 @@ def test_reprocess_validation_only_accepts_unambiguous_settlement_rows(
     }
 
     if accepted:
-        _validate_result(
+        _validate_fixture_result(
             store.job_dir(job_id) / "source.pdf",
             old_result,
             new_result,
@@ -2987,7 +3218,7 @@ def test_reprocess_validation_only_accepts_unambiguous_settlement_rows(
         )
     else:
         with pytest.raises(ValueError, match="unlinked source row.*financial"):
-            _validate_result(
+            _validate_fixture_result(
                 store.job_dir(job_id) / "source.pdf",
                 old_result,
                 new_result,
@@ -3047,7 +3278,7 @@ def test_reprocess_validation_rejects_weak_one_word_summary_match(
     }
 
     with pytest.raises(ValueError, match="unlinked source row.*financial"):
-        _validate_result(
+        _validate_fixture_result(
             store.job_dir(job_id) / "source.pdf",
             old_result,
             new_result,
@@ -3090,7 +3321,7 @@ def test_reprocess_validation_allows_unlinked_non_ledger_text_without_amount(
         "source_tables": printed,
     }
 
-    _validate_result(
+    _validate_fixture_result(
         store.job_dir(job_id) / "source.pdf",
         old_result,
         new_result,
@@ -3793,13 +4024,21 @@ def test_default_gpu_stage_holds_shared_lock_for_every_source_extraction(
             assert not tracking_lock.closed
             events.append(("extract", source))
             source_sha = digest(source.read_bytes())
-            return {
+            payload = {
                 **deepcopy(first_old),
                 "source_sha256": source_sha,
                 "document_id": source_sha,
                 "rows": deepcopy(new_rows),
                 "source_tables": source_tables(new_rows, page_sha),
             }
+            _validate_fixture_result(
+                source,
+                payload,
+                payload,
+                artifact_root,
+                validate=False,
+            )
+            return payload
 
     monkeypatch.setattr(JobStore, "acquire_inference_lock", tracking_inference_lock)
     monkeypatch.setattr(
@@ -3863,11 +4102,19 @@ def test_repeated_default_gpu_stages_reuse_the_process_lifetime_lock(
             source: Path,
             artifact_root: Path,
         ) -> dict[str, Any]:
-            return {
+            payload = {
                 **deepcopy(old_result),
                 "rows": deepcopy(new_rows),
                 "source_tables": source_tables(new_rows, page_sha),
             }
+            _validate_fixture_result(
+                source,
+                payload,
+                payload,
+                artifact_root,
+                validate=False,
+            )
+            return payload
 
     monkeypatch.setattr(JobStore, "acquire_inference_lock", tracking_acquire)
     monkeypatch.setattr(reprocess_module, "OfflineExtractor", DefaultGpuExtractor)
@@ -4401,7 +4648,14 @@ def test_apply_atomically_claims_the_staged_payload_before_cutover(
 
     assert injected is False
     live_result = json.loads((store.job_dir(job_id) / "result.json").read_text())
-    assert live_result.get("diagnostics") == old_result["diagnostics"]
+    assert all(
+        item.get("changed_after_final_check") is not True
+        for item in live_result.get("diagnostics", [])
+    )
+    assert {item["diagnostic_kind"] for item in live_result["diagnostics"]} == {
+        "page",
+        "table",
+    }
 
 
 def test_apply_rejects_a_symlinked_staged_payload_root(tmp_path: Path) -> None:

@@ -11,11 +11,13 @@ from gmoney.contracts.extraction import (
     CanonicalRow,
     DocumentTotal,
     EvidenceRef,
+    ExtractionResultV5,
     PageType,
     ProviderCandidate,
     ReviewDisposition,
     RowRole,
     TableType,
+    TokenManifestEntry,
 )
 from gmoney.contracts.gold import GoldAnnotation, GoldRow
 from gmoney.contracts.phase3 import (
@@ -51,6 +53,7 @@ __all__ = [
     "DriftObservation",
     "DocumentTotal",
     "EvidenceRef",
+    "ExtractionResultV5",
     "GoldAnnotation",
     "GoldRow",
     "GeminiMode",
@@ -78,5 +81,6 @@ __all__ = [
     "RouteDecision",
     "TableRegion",
     "TableType",
+    "TokenManifestEntry",
     "TransformChain",
 ]

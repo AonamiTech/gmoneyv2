@@ -1308,15 +1308,17 @@ def test_crop_recovery_isolates_and_ranks_grounded_variants(
         box=(200, 300, 400, 400),
     )
 
-    recovered, attempts = extractor._recover_crop_ocr(
+    recovered, attempts, recovered_manifest = extractor._recover_crop_ocr(
         source=tmp_path / "bill.pdf",
         artifact_root=tmp_path,
         work=work,
         prior_schemas=(),
         page_artifact_sha256=page_artifact_sha256,
+        page_artifact_relative_path="pages/page-1.png",
         baseline=baseline,
         baseline_tokens=(),
     )
+    assert recovered_manifest
 
     assert recovered is not None
     assert recovered.rows[0].candidate.validation_flags == ()
@@ -1463,12 +1465,13 @@ def test_crop_recovery_uses_targeted_description_lane_for_grounded_financial_row
         box=(50, 80, 800, 300),
     )
 
-    recovered, attempts = extractor._recover_crop_ocr(
+    recovered, attempts, recovered_manifest = extractor._recover_crop_ocr(
         source=tmp_path / "bill.pdf",
         artifact_root=tmp_path,
         work=work,
         prior_schemas=(),
         page_artifact_sha256=page_artifact_sha256,
+        page_artifact_relative_path="pages/page-1.png",
         baseline=baseline,
         baseline_tokens=(
             _ocr_token(
@@ -1489,6 +1492,7 @@ def test_crop_recovery_uses_targeted_description_lane_for_grounded_financial_row
             ),
         ),
     )
+    assert recovered_manifest
 
     assert recovered is not None
     assert tuple(row.candidate.description for row in recovered.rows) == (
@@ -1618,15 +1622,17 @@ def test_crop_recovery_uses_800dpi_clahe_only_for_a_grounded_refund_sign(
         }
     )
 
-    recovered, attempts = extractor._recover_crop_ocr(
+    recovered, attempts, recovered_manifest = extractor._recover_crop_ocr(
         source=tmp_path / "bill.pdf",
         artifact_root=tmp_path,
         work=work,
         prior_schemas=(),
         page_artifact_sha256=page_artifact_sha256,
+        page_artifact_relative_path="pages/page-1.png",
         baseline=baseline,
         baseline_tokens=(baseline_amount_token,),
     )
+    assert recovered_manifest
 
     assert recovered is not None
     assert recovered.rows[0].candidate.amount == Decimal("-23.93")

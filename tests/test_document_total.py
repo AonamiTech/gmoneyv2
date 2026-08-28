@@ -2,6 +2,7 @@ from decimal import Decimal
 
 from gmoney.contracts.evidence import OcrToken, Point, Polygon
 from gmoney.extraction.document_total import (
+    assign_document_total_contexts,
     extract_document_total_candidates,
     select_document_total,
     select_document_totals,
@@ -200,3 +201,55 @@ def test_receipt_and_category_grand_totals_never_produce_a_primary() -> None:
         assert candidates[0].total.scope.value == "section"
         assert candidates[0].total.context_kind == expected_context
         assert select_document_total(candidates) is None
+
+
+def test_payment_table_grand_total_never_produces_a_primary() -> None:
+    candidates = extract_document_total_candidates(
+        (
+            token(0, "Grand Total", (100, 100, 300, 120)),
+            token(1, "1,000.00", (800, 100, 930, 120)),
+        )
+    )
+    classified = assign_document_total_contexts(
+        candidates,
+        [
+            {
+                "page_number": 1,
+                "table_id": "p1-payment",
+                "table_type": "payment",
+                "box": [50, 50, 980, 180],
+            }
+        ],
+    )
+
+    assert classified[0].total.context_kind == "payment"
+    assert classified[0].total.scope.value == "payment"
+    assert select_document_total(classified) is None
+
+
+def test_separated_summary_blocks_receive_distinct_context_ordinals() -> None:
+    candidates = extract_document_total_candidates(
+        (
+            token(0, "Net Bill Amount", (100, 100, 330, 120)),
+            token(1, "1,000.00", (800, 100, 930, 120)),
+            token(2, "Net Bill Amount", (100, 600, 330, 620)),
+            token(3, "1,200.00", (800, 600, 930, 620)),
+        )
+    )
+    classified = assign_document_total_contexts(
+        candidates,
+        [
+            {
+                "page_number": 1,
+                "table_id": "p1-t1",
+                "table_type": "item_ledger",
+                "box": [50, 50, 980, 680],
+            }
+        ],
+    )
+
+    assert [item.total.context_id for item in classified] == [
+        "p1:p1-t1:document_final:o1",
+        "p1:p1-t1:document_final:o2",
+    ]
+    assert select_document_total(classified) is None

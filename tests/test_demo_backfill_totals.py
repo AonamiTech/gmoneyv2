@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
+
+import fitz
 
 from gmoney.demo.backfill_totals import backfill_totals
 from gmoney.demo.store import JobStore
@@ -11,97 +14,128 @@ from gmoney.extraction.document_total import (
 )
 
 
-def completed_cached_job(root: Path) -> tuple[JobStore, str, Path]:
+def completed_job(
+    root: Path,
+    *,
+    output_version: str = "offline_accuracy_spine_v5",
+    status: str = "complete",
+) -> tuple[JobStore, str, Path]:
     store = JobStore(root)
     state = store.create("historic-bill.pdf")
     job_id = state["id"]
-    result = {
-        "output_version": "offline_accuracy_spine_v3",
-        "document_id": "d" * 64,
-        "pages": 1,
-        "page_assets": [
-            {
-                "page_number": 1,
-                "artifact_sha256": "a" * 64,
-                "width": 1000,
-                "height": 1400,
-                "relative_path": "pages/page-1.png",
-            }
-        ],
-        "rows": [],
-    }
+    source_path = store.job_dir(job_id) / "source.pdf"
+    document = fitz.open()
+    document.new_page(width=100, height=200)
+    document.save(source_path)
+    document.close()
+    source_sha = hashlib.sha256(source_path.read_bytes()).hexdigest()
+    page_path = store.job_dir(job_id) / "artifacts" / "pages" / "page-1.png"
+    page_path.parent.mkdir(parents=True)
+    page_path.write_bytes(b"page")
+    page_sha = hashlib.sha256(page_path.read_bytes()).hexdigest()
     result_path = store.job_dir(job_id) / "result.json"
-    result_path.write_text(json.dumps(result))
-    cache_path = store.job_dir(job_id) / "artifacts" / "inference" / "page-1.ocr.json"
-    cache_path.parent.mkdir(parents=True)
-    cache_path.write_text(
+    result_path.write_text(
         json.dumps(
             {
-                "artifact_sha256": "a" * 64,
-                "response": {
-                    "output": {
-                        "pages": [
-                            {
-                                "res": {
-                                    "rec_polys": [
-                                        [[100, 100], [340, 100], [340, 125], [100, 125]],
-                                        [[800, 100], [940, 100], [940, 125], [800, 125]],
-                                    ],
-                                    "rec_texts": ["Net Bill Amount", "1,234.50"],
-                                    "rec_scores": [0.99, 0.98],
-                                }
-                            }
-                        ]
+                "output_version": output_version,
+                "document_total_version": "old-total-version",
+                "document_totals_version": "old-totals-version",
+                "document_total": None,
+                "document_totals": [],
+                "document_id": source_sha,
+                "source_sha256": source_sha,
+                "source_name": "historic-bill.pdf",
+                "pages": 1,
+                "page_assets": [
+                    {
+                        "document_sha256": source_sha,
+                        "page_number": 1,
+                        "artifact_sha256": page_sha,
+                        "relative_path": "pages/page-1.png",
+                        "width": 100,
+                        "height": 200,
+                        "dpi": 300,
+                        "renderer": "test",
+                        "renderer_version": "1",
                     }
+                ],
+                "source_tables": [],
+                "token_manifest": [],
+                "rows": [],
+                "diagnostics": [
+                    {
+                        "diagnostic_id": "page-1",
+                        "diagnostic_kind": "page",
+                        "page_number": 1,
+                        "page_classification": "blank",
+                        "demonstrably_blank": True,
+                    }
+                ],
+                "provider_usage": {
+                    "initial": {"gemini_calls": 0, "gemini_measured_cost_usd": "0"},
+                    "recovery": {"gemini_calls": 0, "gemini_measured_cost_usd": "0"},
+                    "aggregate": {"gemini_calls": 0, "gemini_measured_cost_usd": "0"},
+                },
+                "recovery": {
+                    "attempted": False,
+                    "targets": [],
+                    "untargeted_units_sha256": None,
                 },
             }
         )
     )
-    store.update(job_id, status="complete", pages=1, page=1, row_count=0)
+    store.update(job_id, status=status, pages=1, page=1, row_count=0)
     return store, job_id, result_path
 
 
-def test_backfill_is_dry_by_default_atomic_and_idempotent(tmp_path: Path) -> None:
-    _, _, result_path = completed_cached_job(tmp_path)
+def test_backfill_is_dry_by_default_and_never_changes_live_results(
+    tmp_path: Path,
+) -> None:
+    _, _, result_path = completed_job(tmp_path)
     original = result_path.read_bytes()
 
-    dry_run = backfill_totals(root=tmp_path)
-    assert dry_run["would_update"] == 1
-    assert dry_run["updated"] == 0
-    assert result_path.read_bytes() == original
+    summary = backfill_totals(root=tmp_path)
 
-    applied = backfill_totals(root=tmp_path, apply=True)
-    assert applied["updated"] == 1
-    result = json.loads(result_path.read_text())
-    assert result["document_total_version"] == DOCUMENT_TOTAL_VERSION
-    assert result["document_totals_version"] == DOCUMENT_TOTALS_VERSION
-    assert result["document_total"]["amount"] == "1234.50"
-    assert result["document_totals"][0]["amount"] == "1234.50"
-
-    repeated = backfill_totals(root=tmp_path, apply=True)
-    assert repeated["already_current"] == 1
-    assert repeated["updated"] == 0
-
-
-def test_backfill_leaves_result_unchanged_when_cache_hash_differs(tmp_path: Path) -> None:
-    store, job_id, result_path = completed_cached_job(tmp_path)
-    original = result_path.read_bytes()
-    cache_path = store.job_dir(job_id) / "artifacts" / "inference" / "page-1.ocr.json"
-    envelope = json.loads(cache_path.read_text())
-    envelope["artifact_sha256"] = "b" * 64
-    cache_path.write_text(json.dumps(envelope))
-
-    summary = backfill_totals(root=tmp_path, apply=True)
-    assert summary["failed"] == 1
-    assert "hash differs" in summary["failures"][0]["error"]
+    assert summary["would_update"] == 1
+    assert summary["updated"] == 0
     assert result_path.read_bytes() == original
 
 
-def test_backfill_includes_needs_review_results(tmp_path: Path) -> None:
-    store, job_id, result_path = completed_cached_job(tmp_path)
-    store.update(job_id, status="needs_review")
+def test_apply_publishes_validated_totals_only_reprojection(
+    tmp_path: Path,
+) -> None:
+    store, job_id, result_path = completed_job(tmp_path)
 
     summary = backfill_totals(root=tmp_path, apply=True)
 
     assert summary["updated"] == 1
-    assert json.loads(result_path.read_text())["document_total"]["amount"] == "1234.50"
+    result = json.loads(result_path.read_text())
+    assert result["document_total_version"] == DOCUMENT_TOTAL_VERSION
+    assert result["document_totals_version"] == DOCUMENT_TOTALS_VERSION
+    assert result["semantic_validation"]["status"] == "passed"
+    assert store.read(job_id)["status"] == "complete"
+
+
+def test_legacy_results_require_full_reprocessing_and_remain_unchanged(
+    tmp_path: Path,
+) -> None:
+    _, _, result_path = completed_job(
+        tmp_path,
+        output_version="offline_accuracy_spine_v3",
+    )
+    original = result_path.read_bytes()
+
+    summary = backfill_totals(root=tmp_path, apply=True)
+
+    assert summary["failed"] == 1
+    assert summary["failures"][0]["error"] == "requires_full_reprocess"
+    assert summary["staged"] == 0
+    assert result_path.read_bytes() == original
+
+
+def test_backfill_includes_needs_review_results(tmp_path: Path) -> None:
+    _, _, _ = completed_job(tmp_path, status="needs_review")
+
+    summary = backfill_totals(root=tmp_path, apply=True)
+
+    assert summary["updated"] == 1

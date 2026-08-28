@@ -26,6 +26,7 @@ type Job = {
   hospital_confidence: number | null;
   hospital_name_source: "machine" | "reviewer" | null;
   validation_status?: "passed" | "needs_review" | "not_applicable" | null;
+  certification_status?: "passed" | "needs_review" | "legacy_uncertified" | null;
   validation_issue_count?: number | null;
   validation_issue_codes?: string[] | null;
   error: string | null;

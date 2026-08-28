@@ -84,12 +84,22 @@ def _extract_and_publish(
         if profile_snapshot is not None:
             extraction_options["profiles"] = profile_snapshot.profiles
             extraction_options["profile_registry_revision"] = profile_snapshot.revision
-        result = extractor.extract(
-            directory / "source.pdf",
-            directory / "artifacts",
-            progress,
-            **extraction_options,
-        )
+        draft = None
+        if hasattr(extractor, "extract_draft"):
+            draft = extractor.extract_draft(
+                directory / "source.pdf",
+                directory / "artifacts",
+                progress,
+                **extraction_options,
+            )
+            result = draft.result
+        else:
+            result = extractor.extract(
+                directory / "source.pdf",
+                directory / "artifacts",
+                progress,
+                **extraction_options,
+            )
     except ExtractionAborted:
         return None
     source = directory / "source.pdf"
@@ -98,18 +108,22 @@ def _extract_and_publish(
     if not report.fatal and report.recovery_targets:
         recovery_attempted = True
         try:
-            result = extractor.extract(
-                source,
-                directory / "artifacts",
-                progress,
-                **extraction_options,
-                recovery_targets=report.recovery_targets,
-                baseline_result=result,
-                allow_gemini=False,
-            )
+            if draft is not None and hasattr(extractor, "recover_draft"):
+                draft = extractor.recover_draft(
+                    source,
+                    directory / "artifacts",
+                    draft,
+                    report.recovery_targets,
+                    progress,
+                    **extraction_options,
+                )
+                result = draft.result
+            else:
+                raise RuntimeError("targeted_recovery_requires_extraction_draft")
         except ExtractionAborted:
             return None
-        if int((result.get("provider_usage") or {}).get("gemini_calls") or 0) != 0:
+        recovery_usage = (result.get("provider_usage") or {}).get("recovery") or {}
+        if int(recovery_usage.get("gemini_calls") or 0) != 0:
             raise RuntimeError("targeted_recovery_invoked_gemini")
         report = validate_extraction_result(source, result, directory / "artifacts")
     if report.fatal:
