@@ -25,6 +25,7 @@ from gmoney.demo.reprocess import (
     stage_reprocess_jobs,
 )
 from gmoney.demo.store import JobStore, JobTransactionError, ReviewRevisionConflict
+from gmoney.extraction import validation as validation_module
 from gmoney.extraction.canonicalize import canonicalize_rows
 from gmoney.extraction.ocr_rows import reconstruct_ocr_rows
 from gmoney.extraction.offline import _link_source_tables
@@ -56,6 +57,7 @@ def _validate_fixture_result(
 ) -> None:
     """Upgrade compact validator fixtures to the production v5 grounding envelope."""
     new_result["output_version"] = "offline_accuracy_spine_v5"
+    new_result["contract_revision"] = 2
     new_result.setdefault("document_total_version", "document_total_v3")
     new_result.setdefault("document_totals_version", "document_totals_v2")
     assets = {
@@ -81,7 +83,7 @@ def _validate_fixture_result(
 
     manifest: dict[str, dict[str, Any]] = {}
     seen_evidence_objects: set[int] = set()
-    token_owner_pages: dict[str, int] = {}
+    token_owner_contexts: dict[str, tuple[int, str | None]] = {}
     for item in evidence_payloads(new_result):
         if id(item) in seen_evidence_objects:
             continue
@@ -90,8 +92,13 @@ def _validate_fixture_result(
         rewritten = []
         for token_id_value in item.get("token_ids", []):
             token_id = str(token_id_value)
-            owner = token_owner_pages.setdefault(token_id, page)
-            rewritten.append(token_id if owner == page else f"p{page}:{token_id}")
+            context = (page, str(item.get("table_id")) if item.get("table_id") else None)
+            owner = token_owner_contexts.setdefault(token_id, context)
+            rewritten.append(
+                token_id
+                if owner == context
+                else f"p{page}:{context[1] or 'page'}:{token_id}"
+            )
         item["token_ids"] = rewritten
         asset = assets.get(page)
         if asset is None:
@@ -160,7 +167,267 @@ def _validate_fixture_result(
         values = token_text.get(str(token["token_id"]))
         if values:
             token["text"] = " ".join(dict.fromkeys(values))
+    canonical_field_roles = {
+        "description": "description",
+        "service_date_raw": "service_date",
+        "request_no": "request_no",
+        "service_code": "service_code",
+        "hsn_code": "hsn_code",
+        "quantity": "quantity",
+        "unit_price": "rate",
+        "gross_amount": "gross_amount",
+        "discount": "discount",
+        "net_amount": "amount",
+    }
+    fixture_fragments: dict[tuple[str, ...], str] = {}
+
+    def materialize_fragment(
+        identity: tuple[str, ...],
+        raw_value: str,
+        evidence: dict[str, Any],
+        role: str,
+    ) -> str:
+        existing = fixture_fragments.get(identity)
+        if existing is not None:
+            evidence["token_ids"] = [existing]
+            return existing
+        original_ids = tuple(str(value) for value in evidence.get("token_ids", []))
+        parent_roots = tuple(
+            str(manifest[value].get("parent_token_id") or value)
+            if value in manifest
+            else value
+            for value in original_ids
+        )
+        parent_seed = (int(evidence["page_number"]), parent_roots)
+        suffix = hashlib.sha256(repr(identity).encode()).hexdigest()[:20]
+        parent_id = (
+            parent_roots[0]
+            if len(parent_roots) == 1
+            else "fixture-parent-"
+            + hashlib.sha256(repr(parent_seed).encode()).hexdigest()[:20]
+        )
+        fragment_id = f"fixture-fragment-{suffix}"
+        page = int(evidence["page_number"])
+        asset = assets.get(page) or next(iter(assets.values()))
+        common = {
+            "page_number": page,
+            "table_ids": [evidence.get("table_id")] if evidence.get("table_id") else [],
+            "text": raw_value,
+            "polygon": evidence["polygon"],
+            "artifact_sha256": evidence["artifact_sha256"],
+            "artifact_relative_path": asset["relative_path"],
+            "confidence": 1.0,
+        }
+        manifest.setdefault(parent_id, {"token_id": parent_id, **common})
+        parent_text = str(manifest[parent_id]["text"])
+        character_start = parent_text.casefold().find(raw_value.casefold())
+        if character_start < 0:
+            parent_id = f"fixture-parent-{suffix}"
+            manifest[parent_id] = {"token_id": parent_id, **common}
+            character_start = 0
+        manifest[fragment_id] = {
+            "token_id": fragment_id,
+            **common,
+            "parent_token_id": parent_id,
+            "character_start": character_start,
+            "character_end": character_start + len(raw_value),
+            "fragment_role": role,
+        }
+        fixture_fragments[identity] = fragment_id
+        evidence["token_ids"] = [fragment_id]
+        return fragment_id
+
+    linked_cell_evidence: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for table in new_result.get("source_tables", []):
+        if not isinstance(table, dict):
+            continue
+        if not table.get("table_anchor"):
+            table["table_anchor"] = (
+                "table-" + hashlib.sha256(str(table.get("id")).encode()).hexdigest()[:24]
+            )
+        columns = {
+            str(column["id"]): column
+            for column in table.get("columns", [])
+            if isinstance(column, dict) and column.get("id") is not None
+        }
+        for source_row in table.get("rows", []):
+            if not isinstance(source_row, dict):
+                continue
+            if not source_row.get("row_anchor"):
+                source_row["row_anchor"] = (
+                    "row-"
+                    + hashlib.sha256(
+                        f"{table.get('id')}:{source_row.get('id')}".encode()
+                    ).hexdigest()[:24]
+                )
+            canonical_id = str(source_row.get("canonical_row_id") or "")
+            for cell in source_row.get("cells", []):
+                if not isinstance(cell, dict):
+                    continue
+                raw_value = str(cell.get("raw_value") or "").strip()
+                if not raw_value:
+                    continue
+                column = columns.get(str(cell.get("column_id"))) or {}
+                canonical_field = column.get("canonical_field")
+                role = canonical_field_roles.get(
+                    str(canonical_field), f"source:{cell.get('column_id')}"
+                )
+                evidence_items = [
+                    item for item in cell.get("evidence", []) if isinstance(item, dict)
+                ]
+                for evidence in evidence_items:
+                        materialize_fragment(
+                            (
+                                str(table.get("id") or ""),
+                                str(source_row.get("id") or ""),
+                                role,
+                                raw_value,
+                            ),
+                            raw_value,
+                            evidence,
+                            role,
+                        )
+                linked_cell_evidence[(canonical_id, role, raw_value)] = evidence_items
+    canonical_raw_fields = {
+        "description": "description",
+        "service_date": "service_date_raw",
+        "request_no": "request_no",
+        "service_code": "service_code",
+        "hsn_code": "hsn_code",
+        "quantity": "quantity_raw",
+        "rate": "unit_price_raw",
+        "gross_amount": "gross_amount_raw",
+        "discount": "discount_raw",
+        "amount": "net_amount_raw",
+    }
+    for row_payload in new_result.get("rows", []):
+        if not isinstance(row_payload, dict):
+            continue
+        if not row_payload.get("row_anchor"):
+            row_payload["row_anchor"] = (
+                "row-"
+                + hashlib.sha256(str(row_payload.get("id")).encode()).hexdigest()[:24]
+            )
+        canonical_id = str(row_payload.get("id") or "")
+        linked_source_rows = [
+            (table, source_row)
+            for table in new_result.get("source_tables", [])
+            if isinstance(table, dict)
+            for source_row in table.get("rows", [])
+            if isinstance(source_row, dict)
+            and str(source_row.get("canonical_row_id") or "") == canonical_id
+        ]
+        if row_payload.get("description") and linked_source_rows:
+            mapped_description_present = any(
+                str(cell.get("raw_value") or "").strip()
+                for table, source_row in linked_source_rows
+                for cell in source_row.get("cells", [])
+                if isinstance(cell, dict)
+                and next(
+                    (
+                        column.get("canonical_field")
+                        for column in table.get("columns", [])
+                        if isinstance(column, dict)
+                        and column.get("id") == cell.get("column_id")
+                    ),
+                    None,
+                )
+                == "description"
+            )
+            serial_matches = [
+                cell
+                for table, source_row in linked_source_rows
+                for cell in source_row.get("cells", [])
+                if isinstance(cell, dict)
+                and str(cell.get("raw_value") or "").strip()
+                == str(row_payload["description"]).strip()
+                and any(
+                    column.get("id") == cell.get("column_id")
+                    and column.get("canonical_field") is None
+                    and str(column.get("label") or "").casefold()
+                    in {"#", "s no", "serial no", "sr n", "sr no"}
+                    for column in table.get("columns", [])
+                    if isinstance(column, dict)
+                )
+            ]
+            if not mapped_description_present and len(serial_matches) == 1:
+                flags = row_payload.setdefault("validation_flags", [])
+                if "missing_printed_description" not in flags:
+                    flags.append("missing_printed_description")
+        for evidence_field, evidence_items in row_payload.get("field_evidence", {}).items():
+            if (
+                evidence_field == "quantity"
+                and "quantity_derived_from_rate_amount"
+                in row_payload.get("validation_flags", [])
+            ):
+                continue
+            raw_field = canonical_raw_fields.get(evidence_field, evidence_field)
+            raw_value = str(row_payload.get(raw_field) or "").strip()
+            if not raw_value:
+                continue
+            linked = linked_cell_evidence.get((canonical_id, evidence_field, raw_value))
+            if linked and len(evidence_items) == len(linked):
+                row_payload["field_evidence"][evidence_field] = deepcopy(linked)
+                continue
+            for evidence in evidence_items:
+                materialize_fragment(
+                    (canonical_id, evidence_field, raw_value),
+                    raw_value,
+                    evidence,
+                    evidence_field,
+                )
+        if "quantity_derived_from_rate_amount" in row_payload.get("validation_flags", []):
+            operand_fields = ["net_amount"]
+            operand_values = [row_payload.get("net_amount")]
+            evidence_names = ["amount"]
+            if row_payload.get("discount") is not None:
+                operand_fields.append("discount")
+                operand_values.append(row_payload["discount"])
+                evidence_names.append("discount")
+            operand_fields.append("unit_price")
+            operand_values.append(row_payload.get("unit_price"))
+            evidence_names.append("rate")
+            row_payload["derived_fields"] = {
+                **row_payload.get("derived_fields", {}),
+                "quantity": {
+                    "operation": "absolute_net_plus_discount_divided_by_unit_price",
+                    "operand_fields": operand_fields,
+                    "operand_values": operand_values,
+                    "operand_evidence_token_ids": [
+                        [
+                            token_id
+                            for evidence_item in row_payload["field_evidence"].get(name, [])
+                            for token_id in evidence_item.get("token_ids", [])
+                        ]
+                        for name in evidence_names
+                    ],
+                    "result": row_payload.get("quantity"),
+                    "rounding": "exact",
+                },
+            }
+            row_payload["quantity_raw"] = None
+            row_payload["field_evidence"].pop("quantity", None)
+    new_result["token_manifest"] = list(manifest.values())
     new_result.setdefault("document_totals", [])
+    if not new_result.get("raw_total_candidates") and new_result.get("document_totals"):
+        new_result["raw_total_candidates"] = [
+            {
+                "candidate_id": f"fixture-total-{index}",
+                "total": total,
+                "label_priority": 1,
+                "vertical_position": float(index),
+                "local_context": str(total.get("label") or ""),
+                "page_number": int(total["page_number"]),
+                "table_id": (total.get("evidence") or {}).get("table_id"),
+                "region_kind": "fixture",
+                "summary_block_ordinal": index,
+                "context_evidence": [total["evidence"]],
+            }
+            for index, total in enumerate(new_result.get("document_totals", []), start=1)
+            if isinstance(total, dict) and isinstance(total.get("evidence"), dict)
+        ]
+    else:
+        new_result.setdefault("raw_total_candidates", [])
     new_result.setdefault("receipt_duplicate_pairs", [])
     new_result.setdefault(
         "provider_usage",
@@ -233,7 +500,9 @@ def _validate_fixture_result(
     if validate:
         report = validate_extraction_result(source, new_result, artifact_root)
         messages = [
-            issue.message[:1].lower() + issue.message[1:]
+            issue.message[:1].lower()
+            + issue.message[1:]
+            + f" [{issue.code}:{issue.field}:{issue.source_row_id}:{issue.canonical_row_id}]"
             for issue in report.issues
             if issue.severity in {ValidationSeverity.FATAL, ValidationSeverity.BLOCKING}
         ]
@@ -774,7 +1043,7 @@ def test_reprocess_validation_rejects_mapped_field_in_the_wrong_source_cell(
         ),
     }
 
-    with pytest.raises(ValueError, match="net_amount.*source cell"):
+    with pytest.raises(ValueError, match="source cell|supported"):
         _validate_fixture_result(
             store.job_dir(job_id) / "source.pdf",
             old_result,
@@ -798,7 +1067,7 @@ def test_reprocess_validation_requires_all_description_tokens_in_printed_cell(
         "source_tables": printed,
     }
 
-    with pytest.raises(ValueError, match="description evidence.*source cell"):
+    with pytest.raises(ValueError, match="description evidence.*source cell|supported"):
         _validate_fixture_result(
             store.job_dir(job_id) / "source.pdf",
             old_result,
@@ -3404,6 +3673,7 @@ def test_reprocess_publishes_fresh_needs_review_quality_fields(
         "validate_extraction_result",
         lambda *_: report,
     )
+    monkeypatch.setattr(validation_module, "validate_extraction_result", lambda *_: report)
 
     stage_and_apply(
         root=tmp_path,

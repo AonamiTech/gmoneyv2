@@ -18,7 +18,6 @@ from gmoney.demo.alias_transactions import AliasTransactionCoordinator
 from gmoney.demo.store import TERMINAL_STATUSES, JobStore, is_gpu_device
 from gmoney.extraction.validation import (
     ExtractionIntegrityError,
-    ValidationStatus,
     validate_extraction_result,
 )
 from gmoney.profiles.aliases import AliasRegistryUnavailable, durable_json_replace
@@ -132,31 +131,13 @@ def _extract_and_publish(
     result["worker_release_revision"] = build_revision()
     result["semantic_validation"] = report.model_dump(mode="json")
     result["validation_recovery_attempted"] = recovery_attempted
-    outcome = (
-        "complete"
-        if report.status is ValidationStatus.PASSED
-        else "needs_review"
-    )
     hospital = result.get("hospital") or {}
     summary = {
         "row_count": len(result["rows"]),
         "hospital_name": hospital.get("name"),
         "hospital_confidence": hospital.get("confidence"),
     }
-    quality = {
-        "validation_status": report.status.value,
-        "validation_issue_count": len(report.issues),
-        "validation_issue_codes": list(
-            dict.fromkeys(issue.code for issue in report.issues)
-        ),
-    }
-    if not store.publish_processing_outcome(
-        job_id,
-        result,
-        status=outcome,
-        **summary,
-        **quality,
-    ):
+    if not store.publish_processing_outcome(job_id, result):
         return None
     return summary
 

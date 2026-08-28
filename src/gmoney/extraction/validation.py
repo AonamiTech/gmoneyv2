@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import unicodedata
 from collections import Counter
 from decimal import Decimal
 from enum import StrEnum
@@ -17,6 +18,7 @@ from gmoney.contracts.extraction import (
     CanonicalRow,
     DocumentTotal,
     ExtractionResultV5,
+    RawTotalCandidate,
     SourceTable,
     TokenManifestEntry,
 )
@@ -24,8 +26,9 @@ from gmoney.evaluation.corpus import sha256_file
 from gmoney.extraction.date_context import service_date_from_context
 from gmoney.extraction.typed_values import parse_decimal, parse_quantity, parse_service_date
 
-VALIDATION_VERSION = "extraction_validation_v5"
+VALIDATION_VERSION = "extraction_validation_v5_r2"
 SUPPORTED_OUTPUT_VERSION = "offline_accuracy_spine_v5"
+SUPPORTED_CONTRACT_REVISION = 2
 
 
 class ValidationSeverity(StrEnum):
@@ -65,6 +68,8 @@ class ValidationIssue(ContractModel):
     recovery_scope: RecoveryScope | None = None
     page_number: int | None = Field(default=None, ge=1)
     table_id: str | None = None
+    table_anchor: str | None = None
+    row_anchor: str | None = None
     source_row_id: str | None = None
     canonical_row_id: str | None = None
     field: str | None = None
@@ -258,6 +263,79 @@ def _evidence_token_texts(
     )
 
 
+def _token_lineage_roots(
+    token_id: str,
+    tokens: dict[str, TokenManifestEntry],
+) -> frozenset[str]:
+    """Return the original OCR-token roots for a typed fragment."""
+    pending = [token_id]
+    roots: set[str] = set()
+    visited: set[str] = set()
+    while pending:
+        current = pending.pop()
+        if current in visited:
+            continue
+        visited.add(current)
+        token = tokens.get(current)
+        if token is None:
+            roots.add(current)
+            continue
+        parents = tuple(token.parent_token_ids) or (
+            (token.parent_token_id,) if token.parent_token_id else ()
+        )
+        if parents:
+            pending.extend(parents)
+        else:
+            roots.add(current)
+    return frozenset(roots)
+
+
+def _evidence_has_shared_token_lineage(
+    left: object,
+    right: object,
+    tokens: dict[str, TokenManifestEntry],
+) -> bool:
+    left_ids = _evidence_ids(left)
+    right_ids = _evidence_ids(right)
+    if not left_ids or not right_ids:
+        return False
+    left_roots = {
+        root for token_id in left_ids for root in _token_lineage_roots(token_id, tokens)
+    }
+    right_roots = {
+        root for token_id in right_ids for root in _token_lineage_roots(token_id, tokens)
+    }
+    return bool(left_roots and left_roots == right_roots)
+
+
+def _evidence_is_exact_typed_fragment(
+    evidence: object,
+    tokens: dict[str, TokenManifestEntry],
+    field: str | None,
+    *,
+    source_column_id: str | None = None,
+) -> bool:
+    token_ids = tuple(
+        token_id
+        for item in evidence or ()
+        for token_id in getattr(item, "token_ids", ())
+    )
+    if len(token_ids) != 1 or token_ids[0] not in tokens:
+        return False
+    token = tokens[token_ids[0]]
+    if not (token.parent_token_id or token.parent_token_ids):
+        return False
+    expected = {
+        "service_date_raw": "service_date",
+        "service_date_iso": "service_date",
+        "unit_price": "rate",
+        "net_amount": "amount",
+    }.get(field or "", field)
+    if expected is None and source_column_id is not None:
+        expected = f"source:{source_column_id}"
+    return bool(expected and token.fragment_role == expected)
+
+
 def _token_text_supports_value(
     field: str | None,
     value: object,
@@ -269,7 +347,19 @@ def _token_text_supports_value(
         return True
     if not texts:
         return False
-    joined = " ".join(texts)
+    # Published field evidence must resolve to one purpose-built fragment.  A
+    # bag of OCR tokens makes it possible for a field to borrow a substring or
+    # one number from unrelated text in the same token.
+    if len(texts) != 1:
+        return False
+    observed_text = re.sub(
+        r"\s+", " ", unicodedata.normalize("NFKC", texts[0])
+    ).strip().casefold()
+    expected_text = re.sub(
+        r"\s+", " ", unicodedata.normalize("NFKC", str(value))
+    ).strip().casefold()
+    if expected_text == observed_text:
+        return True
     if field in {
         "amount",
         "net_amount",
@@ -280,20 +370,24 @@ def _token_text_supports_value(
         "quantity",
     }:
         expected = parse_quantity(str(value)) if field == "quantity" else parse_decimal(str(value))
-        observed: set[Decimal] = set()
-        for text in (*texts, joined):
-            candidates = (text, *re.findall(r"[-+()]?\d[\d,]*(?:\.\d+)?[)]?", text))
-            for candidate in candidates:
-                parsed = (
-                    parse_quantity(candidate)
-                    if field == "quantity"
-                    else parse_decimal(candidate)
-                )
-                if parsed is not None:
-                    observed.add(parsed)
+        numeric_lexemes = re.findall(
+            r"[-+]?(?:\(\s*)?\d[\d,]*(?:\.\d+)?(?:\s*\))?",
+            observed_text,
+        )
+        if len(numeric_lexemes) != 1:
+            return False
+        residue = observed_text.replace(numeric_lexemes[0], "", 1)
+        residue = re.sub(r"(?:₹|\brs\.?\b|\binr\b|\s)", "", residue)
+        if residue:
+            return False
+        observed = (
+            parse_quantity(numeric_lexemes[0])
+            if field == "quantity"
+            else parse_decimal(numeric_lexemes[0])
+        )
         if expected is None:
-            return _normalized(value) in _normalized(joined)
-        return expected in observed
+            return expected_text == observed_text
+        return observed == expected
     if field in {"service_date", "service_date_raw", "service_date_iso"}:
         expected_context = service_date_from_context(
             value,
@@ -307,28 +401,15 @@ def _token_text_supports_value(
             else parse_service_date(str(value))
         )
         if expected is None:
-            return _normalized(value) in _normalized(joined)
-        return any(
-            (
-                parsed := service_date_from_context(
-                    text,
-                    column_label="Date",
-                    canonical_field="service_date_raw",
-                    description=description,
-                )
-            )
-            is not None
-            and parsed[1] == expected
-            for text in (*texts, joined)
+            return expected_text == observed_text
+        parsed = service_date_from_context(
+            texts[0],
+            column_label="Date",
+            canonical_field="service_date_raw",
+            description=description,
         )
-    expected_text = _normalized(value)
-    observed_text = _normalized(joined)
-    if field in {"request_no", "service_code", "hsn_code"}:
-        return (
-            expected_text in {_normalized(text) for text in texts}
-            or expected_text == observed_text
-        )
-    return bool(expected_text) and expected_text in observed_text
+        return expected_text == observed_text and parsed is not None and parsed[1] == expected
+    return bool(expected_text) and expected_text == observed_text
 
 
 def _issue(
@@ -340,6 +421,8 @@ def _issue(
     recovery_scope: RecoveryScope | None = None,
     page_number: int | None = None,
     table_id: str | None = None,
+    table_anchor: str | None = None,
+    row_anchor: str | None = None,
     source_row_id: str | None = None,
     canonical_row_id: str | None = None,
     field: str | None = None,
@@ -383,8 +466,11 @@ def _issue(
         recovery_scope = RecoveryScope.PAGE
     identity = {
         "code": code,
+        "severity": severity,
         "page_number": page_number,
         "table_id": table_id,
+        "table_anchor": table_anchor,
+        "row_anchor": row_anchor,
         "source_row_id": source_row_id,
         "canonical_row_id": canonical_row_id,
         "field": field,
@@ -405,6 +491,8 @@ def _issue(
         recovery_scope=recovery_scope,
         page_number=page_number,
         table_id=table_id,
+        table_anchor=table_anchor,
+        row_anchor=row_anchor,
         source_row_id=source_row_id,
         canonical_row_id=canonical_row_id,
         field=field,
@@ -438,6 +526,55 @@ def _report(issues: list[ValidationIssue]) -> ValidationReport:
         )
     )
     return ValidationReport(status=status, issues=ordered)
+
+
+def _attach_stable_issue_anchors(
+    issues: list[ValidationIssue],
+    tables: tuple[SourceTable, ...],
+    canonical: dict[str, CanonicalRow],
+) -> list[ValidationIssue]:
+    table_lookup = {
+        (table.page_number, table.table_id): table for table in tables
+    }
+    source_lookup = {
+        source_row.id: (table, source_row)
+        for table in tables
+        for source_row in table.rows
+    }
+    anchored: list[ValidationIssue] = []
+    for issue in issues:
+        table = table_lookup.get((issue.page_number, issue.table_id))
+        source = source_lookup.get(issue.source_row_id or "")
+        canonical_row = canonical.get(issue.canonical_row_id or "")
+        table_anchor = (
+            issue.table_anchor
+            or (source[0].table_anchor if source else None)
+            or (table.table_anchor if table else None)
+        )
+        row_anchor = (
+            issue.row_anchor
+            or (source[1].row_anchor if source else None)
+            or (canonical_row.row_anchor if canonical_row else None)
+        )
+        anchored.append(
+            _issue(
+                issue.code,
+                issue.severity,
+                issue.message,
+                category=issue.category,
+                recovery_scope=issue.recovery_scope,
+                page_number=issue.page_number,
+                table_id=issue.table_id,
+                table_anchor=table_anchor,
+                row_anchor=row_anchor,
+                source_row_id=issue.source_row_id,
+                canonical_row_id=issue.canonical_row_id,
+                field=issue.field,
+                related_source_row_ids=issue.related_source_row_ids,
+                related_canonical_row_ids=issue.related_canonical_row_ids,
+            )
+        )
+    return anchored
 
 
 def _contract_error_message(error: BaseException) -> str:
@@ -1273,6 +1410,30 @@ def _validate_totals(
     assets: dict[int, dict[str, Any]],
     tokens: dict[str, TokenManifestEntry],
 ) -> None:
+    raw_payloads = result.get("raw_total_candidates")
+    raw_candidates: list[RawTotalCandidate] = []
+    if not isinstance(raw_payloads, list):
+        issues.append(
+            _issue(
+                "raw_total_candidates_contract_invalid",
+                ValidationSeverity.FATAL,
+                "Raw total candidates are not a list",
+                field="raw_total_candidates",
+            )
+        )
+        raw_payloads = []
+    for index, payload in enumerate(raw_payloads):
+        try:
+            raw_candidates.append(RawTotalCandidate.model_validate(payload))
+        except (ValidationError, TypeError, AttributeError) as error:
+            issues.append(
+                _issue(
+                    "raw_total_candidate_invalid",
+                    ValidationSeverity.FATAL,
+                    f"Raw total candidate {index} is invalid: {_contract_error_message(error)}",
+                    field="raw_total_candidates",
+                )
+            )
     totals_payload = result.get("document_totals")
     if not isinstance(totals_payload, list):
         issues.append(
@@ -1322,6 +1483,17 @@ def _validate_totals(
             table_id=total.evidence.table_id,
             field="document_totals",
         )
+        if not any(candidate.total == total for candidate in raw_candidates):
+            issues.append(
+                _issue(
+                    "selected_total_missing_raw_candidate",
+                    ValidationSeverity.FATAL,
+                    "Selected total is not derived from a published raw candidate",
+                    page_number=total.page_number,
+                    table_id=total.evidence.table_id,
+                    field="document_totals",
+                )
+            )
     primary = result.get("document_total")
     if primary is not None and not isinstance(primary, dict):
         issues.append(
@@ -1712,18 +1884,44 @@ def _validate_extraction_result(
                 continue
         token_manifest[token.token_id] = token
     for token in tuple(token_manifest.values()):
-        if token.parent_token_id is None:
-            continue
-        parent = token_manifest.get(token.parent_token_id)
-        if (
-            parent is None
-            or token.page_number != parent.page_number
-            or token.artifact_sha256 != parent.artifact_sha256
-            or token.character_start is None
-            or token.character_end is None
-            or token.character_end > len(parent.text)
-            or parent.text[token.character_start : token.character_end] != token.text
-        ):
+        fragment_valid = True
+        if token.parent_token_id is not None:
+            parent = token_manifest.get(token.parent_token_id)
+            fragment_valid = bool(
+                parent is not None
+                and token.page_number == parent.page_number
+                and token.artifact_sha256 == parent.artifact_sha256
+                and token.character_start is not None
+                and token.character_end is not None
+                and token.character_end <= len(parent.text)
+                and parent.text[token.character_start : token.character_end] == token.text
+            )
+        elif token.parent_token_ids:
+            parents = tuple(token_manifest.get(token_id) for token_id in token.parent_token_ids)
+            fragment_valid = bool(
+                all(parent is not None for parent in parents)
+                and all(parent.page_number == token.page_number for parent in parents if parent)
+                and all(
+                    end <= len(parent.text)
+                    for parent, (start, end) in zip(
+                        parents, token.parent_character_spans, strict=True
+                    )
+                    if parent is not None
+                )
+                and re.sub(
+                    r"\s+",
+                    " ",
+                    " ".join(
+                        parent.text[start:end]
+                        for parent, (start, end) in zip(
+                            parents, token.parent_character_spans, strict=True
+                        )
+                        if parent is not None
+                    ),
+                ).strip().casefold()
+                == re.sub(r"\s+", " ", token.text).strip().casefold()
+            )
+        if not fragment_valid:
             issues.append(
                 _issue(
                     "token_fragment_invalid",
@@ -1781,6 +1979,83 @@ def _validate_extraction_result(
             )
             continue
         canonical[row_id] = row
+        if not row.row_anchor:
+            issues.append(
+                _issue(
+                    "canonical_row_anchor_missing",
+                    ValidationSeverity.FATAL,
+                    "Canonical row lacks a stable geometry anchor",
+                    page_number=row.page_number,
+                    table_id=row.table_id,
+                    canonical_row_id=row_id,
+                    field="row_anchor",
+                )
+            )
+        derived_quantity = "quantity_derived_from_rate_amount" in row.validation_flags
+        provenance = row.derived_fields.get("quantity")
+        if derived_quantity:
+            expected_fields = ["net_amount"]
+            expected_values: list[Decimal] = [row.net_amount] if row.net_amount is not None else []
+            expected_evidence = ["amount"]
+            if row.discount is not None:
+                expected_fields.append("discount")
+                expected_values.append(row.discount)
+                expected_evidence.append("discount")
+            expected_fields.append("unit_price")
+            if row.unit_price is not None:
+                expected_values.append(row.unit_price)
+            expected_evidence.append("rate")
+            provenance_valid = bool(
+                provenance is not None
+                and row.quantity is not None
+                and row.quantity_raw is None
+                and "quantity" not in row.field_evidence
+                and row.net_amount is not None
+                and row.unit_price is not None
+                and row.unit_price > 0
+                and tuple(expected_fields) == provenance.operand_fields
+                and tuple(expected_values) == provenance.operand_values
+                and provenance.result == row.quantity
+                and (abs(row.net_amount) + (row.discount or Decimal("0")))
+                / row.unit_price
+                == row.quantity
+                and all(
+                    tuple(
+                        token_id
+                        for evidence in row.field_evidence.get(evidence_name, ())
+                        for token_id in evidence.token_ids
+                    )
+                    == provenance.operand_evidence_token_ids[index]
+                    for index, evidence_name in enumerate(expected_evidence)
+                )
+            )
+            if not provenance_valid:
+                issues.append(
+                    _issue(
+                        "derived_quantity_provenance_invalid",
+                        ValidationSeverity.BLOCKING,
+                        "Derived quantity lacks exact same-row operand provenance",
+                        category=ValidationCategory.GROUNDING,
+                        page_number=row.page_number,
+                        table_id=row.table_id,
+                        row_anchor=row.row_anchor,
+                        canonical_row_id=row_id,
+                        field="quantity",
+                    )
+                )
+        elif provenance is not None:
+            issues.append(
+                _issue(
+                    "unexpected_derived_quantity_provenance",
+                    ValidationSeverity.FATAL,
+                    "Quantity provenance is present without a derived quantity",
+                    page_number=row.page_number,
+                    table_id=row.table_id,
+                    row_anchor=row.row_anchor,
+                    canonical_row_id=row_id,
+                    field="quantity",
+                )
+            )
         _validate_evidence_refs(
             row.evidence,
             assets_by_page,
@@ -1824,11 +2099,16 @@ def _validate_extraction_result(
             if (
                 value is not None
                 and not derived_quantity
-                and not _token_text_supports_value(
-                    evidence_field,
-                    value,
-                    _evidence_token_texts(evidence, token_manifest),
-                    description=row.description,
+                and (
+                    not _evidence_is_exact_typed_fragment(
+                        evidence, token_manifest, evidence_field
+                    )
+                    or not _token_text_supports_value(
+                        evidence_field,
+                        value,
+                        _evidence_token_texts(evidence, token_manifest),
+                        description=row.description,
+                    )
                 )
             ):
                 issues.append(
@@ -1967,22 +2247,70 @@ def _validate_extraction_result(
                 )
                 continue
             table_ids.add(table.id)
+            if not table.table_anchor:
+                issues.append(
+                    _issue(
+                        "source_table_anchor_missing",
+                        ValidationSeverity.FATAL,
+                        "Source table lacks a stable geometry anchor",
+                        page_number=table.page_number,
+                        table_id=table.table_id,
+                        field="table_anchor",
+                    )
+                )
             columns = {column.id: column for column in table.columns}
             for source_row in table.rows:
+                if not source_row.row_anchor:
+                    issues.append(
+                        _issue(
+                            "source_row_anchor_missing",
+                            ValidationSeverity.FATAL,
+                            "Source row lacks a stable geometry anchor",
+                            page_number=table.page_number,
+                            table_id=table.table_id,
+                            table_anchor=table.table_anchor,
+                            source_row_id=source_row.id,
+                            field="row_anchor",
+                        )
+                    )
                 for cell in source_row.cells:
                     raw_value = cell.raw_value
                     if raw_value is None or not raw_value.strip():
                         continue
+                    if "fragment_occurrence_ambiguous" in cell.validation_flags:
+                        issues.append(
+                            _issue(
+                                "fragment_occurrence_ambiguous",
+                                ValidationSeverity.BLOCKING,
+                                "Printed value cannot be assigned to a unique OCR fragment",
+                                category=ValidationCategory.SPLITTING,
+                                page_number=table.page_number,
+                                table_id=table.table_id,
+                                table_anchor=table.table_anchor,
+                                row_anchor=source_row.row_anchor,
+                                source_row_id=source_row.id,
+                                field=columns[cell.column_id].canonical_field
+                                or cell.column_id,
+                            )
+                        )
                     canonical_field = columns[cell.column_id].canonical_field
-                    if not _token_text_supports_value(
-                        canonical_field,
-                        raw_value,
-                        _evidence_token_texts(cell.evidence, token_manifest),
-                        description=(
-                            canonical.get(source_row.canonical_row_id).description
-                            if source_row.canonical_row_id in canonical
-                            else None
-                        ),
+                    if (
+                        not _evidence_is_exact_typed_fragment(
+                            cell.evidence,
+                            token_manifest,
+                            canonical_field,
+                            source_column_id=cell.column_id,
+                        )
+                        or not _token_text_supports_value(
+                            canonical_field,
+                            raw_value,
+                            _evidence_token_texts(cell.evidence, token_manifest),
+                            description=(
+                                canonical.get(source_row.canonical_row_id).description
+                                if source_row.canonical_row_id in canonical
+                                else None
+                            ),
+                        )
                     ):
                         issues.append(
                             _issue(
@@ -2435,8 +2763,10 @@ def _validate_extraction_result(
                             and (serial_cell := cells[candidate.id]).raw_value
                             and serial_cell.raw_value.strip()
                             == str(canonical_value).strip()
-                            and canonical_ids.issubset(
-                                _evidence_ids(serial_cell.evidence)
+                            and _evidence_has_shared_token_lineage(
+                                row.field_evidence.get(field_evidence[field]),
+                                serial_cell.evidence,
+                                token_manifest,
                             )
                             for candidate in table.columns
                         )
@@ -2460,7 +2790,16 @@ def _validate_extraction_result(
                     continue
                 canonical_ids = _evidence_ids(row.field_evidence.get(field_evidence[field]))
                 cell_ids = _evidence_ids(cell.evidence)
-                if not canonical_ids or not canonical_ids.issubset(cell_ids):
+                if derived_quantity:
+                    continue
+                if not canonical_ids or not cell_ids or not (
+                    canonical_ids.issubset(cell_ids)
+                    or _evidence_has_shared_token_lineage(
+                        row.field_evidence.get(field_evidence[field]),
+                        cell.evidence,
+                        token_manifest,
+                    )
+                ):
                     issues.append(
                         _issue(
                             "mapped_cell_evidence_mismatch",
@@ -2541,7 +2880,14 @@ def _validate_extraction_result(
                 table.page_number == row.page_number
                 and table.table_id == row.table_id
                 and service_ids
-                and service_ids.issubset(_evidence_ids(cell.evidence))
+                and (
+                    service_ids.issubset(_evidence_ids(cell.evidence))
+                    or _evidence_has_shared_token_lineage(
+                        row.field_evidence.get("service_date", ()),
+                        cell.evidence,
+                        token_manifest,
+                    )
+                )
                 and (
                     parsed := service_date_from_context(
                         cell.raw_value,
@@ -2688,7 +3034,7 @@ def _validate_extraction_result(
         )
 
     _validate_totals(result, issues, assets_by_page, token_manifest)
-    return _report(issues)
+    return _report(_attach_stable_issue_anchors(issues, tables, canonical))
 
 
 def validate_extraction_result(

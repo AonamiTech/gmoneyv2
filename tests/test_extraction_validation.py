@@ -7,6 +7,8 @@ from uuid import uuid4
 
 import fitz
 import pytest
+from hypothesis import HealthCheck, given, settings
+from hypothesis import strategies as st
 
 from gmoney.contracts.evidence import Point, Polygon
 from gmoney.contracts.extraction import (
@@ -19,7 +21,13 @@ from gmoney.contracts.extraction import (
     SourceTable,
 )
 from gmoney.demo.store import JobStore
-from gmoney.extraction.offline import ExtractionDraft, OfflineExtractor, PageExtractionUnit
+from gmoney.extraction.document_total import DocumentTotalCandidate
+from gmoney.extraction.offline import (
+    ExtractionDraft,
+    OfflineExtractor,
+    PageExtractionUnit,
+    TableExtractionUnit,
+)
 from gmoney.extraction.validation import validate_extraction_result
 
 
@@ -54,6 +62,12 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, dict[str, object]]:
         artifact_sha256=page_sha,
         token_ids=("description-token", "amount-token"),
     )
+    description_evidence = evidence.model_copy(
+        update={"token_ids": ("description-fragment",)}
+    )
+    amount_evidence = evidence.model_copy(update={"token_ids": ("amount-fragment",)})
+    row_anchor = "row-" + "a" * 24
+    table_anchor = "table-" + "b" * 24
     row = CanonicalRow(
         id=uuid4(),
         contract_version="canonical_row_v2",
@@ -61,11 +75,15 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, dict[str, object]]:
         page_number=1,
         table_id="p1-t1",
         row_order=0,
+        row_anchor=row_anchor,
         description="Consultation",
         net_amount_raw="100.00",
         net_amount="100.00",
         evidence=(evidence,),
-        field_evidence={"description": (evidence,), "amount": (evidence,)},
+        field_evidence={
+            "description": (description_evidence,),
+            "amount": (amount_evidence,),
+        },
         source_routes=("ocr_spatial_graph",),
     )
     columns = (
@@ -86,18 +104,19 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, dict[str, object]]:
     )
     source_row = SourceRow(
         id="p1-t1-s1-r1",
+        row_anchor=row_anchor,
         order=0,
         canonical_row_id=str(row.id),
         cells=(
             SourceCell(
                 column_id="description",
                 raw_value="Consultation",
-                evidence=(evidence,),
+                evidence=(description_evidence,),
             ),
             SourceCell(
                 column_id="amount",
                 raw_value="100.00",
-                evidence=(evidence,),
+                evidence=(amount_evidence,),
             ),
         ),
     )
@@ -105,11 +124,13 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, dict[str, object]]:
         id="p1-t1-s1",
         page_number=1,
         table_id="p1-t1",
+        table_anchor=table_anchor,
         columns=columns,
         rows=(source_row,),
     )
     result: dict[str, object] = {
         "output_version": "offline_accuracy_spine_v5",
+        "contract_revision": 2,
         "document_total_version": "document_total_v3",
         "document_totals_version": "document_totals_v2",
         "document_id": source_sha,
@@ -141,6 +162,31 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, dict[str, object]]:
                 "confidence": 0.99,
             }
             for token_id in evidence.token_ids
+        ]
+        + [
+            {
+                "token_id": fragment_id,
+                "page_number": 1,
+                "table_ids": ["p1-t1"],
+                "text": text,
+                "polygon": evidence.polygon.model_dump(mode="json"),
+                "artifact_sha256": page_sha,
+                "artifact_relative_path": "pages/page-1.png",
+                "confidence": 0.99,
+                "parent_token_id": parent_id,
+                "character_start": 0,
+                "character_end": len(text),
+                "fragment_role": role,
+            }
+            for fragment_id, parent_id, text, role in (
+                (
+                    "description-fragment",
+                    "description-token",
+                    "Consultation",
+                    "description",
+                ),
+                ("amount-fragment", "amount-token", "100.00", "amount"),
+            )
         ],
         "rows": [row.model_dump(mode="json")],
         "source_tables": [table.model_dump(mode="json")],
@@ -161,6 +207,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, dict[str, object]]:
         ],
         "document_total": None,
         "document_totals": [],
+        "raw_total_candidates": [],
         "provider_usage": {
             "initial": {"gemini_calls": 0, "gemini_measured_cost_usd": "0"},
             "recovery": {"gemini_calls": 0, "gemini_measured_cost_usd": "0"},
@@ -310,17 +357,19 @@ def test_receipt_duplicate_pairs_remain_individual_structured_issues(
 
     store = JobStore(tmp_path / "jobs")
     state = store.create("duplicate-receipts.pdf")
+    directory = store.job_dir(state["id"])
+    (directory / "source.pdf").write_bytes(source.read_bytes())
+    (directory / "artifacts").mkdir()
+    (directory / "artifacts" / "pages").mkdir()
+    (directory / "artifacts" / "pages" / "page-1.png").write_bytes(
+        (artifact_root / "pages" / "page-1.png").read_bytes()
+    )
     store.update(state["id"], status="queued")
     assert store.claim_queued(state["id"]) is not None
-    result["semantic_validation"] = report.model_dump(mode="json")
-    assert store.publish_processing_outcome(
-        state["id"],
-        result,
-        status="needs_review",
-        validation_status="needs_review",
-        validation_issue_count=2,
-        validation_issue_codes=["possible_duplicate_supporting_charge"],
-    )
+    assert store.publish_processing_outcome(state["id"], result)
+    certified_state = store.read(state["id"])
+    assert certified_state["status"] == "needs_review"
+    assert certified_state["_certification_valid"] is True
     published = store.read_result(state["id"])
     assert len(published["receipt_duplicate_pairs"]) == 2
     json.dumps(published)
@@ -435,7 +484,9 @@ def test_primary_total_and_page_assets_are_decoded_by_the_envelope(
     ("token_id", "replacement"),
     (
         ("description-token", "UNRELATED"),
+        ("description-token", "Consultation unrelated text"),
         ("amount-token", "999.99"),
+        ("amount-token", "100.00 999.99"),
     ),
 )
 def test_evidence_token_text_must_support_published_values(
@@ -444,9 +495,16 @@ def test_evidence_token_text_must_support_published_values(
     replacement: str,
 ) -> None:
     source, artifact_root, result = _fixture(tmp_path)
-    next(
+    fragment_id = token_id.replace("-token", "-fragment")
+    parent = next(
         token for token in result["token_manifest"] if token["token_id"] == token_id
-    )["text"] = replacement
+    )
+    fragment = next(
+        token for token in result["token_manifest"] if token["token_id"] == fragment_id
+    )
+    parent["text"] = replacement
+    fragment["text"] = replacement
+    fragment["character_end"] = len(replacement)
 
     report = validate_extraction_result(source, result, artifact_root)
 
@@ -541,23 +599,68 @@ def test_recovery_token_retains_crop_identity_and_page_transform(
 
 def _draft_from_result(result: dict[str, object]) -> ExtractionDraft:
     envelope = ExtractionResultV5.model_validate(result)
+    table_units = tuple(
+        TableExtractionUnit(
+            page_number=table.page_number,
+            table_id=table.table_id,
+            source_table=table,
+            row_candidates=tuple(
+                row for row in envelope.rows if row.table_id == table.table_id
+            ),
+            crop_relative_path=None,
+            crop_box=None,
+            diagnostics=tuple(
+                item.model_dump(mode="json")
+                for item in envelope.diagnostics
+                if item.table_id == table.table_id
+            ),
+            normalized_fragments=tuple(
+                token
+                for token in envelope.token_manifest
+                if token.fragment_role and table.table_id in token.table_ids
+            ),
+            recovery_tokens=(),
+            raw_total_candidates=(),
+            provider_usage=envelope.provider_usage.model_dump(mode="json"),
+        )
+        for table in envelope.source_tables
+    )
     unit = PageExtractionUnit(
         page_asset=envelope.page_assets[0],
         ocr_tokens=(),
         token_manifest=envelope.token_manifest,
-        source_tables=envelope.source_tables,
-        canonical_rows=envelope.rows,
+        table_units=table_units,
+        unassigned_row_candidates=(),
         diagnostics=tuple(
             item.model_dump(mode="json") for item in envelope.diagnostics
         ),
-        total_candidates=envelope.document_totals,
+        total_candidates=tuple(
+            DocumentTotalCandidate(
+                total=item.total,
+                label_priority=item.label_priority,
+                vertical_position=item.vertical_position,
+                local_context=item.local_context,
+            )
+            for item in envelope.raw_total_candidates
+        ),
+        provider_usage=envelope.provider_usage.model_dump(mode="json"),
     )
     return ExtractionDraft(
-        publication_result=result,
+        document_id=envelope.document_id,
+        source_sha256=envelope.source_sha256,
+        source_name=envelope.source_name,
         page_units=(unit,),
         provider_usage=envelope.provider_usage.model_dump(mode="json"),
         hospital=envelope.hospital,
         hospital_id=envelope.hospital_id,
+        alias_registry_revision=envelope.alias_registry_revision,
+        profile_registry_revision=envelope.profile_registry_revision,
+        applied_alias_ids=envelope.applied_alias_ids,
+        suppressed_repeated_source_tables=tuple(
+            (item.page_number, item.table_id)
+            for item in envelope.suppressed_repeated_source_tables
+        ),
+        recovery_metadata=envelope.recovery.model_dump(mode="json"),
     )
 
 
@@ -595,9 +698,13 @@ def test_recover_draft_requires_semantic_improvement_and_preserves_charges(
 ) -> None:
     source, artifact_root, baseline_result = _fixture(tmp_path)
     baseline_result["token_manifest"][0]["text"] = "UNRELATED"
+    baseline_result["token_manifest"][2]["text"] = "UNRELATED"
+    baseline_result["token_manifest"][2]["character_end"] = len("UNRELATED")
     baseline = _draft_from_result(baseline_result)
     candidate_result = json.loads(json.dumps(baseline_result))
     candidate_result["token_manifest"][0]["text"] = "Consultation"
+    candidate_result["token_manifest"][2]["text"] = "Consultation"
+    candidate_result["token_manifest"][2]["character_end"] = len("Consultation")
     _as_recovery_candidate(candidate_result)
     candidate = _draft_from_result(candidate_result)
     extractor = object.__new__(OfflineExtractor)
@@ -605,12 +712,22 @@ def test_recover_draft_requires_semantic_improvement_and_preserves_charges(
     def fake_extract(*args: object, **kwargs: object) -> dict[str, object]:
         sink = kwargs["_draft_sink"]
         sink.update(
+            document_id=candidate.document_id,
+            source_sha256=candidate.source_sha256,
+            source_name=candidate.source_name,
             page_units=candidate.page_units,
             provider_usage=candidate.provider_usage,
             hospital=candidate.hospital,
             hospital_id=candidate.hospital_id,
+            alias_registry_revision=candidate.alias_registry_revision,
+            profile_registry_revision=candidate.profile_registry_revision,
+            applied_alias_ids=candidate.applied_alias_ids,
+            suppressed_repeated_source_tables=(
+                candidate.suppressed_repeated_source_tables
+            ),
+            recovery_metadata=candidate.recovery_metadata,
         )
-        return candidate.publication_result
+        return candidate.result
 
     monkeypatch.setattr(extractor, "extract", fake_extract)
     recovered = extractor.recover_draft(
@@ -620,7 +737,7 @@ def test_recover_draft_requires_semantic_improvement_and_preserves_charges(
         ((1, "p1-t1"),),
     )
 
-    assert recovered.publication_result["recovery"]["targets"][0]["selected"] == "candidate"
+    assert recovered.result["recovery"]["targets"][0]["selected"] == "candidate"
     assert recovered.page_units[0].token_manifest[0].text == "Consultation"
 
     unsafe_result = json.loads(json.dumps(candidate_result))
@@ -633,12 +750,22 @@ def test_recover_draft_requires_semantic_improvement_and_preserves_charges(
     def unsafe_extract(*args: object, **kwargs: object) -> dict[str, object]:
         sink = kwargs["_draft_sink"]
         sink.update(
+            document_id=unsafe.document_id,
+            source_sha256=unsafe.source_sha256,
+            source_name=unsafe.source_name,
             page_units=unsafe.page_units,
             provider_usage=unsafe.provider_usage,
             hospital=unsafe.hospital,
             hospital_id=unsafe.hospital_id,
+            alias_registry_revision=unsafe.alias_registry_revision,
+            profile_registry_revision=unsafe.profile_registry_revision,
+            applied_alias_ids=unsafe.applied_alias_ids,
+            suppressed_repeated_source_tables=(
+                unsafe.suppressed_repeated_source_tables
+            ),
+            recovery_metadata=unsafe.recovery_metadata,
         )
-        return unsafe.publication_result
+        return unsafe.result
 
     monkeypatch.setattr(extractor, "extract", unsafe_extract)
     declined = extractor.recover_draft(
@@ -648,7 +775,104 @@ def test_recover_draft_requires_semantic_improvement_and_preserves_charges(
         ((1, "p1-t1"),),
     )
 
-    target = declined.publication_result["recovery"]["targets"][0]
+    target = declined.result["recovery"]["targets"][0]
+    assert target["selected"] == "baseline"
+    assert target["status"] == "recovery_no_safe_improvement"
+
+
+def test_recovery_cannot_move_a_blocker_to_another_row(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, artifact_root, result = _fixture(tmp_path)
+    second = json.loads(json.dumps(result["rows"][0]))
+    second_id = str(uuid4())
+    second["id"] = second_id
+    second["row_order"] = 1
+    second["row_anchor"] = "row-" + "c" * 24
+    replacements = {
+        "description-token": "description-token-2",
+        "description-fragment": "description-fragment-2",
+        "amount-token": "amount-token-2",
+        "amount-fragment": "amount-fragment-2",
+    }
+
+    def replace_token_ids(value: object) -> None:
+        if isinstance(value, dict):
+            if isinstance(value.get("token_ids"), list):
+                value["token_ids"] = [
+                    replacements.get(token_id, token_id)
+                    for token_id in value["token_ids"]
+                ]
+            for nested in value.values():
+                replace_token_ids(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                replace_token_ids(nested)
+
+    replace_token_ids(second)
+    second_source = json.loads(json.dumps(result["source_tables"][0]["rows"][0]))
+    second_source["id"] = "p1-t1-s1-r2"
+    second_source["order"] = 1
+    second_source["row_anchor"] = second["row_anchor"]
+    second_source["canonical_row_id"] = second_id
+    replace_token_ids(second_source)
+    result["rows"].append(second)
+    result["source_tables"][0]["rows"].append(second_source)
+    for token in list(result["token_manifest"]):
+        cloned = json.loads(json.dumps(token))
+        cloned["token_id"] = replacements.get(cloned["token_id"], cloned["token_id"])
+        if cloned.get("parent_token_id"):
+            cloned["parent_token_id"] = replacements.get(
+                cloned["parent_token_id"], cloned["parent_token_id"]
+            )
+        result["token_manifest"].append(cloned)
+
+    baseline_result = json.loads(json.dumps(result))
+    for token in baseline_result["token_manifest"]:
+        if token["token_id"] in {"description-token", "description-fragment"}:
+            token["text"] = "UNRELATED"
+            if token["token_id"] == "description-fragment":
+                token["character_end"] = len("UNRELATED")
+    baseline = _draft_from_result(baseline_result)
+
+    candidate_result = json.loads(json.dumps(result))
+    for token in candidate_result["token_manifest"]:
+        if token["token_id"] in {"description-token-2", "description-fragment-2"}:
+            token["text"] = "UNRELATED"
+            if token["token_id"] == "description-fragment-2":
+                token["character_end"] = len("UNRELATED")
+    _as_recovery_candidate(candidate_result)
+    candidate = _draft_from_result(candidate_result)
+    extractor = object.__new__(OfflineExtractor)
+
+    def fake_extract(*args: object, **kwargs: object) -> dict[str, object]:
+        sink = kwargs["_draft_sink"]
+        sink.update(
+            document_id=candidate.document_id,
+            source_sha256=candidate.source_sha256,
+            source_name=candidate.source_name,
+            page_units=candidate.page_units,
+            provider_usage=candidate.provider_usage,
+            hospital=candidate.hospital,
+            hospital_id=candidate.hospital_id,
+            alias_registry_revision=candidate.alias_registry_revision,
+            profile_registry_revision=candidate.profile_registry_revision,
+            applied_alias_ids=candidate.applied_alias_ids,
+            suppressed_repeated_source_tables=candidate.suppressed_repeated_source_tables,
+            recovery_metadata=candidate.recovery_metadata,
+        )
+        return candidate.result
+
+    monkeypatch.setattr(extractor, "extract", fake_extract)
+    recovered = extractor.recover_draft(
+        source,
+        artifact_root,
+        baseline,
+        ((1, "p1-t1"),),
+    )
+
+    target = recovered.result["recovery"]["targets"][0]
     assert target["selected"] == "baseline"
     assert target["status"] == "recovery_no_safe_improvement"
 
@@ -667,6 +891,21 @@ def test_unique_document_final_context_requires_primary_total(tmp_path: Path) ->
             "confidence": 0.99,
             "context_id": "p1:summary:document_final:o1",
             "context_kind": "document_final",
+        }
+    ]
+    result["raw_total_candidates"] = [
+        {
+            "candidate_id": "total-candidate-1",
+            "total": result["document_totals"][0],
+            "label_priority": 5,
+            "vertical_position": 190.0,
+            "local_context": "Net Bill Amount",
+            "page_number": 1,
+            "table_id": "p1-t1",
+            "table_anchor": "table-" + "b" * 24,
+            "region_kind": "table",
+            "summary_block_ordinal": 1,
+            "context_evidence": [evidence],
         }
     ]
     result["document_total"] = None
@@ -691,3 +930,35 @@ def test_recovery_provider_usage_is_separate_and_gemini_free(tmp_path: Path) -> 
 
     assert report.status == "failed"
     assert "recovery_gemini_invoked" in {issue.code for issue in report.issues}
+
+
+JSON_VALUES = st.recursive(
+    st.none()
+    | st.booleans()
+    | st.integers()
+    | st.floats(allow_nan=False, allow_infinity=False)
+    | st.text(max_size=40),
+    lambda children: st.lists(children, max_size=5)
+    | st.dictionaries(st.text(max_size=20), children, max_size=5),
+    max_leaves=30,
+)
+
+
+@settings(
+    max_examples=200,
+    deadline=None,
+    suppress_health_check=(HealthCheck.function_scoped_fixture,),
+)
+@given(JSON_VALUES)
+def test_validator_is_total_for_arbitrary_nested_json(
+    tmp_path: Path,
+    payload: object,
+) -> None:
+    case_root = tmp_path / str(uuid4())
+    case_root.mkdir()
+    source, artifact_root, _result = _fixture(case_root)
+
+    report = validate_extraction_result(source, payload, artifact_root)
+
+    assert report.status == "failed"
+    assert report.fatal

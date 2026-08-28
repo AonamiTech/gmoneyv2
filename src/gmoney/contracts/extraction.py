@@ -97,6 +97,8 @@ class TokenManifestEntry(ContractModel):
     artifact_relative_path: str
     confidence: float = Field(ge=0, le=1)
     parent_token_id: str | None = None
+    parent_token_ids: tuple[str, ...] = ()
+    parent_character_spans: tuple[tuple[int, int], ...] = ()
     character_start: int | None = Field(default=None, ge=0)
     character_end: int | None = Field(default=None, ge=0)
     fragment_role: str | None = None
@@ -127,6 +129,19 @@ class TokenManifestEntry(ContractModel):
             assert self.character_end is not None
             if self.character_end <= self.character_start:
                 raise ValueError("fragment token range must be non-empty")
+        if self.parent_token_ids or self.parent_character_spans:
+            if not self.parent_token_ids or (
+                len(self.parent_token_ids) != len(self.parent_character_spans)
+            ):
+                raise ValueError("composite fragment parents and spans must align")
+            if any(not token_id.strip() for token_id in self.parent_token_ids):
+                raise ValueError("composite fragment parent IDs must be non-blank")
+            if any(end <= start for start, end in self.parent_character_spans):
+                raise ValueError("composite fragment spans must be non-empty")
+            if not self.fragment_role:
+                raise ValueError("composite fragments require a typed role")
+        if self.parent_token_id and self.parent_token_ids:
+            raise ValueError("fragment provenance must use one parent representation")
         recovery_fields = (
             self.source_artifact_sha256,
             self.source_artifact_relative_path,
@@ -177,6 +192,9 @@ class ProviderUsage(ContractModel):
 class RecoveryTargetRecord(ContractModel):
     page_number: int = Field(ge=1)
     table_id: str | None = None
+    table_anchor: str | None = None
+    row_anchor: str | None = None
+    target_issue_ids: tuple[str, ...] = ()
     selected: Literal["baseline", "candidate"]
     status: Literal[
         "recovered",
@@ -189,6 +207,8 @@ class RecoveryTargetRecord(ContractModel):
     )
     selected_unit_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     removed_issue_ids: tuple[str, ...] = ()
+    remaining_issue_ids: tuple[str, ...] = ()
+    new_issue_ids: tuple[str, ...] = ()
 
 
 class RecoveryMetadata(ContractModel):
@@ -288,6 +308,7 @@ class ReceiptSourceMetadata(ContractModel):
 
 class SourceRow(ContractModel):
     id: str
+    row_anchor: str | None = None
     order: int = Field(ge=0)
     canonical_row_id: str | None = None
     cells: tuple[SourceCell, ...]
@@ -299,6 +320,7 @@ class SourceTable(ContractModel):
     id: str
     page_number: int = Field(ge=1)
     table_id: str
+    table_anchor: str | None = None
     table_type: TableType = TableType.UNKNOWN
     columns: tuple[SourceColumn, ...]
     rows: tuple[SourceRow, ...]
@@ -340,6 +362,42 @@ class DocumentTotal(ContractModel):
     context_kind: str | None = None
 
 
+class RawTotalCandidate(ContractModel):
+    candidate_id: str
+    total: DocumentTotal
+    label_priority: int
+    vertical_position: float
+    local_context: str
+    page_number: int = Field(ge=1)
+    table_id: str | None = None
+    table_anchor: str | None = None
+    table_type: TableType | None = None
+    region_kind: str
+    summary_block_ordinal: int = Field(ge=0)
+    context_evidence: tuple[EvidenceRef, ...]
+
+
+class DerivedFieldProvenance(ContractModel):
+    operation: Literal["absolute_net_plus_discount_divided_by_unit_price"]
+    operand_fields: tuple[Literal["net_amount", "discount", "unit_price"], ...]
+    operand_values: tuple[Decimal, ...]
+    operand_evidence_token_ids: tuple[tuple[str, ...], ...]
+    result: Decimal
+    rounding: Literal["exact"] = "exact"
+
+    @model_validator(mode="after")
+    def require_aligned_operands(self) -> "DerivedFieldProvenance":
+        if not self.operand_fields or not (
+            len(self.operand_fields)
+            == len(self.operand_values)
+            == len(self.operand_evidence_token_ids)
+        ):
+            raise ValueError("derived provenance operands must align")
+        if any(not token_ids for token_ids in self.operand_evidence_token_ids):
+            raise ValueError("derived provenance operands require evidence")
+        return self
+
+
 class ProviderCandidate(VersionedContract):
     provider: str
     model: str
@@ -361,6 +419,7 @@ class CanonicalRow(VersionedContract):
     page_type: PageType | None = None
     table_type: TableType | None = None
     row_order: int = Field(ge=0)
+    row_anchor: str | None = None
     role: RowRole = RowRole.DETAIL
     review_disposition: ReviewDisposition = ReviewDisposition.PENDING
     section: str | None = None
@@ -385,16 +444,19 @@ class CanonicalRow(VersionedContract):
     candidate_ids: tuple[str, ...] = ()
     source_routes: tuple[str, ...] = ()
     validation_flags: tuple[str, ...] = ()
+    derived_fields: dict[str, DerivedFieldProvenance] = Field(default_factory=dict)
 
 
 class ExtractionResultV5(ContractModel):
     """Complete extractor/publication envelope accepted by the safety gate."""
 
     output_version: Literal["offline_accuracy_spine_v5"]
+    contract_revision: Literal[2]
     document_total_version: str
     document_totals_version: str
     document_total: DocumentTotal | None
     document_totals: tuple[DocumentTotal, ...]
+    raw_total_candidates: tuple[RawTotalCandidate, ...]
     document_id: str
     hospital_id: str | None = None
     hospital: dict[str, Any] | None = None

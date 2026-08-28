@@ -18,12 +18,13 @@ from uuid import uuid4
 import cv2
 import typer
 
-from gmoney.contracts.evidence import OcrToken, PageAsset
+from gmoney.contracts.evidence import OcrToken, PageAsset, Point, Polygon
 from gmoney.contracts.extraction import (
     CanonicalRow,
-    DocumentTotal,
+    DerivedFieldProvenance,
     EvidenceRef,
     PageType,
+    RawTotalCandidate,
     ReceiptSourceMetadata,
     RowRole,
     SourceCell,
@@ -3160,20 +3161,70 @@ def _materialize_printed_cell_fragments(
     tuple[TokenManifestEntry, ...],
     dict[tuple[str, str, str], str],
 ]:
-    """Give split Printed values stable typed fragment tokens."""
+    """Give every mapped Printed value one exact, purpose-built fragment."""
     fragments: dict[str, TokenManifestEntry] = {}
     assignments: dict[tuple[str, str, str], str] = {}
     occupied: dict[str, list[tuple[int, int]]] = {}
     output: list[SourceTable] = []
+
+    def normalized(value: str) -> str:
+        return re.sub(r"\s+", " ", value).strip().casefold()
+
+    def bounds(polygon: Polygon) -> tuple[float, float, float, float]:
+        return (
+            min(point.x for point in polygon.points),
+            min(point.y for point in polygon.points),
+            max(point.x for point in polygon.points),
+            max(point.y for point in polygon.points),
+        )
+
+    def rectangle(left: float, top: float, right: float, bottom: float) -> Polygon:
+        return Polygon(
+            points=(
+                Point(x=left, y=top),
+                Point(x=right, y=top),
+                Point(x=right, y=bottom),
+                Point(x=left, y=bottom),
+            )
+        )
+
+    def span_polygon(token: TokenManifestEntry, start: int, end: int) -> Polygon:
+        left, top, right, bottom = bounds(token.polygon)
+        length = max(1, len(token.text))
+        width = right - left
+        return rectangle(
+            left + width * start / length,
+            top,
+            left + width * end / length,
+            bottom,
+        )
+
     for table in tables:
         columns = {column.id: column for column in table.columns}
+        column_centers: dict[str, float] = {}
+        for column in table.columns:
+            polygons = tuple(
+                evidence.polygon
+                for row in table.rows
+                for cell in row.cells
+                if cell.column_id == column.id
+                for evidence in cell.evidence
+            )
+            if not polygons:
+                polygons = tuple(item.polygon for item in column.evidence)
+            if polygons:
+                column_centers[column.id] = median(
+                    (bounds(polygon)[0] + bounds(polygon)[2]) / 2
+                    for polygon in polygons
+                )
         materialized_rows: list[SourceRow] = []
         for source_row in table.rows:
             materialized_cells: list[SourceCell] = []
             for cell in source_row.cells:
                 raw = (cell.raw_value or "").strip()
-                role = columns[cell.column_id].canonical_field
-                if not raw or role is None:
+                canonical_role = columns[cell.column_id].canonical_field
+                role = canonical_role or f"source:{cell.column_id}"
+                if not raw:
                     materialized_cells.append(cell)
                     continue
                 aligned_role = {
@@ -3181,68 +3232,136 @@ def _materialize_printed_cell_fragments(
                     "unit_price": "rate",
                     "net_amount": "amount",
                 }.get(role, role)
-                replacements: dict[str, str] = {}
-                for evidence in cell.evidence:
-                    for token_id in evidence.token_ids:
-                        token = token_lookup.get(token_id)
-                        if token is None or token.parent_token_id is not None:
-                            continue
-                        parent_text = token.text
-                        occurrences = tuple(
-                            match.span()
-                            for match in re.finditer(
-                                re.escape(raw), parent_text, re.IGNORECASE
-                            )
-                            if not any(
-                                match.start() < used_end and match.end() > used_start
-                                for used_start, used_end in occupied.get(token_id, ())
-                            )
+                parent_ids = tuple(
+                    dict.fromkeys(
+                        token_id
+                        for evidence in cell.evidence
+                        for token_id in evidence.token_ids
+                    )
+                )
+                parents = tuple(
+                    token_lookup[token_id]
+                    for token_id in parent_ids
+                    if token_id in token_lookup
+                    and token_lookup[token_id].parent_token_id is None
+                    and not token_lookup[token_id].parent_token_ids
+                )
+                selected_spans: tuple[tuple[int, int], ...] | None = None
+                selected_parents: tuple[TokenManifestEntry, ...] = ()
+                fragment_polygon: Polygon | None = None
+                if parents and normalized(
+                    " ".join(item.text for item in parents)
+                ) == normalized(raw):
+                    selected_parents = parents
+                    selected_spans = tuple((0, len(item.text)) for item in parents)
+                    all_bounds = tuple(bounds(item.polygon) for item in parents)
+                    fragment_polygon = rectangle(
+                        min(item[0] for item in all_bounds),
+                        min(item[1] for item in all_bounds),
+                        max(item[2] for item in all_bounds),
+                        max(item[3] for item in all_bounds),
+                    )
+                elif len(parents) == 1:
+                    token = parents[0]
+                    occurrences = tuple(
+                        match.span()
+                        for match in re.finditer(re.escape(raw), token.text, re.IGNORECASE)
+                        if not any(
+                            match.start() < used_end and match.end() > used_start
+                            for used_start, used_end in occupied.get(token.token_id, ())
                         )
-                        if (
-                            not occurrences
-                            or parent_text.strip().casefold() == raw.casefold()
-                        ):
-                            continue
-                        start, end = occurrences[0]
-                        occupied.setdefault(token_id, []).append((start, end))
-                        identity = hashlib.sha256(
-                            f"{token_id}:{start}:{end}:{role}".encode()
-                        ).hexdigest()[:24]
-                        fragment_id = f"fragment-{identity}"
-                        replacements[token_id] = fragment_id
-                        assignments[(source_row.id, aligned_role, token_id)] = fragment_id
-                        fragments.setdefault(
-                            fragment_id,
-                            TokenManifestEntry(
-                                token_id=fragment_id,
-                                page_number=token.page_number,
-                                table_ids=tuple(
-                                    sorted({*token.table_ids, table.table_id})
-                                ),
-                                text=raw,
-                                polygon=token.polygon,
-                                artifact_sha256=token.artifact_sha256,
-                                artifact_relative_path=token.artifact_relative_path,
-                                confidence=token.confidence,
-                                parent_token_id=token_id,
-                                character_start=start,
-                                character_end=end,
-                                fragment_role=aligned_role,
+                    )
+                    if occurrences:
+                        target = column_centers.get(cell.column_id)
+                        scored = sorted(
+                            (
+                                abs(
+                                    (
+                                        bounds(span_polygon(token, start, end))[0]
+                                        + bounds(span_polygon(token, start, end))[2]
+                                    )
+                                    / 2
+                                    - target
+                                )
+                                if target is not None
+                                else 0.0,
+                                start,
+                                end,
+                            )
+                            for start, end in occurrences
+                        )
+                        unique = len(scored) == 1 or scored[1][0] - scored[0][0] > 1.0
+                        if unique:
+                            _, start, end = scored[0]
+                            selected_parents = (token,)
+                            selected_spans = ((start, end),)
+                            fragment_polygon = span_polygon(token, start, end)
+                            occupied.setdefault(token.token_id, []).append((start, end))
+                if selected_spans is None or fragment_polygon is None:
+                    cell = cell.model_copy(
+                        update={
+                            "validation_flags": tuple(
+                                dict.fromkeys(
+                                    (*cell.validation_flags, "fragment_occurrence_ambiguous")
+                                )
+                            )
+                        }
+                    )
+                    materialized_cells.append(cell)
+                    continue
+                identity = hashlib.sha256(
+                    json.dumps(
+                        {
+                            "parents": [item.token_id for item in selected_parents],
+                            "spans": selected_spans,
+                            "role": aligned_role,
+                            "value": raw,
+                        },
+                        sort_keys=True,
+                    ).encode()
+                ).hexdigest()[:24]
+                fragment_id = f"fragment-{identity}"
+                first = selected_parents[0]
+                if len(selected_parents) == 1:
+                    fragment_kwargs: dict[str, Any] = {
+                        "parent_token_id": first.token_id,
+                        "character_start": selected_spans[0][0],
+                        "character_end": selected_spans[0][1],
+                    }
+                else:
+                    fragment_kwargs = {
+                        "parent_token_ids": tuple(
+                            item.token_id for item in selected_parents
+                        ),
+                        "parent_character_spans": selected_spans,
+                    }
+                fragments[fragment_id] = TokenManifestEntry(
+                    token_id=fragment_id,
+                    page_number=first.page_number,
+                    table_ids=tuple(sorted({*first.table_ids, table.table_id})),
+                    text=raw,
+                    polygon=fragment_polygon,
+                    artifact_sha256=first.artifact_sha256,
+                    artifact_relative_path=first.artifact_relative_path,
+                    confidence=min(item.confidence for item in selected_parents),
+                    fragment_role=aligned_role,
+                    **fragment_kwargs,
+                )
+                for parent in selected_parents:
+                    assignments[(source_row.id, aligned_role, parent.token_id)] = fragment_id
+                first_evidence = cell.evidence[0]
+                cell = cell.model_copy(
+                    update={
+                        "evidence": (
+                            first_evidence.model_copy(
+                                update={
+                                    "polygon": fragment_polygon,
+                                    "token_ids": (fragment_id,),
+                                }
                             ),
                         )
-                if replacements:
-                    evidence = tuple(
-                        item.model_copy(
-                            update={
-                                "token_ids": tuple(
-                                    replacements.get(token_id, token_id)
-                                    for token_id in item.token_ids
-                                )
-                            }
-                        )
-                        for item in cell.evidence
-                    )
-                    cell = cell.model_copy(update={"evidence": evidence})
+                    }
+                )
                 materialized_cells.append(cell)
             materialized_rows.append(
                 source_row.model_copy(update={"cells": tuple(materialized_cells)})
@@ -3365,6 +3484,59 @@ def _synchronize_canonical_from_printed(
     ]
 
 
+def _attach_derived_field_provenance(rows: list[CanonicalRow]) -> list[CanonicalRow]:
+    output: list[CanonicalRow] = []
+    for row in rows:
+        if "quantity_derived_from_rate_amount" not in row.validation_flags:
+            output.append(row)
+            continue
+        if row.quantity is None or row.unit_price is None or row.net_amount is None:
+            output.append(row)
+            continue
+        fields: list[str] = ["net_amount"]
+        values: list[Decimal] = [row.net_amount]
+        evidence_names: list[str] = ["amount"]
+        if row.discount is not None:
+            fields.append("discount")
+            values.append(row.discount)
+            evidence_names.append("discount")
+        fields.append("unit_price")
+        values.append(row.unit_price)
+        evidence_names.append("rate")
+        token_groups = tuple(
+            tuple(
+                token_id
+                for evidence in row.field_evidence.get(evidence_name, ())
+                for token_id in evidence.token_ids
+            )
+            for evidence_name in evidence_names
+        )
+        if any(not token_ids for token_ids in token_groups):
+            output.append(row)
+            continue
+        provenance = DerivedFieldProvenance(
+            operation="absolute_net_plus_discount_divided_by_unit_price",
+            operand_fields=tuple(fields),
+            operand_values=tuple(values),
+            operand_evidence_token_ids=token_groups,
+            result=row.quantity,
+        )
+        output.append(
+            row.model_copy(
+                update={
+                    "derived_fields": {**row.derived_fields, "quantity": provenance},
+                    "field_evidence": {
+                        key: value
+                        for key, value in row.field_evidence.items()
+                        if key != "quantity"
+                    },
+                    "quantity_raw": None,
+                }
+            )
+        )
+    return output
+
+
 def _apply_profile_constraints(reconstruction, profile):
     schema = reconstruction.schema
     if schema is not None:
@@ -3447,6 +3619,151 @@ def _stable_payload_digest(payload: object) -> str:
             default=str,
         ).encode()
     ).hexdigest()
+
+
+def _evidence_bounds(evidence: Collection[EvidenceRef]) -> tuple[float, float, float, float] | None:
+    points = tuple(point for item in evidence for point in item.polygon.points)
+    if not points:
+        return None
+    return (
+        min(point.x for point in points),
+        min(point.y for point in points),
+        max(point.x for point in points),
+        max(point.y for point in points),
+    )
+
+
+def _quantized_geometry(
+    bounds: tuple[float, float, float, float] | None,
+    page: PageAsset,
+) -> tuple[int, int, int, int]:
+    if bounds is None:
+        return (0, 0, 0, 0)
+    left, top, right, bottom = bounds
+    return tuple(
+        int(round(value * 1000))
+        for value in (
+            left / page.width,
+            top / page.height,
+            right / page.width,
+            bottom / page.height,
+        )
+    )
+
+
+def _anchor(kind: str, *parts: object) -> str:
+    return f"{kind}-{_stable_payload_digest(parts)[:24]}"
+
+
+def _assign_geometry_anchors(
+    tables: tuple[SourceTable, ...],
+    rows: list[CanonicalRow],
+    page_assets: Collection[PageAsset],
+) -> tuple[tuple[SourceTable, ...], list[CanonicalRow]]:
+    assets = {page.page_number: page for page in page_assets}
+    ordered_tables: dict[
+        int,
+        list[tuple[SourceTable, tuple[float, float, float, float] | None]],
+    ] = {}
+    for table in tables:
+        evidence = tuple(
+            item
+            for column in table.columns
+            for item in column.evidence
+        ) + tuple(
+            item
+            for source_row in table.rows
+            for cell in source_row.cells
+            for item in cell.evidence
+        )
+        ordered_tables.setdefault(table.page_number, []).append(
+            (table, _evidence_bounds(evidence))
+        )
+    anchored_tables: list[SourceTable] = []
+    canonical_anchors: dict[str, str] = {}
+    for page_number, candidates in sorted(ordered_tables.items()):
+        page = assets[page_number]
+        for ordinal, (table, bounds) in enumerate(
+            sorted(candidates, key=lambda item: item[1] or (0, 0, 0, 0))
+        ):
+            table_anchor = _anchor(
+                "table",
+                page_number,
+                _quantized_geometry(bounds, page),
+                ordinal,
+            )
+            anchored_rows: list[SourceRow] = []
+            for source_row in table.rows:
+                row_bounds = _evidence_bounds(
+                    tuple(item for cell in source_row.cells for item in cell.evidence)
+                )
+                row_anchor = _anchor(
+                    "row",
+                    table_anchor,
+                    _quantized_geometry(row_bounds, page),
+                    source_row.order,
+                )
+                anchored_rows.append(source_row.model_copy(update={"row_anchor": row_anchor}))
+                if source_row.canonical_row_id:
+                    canonical_anchors[source_row.canonical_row_id] = row_anchor
+            anchored_tables.append(
+                table.model_copy(
+                    update={"table_anchor": table_anchor, "rows": tuple(anchored_rows)}
+                )
+            )
+    anchored_canonical: list[CanonicalRow] = []
+    for row in rows:
+        row_anchor = canonical_anchors.get(str(row.id))
+        if row_anchor is None:
+            page = assets[row.page_number]
+            row_anchor = _anchor(
+                "row",
+                row.page_number,
+                _quantized_geometry(_evidence_bounds(row.evidence), page),
+                row.row_order,
+            )
+        anchored_canonical.append(row.model_copy(update={"row_anchor": row_anchor}))
+    return tuple(anchored_tables), anchored_canonical
+
+
+def _raw_total_candidate(
+    candidate: DocumentTotalCandidate,
+    tables: Collection[SourceTable],
+) -> RawTotalCandidate:
+    table = next(
+        (
+            item
+            for item in tables
+            if item.page_number == candidate.total.page_number
+            and item.table_id == candidate.total.evidence.table_id
+        ),
+        None,
+    )
+    context_id = candidate.total.context_id or ""
+    ordinal_match = re.search(r":o(?P<ordinal>\d+)$", context_id)
+    payload = {
+        "total": candidate.total.model_dump(mode="json"),
+        "label_priority": candidate.label_priority,
+        "vertical_position": candidate.vertical_position,
+        "local_context": candidate.local_context,
+        "table_anchor": table.table_anchor if table else None,
+    }
+    return RawTotalCandidate(
+        candidate_id=f"total-{_stable_payload_digest(payload)[:24]}",
+        total=candidate.total,
+        label_priority=candidate.label_priority,
+        vertical_position=candidate.vertical_position,
+        local_context=candidate.local_context,
+        page_number=candidate.total.page_number,
+        table_id=table.table_id if table else candidate.total.evidence.table_id,
+        table_anchor=table.table_anchor if table else None,
+        table_type=table.table_type if table else None,
+        region_kind="table" if table else "page_summary",
+        summary_block_ordinal=(
+            int(ordinal_match.group("ordinal")) if ordinal_match else 0
+        ),
+        context_evidence=(candidate.total.evidence,),
+    )
 
 
 def _provider_usage_leaf(
@@ -3595,16 +3912,76 @@ def _recovery_metadata(
 
 
 @dataclass(frozen=True)
+class TableExtractionUnit:
+    """Raw table/crop reconstruction retained before document projection."""
+
+    page_number: int
+    table_id: str
+    source_table: SourceTable
+    row_candidates: tuple[CanonicalRow, ...]
+    crop_relative_path: str | None
+    crop_box: tuple[int, int, int, int] | None
+    diagnostics: tuple[dict[str, Any], ...]
+    normalized_fragments: tuple[TokenManifestEntry, ...]
+    recovery_tokens: tuple[TokenManifestEntry, ...]
+    raw_total_candidates: tuple[DocumentTotalCandidate, ...]
+    provider_usage: dict[str, Any]
+
+    def raw_digest(self) -> str:
+        return _stable_payload_digest(
+            {
+                "page_number": self.page_number,
+                "table_id": self.table_id,
+                "source_table": self.source_table.model_dump(mode="json"),
+                "row_candidates": [
+                    row.model_dump(mode="json") for row in self.row_candidates
+                ],
+                "crop_relative_path": self.crop_relative_path,
+                "crop_box": self.crop_box,
+                "diagnostics": self.diagnostics,
+                "normalized_fragments": [
+                    item.model_dump(mode="json") for item in self.normalized_fragments
+                ],
+                "recovery_tokens": [
+                    item.model_dump(mode="json") for item in self.recovery_tokens
+                ],
+                "raw_total_candidates": [
+                    {
+                        "total": item.total.model_dump(mode="json"),
+                        "label_priority": item.label_priority,
+                        "vertical_position": item.vertical_position,
+                        "local_context": item.local_context,
+                    }
+                    for item in self.raw_total_candidates
+                ],
+                "provider_usage": self.provider_usage,
+            }
+        )
+
+
+@dataclass(frozen=True)
 class PageExtractionUnit:
-    """Typed raw substrate retained before public-result serialization."""
+    """Raw page substrate; it contains no linked or certified public rows."""
 
     page_asset: PageAsset
     ocr_tokens: tuple[OcrToken, ...]
     token_manifest: tuple[TokenManifestEntry, ...]
-    source_tables: tuple[SourceTable, ...]
-    canonical_rows: tuple[CanonicalRow, ...]
+    table_units: tuple[TableExtractionUnit, ...]
+    unassigned_row_candidates: tuple[CanonicalRow, ...]
     diagnostics: tuple[dict[str, Any], ...]
-    total_candidates: tuple[DocumentTotal, ...]
+    total_candidates: tuple[DocumentTotalCandidate, ...]
+    provider_usage: dict[str, Any]
+
+    @property
+    def source_tables(self) -> tuple[SourceTable, ...]:
+        return tuple(unit.source_table for unit in self.table_units)
+
+    @property
+    def canonical_rows(self) -> tuple[CanonicalRow, ...]:
+        return (
+            *(row for unit in self.table_units for row in unit.row_candidates),
+            *self.unassigned_row_candidates,
+        )
 
     def raw_digest(self) -> str:
         payload = {
@@ -3614,36 +3991,48 @@ class PageExtractionUnit:
                 item.model_dump(mode="json") for item in self.token_manifest
             ],
             "source_tables": [
-                {
-                    **table.model_dump(mode="json"),
-                    "rows": [
-                        {
-                            **row.model_dump(mode="json"),
-                            "canonical_row_id": None,
-                        }
-                        for row in table.rows
-                    ],
-                }
-                for table in self.source_tables
+                unit.raw_digest() for unit in self.table_units
+            ],
+            "unassigned_row_candidates": [
+                row.model_dump(mode="json") for row in self.unassigned_row_candidates
             ],
             "diagnostics": list(self.diagnostics),
+            "total_candidates": [
+                {
+                    "total": item.total.model_dump(mode="json"),
+                    "label_priority": item.label_priority,
+                    "vertical_position": item.vertical_position,
+                    "local_context": item.local_context,
+                }
+                for item in self.total_candidates
+            ],
+            "provider_usage": self.provider_usage,
         }
         return _stable_payload_digest(payload)
 
 
 @dataclass(frozen=True)
 class ExtractionDraft:
-    """Internal OCR draft used directly by targeted recovery."""
+    """Internal OCR draft projected only when a public result is requested."""
 
-    publication_result: dict[str, Any]
+    document_id: str
+    source_sha256: str
+    source_name: str
     page_units: tuple[PageExtractionUnit, ...]
     provider_usage: dict[str, Any]
     hospital: dict[str, Any] | None
     hospital_id: str | None
+    alias_registry_revision: int | None
+    profile_registry_revision: int | None
+    applied_alias_ids: tuple[str, ...]
+    suppressed_repeated_source_tables: tuple[tuple[int, str], ...]
+    recovery_metadata: dict[str, Any]
+    worker_release_revision: str | None = None
+    validation_recovery_attempted: bool | None = None
 
     @property
     def result(self) -> dict[str, Any]:
-        return deepcopy(self.publication_result)
+        return _project_extraction_draft(self)
 
     @property
     def raw_unit_sha256(self) -> dict[str, str]:
@@ -3653,12 +4042,116 @@ class ExtractionDraft:
         }
 
 
+def _project_extraction_draft(draft: ExtractionDraft) -> dict[str, Any]:
+    source_tables = tuple(
+        table for unit in draft.page_units for table in unit.source_tables
+    )
+    rows = _apply_document_role_policy(
+        _deduplicate(
+            [row for unit in draft.page_units for row in unit.canonical_rows]
+        )
+    )
+    source_tables = _link_source_tables(source_tables, rows)
+    canonical_by_id = {str(row.id): row for row in rows}
+    source_tables = tuple(
+        _promote_grounded_date_column(
+            table,
+            tuple(
+                canonical_by_id[source_row.canonical_row_id]
+                for source_row in table.rows
+                if source_row.canonical_row_id in canonical_by_id
+                and canonical_by_id[source_row.canonical_row_id].role
+                in {RowRole.DETAIL, RowRole.REFUND, RowRole.CATEGORY_ROLLUP}
+            ),
+        )
+        for table in source_tables
+    )
+    rows = _recover_grounded_service_dates(source_tables, rows, already_linked=True)
+    rows = _synchronize_canonical_from_printed(source_tables, rows)
+    rows = _attach_derived_field_provenance(rows)
+    source_tables = _attach_receipt_source_metadata(source_tables, rows)
+    source_tables, rows = _assign_geometry_anchors(
+        source_tables,
+        rows,
+        tuple(unit.page_asset for unit in draft.page_units),
+    )
+    rows, receipt_duplicate_pairs = _flag_possible_supporting_receipt_duplicates(
+        rows,
+        source_tables,
+    )
+    total_candidates = [
+        candidate for unit in draft.page_units for candidate in unit.total_candidates
+    ]
+    document_totals = select_document_totals(total_candidates)
+    document_total = select_document_total(total_candidates)
+    raw_total_candidates = tuple(
+        _raw_total_candidate(candidate, source_tables) for candidate in total_candidates
+    )
+    token_manifest = tuple(
+        {
+            token.token_id: token
+            for unit in draft.page_units
+            for token in unit.token_manifest
+        }.values()
+    )
+    diagnostics = [
+        deepcopy(item) for unit in draft.page_units for item in unit.diagnostics
+    ]
+    result: dict[str, Any] = {
+        "output_version": "offline_accuracy_spine_v5",
+        "contract_revision": 2,
+        "document_total_version": DOCUMENT_TOTAL_VERSION,
+        "document_totals_version": DOCUMENT_TOTALS_VERSION,
+        "document_total": (
+            document_total.model_dump(mode="json") if document_total else None
+        ),
+        "document_totals": [item.model_dump(mode="json") for item in document_totals],
+        "raw_total_candidates": [
+            item.model_dump(mode="json") for item in raw_total_candidates
+        ],
+        "document_id": draft.document_id,
+        "hospital_id": draft.hospital_id,
+        "hospital": deepcopy(draft.hospital),
+        "alias_registry_revision": draft.alias_registry_revision,
+        "profile_registry_revision": draft.profile_registry_revision,
+        "applied_alias_ids": list(draft.applied_alias_ids),
+        "source_sha256": draft.source_sha256,
+        "source_name": draft.source_name,
+        "pages": len(draft.page_units),
+        "page_assets": [
+            unit.page_asset.model_dump(mode="json") for unit in draft.page_units
+        ],
+        "source_tables": [table.model_dump(mode="json") for table in source_tables],
+        "token_manifest": [token.model_dump(mode="json") for token in token_manifest],
+        "suppressed_repeated_source_tables": [
+            {"page_number": page, "table_id": table_id}
+            for page, table_id in draft.suppressed_repeated_source_tables
+        ],
+        "rows": [row.model_dump(mode="json") for row in rows],
+        "receipt_duplicate_pairs": receipt_duplicate_pairs,
+        "diagnostics": diagnostics,
+        "provider_usage": deepcopy(draft.provider_usage),
+        "recovery": deepcopy(draft.recovery_metadata),
+    }
+    if draft.worker_release_revision is not None:
+        result["worker_release_revision"] = draft.worker_release_revision
+    if draft.validation_recovery_attempted is not None:
+        result["validation_recovery_attempted"] = draft.validation_recovery_attempted
+    return result
+
+
 def _issue_semantic_key(issue: object) -> tuple[object, ...]:
     return (
+        getattr(issue, "id", None),
         getattr(issue, "code", None),
         getattr(issue, "severity", None),
+        getattr(issue, "category", None),
         getattr(issue, "page_number", None),
         getattr(issue, "table_id", None),
+        getattr(issue, "table_anchor", None),
+        getattr(issue, "row_anchor", None),
+        getattr(issue, "source_row_id", None),
+        getattr(issue, "canonical_row_id", None),
         getattr(issue, "field", None),
     )
 
@@ -3683,48 +4176,118 @@ def _recovery_preserves_grounded_charges(
 ) -> bool:
     billable = {RowRole.DETAIL, RowRole.REFUND, RowRole.CATEGORY_ROLLUP}
 
+    compared_fields = (
+        "role",
+        "description",
+        "service_date_raw",
+        "service_date_iso",
+        "request_no",
+        "service_code",
+        "hsn_code",
+        "quantity",
+        "unit_price",
+        "gross_amount",
+        "discount",
+        "net_amount",
+    )
+
+    evidence_names = {
+        "description": "description",
+        "service_date_raw": "service_date",
+        "service_date_iso": "service_date",
+        "request_no": "request_no",
+        "service_code": "service_code",
+        "hsn_code": "hsn_code",
+        "quantity": "quantity",
+        "unit_price": "rate",
+        "gross_amount": "gross_amount",
+        "discount": "discount",
+        "net_amount": "amount",
+    }
+
     def rows(draft: ExtractionDraft) -> list[CanonicalRow]:
         return [
             row
             for unit in draft.page_units
             for row in unit.canonical_rows
-            if row.role in billable
-            and row.net_amount is not None
-            and _issue_is_in_recovery_target(row, targets)
+            if row.role in billable and row.net_amount is not None
         ]
 
+    def token_lookup(draft: ExtractionDraft) -> dict[str, TokenManifestEntry]:
+        return {
+            token.token_id: token
+            for unit in draft.page_units
+            for token in unit.token_manifest
+        }
+
+    baseline_tokens = token_lookup(baseline)
+    candidate_tokens = token_lookup(candidate)
+
+    def evidence_digest(row: CanonicalRow, field: str) -> str:
+        name = evidence_names.get(field)
+        return _stable_payload_digest(
+            [
+                item.model_dump(mode="json")
+                for item in (row.field_evidence.get(name, ()) if name else row.evidence)
+            ]
+        )
+
+    def grounding_strength(
+        row: CanonicalRow,
+        field: str,
+        manifest: dict[str, TokenManifestEntry],
+    ) -> int:
+        name = evidence_names.get(field)
+        evidence = row.field_evidence.get(name, ()) if name else row.evidence
+        token_ids = tuple(
+            token_id for item in evidence for token_id in item.token_ids
+        )
+        if not token_ids:
+            return 0
+        if len(token_ids) != 1 or token_ids[0] not in manifest:
+            return 1
+        token = manifest[token_ids[0]]
+        expected_role = name
+        return int(
+            bool(
+                expected_role
+                and token.fragment_role == expected_role
+                and (token.parent_token_id or token.parent_token_ids)
+            )
+        ) + 1
+
     available = rows(candidate)
-    used: set[int] = set()
+    candidate_by_anchor = {
+        row.row_anchor: row for row in available if row.row_anchor
+    }
     for baseline_row in rows(baseline):
-        targeted_fields = implicated_fields.get(str(baseline_row.id), set())
-        matches = [
-            index
-            for index, candidate_row in enumerate(available)
-            if index not in used
-            and candidate_row.table_id == baseline_row.table_id
-            and (
-                candidate_row.row_order == baseline_row.row_order
-                if targeted_fields
-                else True
-            )
-            and (
-                candidate_row.net_amount == baseline_row.net_amount
-                or "amount" in targeted_fields
-                or "net_amount" in targeted_fields
-            )
-            and (
-                SequenceMatcher(
-                    None,
-                    _normalize_text(baseline_row.description),
-                    _normalize_text(candidate_row.description),
-                ).ratio()
-                >= 0.80
-                or "description" in targeted_fields
-            )
-        ]
-        if len(matches) != 1:
+        targeted_fields = set(
+            implicated_fields.get(baseline_row.row_anchor or "", set())
+        ) | set(implicated_fields.get(str(baseline_row.id), set()))
+        candidate_row = candidate_by_anchor.get(baseline_row.row_anchor or "")
+        if candidate_row is None:
             return False
-        used.add(matches[0])
+        for field in compared_fields:
+            baseline_value = getattr(baseline_row, field)
+            candidate_value = getattr(candidate_row, field)
+            normalized_field = {
+                "unit_price": "rate",
+                "net_amount": "amount",
+                "service_date_raw": "service_date",
+                "service_date_iso": "service_date",
+            }.get(field, field)
+            targeted = field in targeted_fields or normalized_field in targeted_fields
+            if not targeted:
+                if baseline_value != candidate_value:
+                    return False
+                if evidence_digest(baseline_row, field) != evidence_digest(
+                    candidate_row, field
+                ):
+                    return False
+            elif baseline_value != candidate_value and grounding_strength(
+                candidate_row, field, candidate_tokens
+            ) <= grounding_strength(baseline_row, field, baseline_tokens):
+                return False
     return True
 
 
@@ -3736,8 +4299,8 @@ def _declined_recovery_draft(
     baseline: ExtractionDraft,
     candidate: ExtractionDraft,
     targets: tuple[tuple[int, str | None], ...],
+    target_audit: dict[tuple[int, str | None], dict[str, tuple[str, ...]]] | None = None,
 ) -> ExtractionDraft:
-    result = deepcopy(baseline.publication_result)
     initial = dict(baseline.provider_usage.get("initial") or {})
     recovery = {
         "gemini_calls": 0,
@@ -3769,19 +4332,34 @@ def _declined_recovery_draft(
         return _stable_payload_digest(payload)
 
     records = []
+    candidate_records = {
+        (int(item.get("page_number") or 0), item.get("table_id")): item
+        for item in candidate.recovery_metadata.get("targets", [])
+    }
     for page, table in targets:
         baseline_digest = target_digest(baseline, page, table)
         candidate_digest = target_digest(candidate, page, table)
+        candidate_record = candidate_records.get((page, table), {})
+        candidate_status = candidate_record.get("status")
+        status = (
+            candidate_status
+            if candidate_status == "recovery_target_not_located"
+            else "recovery_no_safe_improvement"
+        )
+        audit = (target_audit or {}).get((page, table), {})
         records.append(
             {
                 "page_number": page,
                 "table_id": table,
                 "selected": "baseline",
-                "status": "recovery_no_safe_improvement",
+                "status": status,
                 "baseline_unit_sha256": baseline_digest,
                 "candidate_unit_sha256": candidate_digest,
                 "selected_unit_sha256": baseline_digest,
-                "removed_issue_ids": [],
+                "target_issue_ids": list(audit.get("target_issue_ids", ())),
+                "removed_issue_ids": list(audit.get("removed_issue_ids", ())),
+                "remaining_issue_ids": list(audit.get("remaining_issue_ids", ())),
+                "new_issue_ids": list(audit.get("new_issue_ids", ())),
             }
         )
     targeted_pages = {page for page, _table in targets}
@@ -3790,18 +4368,15 @@ def _declined_recovery_draft(
         for key, digest in baseline.raw_unit_sha256.items()
         if int(key.partition(":")[2]) not in targeted_pages
     }
-    result["provider_usage"] = provider_usage
-    result["recovery"] = {
+    recovery_metadata = {
         "attempted": True,
         "targets": records,
         "untargeted_units_sha256": _stable_payload_digest(untargeted),
     }
-    return ExtractionDraft(
-        publication_result=result,
-        page_units=baseline.page_units,
+    return replace(
+        baseline,
         provider_usage=provider_usage,
-        hospital=baseline.hospital,
-        hospital_id=baseline.hospital_id,
+        recovery_metadata=recovery_metadata,
     )
 
 
@@ -4629,20 +5204,10 @@ class OfflineExtractor:
         targeted_pages = {page_number for page_number, _table_id in recovery_target_set}
         if baseline_draft is not None:
             for unit in baseline_draft.page_units:
-                for total in unit.total_candidates:
-                    if total.page_number in targeted_pages:
+                for candidate in unit.total_candidates:
+                    if candidate.total.page_number in targeted_pages:
                         continue
-                    points = total.evidence.polygon.points
-                    document_total_candidates.append(
-                        DocumentTotalCandidate(
-                            total=total,
-                            label_priority=0,
-                            vertical_position=(
-                                sum(point.y for point in points) / len(points)
-                            ),
-                            local_context=total.label,
-                        )
-                    )
+                    document_total_candidates.append(candidate)
         hospital = baseline_draft.hospital if baseline_draft else None
         if baseline_draft is not None:
             resolved_hospital_id = baseline_draft.hospital_id
@@ -5650,6 +6215,8 @@ class OfflineExtractor:
         )
         token_lookup.update({item.token_id: item for item in printed_fragments})
         rows = _apply_document_role_policy(_deduplicate(selected_rows))
+        draft_source_tables = selected_source_tables
+        draft_row_candidates = tuple(rows)
         source_tables = _link_source_tables(selected_source_tables, rows)
         canonical_by_id = {str(row.id): row for row in rows}
         source_tables = tuple(
@@ -5671,13 +6238,28 @@ class OfflineExtractor:
             already_linked=True,
         )
         rows = _synchronize_canonical_from_printed(source_tables, rows)
+        rows = _attach_derived_field_provenance(rows)
         source_tables = _attach_receipt_source_metadata(source_tables, rows)
+        source_tables, rows = _assign_geometry_anchors(
+            source_tables,
+            rows,
+            tuple(
+                page.model_copy(
+                    update={"relative_path": str(Path("pages") / page.relative_path)}
+                )
+                for page in manifest.pages
+            ),
+        )
         rows, receipt_duplicate_pairs = _flag_possible_supporting_receipt_duplicates(
             rows,
             source_tables,
         )
         document_total_candidates = list(
             assign_document_total_contexts(document_total_candidates, diagnostics)
+        )
+        raw_total_candidates = tuple(
+            _raw_total_candidate(candidate, source_tables)
+            for candidate in document_total_candidates
         )
         document_totals = select_document_totals(document_total_candidates)
         document_total = select_document_total(document_total_candidates)
@@ -5808,12 +6390,16 @@ class OfflineExtractor:
         )
         result = {
             "output_version": "offline_accuracy_spine_v5",
+            "contract_revision": 2,
             "document_total_version": DOCUMENT_TOTAL_VERSION,
             "document_totals_version": DOCUMENT_TOTALS_VERSION,
             "document_total": (
                 document_total.model_dump(mode="json") if document_total is not None else None
             ),
             "document_totals": [total.model_dump(mode="json") for total in document_totals],
+            "raw_total_candidates": [
+                candidate.model_dump(mode="json") for candidate in raw_total_candidates
+            ],
             "document_id": document_id,
             "hospital_id": resolved_hospital_id,
             "hospital": hospital,
@@ -5868,6 +6454,81 @@ class OfflineExtractor:
                 published_asset = page.model_copy(
                     update={"relative_path": str(Path("pages") / page.relative_path)}
                 )
+                raw_page_tables = tuple(
+                    table
+                    for table in draft_source_tables
+                    if table.page_number == page.page_number
+                )
+                raw_page_rows = tuple(
+                    row
+                    for row in draft_row_candidates
+                    if row.page_number == page.page_number
+                )
+                page_manifest = tuple(
+                    item
+                    for item in token_manifest
+                    if item.page_number == page.page_number
+                )
+                page_diagnostics = tuple(
+                    item
+                    for item in diagnostics
+                    if int(item.get("page_number") or 0) == page.page_number
+                )
+                page_totals = tuple(
+                    candidate
+                    for candidate in document_total_candidates
+                    if candidate.total.page_number == page.page_number
+                )
+                table_units = tuple(
+                    TableExtractionUnit(
+                        page_number=page.page_number,
+                        table_id=table.table_id,
+                        source_table=table,
+                        row_candidates=tuple(
+                            row for row in raw_page_rows if row.table_id == table.table_id
+                        ),
+                        crop_relative_path=(
+                            str(
+                                source_table_crop_paths[
+                                    (page.page_number, table.table_id)
+                                ]
+                                .resolve()
+                                .relative_to(artifact_root.resolve())
+                            )
+                            if (page.page_number, table.table_id)
+                            in source_table_crop_paths
+                            else None
+                        ),
+                        crop_box=source_table_crop_boxes.get(
+                            (page.page_number, table.table_id)
+                        ),
+                        diagnostics=tuple(
+                            item
+                            for item in page_diagnostics
+                            if item.get("table_id") == table.table_id
+                        ),
+                        normalized_fragments=tuple(
+                            item
+                            for item in page_manifest
+                            if item.fragment_role is not None
+                            and table.table_id in item.table_ids
+                        ),
+                        recovery_tokens=tuple(
+                            item
+                            for item in page_manifest
+                            if item.source_artifact_sha256 is not None
+                            and table.table_id in item.table_ids
+                        ),
+                        raw_total_candidates=tuple(
+                            item
+                            for item in page_totals
+                            if item.total.evidence.table_id == table.table_id
+                        ),
+                        provider_usage=provider_usage,
+                    )
+                    for table in raw_page_tables
+                )
+                assigned_table_ids = {table.table_id for table in raw_page_tables}
                 page_units.append(
                     PageExtractionUnit(
                         page_asset=published_asset,
@@ -5877,35 +6538,38 @@ class OfflineExtractor:
                             if page.page_number in baseline_units
                             else (),
                         ),
-                        token_manifest=tuple(
-                            item
-                            for item in token_manifest
-                            if item.page_number == page.page_number
+                        token_manifest=page_manifest,
+                        table_units=table_units,
+                        unassigned_row_candidates=tuple(
+                            row
+                            for row in raw_page_rows
+                            if row.table_id not in assigned_table_ids
                         ),
-                        source_tables=tuple(
-                            table
-                            for table in source_tables
-                            if table.page_number == page.page_number
-                        ),
-                        canonical_rows=tuple(
-                            row for row in rows if row.page_number == page.page_number
-                        ),
-                        diagnostics=tuple(
-                            item
-                            for item in diagnostics
-                            if int(item.get("page_number") or 0) == page.page_number
-                        ),
-                        total_candidates=tuple(
-                            total
-                            for total in document_totals
-                            if total.page_number == page.page_number
-                        ),
+                        diagnostics=page_diagnostics,
+                        total_candidates=page_totals,
+                        provider_usage=provider_usage,
                     )
                 )
             _draft_sink["page_units"] = tuple(page_units)
             _draft_sink["provider_usage"] = provider_usage
             _draft_sink["hospital"] = hospital
             _draft_sink["hospital_id"] = resolved_hospital_id
+            _draft_sink["document_id"] = document_id
+            _draft_sink["source_sha256"] = sha256_file(source)
+            _draft_sink["source_name"] = source.name
+            _draft_sink["alias_registry_revision"] = (
+                alias_snapshot["revision"] if alias_snapshot is not None else None
+            )
+            _draft_sink["profile_registry_revision"] = (
+                profile_registry_revision
+                if profile_registry_revision is not None
+                else getattr(self, "profile_registry_revision", None)
+            )
+            _draft_sink["applied_alias_ids"] = tuple(matched_header_alias_ids())
+            _draft_sink["suppressed_repeated_source_tables"] = tuple(
+                suppressed_source_tables
+            )
+            _draft_sink["recovery_metadata"] = recovery_metadata
         return result
 
     def extract_draft(
@@ -5916,7 +6580,7 @@ class OfflineExtractor:
         **options: Any,
     ) -> ExtractionDraft:
         sink: dict[str, Any] = {}
-        result = self.extract(
+        self.extract(
             source,
             artifact_root,
             progress,
@@ -5924,11 +6588,20 @@ class OfflineExtractor:
             **options,
         )
         return ExtractionDraft(
-            publication_result=result,
+            document_id=sink["document_id"],
+            source_sha256=sink["source_sha256"],
+            source_name=sink["source_name"],
             page_units=sink["page_units"],
             provider_usage=sink["provider_usage"],
             hospital=sink["hospital"],
             hospital_id=sink["hospital_id"],
+            alias_registry_revision=sink["alias_registry_revision"],
+            profile_registry_revision=sink["profile_registry_revision"],
+            applied_alias_ids=sink["applied_alias_ids"],
+            suppressed_repeated_source_tables=sink[
+                "suppressed_repeated_source_tables"
+            ],
+            recovery_metadata=sink["recovery_metadata"],
         )
 
     def recover_draft(
@@ -5944,7 +6617,7 @@ class OfflineExtractor:
         options.pop("allow_gemini", None)
         options.pop("baseline_draft", None)
         options.pop("recovery_targets", None)
-        recovered = self.extract(
+        self.extract(
             source,
             artifact_root,
             progress,
@@ -5955,11 +6628,20 @@ class OfflineExtractor:
             **options,
         )
         candidate = ExtractionDraft(
-            publication_result=recovered,
+            document_id=sink["document_id"],
+            source_sha256=sink["source_sha256"],
+            source_name=sink["source_name"],
             page_units=sink["page_units"],
             provider_usage=sink["provider_usage"],
             hospital=sink["hospital"],
             hospital_id=sink["hospital_id"],
+            alias_registry_revision=sink["alias_registry_revision"],
+            profile_registry_revision=sink["profile_registry_revision"],
+            applied_alias_ids=sink["applied_alias_ids"],
+            suppressed_repeated_source_tables=sink[
+                "suppressed_repeated_source_tables"
+            ],
+            recovery_metadata=sink["recovery_metadata"],
         )
         targeted_pages = {page for page, _table in recovery_targets}
         for unit, digest in draft.raw_unit_sha256.items():
@@ -5969,10 +6651,10 @@ class OfflineExtractor:
         from gmoney.extraction.validation import validate_extraction_result
 
         baseline_report = validate_extraction_result(
-            source, draft.publication_result, artifact_root
+            source, draft.result, artifact_root
         )
         candidate_report = validate_extraction_result(
-            source, candidate.publication_result, artifact_root
+            source, candidate.result, artifact_root
         )
         baseline_blocking = tuple(
             issue
@@ -5994,28 +6676,81 @@ class OfflineExtractor:
             for issue in candidate_blocking
             if _issue_is_in_recovery_target(issue, recovery_targets)
         )
-        baseline_counts = Counter(_issue_semantic_key(issue) for issue in baseline_blocking)
-        candidate_counts = Counter(_issue_semantic_key(issue) for issue in candidate_blocking)
+        baseline_keys = {_issue_semantic_key(issue): issue for issue in baseline_blocking}
+        candidate_keys = {_issue_semantic_key(issue): issue for issue in candidate_blocking}
         removed_issue_ids = tuple(
             issue.id
-            for issue in baseline_targeted
-            if candidate_counts[_issue_semantic_key(issue)]
-            < baseline_counts[_issue_semantic_key(issue)]
+            for key, issue in baseline_keys.items()
+            if key not in candidate_keys and issue in baseline_targeted
         )
-        new_blocking = any(
-            count > baseline_counts[key]
-            for key, count in candidate_counts.items()
-        )
+        new_blocking = any(key not in baseline_keys for key in candidate_keys)
+        target_audit: dict[
+            tuple[int, str | None], dict[str, tuple[str, ...]]
+        ] = {}
+        for target in recovery_targets:
+            baseline_for_target = tuple(
+                issue
+                for issue in baseline_blocking
+                if _issue_is_in_recovery_target(issue, (target,))
+            )
+            candidate_for_target = tuple(
+                issue
+                for issue in candidate_blocking
+                if _issue_is_in_recovery_target(issue, (target,))
+            )
+            baseline_target_keys = {
+                _issue_semantic_key(issue): issue for issue in baseline_for_target
+            }
+            candidate_target_keys = {
+                _issue_semantic_key(issue): issue for issue in candidate_for_target
+            }
+            target_audit[target] = {
+                "target_issue_ids": tuple(issue.id for issue in baseline_for_target),
+                "removed_issue_ids": tuple(
+                    issue.id
+                    for key, issue in baseline_target_keys.items()
+                    if key not in candidate_target_keys
+                ),
+                "remaining_issue_ids": tuple(
+                    issue.id
+                    for key, issue in baseline_target_keys.items()
+                    if key in candidate_target_keys
+                ),
+                "new_issue_ids": tuple(
+                    issue.id
+                    for key, issue in candidate_target_keys.items()
+                    if key not in baseline_target_keys
+                ),
+            }
         implicated_fields: dict[str, set[str]] = {}
+        baseline_rows_by_id = {
+            str(row.id): row for unit in draft.page_units for row in unit.canonical_rows
+        }
         for issue in baseline_targeted:
             if issue.canonical_row_id and issue.field:
                 implicated_fields.setdefault(str(issue.canonical_row_id), set()).add(
                     str(issue.field)
                 )
+                baseline_row = baseline_rows_by_id.get(str(issue.canonical_row_id))
+                if baseline_row is not None and baseline_row.row_anchor:
+                    implicated_fields.setdefault(baseline_row.row_anchor, set()).add(
+                        str(issue.field)
+                    )
+        candidate_recovery_records = {
+            (int(item.get("page_number") or 0), item.get("table_id")): item
+            for item in candidate.recovery_metadata.get("targets", [])
+        }
+        target_status_safe = all(
+            candidate_recovery_records.get(target, {}).get("status") == "recovered"
+            and target_audit[target]["removed_issue_ids"]
+            and not target_audit[target]["new_issue_ids"]
+            for target in recovery_targets
+        )
         safe = bool(
             removed_issue_ids
             and len(candidate_targeted) < len(baseline_targeted)
             and not new_blocking
+            and target_status_safe
             and _recovery_preserves_grounded_charges(
                 draft,
                 candidate,
@@ -6024,18 +6759,37 @@ class OfflineExtractor:
             )
         )
         if not safe:
-            return _declined_recovery_draft(draft, candidate, recovery_targets)
-        result = deepcopy(candidate.publication_result)
-        for target in result.get("recovery", {}).get("targets", []):
-            target["removed_issue_ids"] = list(removed_issue_ids)
+            return _declined_recovery_draft(
+                draft,
+                candidate,
+                recovery_targets,
+                target_audit,
+            )
+        recovery_metadata = deepcopy(candidate.recovery_metadata)
+        for target in recovery_metadata.get("targets", []):
+            identity = (int(target.get("page_number") or 0), target.get("table_id"))
+            audit = target_audit.get(identity, {})
+            target["target_issue_ids"] = list(audit.get("target_issue_ids", ()))
+            target["removed_issue_ids"] = list(audit.get("removed_issue_ids", ()))
+            target["remaining_issue_ids"] = list(audit.get("remaining_issue_ids", ()))
+            target["new_issue_ids"] = list(audit.get("new_issue_ids", ()))
             target["status"] = "recovered"
             target["selected"] = "candidate"
         return ExtractionDraft(
-            publication_result=result,
+            document_id=candidate.document_id,
+            source_sha256=candidate.source_sha256,
+            source_name=candidate.source_name,
             page_units=candidate.page_units,
             provider_usage=candidate.provider_usage,
             hospital=candidate.hospital,
             hospital_id=candidate.hospital_id,
+            alias_registry_revision=candidate.alias_registry_revision,
+            profile_registry_revision=candidate.profile_registry_revision,
+            applied_alias_ids=candidate.applied_alias_ids,
+            suppressed_repeated_source_tables=(
+                candidate.suppressed_repeated_source_tables
+            ),
+            recovery_metadata=recovery_metadata,
         )
 
 

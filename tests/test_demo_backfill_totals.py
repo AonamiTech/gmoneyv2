@@ -38,10 +38,12 @@ def completed_job(
         json.dumps(
             {
                 "output_version": output_version,
+                "contract_revision": 2,
                 "document_total_version": "old-total-version",
                 "document_totals_version": "old-totals-version",
                 "document_total": None,
                 "document_totals": [],
+                "raw_total_candidates": [],
                 "document_id": source_sha,
                 "source_sha256": source_sha,
                 "source_name": "historic-bill.pdf",

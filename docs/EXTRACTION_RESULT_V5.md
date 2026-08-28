@@ -4,6 +4,11 @@
 certified. Earlier results remain readable as legacy, uncertified history and
 must be reprocessed before approval or export.
 
+New publications require `contract_revision: 2`. Revision 2 adds stable
+geometry anchors, typed derived-field provenance, complete token-fragment
+lineage, and the raw total-candidate contexts required for safe totals-only
+maintenance. Revisionless and revision-1 v5 results remain uncertified.
+
 The complete top-level result is decoded by `ExtractionResultV5` before any
 semantic validation. Malformed nested values therefore produce fatal,
 field-addressed validation issues instead of parser exceptions.

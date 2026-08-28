@@ -2635,7 +2635,7 @@ def test_expdate_in_product_cell_is_not_recovered_as_service_date() -> None:
     assert recovered[0].service_date_iso is None
 
 
-def test_standalone_financial_receipt_is_billable_and_requests_full_page_recovery() -> None:
+def test_issuerless_financial_receipt_requests_recovery_and_remains_unresolved() -> None:
     tokens = (
         token(0, "Distribution Receipt Book", (100, 20, 500, 35)),
         token(1, "Receipt No 9658", (100, 50, 300, 65)),
@@ -2652,13 +2652,13 @@ def test_standalone_financial_receipt_is_billable_and_requests_full_page_recover
     )
 
     assert len(result.rows) == 1
-    assert result.rows[0].candidate.role is RowRole.DETAIL
-    assert result.rows[0].candidate.section == "Supporting receipt"
+    assert result.rows[0].candidate.role is RowRole.UNRESOLVED
+    assert result.rows[0].candidate.section == "Receipt"
     assert result.rows[0].candidate.amount == Decimal("1500.00")
     assert result.rows[0].candidate.source_route == "receipt_form"
 
 
-def test_generic_hospital_receipt_is_grounded_as_supporting_charge() -> None:
+def test_generic_issuerless_hospital_receipt_remains_unresolved() -> None:
     result = reconstruct_ocr_rows(
         (
             token(0, "Hospital Receipt", (100, 20, 500, 40)),
@@ -2672,14 +2672,39 @@ def test_generic_hospital_receipt_is_grounded_as_supporting_charge() -> None:
     )
 
     assert len(result.rows) == 1
-    assert result.rows[0].candidate.role is RowRole.DETAIL
+    assert result.rows[0].candidate.role is RowRole.UNRESOLVED
     assert result.rows[0].candidate.request_no == "R-123"
     assert result.rows[0].candidate.amount == Decimal("1500")
     receipt_table = result.source_tables[0]
     values = {cell.column_id: cell.raw_value for cell in receipt_table.rows[0].cells}
-    assert values["issuer"] == "Hospital"
+    assert values["issuer"] is None
     assert values["reference"] == "R-123"
     assert values["amount"] == "Rs. 1500"
+    assert result.diagnostics["financial_form_classification"] == "ambiguous_receipt"
+
+
+def test_split_receipt_reference_is_grounded_from_the_value_token() -> None:
+    result = reconstruct_ocr_rows(
+        (
+            token(0, "Alpha Hospital", (100, 15, 500, 35)),
+            token(1, "Receipt", (100, 45, 300, 65)),
+            token(2, "Receipt No", (100, 75, 260, 95)),
+            token(3, "R-123", (280, 75, 380, 95)),
+            token(4, "Total Amount", (100, 110, 350, 130)),
+            token(5, "Rs. 1500", (800, 110, 950, 130)),
+        ),
+        page_number=1,
+        table_id="p1-t1",
+        box=(0, 0, 1000, 150),
+    )
+
+    assert result.rows[0].candidate.role is RowRole.DETAIL
+    assert result.rows[0].candidate.request_no == "R-123"
+    source_row = result.source_tables[0].rows[0]
+    cells = {cell.column_id: cell for cell in source_row.cells}
+    assert cells["issuer"].raw_value == "Alpha Hospital"
+    assert cells["reference"].raw_value == "R-123"
+    assert cells["reference"].evidence[0].token_ids == ("token-3",)
 
 
 def test_bare_amount_received_form_remains_unresolved() -> None:

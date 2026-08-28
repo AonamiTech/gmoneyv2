@@ -66,6 +66,27 @@ def registry_event(action: str) -> dict[str, str]:
     }
 
 
+def test_public_state_never_labels_legacy_output_as_certified(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _client, store = client_for(tmp_path, monkeypatch)
+    job = store.create("legacy.pdf")
+    state = store.update(
+        job["id"],
+        status="complete",
+        validation_status="passed",
+        validation_issue_count=0,
+        validation_issue_codes=[],
+    )
+    public = api._public_state(state)
+
+    assert public["certification_status"] == "legacy_uncertified"
+    assert public["validation_status"] is None
+    assert public["validation_issue_count"] is None
+    assert public["validation_issue_codes"] is None
+
+
 def registry_with_alias(revision: int = 1) -> dict[str, object]:
     return {
         "registry_version": ALIAS_REGISTRY_VERSION,
@@ -1657,7 +1678,10 @@ def test_needs_review_result_remains_visible_and_blocks_approval(
     assert review.json()["issues_open"] == 1
     listing = client.get("/api/v2/documents", params={"status": "needs_review"})
     assert listing.status_code == 200
-    assert listing.json()["documents"][0]["validation_issue_count"] == 1
+    listed = listing.json()["documents"][0]
+    assert listed["certification_status"] == "legacy_uncertified"
+    assert listed["validation_status"] is None
+    assert listed["validation_issue_count"] is None
     approval = client.post(
         f"/api/v2/documents/{job_id}/approval",
         headers={"If-Match": "0"},

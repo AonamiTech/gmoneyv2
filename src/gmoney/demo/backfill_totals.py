@@ -7,17 +7,15 @@ from typing import Annotated, Any
 
 import typer
 
-from gmoney.contracts.extraction import DocumentTotal
+from gmoney.contracts.extraction import RawTotalCandidate
 from gmoney.demo.store import JobStore, JobTransactionError
 from gmoney.extraction.document_total import (
     DOCUMENT_TOTAL_VERSION,
     DOCUMENT_TOTALS_VERSION,
     DocumentTotalCandidate,
-    assign_document_total_contexts,
     select_document_total,
     select_document_totals,
 )
-from gmoney.extraction.validation import ValidationStatus, validate_extraction_result
 
 app = typer.Typer(add_completion=False, invoke_without_command=True)
 
@@ -56,7 +54,11 @@ def backfill_totals(*, root: Path, apply: bool = False) -> dict[str, Any]:
             ):
                 summary["already_current"] += 1
                 continue
-            if result.get("output_version") != "offline_accuracy_spine_v5":
+            if (
+                result.get("output_version") != "offline_accuracy_spine_v5"
+                or result.get("contract_revision") != 2
+                or not isinstance(result.get("raw_total_candidates"), list)
+            ):
                 summary["failed"] += 1
                 summary["failures"].append(
                     {"job_id": job_id, "error": "requires_full_reprocess"}
@@ -66,52 +68,28 @@ def backfill_totals(*, root: Path, apply: bool = False) -> dict[str, Any]:
                 summary["would_update"] += 1
                 continue
             candidates = []
-            for payload in result.get("document_totals") or ():
-                total = DocumentTotal.model_validate(payload)
-                points = total.evidence.polygon.points
+            for payload in result["raw_total_candidates"]:
+                raw = RawTotalCandidate.model_validate(payload)
                 candidates.append(
                     DocumentTotalCandidate(
-                        total=total,
-                        label_priority=0,
-                        vertical_position=sum(point.y for point in points) / len(points),
-                        local_context=total.label,
+                        total=raw.total,
+                        label_priority=raw.label_priority,
+                        vertical_position=raw.vertical_position,
+                        local_context=raw.local_context,
                     )
                 )
-            classified = assign_document_total_contexts(
-                candidates,
-                result.get("diagnostics") or [],
-            )
-            totals = select_document_totals(classified)
-            primary = select_document_total(classified)
+            totals = select_document_totals(candidates)
+            primary = select_document_total(candidates)
             result["document_total_version"] = DOCUMENT_TOTAL_VERSION
             result["document_totals_version"] = DOCUMENT_TOTALS_VERSION
             result["document_totals"] = [item.model_dump(mode="json") for item in totals]
             result["document_total"] = (
                 primary.model_dump(mode="json") if primary is not None else None
             )
-            report = validate_extraction_result(
-                store.job_dir(job_id) / "source.pdf",
-                result,
-                store.job_dir(job_id) / "artifacts",
-            )
-            if report.fatal:
-                raise ValueError("totals reprojection failed integrity validation")
-            result["semantic_validation"] = report.model_dump(mode="json")
-            status = (
-                "complete"
-                if report.status is ValidationStatus.PASSED
-                else "needs_review"
-            )
             published = store.publish_maintenance_result(
                 job_id,
                 result,
                 expected_result_sha256=result_digest,
-                status=status,
-                validation_status=report.status.value,
-                validation_issue_count=len(report.issues),
-                validation_issue_codes=list(
-                    dict.fromkeys(issue.code for issue in report.issues)
-                ),
             )
             if not published:
                 raise ValueError("job state changed during totals reprojection")

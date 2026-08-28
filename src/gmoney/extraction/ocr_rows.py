@@ -2394,22 +2394,12 @@ def _grounded_receipt_form(
         and not DATE_SPAN.search(token.text)
         and not re.search(r"(?:receipt|reference|ref)\s*(?:no|number|#)", token.text, re.I)
     )
-    description_tokens = tuple(
-        token
-        for token in ordered
-        if token not in reference_tokens
-        and token not in amount_label_tokens
-        and token not in amount_tokens
-        and "receipt" not in _normalize(token.text)
-        and DATE_SPAN.search(token.text) is None
-        and any(character.isalpha() for character in token.text)
-    )
     if (
         not (has_receipt_title or has_received_label)
         or not amount_tokens
         or not (
             amount_label_tokens
-            or (has_receipt_title and reference_tokens and description_tokens)
+            or (has_receipt_title and reference_tokens)
         )
     ):
         return None
@@ -2432,6 +2422,7 @@ def _grounded_receipt_form(
     )
     reference_raw: str | None = None
     reference_evidence: tuple[OcrToken, ...] = ()
+    reference_value_token: OcrToken | None = None
     for token in reference_tokens:
         match = re.search(
             r"\b(?:receipt|reference|ref)\s*(?:no|number|#)?\s*[:#.-]?\s*"
@@ -2439,26 +2430,84 @@ def _grounded_receipt_form(
             token.text,
             re.IGNORECASE,
         )
-        if match:
+        if match and match.group("value").casefold() not in {"no", "number"}:
             reference_raw = match.group("value")
             reference_evidence = (token,)
+            reference_value_token = token
+            break
+        label_left, label_top, label_right, label_bottom = _bounds(token)
+        same_line = tuple(
+            candidate
+            for candidate in ordered
+            if candidate is not token
+            and _bounds(candidate)[0] >= label_right - 2
+            and min(label_bottom, _bounds(candidate)[3])
+            - max(label_top, _bounds(candidate)[1])
+            > 0
+            and not DATE_SPAN.search(candidate.text)
+            and parse_decimal(candidate.text) is None
+            and bool(re.fullmatch(r"[a-z0-9][a-z0-9/-]{1,}", candidate.text.strip(), re.I))
+        )
+        next_line = tuple(
+            candidate
+            for candidate in ordered
+            if candidate is not token
+            and _bounds(candidate)[1] >= label_bottom
+            and _bounds(candidate)[1] - label_bottom <= max(20.0, _height(token) * 2.0)
+            and abs(_bounds(candidate)[0] - label_left)
+            <= max(30.0, label_right - label_left)
+            and not DATE_SPAN.search(candidate.text)
+            and parse_decimal(candidate.text) is None
+            and bool(re.fullmatch(r"[a-z0-9][a-z0-9/-]{1,}", candidate.text.strip(), re.I))
+        )
+        adjacent = min(
+            (*same_line, *next_line),
+            key=lambda candidate: (
+                abs(_center_y(candidate) - _center_y(token)),
+                abs(_center_x(candidate) - _center_x(token)),
+            ),
+            default=None,
+        )
+        if adjacent is not None:
+            reference_raw = adjacent.text.strip()
+            reference_evidence = (adjacent,)
+            reference_value_token = adjacent
             break
     title_token = next(
         (token for token in ordered if "receipt" in _normalize(token.text)),
         ordered[0],
     )
-    issuer_raw = (
-        re.sub(r"\breceipt\b", "", title_token.text, flags=re.I).strip(" :-")
-        if has_receipt_title
-        else ""
-    )
-    if has_receipt_title and not issuer_raw:
-        preceding = tuple(
-            token for token in ordered if _bounds(token)[1] < _bounds(title_token)[1]
+    issuer_raw: str | None = None
+    issuer_token: OcrToken | None = None
+    for token in ordered:
+        explicit_issuer = re.search(
+            r"\b(?:issuer|provider|payee|hospital)\s*[:.-]\s*(?P<value>.+)$",
+            token.text,
+            re.I,
         )
-        if preceding:
-            issuer_raw = preceding[-1].text.strip()
-            title_token = preceding[-1]
+        if explicit_issuer and explicit_issuer.group("value").strip():
+            issuer_raw = explicit_issuer.group("value").strip()
+            issuer_token = token
+            break
+        normalized_token = _normalize(token.text)
+        if (
+            token is not title_token
+            and "receipt" not in normalized_token
+            and any(
+                marker in normalized_token
+                for marker in (
+                    "hospital",
+                    "clinic",
+                    "medical centre",
+                    "medical center",
+                    "healthcare",
+                    "provider",
+                )
+            )
+        ):
+            issuer_raw = token.text.strip()
+            issuer_token = token
+            break
     date_token = next(
         (
             token
@@ -2472,9 +2521,24 @@ def _grounded_receipt_form(
         ),
         None,
     )
-    ambiguous = not reference_raw and not issuer_raw and not explicit_payment
+    # A grounded payment/refund form is explicitly non-ledger even when the
+    # issuer is absent.  A potentially billable receipt, however, remains
+    # unresolved until a real issuer is grounded.
+    ambiguous = not issuer_raw and not explicit_payment
     role = RowRole.UNRESOLVED if ambiguous else (
         RowRole.PAYMENT if explicit_payment else RowRole.DETAIL
+    )
+    description_tokens = tuple(
+        token
+        for token in ordered
+        if token not in reference_tokens
+        and token is not reference_value_token
+        and token not in amount_label_tokens
+        and token not in amount_tokens
+        and token is not issuer_token
+        and "receipt" not in _normalize(token.text)
+        and DATE_SPAN.search(token.text) is None
+        and any(character.isalpha() for character in token.text)
     )
     description_token = min(
         description_tokens,
@@ -2528,7 +2592,13 @@ def _grounded_receipt_form(
         source_routes=("receipt_form",),
     )
     column_specs = (
-        ("issuer", "Issuer", None, issuer_raw, (title_token,)),
+        (
+            "issuer",
+            "Issuer",
+            None,
+            issuer_raw,
+            (issuer_token,) if issuer_token is not None else (),
+        ),
         (
             "reference",
             "Receipt Reference",

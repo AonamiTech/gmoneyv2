@@ -30,7 +30,6 @@ from gmoney.extraction.typed_values import (
 from gmoney.extraction.validation import (
     ValidationReport,
     ValidationSeverity,
-    ValidationStatus,
     validate_extraction_result,
 )
 
@@ -870,32 +869,82 @@ def _unlinked_financial_row_is_explained(
     return bool(exact_matches) or len(summary_matches) == 1
 
 
-def _field_token_ids(row: dict[str, Any], field: str | None = None) -> set[str]:
+def _manifest_root_ids(result: dict[str, Any]) -> dict[str, set[str]]:
+    parents = {
+        str(token.get("token_id")): tuple(
+            str(value)
+            for value in (
+                token.get("parent_token_ids")
+                or ([token["parent_token_id"]] if token.get("parent_token_id") else [])
+            )
+        )
+        for token in result.get("token_manifest", [])
+        if isinstance(token, dict) and token.get("token_id")
+    }
+
+    def roots(token_id: str, trail: frozenset[str] = frozenset()) -> set[str]:
+        if token_id in trail:
+            return {token_id}
+        token_parents = parents.get(token_id, ())
+        if not token_parents:
+            return {token_id}
+        return {
+            root
+            for parent in token_parents
+            for root in roots(parent, trail | {token_id})
+        }
+
+    return {token_id: roots(token_id) for token_id in parents}
+
+
+def _field_token_ids(
+    row: dict[str, Any],
+    field: str | None = None,
+    *,
+    root_ids: dict[str, set[str]] | None = None,
+) -> set[str]:
     evidence_by_field = row.get("field_evidence") or {}
     evidence = evidence_by_field.get(field, []) if field else [
         item for values in evidence_by_field.values() for item in values
     ]
-    return {
+    token_ids = {
         str(token_id)
         for item in evidence
         for token_id in (item.get("token_ids") or [])
+    }
+    if root_ids is None:
+        return token_ids
+    return {
+        root
+        for token_id in token_ids
+        for root in root_ids.get(token_id, {token_id})
     }
 
 
 def _review_mapping_score(
     old_row: dict[str, Any],
     candidate: dict[str, Any],
+    *,
+    old_root_ids: dict[str, set[str]] | None = None,
+    candidate_root_ids: dict[str, set[str]] | None = None,
 ) -> tuple[int, int, int, int, float, int, int] | None:
     if int(candidate.get("page_number") or 0) != int(
         old_row.get("page_number") or 0
     ):
         return None
-    old_description_ids = _field_token_ids(old_row, "description")
-    old_all_ids = _field_token_ids(old_row)
-    description_overlap = len(
-        old_description_ids & _field_token_ids(candidate, "description")
+    old_description_ids = _field_token_ids(
+        old_row, "description", root_ids=old_root_ids
     )
-    all_overlap = len(old_all_ids & _field_token_ids(candidate))
+    old_all_ids = _field_token_ids(old_row, root_ids=old_root_ids)
+    description_overlap = len(
+        old_description_ids
+        & _field_token_ids(
+            candidate, "description", root_ids=candidate_root_ids
+        )
+    )
+    all_overlap = len(
+        old_all_ids & _field_token_ids(candidate, root_ids=candidate_root_ids)
+    )
     similarity = SequenceMatcher(
         None,
         _normalized(old_row.get("description")),
@@ -949,13 +998,22 @@ def _review_mapping_score(
 
 
 def _map_reviewed_row(
-    old_row: dict[str, Any], new_rows: list[dict[str, Any]]
+    old_row: dict[str, Any],
+    new_rows: list[dict[str, Any]],
+    *,
+    old_root_ids: dict[str, set[str]] | None = None,
+    candidate_root_ids: dict[str, set[str]] | None = None,
 ) -> str | None:
     scored: list[
         tuple[tuple[int, int, int, int, float, int, int], str]
     ] = []
     for candidate in new_rows:
-        score = _review_mapping_score(old_row, candidate)
+        score = _review_mapping_score(
+            old_row,
+            candidate,
+            old_root_ids=old_root_ids,
+            candidate_root_ids=candidate_root_ids,
+        )
         if score is None:
             continue
         scored.append((score, str(candidate["id"])))
@@ -1015,6 +1073,8 @@ def _migrate_review(
     new_rows = list(new_result.get("rows", []))
     new_rows_by_id = {str(row["id"]): row for row in new_rows}
     new_ids = {str(row["id"]) for row in new_rows}
+    old_root_ids = _manifest_root_ids(old_result)
+    new_root_ids = _manifest_root_ids(new_result)
     migrated_overrides: dict[str, Any] = {}
     migrated_override_sources: dict[str, str] = {}
     migrated_override_members: dict[str, list[str]] = {}
@@ -1063,6 +1123,8 @@ def _migrate_review(
         score = _review_mapping_score(
             reviewed_row,
             new_rows_by_id[target_id],
+            old_root_ids=old_root_ids,
+            candidate_root_ids=new_root_ids,
         )
         return (
             old_id == target_id,
@@ -1082,7 +1144,19 @@ def _migrate_review(
                 **old_row,
                 **(override.get("changes") or {}),
             }
-            target_id = _map_reviewed_row(reviewed_row, new_rows)
+            target_id = _map_reviewed_row(
+                old_row,
+                new_rows,
+                old_root_ids=old_root_ids,
+                candidate_root_ids=new_root_ids,
+            )
+            if target_id is None:
+                target_id = _map_reviewed_row(
+                    reviewed_row,
+                    new_rows,
+                    old_root_ids=old_root_ids,
+                    candidate_root_ids=new_root_ids,
+                )
         if target_id is None:
             preserve_override(old_id, override)
             continue
@@ -1396,6 +1470,12 @@ def _cutover_job(
     commit_marker: Path,
 ) -> Path:
     job_dir = store.job_dir(prepared.job_id)
+    certified_result, certified_state = store._certify_result_unlocked(
+        prepared.job_id,
+        prepared.new_result,
+        artifact_root=prepared.stage_dir / "artifacts",
+    )
+    _atomic_json(prepared.stage_dir / "result.json", certified_result)
     backup_dir = backup_root / prepared.job_id
     journal_path = job_dir / ".cutover.json"
 
@@ -1438,33 +1518,13 @@ def _cutover_job(
         (job_dir / "result.json").replace(backup_dir / "result.json")
         (prepared.stage_dir / "result.json").replace(job_dir / "result.json")
         _atomic_json(job_dir / "review.json", prepared.migrated_review)
-        hospital = prepared.new_result.get("hospital") or {}
-        validation = ValidationReport.model_validate(
-            prepared.new_result["semantic_validation"]
-        )
-        terminal_status = (
-            "complete"
-            if validation.status is ValidationStatus.PASSED
-            else "needs_review"
-        )
         # The batch coordinator already holds this job's exclusive lock.  Use
         # the raw state primitives so cutover cannot recursively flock the
         # same lock file and deadlock.
         state = store._read_state_unlocked(prepared.job_id)
         state.update(
             {
-                "status": terminal_status,
-                "page": int(prepared.new_result.get("pages") or 0),
-                "pages": int(prepared.new_result.get("pages") or 0),
-                "row_count": len(prepared.new_result.get("rows", [])),
-                "hospital_name": hospital.get("name"),
-                "hospital_confidence": hospital.get("confidence"),
-                "validation_status": validation.status.value,
-                "validation_issue_count": len(validation.issues),
-                "validation_issue_codes": list(
-                    dict.fromkeys(issue.code for issue in validation.issues)
-                ),
-                "error": None,
+                **certified_state,
                 "reprocessed_at": utc_now(),
             }
         )
