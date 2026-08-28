@@ -116,14 +116,13 @@ class TokenManifestEntry(ContractModel):
 
     @model_validator(mode="after")
     def require_consistent_fragment(self) -> "TokenManifestEntry":
-        fragment_fields = (
+        single_parent_fields = (
             self.parent_token_id,
             self.character_start,
             self.character_end,
-            self.fragment_role,
         )
-        if any(value is not None for value in fragment_fields):
-            if any(value is None for value in fragment_fields):
+        if any(value is not None for value in single_parent_fields):
+            if any(value is None for value in single_parent_fields) or not self.fragment_role:
                 raise ValueError("fragment token metadata must be complete")
             assert self.character_start is not None
             assert self.character_end is not None
@@ -142,6 +141,8 @@ class TokenManifestEntry(ContractModel):
                 raise ValueError("composite fragments require a typed role")
         if self.parent_token_id and self.parent_token_ids:
             raise ValueError("fragment provenance must use one parent representation")
+        if self.fragment_role and not self.parent_token_id and not self.parent_token_ids:
+            raise ValueError("typed fragments require parent provenance")
         recovery_fields = (
             self.source_artifact_sha256,
             self.source_artifact_relative_path,

@@ -4,7 +4,12 @@ import pytest
 from pydantic import ValidationError
 
 from gmoney.contracts.evidence import Point, Polygon, TransformChain
-from gmoney.contracts.extraction import SourceCell, SourceColumn, SourceTable
+from gmoney.contracts.extraction import (
+    SourceCell,
+    SourceColumn,
+    SourceTable,
+    TokenManifestEntry,
+)
 from gmoney.contracts.gold import GoldAnnotation
 from gmoney.settings import Settings
 
@@ -48,6 +53,33 @@ def test_gold_amount_is_decimal() -> None:
 def test_non_empty_source_cell_requires_token_grounding() -> None:
     with pytest.raises(ValidationError, match="grounded OCR evidence"):
         SourceCell(column_id="c1", raw_value="invented")
+
+
+def test_composite_typed_fragment_does_not_require_single_parent_fields() -> None:
+    polygon = Polygon(
+        points=(
+            Point(x=1, y=1),
+            Point(x=20, y=1),
+            Point(x=20, y=10),
+            Point(x=1, y=10),
+        )
+    )
+
+    fragment = TokenManifestEntry(
+        token_id="fragment-composite",
+        page_number=1,
+        text="12 Aug",
+        polygon=polygon,
+        artifact_sha256="a" * 64,
+        artifact_relative_path="pages/page-1.png",
+        confidence=0.9,
+        parent_token_ids=("day-token", "month-token"),
+        parent_character_spans=((0, 2), (0, 3)),
+        fragment_role="service_date",
+    )
+
+    assert fragment.parent_token_id is None
+    assert fragment.parent_token_ids == ("day-token", "month-token")
 
 
 @pytest.mark.parametrize("token_id", ["", "   "])
