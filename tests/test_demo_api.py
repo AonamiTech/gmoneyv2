@@ -87,6 +87,39 @@ def test_public_state_never_labels_legacy_output_as_certified(
     assert public["validation_issue_codes"] is None
 
 
+def test_failed_document_exposes_atomically_retained_validation_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, store = client_for(tmp_path, monkeypatch)
+    job = store.create("invalid.pdf")
+    (store.job_dir(job["id"]) / "source.pdf").write_bytes(pdf_bytes())
+    store.update(job["id"], status="queued")
+    assert store.claim_queued(job["id"]) is not None
+    assert store.publish_processing_outcome(job["id"], {"invalid": True})
+
+    state = client.get(f"/api/v2/documents/{job['id']}")
+    assert state.status_code == 200
+    assert state.json()["status"] == "failed"
+    assert state.json()["error"] == "extraction_integrity_failed"
+    report = client.get(f"/api/v2/documents/{job['id']}/validation")
+    assert report.status_code == 200
+    assert report.json()["status"] == "failed"
+    assert report.json()["issues"]
+
+
+def test_validation_for_unknown_uuid_returns_404(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _store = client_for(tmp_path, monkeypatch)
+
+    response = client.get("/api/v2/documents/00000000-0000-0000-0000-000000000001/validation")
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Document not found"
+
+
 def registry_with_alias(revision: int = 1) -> dict[str, object]:
     return {
         "registry_version": ALIAS_REGISTRY_VERSION,
@@ -577,9 +610,7 @@ def test_hospital_alias_preview_and_apply_preserve_grounded_source_evidence(
         json={**apply_payload, "selected_candidate_ids": ["unknown-candidate"]},
     )
     assert unknown_candidate.status_code == 422
-    assert unknown_candidate.json()["detail"] == (
-        "Selected alias candidates are stale or unknown"
-    )
+    assert unknown_candidate.json()["detail"] == ("Selected alias candidates are stale or unknown")
     assert store.read_review(job_id)["revision"] == 1
     assert JsonAliasRepository(api.ALIAS_REGISTRY).read()["revision"] == 1
 
@@ -968,9 +999,7 @@ def test_snapshot_cannot_observe_future_registry_before_review_is_durable(
     try:
         assert registry_written.wait(8)
         assert json.loads(registry_path.read_text())["revision"] == 1
-        assert json.loads(
-            (store.job_dir(job_id) / "review.json").read_text()
-        )["revision"] == 0
+        assert json.loads((store.job_dir(job_id) / "review.json").read_text())["revision"] == 0
         assert not receiver.poll(0.5)
         release.set()
         assert receiver.poll(8)
@@ -996,9 +1025,7 @@ def test_registry_callback_programming_errors_are_not_reported_as_outages(
     tmp_path: Path,
     error: Exception,
 ) -> None:
-    coordinator = AliasTransactionCoordinator(
-        JobStore(tmp_path), tmp_path / "alias-registry.json"
-    )
+    coordinator = AliasTransactionCoordinator(JobStore(tmp_path), tmp_path / "alias-registry.json")
 
     def broken_callback(registry):
         raise error
@@ -1109,9 +1136,7 @@ def test_concurrent_processes_migrate_v2_registry_idempotently(tmp_path: Path) -
     assert second == ("snapshot", 5)
     final = JsonAliasRepository(registry_path).read()
     assert final["revision"] == 5
-    assert sum(
-        event["action"] == "alias_registry_migrated" for event in final["events"]
-    ) == 1
+    assert sum(event["action"] == "alias_registry_migrated" for event in final["events"]) == 1
 
 
 def test_pending_v2_journal_recovers_before_registry_migration(tmp_path: Path) -> None:
@@ -1241,9 +1266,7 @@ def test_missing_registry_refuses_non_empty_journal_base(tmp_path: Path) -> None
     (
         lambda registry: registry.update(revision=True),
         lambda registry: registry["hospitals"][0].update(origins="profile"),
-        lambda registry: registry["hospitals"][0]["name_variants"][0].update(
-            verified="true"
-        ),
+        lambda registry: registry["hospitals"][0]["name_variants"][0].update(verified="true"),
         lambda registry: registry["aliases"][0].update(active="false"),
         lambda registry: registry["events"][0].pop("reviewer"),
         lambda registry: registry["events"][0].update(created_at="yesterday"),
@@ -1537,6 +1560,10 @@ def completed_job(
     artifact = store.job_dir(job_id) / "artifacts" / "pages" / "page-1.png"
     artifact.parent.mkdir(parents=True)
     artifact.write_bytes(b"PNG fixture")
+    artifact_sha256 = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    source_bytes = pdf_bytes()
+    (store.job_dir(job_id) / "source.pdf").write_bytes(source_bytes)
+    source_sha256 = hashlib.sha256(source_bytes).hexdigest()
     evidence = {
         "page_number": 1,
         "table_id": "p1-t1",
@@ -1548,7 +1575,7 @@ def completed_job(
                 {"x": 10, "y": 30},
             ]
         },
-        "artifact_sha256": "a" * 64,
+        "artifact_sha256": artifact_sha256,
         "token_ids": ["one"],
     }
     row = {
@@ -1588,6 +1615,7 @@ def completed_job(
     }
     result: dict[str, object] = {
         "output_version": "offline_accuracy_spine_v5",
+        "contract_revision": 2,
         "document_total_version": "document_total_v1",
         "document_total": {
             "total_version": "document_total_v1",
@@ -1600,7 +1628,7 @@ def completed_job(
             "source_route": "page_ocr_final_total",
         },
         "document_id": "d" * 64,
-        "source_sha256": "e" * 64,
+        "source_sha256": source_sha256,
         "source_name": "client-bill.pdf",
         "hospital": {
             "name": "Machine Hospital",
@@ -1613,7 +1641,7 @@ def completed_job(
         "page_assets": [
             {
                 "page_number": 1,
-                "artifact_sha256": "a" * 64,
+                "artifact_sha256": artifact_sha256,
                 "width": 100,
                 "height": 200,
                 "relative_path": "pages/page-1.png",
@@ -1628,7 +1656,17 @@ def completed_job(
             "issues": [],
         },
     }
-    (store.job_dir(job_id) / "result.json").write_text(json.dumps(result))
+    result_bytes = (json.dumps(result, indent=2, sort_keys=True) + "\n").encode()
+    report = result["semantic_validation"]
+    report_bytes = json.dumps(
+        report,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    (store.job_dir(job_id) / "result.json").write_bytes(result_bytes)
+    (store.job_dir(job_id) / "validation.json").write_text(
+        json.dumps(report, indent=2, sort_keys=True) + "\n"
+    )
     store.update(
         job_id,
         status="complete",
@@ -1637,6 +1675,17 @@ def completed_job(
         page=1,
         hospital_name="Machine Hospital",
         hospital_confidence=0.94,
+        validation_status="passed",
+        validation_issue_count=0,
+        validation_issue_codes=[],
+        validation_report_sha256=hashlib.sha256(report_bytes).hexdigest(),
+        certification=store._certification_v2_unlocked(
+            job_id,
+            result,
+            result_bytes,
+            report,
+            report_bytes,
+        ),
     )
     return job_id, result
 
@@ -1661,13 +1710,28 @@ def test_needs_review_result_remains_visible_and_blocks_approval(
             }
         ],
     }
-    (store.job_dir(job_id) / "result.json").write_text(json.dumps(result))
+    result_bytes = (json.dumps(result, indent=2, sort_keys=True) + "\n").encode()
+    report_bytes = json.dumps(
+        result["semantic_validation"], sort_keys=True, separators=(",", ":")
+    ).encode()
+    (store.job_dir(job_id) / "result.json").write_bytes(result_bytes)
+    (store.job_dir(job_id) / "validation.json").write_text(
+        json.dumps(result["semantic_validation"], indent=2, sort_keys=True) + "\n"
+    )
     store.update(
         job_id,
         status="needs_review",
         validation_status="needs_review",
         validation_issue_count=1,
         validation_issue_codes=["unlinked_financial_row"],
+        validation_report_sha256=hashlib.sha256(report_bytes).hexdigest(),
+        certification=store._certification_v2_unlocked(
+            job_id,
+            result,
+            result_bytes,
+            result["semantic_validation"],
+            report_bytes,
+        ),
     )
 
     rows = client.get(f"/api/v2/documents/{job_id}/rows")
@@ -1679,15 +1743,16 @@ def test_needs_review_result_remains_visible_and_blocks_approval(
     listing = client.get("/api/v2/documents", params={"status": "needs_review"})
     assert listing.status_code == 200
     listed = listing.json()["documents"][0]
-    assert listed["certification_status"] == "legacy_uncertified"
-    assert listed["validation_status"] is None
-    assert listed["validation_issue_count"] is None
+    assert listed["certification_status"] == "needs_review"
+    assert listed["validation_status"] == "needs_review"
+    assert listed["validation_issue_count"] == 1
     approval = client.post(
         f"/api/v2/documents/{job_id}/approval",
         headers={"If-Match": "0"},
     )
     assert approval.status_code == 422
-    assert "open_structural_issues" in str(approval.json())
+    assert approval.json()["detail"]["code"] == "approval_blocked"
+    assert "open_structural_issues" in approval.json()["detail"]["blockers"]
 
 
 def test_review_updates_are_revisioned_and_machine_output_is_immutable(
@@ -1933,9 +1998,7 @@ def test_machine_rejected_rows_are_not_reviewer_restorable(tmp_path: Path, monke
         },
     )
     assert description_only.status_code == 200
-    assert description_only.json()["row"]["description"] == (
-        "Corrected machine-rejected charge"
-    )
+    assert description_only.json()["row"]["description"] == ("Corrected machine-rejected charge")
     assert description_only.json()["row"]["review_disposition"] == "rejected"
     assert description_only.json()["row"]["bulk_action"] is None
 
@@ -2041,9 +2104,7 @@ def test_service_date_corrections_update_raw_projection_and_clear_authoritativel
         },
     )
     assert raw_only.status_code == 422
-    assert raw_only.json()["detail"] == (
-        "service_date_raw requires authoritative service_date_iso"
-    )
+    assert raw_only.json()["detail"] == ("service_date_raw requires authoritative service_date_iso")
     assert store.read_review(job_id)["revision"] == 0
 
     changed = client.patch(
@@ -2231,8 +2292,25 @@ def test_informational_rows_are_visible_but_excluded_from_totals_and_approval(
         },
     }
     result["rows"].append(informational)
-    (store.job_dir(job_id) / "result.json").write_text(json.dumps(result))
-    store.update(job_id, row_count=2)
+    result_bytes = (json.dumps(result, indent=2, sort_keys=True) + "\n").encode()
+    report_bytes = json.dumps(
+        result["semantic_validation"],
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    (store.job_dir(job_id) / "result.json").write_bytes(result_bytes)
+    store.update(
+        job_id,
+        row_count=2,
+        validation_report_sha256=hashlib.sha256(report_bytes).hexdigest(),
+        certification=store._certification_v2_unlocked(
+            job_id,
+            result,
+            result_bytes,
+            result["semantic_validation"],
+            report_bytes,
+        ),
+    )
 
     rows = client.get(f"/api/v2/documents/{job_id}/rows").json()
     assert rows["total"] == 2
@@ -2400,6 +2478,72 @@ def test_structural_issue_blocks_approval_then_exports_are_available(
     assert bundle.content.startswith(b"PK")
 
 
+def test_legacy_existing_approval_is_ineffective_and_cannot_export(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, store = client_for(tmp_path, monkeypatch)
+    job_id, _result = completed_job(store)
+    review = store.empty_review()
+    review["approval"] = {
+        "status": "approved",
+        "reviewer": "legacy-reviewer",
+        "approved_at": "2026-08-01T00:00:00Z",
+        "review_revision": 1,
+    }
+    review["revision"] = 1
+    (store.job_dir(job_id) / "review.json").write_text(json.dumps(review))
+    store.update(job_id, certification=None)
+
+    summary = client.get(f"/api/v2/documents/{job_id}/review")
+    assert summary.status_code == 200
+    assert summary.json()["approval"] is not None
+    assert summary.json()["approval_effective"] is False
+    assert summary.json()["export_eligible"] is False
+    assert "legacy_uncertified" in summary.json()["approval_blockers"]
+
+    for export_format in ("csv", "json", "evidence.zip"):
+        response = client.get(f"/api/v2/documents/{job_id}/exports/{export_format}")
+        assert response.status_code == 409
+        assert response.json()["detail"]["code"] == "legacy_uncertified"
+
+    approval = client.post(
+        f"/api/v2/documents/{job_id}/approval",
+        headers={"If-Match": "1"},
+    )
+    assert approval.status_code == 409
+    assert approval.json()["detail"]["code"] == "legacy_uncertified"
+
+
+@pytest.mark.parametrize("tampered", ("source", "artifact"))
+def test_source_or_artifact_tampering_invalidates_approval_and_export(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tampered: str,
+) -> None:
+    client, store = client_for(tmp_path, monkeypatch)
+    job_id, _result = completed_job(store)
+    approved = client.post(
+        f"/api/v2/documents/{job_id}/approval",
+        headers={"If-Match": "0"},
+    )
+    assert approved.status_code == 200
+
+    target = (
+        store.job_dir(job_id) / "source.pdf"
+        if tampered == "source"
+        else store.job_dir(job_id) / "artifacts/pages/page-1.png"
+    )
+    target.write_bytes(target.read_bytes() + b"tampered")
+
+    review = client.get(f"/api/v2/documents/{job_id}/review")
+    assert review.status_code == 200
+    assert "certification_invalid" in review.json()["approval_blockers"]
+    exported = client.get(f"/api/v2/documents/{job_id}/exports/json")
+    assert exported.status_code == 409
+    assert exported.json()["detail"]["code"] == "certification_invalid"
+
+
 def test_active_job_cannot_be_deleted(tmp_path: Path, monkeypatch) -> None:
     client, store = client_for(tmp_path, monkeypatch)
     state = store.create("bill.pdf")
@@ -2563,9 +2707,7 @@ def test_nameless_profile_retains_alias_canonical_hospital_name(
         )
     )
     monkeypatch.setattr(api, "PROFILE_REGISTRY", profile_registry)
-    JsonAliasRepository(api.ALIAS_REGISTRY)._write_unlocked(
-        registry_with_alias(revision=1)
-    )
+    JsonAliasRepository(api.ALIAS_REGISTRY)._write_unlocked(registry_with_alias(revision=1))
 
     directory = client.get("/api/v2/hospitals/trained")
     assert directory.status_code == 200
@@ -2644,9 +2786,7 @@ def test_profile_registry_outages_return_structured_503(
     for path in ("/api/v2/health/ready", "/api/v2/hospitals/trained"):
         response = client.get(path)
         assert response.status_code == 503
-        assert response.json()["detail"] == {
-            "code": "profile_registry_unavailable"
-        }
+        assert response.json()["detail"] == {"code": "profile_registry_unavailable"}
 
     response = client.post(
         f"/api/v2/documents/{job_id}/hospital-link",
@@ -2947,9 +3087,7 @@ def test_hospital_link_persists_profile_metadata_from_locked_snapshot(
     assert registry["hospitals"][0]["hospital_name"] == "MACHINE HOSPITAL"
     assert registry["hospitals"][0]["origins"] == ["profile", "reviewer_alias"]
     review = store.read_review(job_id)
-    assert review["document_overrides"]["hospital_link"]["hospital_name"] == (
-        "MACHINE HOSPITAL"
-    )
+    assert review["document_overrides"]["hospital_link"]["hospital_name"] == ("MACHINE HOSPITAL")
 
 
 def test_hospital_link_refreshes_existing_record_from_locked_profile_name(
@@ -2996,9 +3134,7 @@ def test_hospital_link_refreshes_existing_record_from_locked_profile_name(
     assert response.json()["hospital_name"] == "New Machine Medical Center"
     registry = JsonAliasRepository(api.ALIAS_REGISTRY).read()
     assert registry["hospitals"][0]["hospital_name"] == "New Machine Medical Center"
-    assert registry["hospitals"][0]["name_variants"][0]["display_name"] == (
-        "Machine Hospital"
-    )
+    assert registry["hospitals"][0]["name_variants"][0]["display_name"] == ("Machine Hospital")
     assert (
         JsonAliasRepository.resolve_hospital(
             registry,
@@ -3006,18 +3142,17 @@ def test_hospital_link_refreshes_existing_record_from_locked_profile_name(
         )
         == "profile-machine-hospital"
     )
-    assert store.read_review(job_id)["document_overrides"]["hospital_link"][
-        "hospital_name"
-    ] == "New Machine Medical Center"
+    assert (
+        store.read_review(job_id)["document_overrides"]["hospital_link"]["hospital_name"]
+        == "New Machine Medical Center"
+    )
     registry_event = registry["events"][-1]
     assert registry_event["old_hospital_name"] == "Machine Hospital"
     assert registry_event["new_hospital_name"] == "New Machine Medical Center"
     assert registry_event["canonical_name_source"] == "active_profile"
     review_event = store.read_review(job_id)["events"][-1]
     assert review_event["changes"]["old_hospital_name"] == "Machine Hospital"
-    assert review_event["changes"]["new_hospital_name"] == (
-        "New Machine Medical Center"
-    )
+    assert review_event["changes"]["new_hospital_name"] == ("New Machine Medical Center")
     assert review_event["changes"]["canonical_name_source"] == "active_profile"
 
 
@@ -3171,26 +3306,27 @@ def test_evidence_export_holds_workspace_lock_through_page_snapshot(
 ) -> None:
     client, store = client_for(tmp_path, monkeypatch)
     job_id, _ = completed_job(store)
-    review = store.empty_review()
-    review["approval"] = {
-        "status": "approved",
-        "reviewer": "test-reviewer",
-        "approved_at": "2026-07-23T00:00:00Z",
-        "review_revision": 0,
-    }
-    (store.job_dir(job_id) / "review.json").write_text(json.dumps(review))
+    assert client.post(
+        f"/api/v2/documents/{job_id}/approval",
+        headers={"If-Match": "0"},
+    ).status_code == 200
     artifact = store.job_dir(job_id) / "artifacts" / "pages" / "page-1.png"
     page_read_started = threading.Event()
     allow_page_read = threading.Event()
     writer_acquired = threading.Event()
     response_holder: list[object] = []
-    original_read_bytes = Path.read_bytes
+    original_contained_read = JobStore._contained_file_bytes
 
-    def paused_read_bytes(path: Path) -> bytes:
-        if path == artifact:
+    def paused_read_bytes(
+        current_store: JobStore,
+        root: Path,
+        relative: Path,
+        error: str,
+    ) -> bytes:
+        if root / relative == artifact:
             page_read_started.set()
             assert allow_page_read.wait(timeout=2)
-        return original_read_bytes(path)
+        return original_contained_read(current_store, root, relative, error)
 
     def request_export() -> None:
         response_holder.append(client.get(f"/api/v2/documents/{job_id}/exports/evidence.zip"))
@@ -3199,7 +3335,7 @@ def test_evidence_export_holds_workspace_lock_through_page_snapshot(
         with store.job_lock(job_id, exclusive=True):
             writer_acquired.set()
 
-    monkeypatch.setattr(Path, "read_bytes", paused_read_bytes)
+    monkeypatch.setattr(JobStore, "_contained_file_bytes", paused_read_bytes)
     export_thread = threading.Thread(target=request_export)
     export_thread.start()
     assert page_read_started.wait(timeout=2)

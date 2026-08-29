@@ -26,9 +26,8 @@ from gmoney.evaluation.corpus import sha256_file
 from gmoney.extraction.date_context import service_date_from_context
 from gmoney.extraction.typed_values import parse_decimal, parse_quantity, parse_service_date
 
-VALIDATION_VERSION = "extraction_validation_v5_r2"
+VALIDATION_VERSION = "extraction_validation_v5_r3"
 SUPPORTED_OUTPUT_VERSION = "offline_accuracy_spine_v5"
-SUPPORTED_CONTRACT_REVISION = 2
 
 
 class ValidationSeverity(StrEnum):
@@ -120,8 +119,7 @@ def _validate_provider_and_recovery_metadata(
 ) -> None:
     provider = result.get("provider_usage")
     valid_provider = isinstance(provider, dict) and all(
-        isinstance(provider.get(key), dict)
-        for key in ("initial", "recovery", "aggregate")
+        isinstance(provider.get(key), dict) for key in ("initial", "recovery", "aggregate")
     )
     if not valid_provider:
         issues.append(
@@ -153,9 +151,7 @@ def _validate_provider_and_recovery_metadata(
                 )
                 continue
             parsed[key] = (calls, cost)
-        if set(parsed) == {"initial", "recovery", "aggregate"} and parsed[
-            "aggregate"
-        ] != (
+        if set(parsed) == {"initial", "recovery", "aggregate"} and parsed["aggregate"] != (
             parsed["initial"][0] + parsed["recovery"][0],
             parsed["initial"][1] + parsed["recovery"][1],
         ):
@@ -213,13 +209,13 @@ def _validate_provider_and_recovery_metadata(
             )
         )
     for target in targets:
+        revision_three = result.get("contract_revision") == 3
         if not isinstance(target, dict) or (
             type(target.get("page_number")) is not int
             or target["page_number"] < 1
             or target.get("selected") not in {"baseline", "candidate"}
             or not all(
-                isinstance(target.get(field), str)
-                and digest_pattern.fullmatch(target[field])
+                isinstance(target.get(field), str) and digest_pattern.fullmatch(target[field])
                 for field in ("baseline_unit_sha256", "selected_unit_sha256")
             )
             or (
@@ -227,6 +223,28 @@ def _validate_provider_and_recovery_metadata(
                 and not (
                     isinstance(target["candidate_unit_sha256"], str)
                     and digest_pattern.fullmatch(target["candidate_unit_sha256"])
+                )
+            )
+            or (
+                revision_three
+                and (
+                    not all(
+                        isinstance(target.get(field), str)
+                        and digest_pattern.fullmatch(target[field])
+                        for field in (
+                            "baseline_financial_inventory_sha256",
+                            "selected_financial_inventory_sha256",
+                        )
+                    )
+                    or any(
+                        type(target.get(field)) is not int or target[field] < 0
+                        for field in (
+                            "baseline_financial_row_count",
+                            "candidate_financial_row_count",
+                            "preserved_financial_row_count",
+                            "added_financial_row_count",
+                        )
+                    )
                 )
             )
         ):
@@ -299,9 +317,7 @@ def _evidence_has_shared_token_lineage(
     right_ids = _evidence_ids(right)
     if not left_ids or not right_ids:
         return False
-    left_roots = {
-        root for token_id in left_ids for root in _token_lineage_roots(token_id, tokens)
-    }
+    left_roots = {root for token_id in left_ids for root in _token_lineage_roots(token_id, tokens)}
     right_roots = {
         root for token_id in right_ids for root in _token_lineage_roots(token_id, tokens)
     }
@@ -316,9 +332,7 @@ def _evidence_is_exact_typed_fragment(
     source_column_id: str | None = None,
 ) -> bool:
     token_ids = tuple(
-        token_id
-        for item in evidence or ()
-        for token_id in getattr(item, "token_ids", ())
+        token_id for item in evidence or () for token_id in getattr(item, "token_ids", ())
     )
     if len(token_ids) != 1 or token_ids[0] not in tokens:
         return False
@@ -352,12 +366,10 @@ def _token_text_supports_value(
     # one number from unrelated text in the same token.
     if len(texts) != 1:
         return False
-    observed_text = re.sub(
-        r"\s+", " ", unicodedata.normalize("NFKC", texts[0])
-    ).strip().casefold()
-    expected_text = re.sub(
-        r"\s+", " ", unicodedata.normalize("NFKC", str(value))
-    ).strip().casefold()
+    observed_text = re.sub(r"\s+", " ", unicodedata.normalize("NFKC", texts[0])).strip().casefold()
+    expected_text = (
+        re.sub(r"\s+", " ", unicodedata.normalize("NFKC", str(value))).strip().casefold()
+    )
     if expected_text == observed_text:
         return True
     if field in {
@@ -396,9 +408,7 @@ def _token_text_supports_value(
             description=description,
         )
         expected = (
-            expected_context[1]
-            if expected_context is not None
-            else parse_service_date(str(value))
+            expected_context[1] if expected_context is not None else parse_service_date(str(value))
         )
         if expected is None:
             return expected_text == observed_text
@@ -533,13 +543,9 @@ def _attach_stable_issue_anchors(
     tables: tuple[SourceTable, ...],
     canonical: dict[str, CanonicalRow],
 ) -> list[ValidationIssue]:
-    table_lookup = {
-        (table.page_number, table.table_id): table for table in tables
-    }
+    table_lookup = {(table.page_number, table.table_id): table for table in tables}
     source_lookup = {
-        source_row.id: (table, source_row)
-        for table in tables
-        for source_row in table.rows
+        source_row.id: (table, source_row) for table in tables for source_row in table.rows
     }
     anchored: list[ValidationIssue] = []
     for issue in issues:
@@ -590,9 +596,7 @@ def _evidence_ids(items: object) -> set[str]:
         str(token_id)
         for item in items or ()
         for token_id in (
-            item.get("token_ids", ())
-            if isinstance(item, dict)
-            else getattr(item, "token_ids", ())
+            item.get("token_ids", ()) if isinstance(item, dict) else getattr(item, "token_ids", ())
         )
     }
 
@@ -640,30 +644,28 @@ def _validate_evidence_refs(
         height = float((asset or {}).get("height") or 0)
         evidence_token_ids = tuple(getattr(evidence, "token_ids", ()) or ())
         manifest_tokens = tuple(tokens.get(str(token_id)) for token_id in evidence_token_ids)
-        polygon_area = abs(
-            sum(
-                point.x * points[(index + 1) % len(points)].y
-                - points[(index + 1) % len(points)].x * point.y
-                for index, point in enumerate(points)
+        polygon_area = (
+            abs(
+                sum(
+                    point.x * points[(index + 1) % len(points)].y
+                    - points[(index + 1) % len(points)].x * point.y
+                    for index, point in enumerate(points)
+                )
+                / 2
             )
-            / 2
-        ) if len(points) >= 3 else 0
+            if len(points) >= 3
+            else 0
+        )
         invalid = bool(
             asset is None
             or evidence_page != page_number
-            or (
-                table_id is not None
-                and getattr(evidence, "table_id", None) != table_id
-            )
+            or (table_id is not None and getattr(evidence, "table_id", None) != table_id)
             or getattr(evidence, "artifact_sha256", None) != asset.get("artifact_sha256")
             or not evidence_token_ids
             or len(points) < 3
             or polygon_area <= 0
             or any(
-                point.x < 0
-                or point.y < 0
-                or point.x > width
-                or point.y > height
+                point.x < 0 or point.y < 0 or point.x > width or point.y > height
                 for point in points
             )
             or any(token is None for token in manifest_tokens)
@@ -673,9 +675,7 @@ def _validate_evidence_refs(
                     token.page_number != evidence_page
                     or token.artifact_sha256 != getattr(evidence, "artifact_sha256", None)
                     or (
-                        table_id is not None
-                        and token.table_ids
-                        and table_id not in token.table_ids
+                        table_id is not None and token.table_ids and table_id not in token.table_ids
                     )
                 )
                 for token in manifest_tokens
@@ -713,9 +713,7 @@ _SUMMARY_WORDS = {
 
 def _meaningful_summary_words(value: object) -> set[str]:
     return {
-        word
-        for word in _normalized(value).split()
-        if len(word) >= 3 and word not in _SUMMARY_WORDS
+        word for word in _normalized(value).split() if len(word) >= 3 and word not in _SUMMARY_WORDS
     }
 
 
@@ -724,10 +722,7 @@ def _source_table_signature(
 ) -> tuple[Any, tuple[tuple[str, str | None], ...]]:
     return (
         table.table_type,
-        tuple(
-            (column.id, column.canonical_field)
-            for column in table.columns
-        ),
+        tuple((column.id, column.canonical_field) for column in table.columns),
     )
 
 
@@ -748,11 +743,7 @@ def _source_tables_are_contiguous(
         return False
     previous_slot = _source_table_slot(previous)
     following_slot = _source_table_slot(following)
-    return (
-        previous_slot is None
-        or following_slot is None
-        or previous_slot == following_slot
-    )
+    return previous_slot is None or following_slot is None or previous_slot == following_slot
 
 
 def _has_pharmacy_tail_summary(table: SourceTable) -> bool:
@@ -769,14 +760,9 @@ def _has_pharmacy_tail_summary(table: SourceTable) -> bool:
             )
         )
         words = set(label.split())
-        is_summary = (
-            "return" in words
-            or "returns" in words
-            or {"total", "amount"}.issubset(words)
-        )
+        is_summary = "return" in words or "returns" in words or {"total", "amount"}.issubset(words)
         if is_summary and any(
-            parse_decimal(cell.raw_value or "") is not None
-            for cell in row.cells
+            parse_decimal(cell.raw_value or "") is not None for cell in row.cells
         ):
             return True
     return False
@@ -799,9 +785,7 @@ def _unlinked_financial_row_is_explained(
         "service_code",
         "hsn_code",
     }
-    fields_by_column = {
-        column.id: column.canonical_field for column in table.columns
-    }
+    fields_by_column = {column.id: column.canonical_field for column in table.columns}
     total_labels = {
         "bill amount",
         "bill total",
@@ -830,15 +814,15 @@ def _unlinked_financial_row_is_explained(
         return _normalized(cell.raw_value or "") in total_labels
 
     def is_section_subtotal_label(value: str) -> bool:
-        return (
-            value in {"bill total", "sub total", "subtotal"}
-            or value.startswith(("sub total ", "subtotal "))
+        return value in {"bill total", "sub total", "subtotal"} or value.startswith(
+            ("sub total ", "subtotal ")
         )
 
     label_values = tuple(
         cell.raw_value.strip()
         for cell in source_row.cells
-        if cell.raw_value and cell.raw_value.strip()
+        if cell.raw_value
+        and cell.raw_value.strip()
         and parse_decimal(cell.raw_value) is None
         and is_printed_label_cell(cell)
     )
@@ -890,8 +874,7 @@ def _unlinked_financial_row_is_explained(
         description_values = tuple(
             row_cells[column.id].raw_value
             for column in table.columns
-            if column.canonical_field == "description"
-            and row_cells[column.id].raw_value
+            if column.canonical_field == "description" and row_cells[column.id].raw_value
         )
         financial_columns = tuple(
             column
@@ -903,10 +886,7 @@ def _unlinked_financial_row_is_explained(
         )
         if len(financial_columns) != 1:
             return False
-        if (
-            len(description_values) == 1
-            and is_settlement_label(description_values[0])
-        ):
+        if len(description_values) == 1 and is_settlement_label(description_values[0]):
             return True
         displaced_labels = tuple(
             row_cells[column.id].raw_value
@@ -922,9 +902,7 @@ def _unlinked_financial_row_is_explained(
         ):
             return True
         mapped_descriptions = tuple(
-            column
-            for column in table.columns
-            if column.canonical_field == "description"
+            column for column in table.columns if column.canonical_field == "description"
         )
         if not mapped_descriptions or description_values:
             return False
@@ -936,10 +914,7 @@ def _unlinked_financial_row_is_explained(
 
     def cell_bounds(cell: Any) -> tuple[float, float, float, float] | None:
         points = tuple(
-            point
-            for item in cell.evidence
-            if item.token_ids
-            for point in item.polygon.points
+            point for item in cell.evidence if item.token_ids for point in item.polygon.points
         )
         if not points:
             return None
@@ -951,11 +926,7 @@ def _unlinked_financial_row_is_explained(
         )
 
     description_column = next(
-        (
-            column
-            for column in table.columns
-            if column.canonical_field == "description"
-        ),
+        (column for column in table.columns if column.canonical_field == "description"),
         None,
     )
 
@@ -969,17 +940,12 @@ def _unlinked_financial_row_is_explained(
             return False
         current = preceding_rows[row_index]
         previous = preceding_rows[row_index - 1]
-        if (
-            previous.canonical_row_id is None
-            and not previous_is_continuation
-        ):
+        if previous.canonical_row_id is None and not previous_is_continuation:
             return False
         current_cells = {cell.column_id: cell for cell in current.cells}
         previous_cells = {cell.column_id: cell for cell in previous.cells}
         populated_current = tuple(
-            cell
-            for cell in current.cells
-            if cell.raw_value and cell.raw_value.strip()
+            cell for cell in current.cells if cell.raw_value and cell.raw_value.strip()
         )
         current_description = current_cells[description_column.id]
         previous_description = previous_cells[description_column.id]
@@ -1000,11 +966,7 @@ def _unlinked_financial_row_is_explained(
             and cell.raw_value.strip()
             and (bounds := cell_bounds(cell)) is not None
         )
-        if (
-            current_bounds is None
-            or previous_bounds is None
-            or not previous_row_bounds
-        ):
+        if current_bounds is None or previous_bounds is None or not previous_row_bounds:
             return False
         current_height = max(1.0, current_bounds[3] - current_bounds[1])
         previous_height = max(1.0, previous_bounds[3] - previous_bounds[1])
@@ -1012,11 +974,9 @@ def _unlinked_financial_row_is_explained(
         vertical_gap = current_bounds[1] - previous_bounds[3]
         return (
             current_bounds[1] > previous_bounds[1]
-            and current_bounds[1]
-            <= max(bounds[3] for bounds in previous_row_bounds)
+            and current_bounds[1] <= max(bounds[3] for bounds in previous_row_bounds)
             and -line_height * 0.25 <= vertical_gap <= line_height * 1.5
-            and abs(current_bounds[0] - previous_bounds[0])
-            <= max(4.0, line_height * 0.25)
+            and abs(current_bounds[0] - previous_bounds[0]) <= max(4.0, line_height * 0.25)
         )
 
     if is_structurally_grounded_settlement(cells):
@@ -1030,14 +990,8 @@ def _unlinked_financial_row_is_explained(
         )
         if isinstance(payload, dict) and parse_decimal(str(payload.get("amount"))) is not None
     ]
-    total_amounts = {
-        parse_decimal(str(payload["amount"]))
-        for payload in total_payloads
-    }
-    if (
-        normalized_label in total_labels
-        or normalized_label.startswith(total_prefixes)
-    ) and all(
+    total_amounts = {parse_decimal(str(payload["amount"])) for payload in total_payloads}
+    if (normalized_label in total_labels or normalized_label.startswith(total_prefixes)) and all(
         value in total_amounts for _, value in financial_values
     ):
         return True
@@ -1046,11 +1000,7 @@ def _unlinked_financial_row_is_explained(
     pharmacy_summary_sign = (
         -1
         if "return" in summary_words or "returns" in summary_words
-        else (
-            1
-            if {"total", "amount"}.issubset(summary_words)
-            else 0
-        )
+        else (1 if {"total", "amount"}.issubset(summary_words) else 0)
     )
     source_row_seen = False
     linked_row_follows = False
@@ -1061,23 +1011,16 @@ def _unlinked_financial_row_is_explained(
         if source_row_seen and candidate.canonical_row_id is not None:
             linked_row_follows = True
             break
-    if (
-        table.table_type.value == "pharmacy"
-        and pharmacy_summary_sign
-        and not linked_row_follows
-    ):
+    if table.table_type.value == "pharmacy" and pharmacy_summary_sign and not linked_row_follows:
         table_index = next(
-            index
-            for index, candidate in enumerate(source_tables)
-            if candidate is table
+            index for index, candidate in enumerate(source_tables) if candidate is table
         )
         pharmacy_start = table_index
         while pharmacy_start > 0:
             previous = source_tables[pharmacy_start - 1]
             following = source_tables[pharmacy_start]
-            if (
-                not _source_tables_are_contiguous(previous, following)
-                or _has_pharmacy_tail_summary(previous)
+            if not _source_tables_are_contiguous(previous, following) or _has_pharmacy_tail_summary(
+                previous
             ):
                 break
             pharmacy_start -= 1
@@ -1100,11 +1043,7 @@ def _unlinked_financial_row_is_explained(
                     parsed
                     for row in pharmacy_rows
                     if (parsed := parse_decimal(str(row.get(field)))) is not None
-                    and (
-                        parsed > 0
-                        if pharmacy_summary_sign > 0
-                        else parsed < 0
-                    )
+                    and (parsed > 0 if pharmacy_summary_sign > 0 else parsed < 0)
                 ),
                 Decimal("0"),
             )
@@ -1143,9 +1082,7 @@ def _unlinked_financial_row_is_explained(
         section_rows: list[dict[str, Any]] = []
         section_heading_words: set[str] = set()
         table_index = next(
-            index
-            for index, candidate in enumerate(source_tables)
-            if candidate is table
+            index for index, candidate in enumerate(source_tables) if candidate is table
         )
         section_start = table_index
         while section_start > 0:
@@ -1162,9 +1099,7 @@ def _unlinked_financial_row_is_explained(
         )
         previous_was_continuation = False
         for preceding_index, preceding in enumerate(preceding_rows):
-            preceding_cells = {
-                cell.column_id: cell for cell in preceding.cells
-            }
+            preceding_cells = {cell.column_id: cell for cell in preceding.cells}
             if preceding.canonical_row_id is not None:
                 canonical = canonical_rows.get(preceding.canonical_row_id)
                 if canonical and canonical.get("role") in {
@@ -1194,8 +1129,7 @@ def _unlinked_financial_row_is_explained(
             preceding_has_financial_value = any(
                 column.canonical_field in {"net_amount", "gross_amount"}
                 and preceding_cells[column.id].raw_value
-                and parse_decimal(preceding_cells[column.id].raw_value or "")
-                is not None
+                and parse_decimal(preceding_cells[column.id].raw_value or "") is not None
                 for column in table.columns
             )
             preceding_is_financial_boundary = (
@@ -1219,9 +1153,7 @@ def _unlinked_financial_row_is_explained(
                 and not preceding_is_continuation
             ):
                 section_rows.clear()
-                section_heading_words = _meaningful_summary_words(
-                    preceding_label
-                )
+                section_heading_words = _meaningful_summary_words(preceding_label)
             previous_was_continuation = preceding_is_continuation
         subtotal_scope = re.sub(
             r"^(?:sub\s+total|subtotal)\s*",
@@ -1249,16 +1181,16 @@ def _unlinked_financial_row_is_explained(
             section_rows
             and (not scope_words or scope_words.issubset(section_words))
             and all(
-            sum(
-                (
-                    parsed
-                    for row in section_rows
-                    if (parsed := parse_decimal(str(row.get(field)))) is not None
-                ),
-                Decimal("0"),
-            )
-            == value
-            for field, value in financial_values
+                sum(
+                    (
+                        parsed
+                        for row in section_rows
+                        if (parsed := parse_decimal(str(row.get(field)))) is not None
+                    ),
+                    Decimal("0"),
+                )
+                == value
+                for field, value in financial_values
             )
         ):
             return True
@@ -1272,9 +1204,7 @@ def _unlinked_financial_row_is_explained(
         and cells[column.id].raw_value
         and cells[column.id].raw_value.strip()
     )
-    normalized_descriptions = {
-        _normalized(description) for description in printed_descriptions
-    }
+    normalized_descriptions = {_normalized(description) for description in printed_descriptions}
     if len(normalized_descriptions) != 1:
         return False
     printed_description = printed_descriptions[0]
@@ -1296,11 +1226,7 @@ def _unlinked_financial_row_is_explained(
         raw_value = cells[column.id].raw_value
         if field not in numeric_fields or not raw_value or not raw_value.strip():
             continue
-        parsed = (
-            parse_quantity(raw_value)
-            if field == "quantity"
-            else parse_decimal(raw_value)
-        )
+        parsed = parse_quantity(raw_value) if field == "quantity" else parse_decimal(raw_value)
         if parsed is None:
             return False
         mapped_numeric_values.append((field, parsed))
@@ -1332,8 +1258,6 @@ def _unlinked_financial_row_is_explained(
         ):
             summary_matches.add(row_id)
     return bool(exact_matches) or len(summary_matches) == 1
-
-
 
 
 def _unlinked_financial_is_explained(
@@ -1424,7 +1348,8 @@ def _validate_totals(
         raw_payloads = []
     for index, payload in enumerate(raw_payloads):
         try:
-            raw_candidates.append(RawTotalCandidate.model_validate(payload))
+            candidate = RawTotalCandidate.model_validate(payload)
+            raw_candidates.append(candidate)
         except (ValidationError, TypeError, AttributeError) as error:
             issues.append(
                 _issue(
@@ -1433,6 +1358,61 @@ def _validate_totals(
                     f"Raw total candidate {index} is invalid: {_contract_error_message(error)}",
                     field="raw_total_candidates",
                 )
+            )
+            continue
+        identity_mismatch = bool(
+            candidate.total.page_number != candidate.page_number
+            or candidate.total.evidence.page_number != candidate.page_number
+            or (
+                candidate.table_id is not None
+                and candidate.total.evidence.table_id != candidate.table_id
+            )
+            or any(
+                evidence.page_number != candidate.page_number
+                or (candidate.table_id is not None and evidence.table_id != candidate.table_id)
+                for evidence in candidate.context_evidence
+            )
+        )
+        if identity_mismatch:
+            issues.append(
+                _issue(
+                    "raw_total_candidate_identity_mismatch",
+                    ValidationSeverity.FATAL,
+                    "Raw total evidence does not match its page and table identity",
+                    page_number=candidate.page_number,
+                    table_id=candidate.table_id,
+                    field="raw_total_candidates",
+                )
+            )
+        _validate_evidence_refs(
+            (candidate.total.evidence,),
+            assets,
+            tokens,
+            issues,
+            page_number=candidate.page_number,
+            table_id=candidate.table_id,
+            field="raw_total_candidates.total.evidence",
+        )
+        if not candidate.context_evidence:
+            issues.append(
+                _issue(
+                    "raw_total_context_evidence_missing",
+                    ValidationSeverity.FATAL,
+                    "Raw total candidate has no grounded context evidence",
+                    page_number=candidate.page_number,
+                    table_id=candidate.table_id,
+                    field="raw_total_candidates.context_evidence",
+                )
+            )
+        else:
+            _validate_evidence_refs(
+                candidate.context_evidence,
+                assets,
+                tokens,
+                issues,
+                page_number=candidate.page_number,
+                table_id=candidate.table_id,
+                field="raw_total_candidates.context_evidence",
             )
     totals_payload = result.get("document_totals")
     if not isinstance(totals_payload, list):
@@ -1445,11 +1425,7 @@ def _validate_totals(
             )
         )
         totals_payload = []
-    totals = tuple(
-        payload
-        for payload in totals_payload
-        if isinstance(payload, dict)
-    )
+    totals = tuple(payload for payload in totals_payload if isinstance(payload, dict))
     if len(totals) != len(totals_payload):
         issues.append(
             _issue(
@@ -1505,12 +1481,19 @@ def _validate_totals(
             )
         )
         primary = None
-    document_contexts = {
+    selected_document_contexts = {
         str(total.get("context_id"))
         for total in totals
         if total.get("scope") == "document"
         and total.get("context_kind") == "document_final"
         and total.get("context_id")
+    }
+    raw_document_contexts = {
+        str(candidate.total.context_id)
+        for candidate in raw_candidates
+        if candidate.total.scope.value == "document"
+        and candidate.total.context_kind == "document_final"
+        and candidate.total.context_id
     }
     if primary is not None and primary not in totals:
         issues.append(
@@ -1519,16 +1502,13 @@ def _validate_totals(
                 ValidationSeverity.BLOCKING,
                 "Primary total is not a member of the published total candidates",
                 page_number=(
-                    (primary or {}).get("page_number")
-                    if isinstance(primary, dict)
-                    else None
+                    (primary or {}).get("page_number") if isinstance(primary, dict) else None
                 ),
                 field="document_total",
             )
         )
     if isinstance(primary, dict) and (
-        primary.get("scope") != "document"
-        or primary.get("context_kind") != "document_final"
+        primary.get("scope") != "document" or primary.get("context_kind") != "document_final"
     ):
         issues.append(
             _issue(
@@ -1539,7 +1519,35 @@ def _validate_totals(
                 field="document_total",
             )
         )
-    if len(document_contexts) > 1:
+    if len(raw_document_contexts) == 1:
+        raw_context = next(iter(raw_document_contexts))
+        selected_members = tuple(
+            total
+            for total in totals
+            if str(total.get("context_id")) == raw_context
+            and total.get("scope") == "document"
+            and total.get("context_kind") == "document_final"
+        )
+        if not selected_members:
+            issues.append(
+                _issue(
+                    "raw_document_final_total_omitted",
+                    ValidationSeverity.BLOCKING,
+                    "A unique grounded raw document-final total context was omitted",
+                    field="document_total",
+                )
+            )
+        elif primary not in selected_members:
+            issues.append(
+                _issue(
+                    "primary_total_missing_for_unique_raw_context",
+                    ValidationSeverity.BLOCKING,
+                    "The primary total is not a selected member of the unique "
+                    "raw document-final context",
+                    field="document_total",
+                )
+            )
+    if len(raw_document_contexts) > 1:
         issues.append(
             _issue(
                 "ambiguous_primary_total",
@@ -1548,7 +1556,7 @@ def _validate_totals(
                 field="document_total",
             )
         )
-    if len(document_contexts) == 1 and primary is None:
+    if len(selected_document_contexts) == 1 and primary is None:
         issues.append(
             _issue(
                 "primary_total_missing_for_unique_context",
@@ -1557,7 +1565,7 @@ def _validate_totals(
                 field="document_total",
             )
         )
-    if not document_contexts:
+    if not raw_document_contexts:
         issues.append(
             _issue(
                 "document_total_unavailable",
@@ -1566,12 +1574,12 @@ def _validate_totals(
                 field="document_total",
             )
         )
-    for context_id in sorted(document_contexts):
+    for context_id in sorted(raw_document_contexts):
         context_amounts = {
-            parse_decimal(str(total.get("amount")))
-            for total in totals
-            if str(total.get("context_id")) == context_id
-            and total.get("context_kind") == "document_final"
+            candidate.total.amount
+            for candidate in raw_candidates
+            if str(candidate.total.context_id) == context_id
+            and candidate.total.context_kind == "document_final"
         }
         context_amounts.discard(None)
         if len(context_amounts) > 1:
@@ -1583,7 +1591,7 @@ def _validate_totals(
                     field="document_total",
                 )
             )
-    if len(document_contexts) != 1 and primary is not None:
+    if len(raw_document_contexts) != 1 and primary is not None:
         issues.append(
             _issue(
                 "primary_total_requires_unique_context",
@@ -1818,10 +1826,7 @@ def _validate_extraction_result(
             or _path_uses_symlink(unresolved, artifact_root)
             or sha256_file(path) != token.artifact_sha256
             or polygon_area <= 0
-            or any(
-                point.x > width or point.y > height
-                for point in points
-            )
+            or any(point.x > width or point.y > height for point in points)
         ):
             issues.append(
                 _issue(
@@ -1841,12 +1846,8 @@ def _validate_extraction_result(
             matrix = token.source_to_page_matrix or ()
             transformed = tuple(
                 (
-                    matrix[0][0] * point.x
-                    + matrix[0][1] * point.y
-                    + matrix[0][2],
-                    matrix[1][0] * point.x
-                    + matrix[1][1] * point.y
-                    + matrix[1][2],
+                    matrix[0][0] * point.x + matrix[0][1] * point.y + matrix[0][2],
+                    matrix[1][0] * point.x + matrix[1][1] * point.y + matrix[1][2],
                 )
                 for point in source_points
             )
@@ -1858,17 +1859,13 @@ def _validate_extraction_result(
                 and sha256_file(source_path) == token.source_artifact_sha256
                 and source_points
                 and all(
-                    point.x <= (token.source_width or 0)
-                    and point.y <= (token.source_height or 0)
+                    point.x <= (token.source_width or 0) and point.y <= (token.source_height or 0)
                     for point in source_points
                 )
                 and len(transformed) == len(points)
                 and all(
-                    abs(actual_x - expected.x) <= 1.0
-                    and abs(actual_y - expected.y) <= 1.0
-                    for (actual_x, actual_y), expected in zip(
-                        transformed, points, strict=True
-                    )
+                    abs(actual_x - expected.x) <= 1.0 and abs(actual_y - expected.y) <= 1.0
+                    for (actual_x, actual_y), expected in zip(transformed, points, strict=True)
                 )
             )
             if not provenance_valid:
@@ -1918,7 +1915,9 @@ def _validate_extraction_result(
                         )
                         if parent is not None
                     ),
-                ).strip().casefold()
+                )
+                .strip()
+                .casefold()
                 == re.sub(r"\s+", " ", token.text).strip().casefold()
             )
         if not fragment_valid:
@@ -1955,9 +1954,7 @@ def _validate_extraction_result(
                     "Canonical row "
                     f"{index} failed contract validation: {_contract_error_message(error)}",
                     page_number=(
-                        (payload or {}).get("page_number")
-                        if isinstance(payload, dict)
-                        else None
+                        (payload or {}).get("page_number") if isinstance(payload, dict) else None
                     ),
                     canonical_row_id=str((payload or {}).get("id") or index),
                     field="rows",
@@ -2016,8 +2013,7 @@ def _validate_extraction_result(
                 and tuple(expected_fields) == provenance.operand_fields
                 and tuple(expected_values) == provenance.operand_values
                 and provenance.result == row.quantity
-                and (abs(row.net_amount) + (row.discount or Decimal("0")))
-                / row.unit_price
+                and (abs(row.net_amount) + (row.discount or Decimal("0"))) / row.unit_price
                 == row.quantity
                 and all(
                     tuple(
@@ -2100,9 +2096,7 @@ def _validate_extraction_result(
                 value is not None
                 and not derived_quantity
                 and (
-                    not _evidence_is_exact_typed_fragment(
-                        evidence, token_manifest, evidence_field
-                    )
+                    not _evidence_is_exact_typed_fragment(evidence, token_manifest, evidence_field)
                     or not _token_text_supports_value(
                         evidence_field,
                         value,
@@ -2289,28 +2283,24 @@ def _validate_extraction_result(
                                 table_anchor=table.table_anchor,
                                 row_anchor=source_row.row_anchor,
                                 source_row_id=source_row.id,
-                                field=columns[cell.column_id].canonical_field
-                                or cell.column_id,
+                                field=columns[cell.column_id].canonical_field or cell.column_id,
                             )
                         )
                     canonical_field = columns[cell.column_id].canonical_field
-                    if (
-                        not _evidence_is_exact_typed_fragment(
-                            cell.evidence,
-                            token_manifest,
-                            canonical_field,
-                            source_column_id=cell.column_id,
-                        )
-                        or not _token_text_supports_value(
-                            canonical_field,
-                            raw_value,
-                            _evidence_token_texts(cell.evidence, token_manifest),
-                            description=(
-                                canonical.get(source_row.canonical_row_id).description
-                                if source_row.canonical_row_id in canonical
-                                else None
-                            ),
-                        )
+                    if not _evidence_is_exact_typed_fragment(
+                        cell.evidence,
+                        token_manifest,
+                        canonical_field,
+                        source_column_id=cell.column_id,
+                    ) or not _token_text_supports_value(
+                        canonical_field,
+                        raw_value,
+                        _evidence_token_texts(cell.evidence, token_manifest),
+                        description=(
+                            canonical.get(source_row.canonical_row_id).description
+                            if source_row.canonical_row_id in canonical
+                            else None
+                        ),
                     ):
                         issues.append(
                             _issue(
@@ -2419,9 +2409,7 @@ def _validate_extraction_result(
                         "Diagnostic classification evidence is not in the token manifest",
                         page_number=page,
                         table_id=(
-                            str(payload.get("table_id"))
-                            if payload.get("table_id")
-                            else None
+                            str(payload.get("table_id")) if payload.get("table_id") else None
                         ),
                         field="diagnostics",
                     )
@@ -2450,9 +2438,7 @@ def _validate_extraction_result(
                         "Diagnostic crop artifact path or hash is invalid",
                         page_number=page,
                         table_id=(
-                            str(payload.get("table_id"))
-                            if payload.get("table_id")
-                            else None
+                            str(payload.get("table_id")) if payload.get("table_id") else None
                         ),
                         field="diagnostics",
                     )
@@ -2475,9 +2461,7 @@ def _validate_extraction_result(
                     field="diagnostics",
                 )
             )
-    expected_table_diagnostics = {
-        (table.page_number, table.id): table for table in tables
-    }
+    expected_table_diagnostics = {(table.page_number, table.id): table for table in tables}
     actual_table_diagnostic_counts: Counter[tuple[int, str]] = Counter(
         (int(item["page_number"]), str(item.get("source_table_id")))
         for item in parsed_diagnostics
@@ -2528,8 +2512,7 @@ def _validate_extraction_result(
                 (
                     item
                     for item in parsed_diagnostics
-                    if item.get("diagnostic_kind") == "page"
-                    and item.get("page_number") == page
+                    if item.get("diagnostic_kind") == "page" and item.get("page_number") == page
                 ),
                 None,
             )
@@ -2542,13 +2525,8 @@ def _validate_extraction_result(
                 (diagnostic or {}).get("financial_form_classification_evidence")
             )
             demonstrably_blank = bool((diagnostic or {}).get("demonstrably_blank"))
-            if (
-                classification not in allowed_empty_classifications
-                or (
-                    classification != "blank"
-                    and not demonstrably_blank
-                    and not grounded_nonblank
-                )
+            if classification not in allowed_empty_classifications or (
+                classification != "blank" and not demonstrably_blank and not grounded_nonblank
             ):
                 issues.append(
                     _issue(
@@ -2576,9 +2554,7 @@ def _validate_extraction_result(
     }
     numeric_fields = {"quantity", "unit_price", "gross_amount", "discount", "net_amount"}
     linked_canonical: set[str] = set()
-    canonical_payloads = {
-        row_id: row.model_dump(mode="json") for row_id, row in canonical.items()
-    }
+    canonical_payloads = {row_id: row.model_dump(mode="json") for row_id, row in canonical.items()}
     for table in tables:
         columns = {column.id: column for column in table.columns}
         for column in table.columns:
@@ -2608,8 +2584,7 @@ def _validate_extraction_result(
                 cell
                 for cell in source_row.cells
                 if columns[cell.column_id].canonical_field is None
-                and "inferred_financial_lane"
-                in columns[cell.column_id].validation_flags
+                and "inferred_financial_lane" in columns[cell.column_id].validation_flags
                 and parse_decimal(cell.raw_value or "") is not None
             )
             if (
@@ -2639,10 +2614,8 @@ def _validate_extraction_result(
                     for cell in source_row.cells
                     if (parsed := parse_decimal(cell.raw_value or "")) is not None
                     and (
-                        columns[cell.column_id].canonical_field
-                        in {"gross_amount", "net_amount"}
-                        or "inferred_financial_lane"
-                        in columns[cell.column_id].validation_flags
+                        columns[cell.column_id].canonical_field in {"gross_amount", "net_amount"}
+                        or "inferred_financial_lane" in columns[cell.column_id].validation_flags
                     )
                 )
                 if financial_values and not _unlinked_financial_row_is_explained(
@@ -2736,9 +2709,7 @@ def _validate_extraction_result(
                     )
                     continue
                 if present and not printed:
-                    canonical_ids = _evidence_ids(
-                        row.field_evidence.get(field_evidence[field])
-                    )
+                    canonical_ids = _evidence_ids(row.field_evidence.get(field_evidence[field]))
                     supporting_ids = {
                         token_id
                         for supporting_column in table.columns
@@ -2761,8 +2732,7 @@ def _validate_extraction_result(
                             and _normalized(candidate.label)
                             in {"#", "s no", "serial no", "sr n", "sr no"}
                             and (serial_cell := cells[candidate.id]).raw_value
-                            and serial_cell.raw_value.strip()
-                            == str(canonical_value).strip()
+                            and serial_cell.raw_value.strip() == str(canonical_value).strip()
                             and _evidence_has_shared_token_lineage(
                                 row.field_evidence.get(field_evidence[field]),
                                 serial_cell.evidence,
@@ -2792,12 +2762,16 @@ def _validate_extraction_result(
                 cell_ids = _evidence_ids(cell.evidence)
                 if derived_quantity:
                     continue
-                if not canonical_ids or not cell_ids or not (
-                    canonical_ids.issubset(cell_ids)
-                    or _evidence_has_shared_token_lineage(
-                        row.field_evidence.get(field_evidence[field]),
-                        cell.evidence,
-                        token_manifest,
+                if (
+                    not canonical_ids
+                    or not cell_ids
+                    or not (
+                        canonical_ids.issubset(cell_ids)
+                        or _evidence_has_shared_token_lineage(
+                            row.field_evidence.get(field_evidence[field]),
+                            cell.evidence,
+                            token_manifest,
+                        )
                     )
                 ):
                     issues.append(
@@ -2989,11 +2963,7 @@ def _validate_extraction_result(
             continue
         canonical_ids = tuple(str(value) for value in pair.get("canonical_row_ids") or ())
         source_ids = tuple(str(value) for value in pair.get("source_row_ids") or ())
-        known_source_rows = {
-            source_row.id: table
-            for table in tables
-            for source_row in table.rows
-        }
+        known_source_rows = {source_row.id: table for table in tables for source_row in table.rows}
         referenced_tables = {
             known_source_rows[source_id].table_id
             for source_id in source_ids

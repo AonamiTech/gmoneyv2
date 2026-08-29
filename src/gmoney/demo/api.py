@@ -73,9 +73,7 @@ WORKER_CAPACITY = int(os.environ.get("GMONEY_WORKER_CAPACITY", "2"))
 RETENTION_HOURS = int(os.environ.get("GMONEY_RETENTION_HOURS", "720"))
 MIN_FREE_BYTES = int(os.environ.get("GMONEY_MIN_FREE_BYTES", "0"))
 RELEASE_REVISION = build_revision()
-WORKER_STATUS_MAX_AGE_SECONDS = int(
-    os.environ.get("GMONEY_WORKER_STATUS_MAX_AGE_SECONDS", "30")
-)
+WORKER_STATUS_MAX_AGE_SECONDS = int(os.environ.get("GMONEY_WORKER_STATUS_MAX_AGE_SECONDS", "30"))
 WORKER_STATUS_FUTURE_SKEW_SECONDS = int(
     os.environ.get("GMONEY_WORKER_STATUS_FUTURE_SKEW_SECONDS", "5")
 )
@@ -96,9 +94,7 @@ PROFILE_REGISTRY_LOCK = Path(
 ALIAS_REGISTRY = Path(
     os.environ.get("GMONEY_ALIAS_REGISTRY", str(DEMO_ROOT / "alias-registry.json"))
 )
-WORKER_STATUS_PATH = (
-    Path(value) if (value := os.environ.get("GMONEY_WORKER_STATUS_PATH")) else None
-)
+WORKER_STATUS_PATH = Path(value) if (value := os.environ.get("GMONEY_WORKER_STATUS_PATH")) else None
 store = JobStore(DEMO_ROOT)
 logger = logging.getLogger(__name__)
 
@@ -214,6 +210,21 @@ class HospitalIdentityConflict(ReviewValidationError):
         self.candidate_ids = sorted(candidate_ids)
 
 
+class ApprovalBlocked(ReviewValidationError):
+    def __init__(self, blockers: list[str]) -> None:
+        self.blockers = sorted(set(blockers))
+        if "legacy_uncertified" in self.blockers:
+            self.code = "legacy_uncertified"
+            self.status_code = 409
+        elif "certification_invalid" in self.blockers:
+            self.code = "certification_invalid"
+            self.status_code = 409
+        else:
+            self.code = "approval_blocked"
+            self.status_code = 422
+        super().__init__(self.code)
+
+
 @app.middleware("http")
 async def private_demo_responses(request: Any, call_next: Any) -> Response:
     response = await call_next(request)
@@ -252,7 +263,7 @@ def _public_state(state: dict[str, Any]) -> dict[str, Any]:
         state.get("validation_status")
         if certified
         else (
-            "legacy_uncertified"
+            state.get("_certification_status", "legacy_uncertified")
             if state.get("status") in {"complete", "needs_review"}
             else None
         )
@@ -278,16 +289,18 @@ def _public_state(state: dict[str, Any]) -> dict[str, Any]:
 def _state_or_404(job_id: str) -> dict[str, Any]:
     try:
         return store.read(job_id)
-    except KeyError as error:
+    except (KeyError, FileNotFoundError) as error:
         raise HTTPException(status_code=404, detail="Document not found") from error
 
 
-def _complete_result(job_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
+def _complete_workspace(
+    job_id: str,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     try:
         state, result, review = _alias_coordinator().run_job_operation(
             job_id, lambda: store.read_workspace(job_id)
         )
-    except KeyError as error:
+    except (KeyError, FileNotFoundError) as error:
         raise HTTPException(status_code=404, detail="Document not found") from error
     except JobTransactionError as error:
         raise HTTPException(
@@ -301,6 +314,11 @@ def _complete_result(job_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
         ) from error
     if state.get("status") not in {"complete", "needs_review"}:
         raise HTTPException(status_code=409, detail="Extraction is not complete")
+    return state, result, review
+
+
+def _complete_result(job_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    _state, result, review = _complete_workspace(job_id)
     return result, review
 
 
@@ -352,6 +370,44 @@ def _mutate(
     except AliasRegistryUnavailable as error:
         raise HTTPException(
             status_code=503, detail={"code": "alias_registry_unavailable"}
+        ) from error
+
+
+def _mutate_with_workspace(
+    job_id: str,
+    expected: int,
+    mutation: Any,
+) -> dict[str, Any]:
+    try:
+        return _alias_coordinator().mutate_review_with_workspace(
+            job_id,
+            expected,
+            mutation,
+        )
+    except ReviewRevisionConflict as error:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "review_revision_conflict",
+                "current_revision": error.current_revision,
+            },
+        ) from error
+    except ApprovalBlocked as error:
+        raise HTTPException(
+            status_code=error.status_code,
+            detail={"code": error.code, "blockers": error.blockers},
+        ) from error
+    except ReviewValidationError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    except JobTransactionError as error:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": str(error)},
+        ) from error
+    except AliasRegistryUnavailable as error:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "alias_registry_unavailable"},
         ) from error
 
 
@@ -731,16 +787,12 @@ def ready(response: Response) -> dict[str, Any]:
             worker_status = json.loads(WORKER_STATUS_PATH.read_text())
             worker_release_revision = str(worker_status["release_revision"])
             worker_status_updated_at = str(worker_status["updated_at"])
-            updated_at = datetime.fromisoformat(
-                worker_status_updated_at.replace("Z", "+00:00")
-            )
+            updated_at = datetime.fromisoformat(worker_status_updated_at.replace("Z", "+00:00"))
             age = (datetime.now(UTC) - updated_at).total_seconds()
             worker_ready = (
                 worker_status.get("status") == "running"
                 and updated_at.tzinfo is not None
-                and -WORKER_STATUS_FUTURE_SKEW_SECONDS
-                <= age
-                <= WORKER_STATUS_MAX_AGE_SECONDS
+                and -WORKER_STATUS_FUTURE_SKEW_SECONDS <= age <= WORKER_STATUS_MAX_AGE_SECONDS
             )
             release_consistent = worker_release_revision == RELEASE_REVISION
         except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
@@ -950,6 +1002,26 @@ def get_document(job_id: str) -> dict[str, Any]:
         ) from error
 
 
+@app.get("/api/v2/documents/{job_id}/validation")
+def get_document_validation(job_id: str) -> dict[str, Any]:
+    try:
+        return _alias_coordinator().run_job_operation(
+            job_id,
+            lambda: store.read_validation(job_id),
+        )
+    except (KeyError, FileNotFoundError) as error:
+        raise HTTPException(status_code=404, detail="Document not found") from error
+    except JobTransactionError as error:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": str(error)},
+        ) from error
+    except AliasRegistryUnavailable as error:
+        raise HTTPException(
+            status_code=503, detail={"code": "alias_registry_unavailable"}
+        ) from error
+
+
 @app.get("/api/v2/documents/{job_id}/rows")
 def get_rows(
     job_id: str,
@@ -1075,11 +1147,7 @@ def get_source_tables(
     total = len(selected_rows)
     if anchor_row_id is not None:
         anchor_index = next(
-            (
-                index
-                for index, (_, row) in enumerate(selected_rows)
-                if str(row.id) == anchor_row_id
-            ),
+            (index for index, (_, row) in enumerate(selected_rows) if str(row.id) == anchor_row_id),
             None,
         )
         if anchor_index is None:
@@ -1114,8 +1182,19 @@ def get_source_tables(
 
 @app.get("/api/v2/documents/{job_id}/review")
 def get_review(job_id: str) -> dict[str, Any]:
-    result, review = _complete_result(job_id)
-    return review_summary(result, review)
+    state, result, review = _complete_workspace(job_id)
+    blockers = approval_blockers(
+        store,
+        job_id,
+        result,
+        review,
+        state=state,
+    )
+    summary = review_summary(result, review)
+    summary["approval_blockers"] = blockers
+    summary["approval_effective"] = bool(review.get("approval")) and not blockers
+    summary["export_eligible"] = summary["approval_effective"]
+    return summary
 
 
 @app.patch("/api/v2/documents/{job_id}/metadata")
@@ -1294,9 +1373,8 @@ def link_document_hospital(
             if profile_identity and profile_identity.get("hospital_name")
             else None
         )
-        locked_canonical_name = (
-            locked_profile_name
-            or (str(record["hospital_name"]) if record is not None else selected_name)
+        locked_canonical_name = locked_profile_name or (
+            str(record["hospital_name"]) if record is not None else selected_name
         )
         canonical_owners = combined_hospital_name_owners(
             locked_identities,
@@ -1309,9 +1387,7 @@ def link_document_hospital(
                 "hospital_name_conflict",
                 conflicting_canonical_owners,
             )
-        old_canonical_name = (
-            str(record["hospital_name"]) if record is not None else None
-        )
+        old_canonical_name = str(record["hospital_name"]) if record is not None else None
         canonical_name_source = (
             "active_profile"
             if locked_profile_name
@@ -1563,9 +1639,7 @@ def apply_column_alias(
             row_id = str(candidate["row_id"])
             row = projected[row_id]
             changes = (
-                {}
-                if candidate["classification"] == "unchanged"
-                else dict(candidate["changes"])
+                {} if candidate["classification"] == "unchanged" else dict(candidate["changes"])
             )
             field_evidence = dict(row.get("field_evidence") or {})
             field_evidence[candidate["evidence_field"]] = candidate["evidence"]
@@ -1806,9 +1880,7 @@ def _apply_direct_disposition(
         added.pop("pre_rejection_disposition", None)
         added["review_reason"] = reason.strip()
     else:
-        machine = next(
-            row for row in result.get("rows", []) if str(row["id"]) == row_id
-        )
+        machine = next(row for row in result.get("rows", []) if str(row["id"]) == row_id)
         machine_disposition = str(machine.get("review_disposition") or "pending")
         previous = review["row_overrides"].get(row_id, {})
         direct_changes = dict(previous.get("changes", {}))
@@ -2048,18 +2120,39 @@ def approve_document(
     job_id: str,
     if_match: Annotated[str | None, Header(alias="If-Match")] = None,
 ) -> dict[str, Any]:
-    result, _ = _complete_result(job_id)
+    _complete_result(job_id)
     expected = _expected_revision(if_match)
 
-    def mutation(review: dict[str, Any]) -> dict[str, Any]:
-        blockers = approval_blockers(store, job_id, result, review)
+    def mutation(
+        review: dict[str, Any],
+        state: dict[str, Any],
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        blockers = approval_blockers(
+            store,
+            job_id,
+            result,
+            review,
+            state=state,
+        )
         if blockers:
-            raise ReviewValidationError(f"Approval blocked: {', '.join(blockers)}")
+            raise ApprovalBlocked(blockers)
+        certification = state["certification"]
         approval = {
             "status": "approved",
             "reviewer": "demo-reviewer",
             "approved_at": utc_now(),
             "review_revision": expected + 1,
+            **{
+                field: certification[field]
+                for field in (
+                    "certification_sha256",
+                    "result_sha256",
+                    "report_sha256",
+                    "source_sha256",
+                    "artifact_inventory_sha256",
+                )
+            },
         }
         review["approval"] = approval
         review["events"].append(
@@ -2067,8 +2160,46 @@ def approve_document(
         )
         return review
 
-    review = _mutate(job_id, expected, mutation)
+    review = _mutate_with_workspace(job_id, expected, mutation)
     return {"review_revision": review["revision"], "approval": review["approval"]}
+
+
+def _require_effective_approval(
+    job_id: str,
+    state: dict[str, Any],
+    result: dict[str, Any],
+    review: dict[str, Any],
+) -> None:
+    blockers = approval_blockers(
+        store,
+        job_id,
+        result,
+        review,
+        state=state,
+    )
+    if "legacy_uncertified" in blockers:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "legacy_uncertified",
+                "blockers": blockers,
+            },
+        )
+    if "certification_invalid" in blockers:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "certification_invalid", "blockers": blockers},
+        )
+    if review.get("approval") is None:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "document_not_approved"},
+        )
+    if blockers:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "approval_no_longer_effective", "blockers": blockers},
+        )
 
 
 @app.get("/api/v2/documents/{job_id}/exports/{export_format}")
@@ -2082,13 +2213,9 @@ def export_document(job_id: str, export_format: Literal["csv", "json", "evidence
                         status_code=409,
                         detail="Extraction is not complete",
                     )
-                if review.get("approval") is None:
-                    raise HTTPException(
-                        status_code=409,
-                        detail="Document must be approved before export",
-                    )
+                _require_effective_approval(job_id, state, result, review)
                 stem = _download_stem(state["original_name"])
-                return stem, create_evidence_bundle(store, job_id, result, review)
+                return stem, create_evidence_bundle(store, job_id, state, result, review)
 
         try:
             stem, bundle = _alias_coordinator().run_job_operation(job_id, build_evidence_export)
@@ -2111,20 +2238,47 @@ def export_document(job_id: str, export_format: Literal["csv", "json", "evidence
             filename=f"{stem}-evidence.zip",
         )
 
-    result, review = _complete_result(job_id)
-    if review.get("approval") is None:
-        raise HTTPException(status_code=409, detail="Document must be approved before export")
-    state = _state_or_404(job_id)
-    stem = _download_stem(state["original_name"])
+    def build_regular_export() -> tuple[str, str]:
+        with store.locked_workspace(job_id) as (state, result, review):
+            if state.get("status") not in {"complete", "needs_review"}:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Extraction is not complete",
+                )
+            _require_effective_approval(job_id, state, result, review)
+            stem = _download_stem(state["original_name"])
+            if export_format == "csv":
+                return stem, export_csv(result, review)
+            return (
+                stem,
+                json.dumps(export_payload(result, review), indent=2, sort_keys=True) + "\n",
+            )
+
+    try:
+        stem, content = _alias_coordinator().run_job_operation(
+            job_id,
+            build_regular_export,
+        )
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="Document not found") from error
+    except JobTransactionError as error:
+        raise HTTPException(
+            status_code=409,
+            detail="Document workspace is temporarily unavailable",
+        ) from error
+    except AliasRegistryUnavailable as error:
+        raise HTTPException(
+            status_code=503, detail={"code": "alias_registry_unavailable"}
+        ) from error
     if export_format == "csv":
         return Response(
-            export_csv(result, review),
+            content,
             media_type="text/csv",
             headers={"Content-Disposition": f'attachment; filename="{stem}-reviewed.csv"'},
         )
     if export_format == "json":
         return Response(
-            json.dumps(export_payload(result, review), indent=2, sort_keys=True) + "\n",
+            content,
             media_type="application/json",
             headers={"Content-Disposition": f'attachment; filename="{stem}-reviewed.json"'},
         )

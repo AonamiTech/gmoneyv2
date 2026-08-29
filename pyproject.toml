@@ -58,6 +58,8 @@ gmoney-demo-backfill-totals = "gmoney.demo.backfill_totals:app"
 gmoney-demo-reprocess = "gmoney.demo.reprocess:app"
 gmoney-profiles = "gmoney.profiles.cli:app"
 gmoney-phase3-evaluate = "gmoney.evaluation.phase3_cli:app"
+gmoney-release-corpus = "gmoney.evaluation.release_gate:app"
+gmoney-recertify = "gmoney.demo.recertify:app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/gmoney"]

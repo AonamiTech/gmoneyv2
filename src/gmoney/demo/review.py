@@ -76,10 +76,7 @@ def load_result(store: JobStore, job_id: str) -> dict[str, Any]:
 
 def public_page_assets(result: dict[str, Any]) -> list[dict[str, Any]]:
     return [
-        {
-            key: asset[key]
-            for key in ("page_number", "artifact_sha256", "width", "height")
-        }
+        {key: asset[key] for key in ("page_number", "artifact_sha256", "width", "height")}
         for asset in result.get("page_assets", [])
     ]
 
@@ -89,9 +86,7 @@ def normalize_changes(changes: dict[str, Any]) -> dict[str, Any]:
     if unsupported:
         raise ReviewValidationError(f"Unsupported fields: {', '.join(sorted(unsupported))}")
     if "service_date_raw" in changes and "service_date_iso" not in changes:
-        raise ReviewValidationError(
-            "service_date_raw requires authoritative service_date_iso"
-        )
+        raise ReviewValidationError("service_date_raw requires authoritative service_date_iso")
     normalized: dict[str, Any] = {}
     service_date_supplied = "service_date_iso" in changes
     if service_date_supplied:
@@ -104,9 +99,7 @@ def normalize_changes(changes: dict[str, Any]) -> dict[str, Any]:
             try:
                 parsed = date.fromisoformat(candidate)
             except ValueError as error:
-                raise ReviewValidationError(
-                    "service_date_iso is not a valid ISO date"
-                ) from error
+                raise ReviewValidationError("service_date_iso is not a valid ISO date") from error
             rendered = parsed.isoformat()
             if rendered != candidate:
                 raise ReviewValidationError("service_date_iso is not a valid ISO date")
@@ -288,8 +281,7 @@ def totals_summary(
     included = [
         row
         for row in projected
-        if row.get("review_disposition") != "rejected"
-        and row.get("role") in ITEM_TOTAL_ROLES
+        if row.get("review_disposition") != "rejected" and row.get("role") in ITEM_TOTAL_ROLES
     ]
     item_total = Decimal("0")
     missing_amounts = 0
@@ -329,9 +321,7 @@ def totals_summary(
                 )
             }
 
-    has_granular_rows = any(
-        row.get("role") in {"detail", "refund"} for row in included
-    )
+    has_granular_rows = any(row.get("role") in {"detail", "refund"} for row in included)
     has_rollup_matching_bill_total = bool(
         bill_amount is not None
         and any(
@@ -409,9 +399,9 @@ def structural_issues(result: dict[str, Any], review: dict[str, Any]) -> list[di
         message = str(item.get("message") or code)
         page_number = item.get("page_number")
         table_id = item.get("table_id")
-        issue_id = str(item.get("id") or hashlib.sha256(
-            f"semantic:{code}:{message}".encode()
-        ).hexdigest()[:20])
+        issue_id = str(
+            item.get("id") or hashlib.sha256(f"semantic:{code}:{message}".encode()).hexdigest()[:20]
+        )
         override = overrides.get(issue_id, {})
         issues.append(
             {
@@ -509,21 +499,22 @@ def review_summary(result: dict[str, Any], review: dict[str, Any]) -> dict[str, 
         "issues": issues,
         "hospital": project_hospital(result, review),
         "hospital_id": (
-            review.get("document_overrides", {})
-            .get("hospital_link", {})
-            .get("hospital_id")
+            review.get("document_overrides", {}).get("hospital_link", {}).get("hospital_id")
         ),
         "approval": review.get("approval"),
     }
 
 
 def _polygon_area(points: list[dict[str, float]]) -> float:
-    return abs(
-        sum(
-            first["x"] * second["y"] - second["x"] * first["y"]
-            for first, second in zip(points, points[1:] + points[:1], strict=True)
+    return (
+        abs(
+            sum(
+                first["x"] * second["y"] - second["x"] * first["y"]
+                for first, second in zip(points, points[1:] + points[:1], strict=True)
+            )
         )
-    ) / 2
+        / 2
+    )
 
 
 def evidence_for_page(
@@ -608,14 +599,34 @@ def reviewer_row(
 
 
 def approval_blockers(
-    store: JobStore, job_id: str, result: dict[str, Any], review: dict[str, Any]
+    store: JobStore,
+    job_id: str,
+    result: dict[str, Any],
+    review: dict[str, Any],
+    *,
+    state: dict[str, Any] | None = None,
 ) -> list[str]:
     blockers: list[str] = []
-    if (
-        result.get("output_version") != "offline_accuracy_spine_v5"
-        or not isinstance(result.get("semantic_validation"), dict)
-    ):
-        blockers.append("legacy_uncertified")
+    certified_state = state if state is not None else store.read(job_id)
+    if certified_state.get("_certification_valid") is not True:
+        blockers.append(
+            "certification_invalid"
+            if certified_state.get("_certification_status") == "invalid"
+            else "legacy_uncertified"
+        )
+    certification = certified_state.get("certification")
+    approval = review.get("approval")
+    if isinstance(approval, dict) and isinstance(certification, dict):
+        for field in (
+            "certification_sha256",
+            "result_sha256",
+            "report_sha256",
+            "source_sha256",
+            "artifact_inventory_sha256",
+        ):
+            if approval.get(field) != certification.get(field):
+                blockers.append("approval_certification_mismatch")
+                break
     rows = project_rows(result, review)
     active = [row for row in rows if row.get("review_disposition") != "rejected"]
     billable = [row for row in active if row.get("role") in ITEM_TOTAL_ROLES]
@@ -627,8 +638,7 @@ def approval_blockers(
     if any(not row.get("description") or row.get("net_amount") is None for row in billable):
         blockers.append("missing_required_values")
     if any(
-        not {"description", "amount"}.issubset(row.get("field_evidence", {}))
-        for row in billable
+        not {"description", "amount"}.issubset(row.get("field_evidence", {})) for row in billable
     ):
         blockers.append("missing_field_evidence")
     if any(
@@ -644,8 +654,7 @@ def approval_blockers(
     ):
         blockers.append("missing_informational_evidence")
     if any(
-        issue["status"] == "open"
-        and issue.get("severity", "blocking") in {"fatal", "blocking"}
+        issue["status"] == "open" and issue.get("severity", "blocking") in {"fatal", "blocking"}
         for issue in structural_issues(result, review)
     ):
         blockers.append("open_structural_issues")
@@ -654,8 +663,7 @@ def approval_blockers(
         blockers.append("incomplete_page_inventory")
     artifact_root = (store.job_dir(job_id) / "artifacts").resolve()
     if any(
-        not (artifact_root / asset.get("relative_path", "")).resolve().is_file()
-        for asset in assets
+        not (artifact_root / asset.get("relative_path", "")).resolve().is_file() for asset in assets
     ):
         blockers.append("missing_page_artifacts")
     return sorted(set(blockers))
@@ -663,7 +671,7 @@ def approval_blockers(
 
 def export_payload(result: dict[str, Any], review: dict[str, Any]) -> dict[str, Any]:
     return {
-        "export_version": "demo_review_export_v1",
+        "export_version": "demo_review_export_v2",
         "document_id": result["document_id"],
         "source_name": result.get("source_name"),
         "hospital": project_hospital(result, review),
@@ -708,14 +716,17 @@ def export_csv(result: dict[str, Any], review: dict[str, Any]) -> str:
 def create_evidence_bundle(
     store: JobStore,
     job_id: str,
+    state: dict[str, Any],
     result: dict[str, Any],
     review: dict[str, Any],
 ) -> Path:
     exports = store.job_dir(job_id) / "exports"
     exports.mkdir(exist_ok=True)
-    target = exports / f"evidence-r{review['revision']}.zip"
-    if target.is_file():
-        return target
+    certification = state.get("certification") or {}
+    certification_digest = certification.get("certification_sha256")
+    if not isinstance(certification_digest, str):
+        raise ReviewValidationError("The extraction certification is unavailable")
+    target = exports / (f"evidence-r{review['revision']}-{certification_digest[:16]}.zip")
     reviewed = (
         json.dumps(export_payload(result, review), indent=2, sort_keys=True) + "\n"
     ).encode()
@@ -741,13 +752,25 @@ def create_evidence_bundle(
         ("reviewed-output.json", reviewed),
         ("machine-output.json", machine),
     ]
-    artifact_root = (store.job_dir(job_id) / "artifacts").resolve()
-    for asset in result.get("page_assets", []):
-        page_path = (artifact_root / asset["relative_path"]).resolve()
-        if artifact_root not in page_path.parents or not page_path.is_file():
-            raise ReviewValidationError("A page artifact is unavailable")
+    artifact_root = store.job_dir(job_id) / "artifacts"
+    inventory, inventory_digest = store._artifact_inventory_unlocked(job_id, result, artifact_root)
+    if inventory_digest != certification.get("artifact_inventory_sha256"):
+        raise ReviewValidationError("The extraction artifact inventory changed")
+    page_names = {
+        str(asset["relative_path"]): f"pages/page-{asset['page_number']}.png"
+        for asset in result.get("page_assets", [])
+    }
+    for entry in inventory:
+        relative = str(entry["relative_path"])
         files.append(
-            (f"pages/page-{asset['page_number']}.png", page_path.read_bytes())
+            (
+                page_names.get(relative, f"artifacts/{relative}"),
+                store._contained_file_bytes(
+                    artifact_root,
+                    Path(relative),
+                    "invalid_certification_artifact",
+                ),
+            )
         )
     manifest_lines: list[str] = []
     for name, content in files:
@@ -764,6 +787,7 @@ def create_evidence_bundle(
             for name, content in files:
                 archive.writestr(name, content)
         temporary.replace(target)
+        JobStore._fsync_directory(exports)
     finally:
         temporary.unlink(missing_ok=True)
     return target

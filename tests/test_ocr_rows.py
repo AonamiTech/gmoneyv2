@@ -71,9 +71,7 @@ def token(index: int, text: str, box: tuple[float, float, float, float]) -> OcrT
 
 
 def test_clean_description_collapses_an_exact_ocr_phrase_echo() -> None:
-    description, service_date, request_no = _clean_description(
-        "Emeset 2 Ml Inj Emeset 2 Ml Inj"
-    )
+    description, service_date, request_no = _clean_description("Emeset 2 Ml Inj Emeset 2 Ml Inj")
 
     assert description == "Emeset 2 Ml Inj"
     assert service_date is None
@@ -164,10 +162,7 @@ def test_same_receipt_reference_with_incompatible_issuers_is_not_a_duplicate() -
     )
 
     assert len(positive_pairs) == 1
-    assert all(
-        isinstance(row_id, str)
-        for row_id in positive_pairs[0]["canonical_row_ids"]
-    )
+    assert all(isinstance(row_id, str) for row_id in positive_pairs[0]["canonical_row_ids"])
     json.dumps(positive_pairs)
 
 
@@ -209,11 +204,14 @@ def test_explicit_date_column_accepts_medicine_row_but_not_expiry_text() -> None
         column_label="Date",
         description="Medicine batch ABC",
     ) == ("10/07/2026", "2026-07-10")
-    assert service_date_from_context(
-        "ExpDate 10/07/2026",
-        column_label="ProductName",
-        description="Medicine batch ABC",
-    ) is None
+    assert (
+        service_date_from_context(
+            "ExpDate 10/07/2026",
+            column_label="ProductName",
+            description="Medicine batch ABC",
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize("printed_alias", ("Date", "Dt.", "DOS", "Service On"))
@@ -229,12 +227,15 @@ def test_canonical_date_mapping_accepts_date_only_values_on_medicine_rows(
 
 
 def test_canonical_date_mapping_does_not_accept_embedded_expiry_values() -> None:
-    assert service_date_from_context(
-        "Expiry 10/07/2026",
-        column_label="DOS",
-        canonical_field="service_date_raw",
-        description="Medicine batch ABC",
-    ) is None
+    assert (
+        service_date_from_context(
+            "Expiry 10/07/2026",
+            column_label="DOS",
+            canonical_field="service_date_raw",
+            description="Medicine batch ABC",
+        )
+        is None
+    )
 
 
 def test_hospital_header_alias_maps_an_exact_unseen_column() -> None:
@@ -259,10 +260,7 @@ def test_hospital_header_alias_maps_an_exact_unseen_column() -> None:
 
     assert len(result.rows) == 1
     assert result.rows[0].candidate.service_code == "PROC-44"
-    mapped = {
-        column.label: column.canonical_field
-        for column in result.source_tables[0].columns
-    }
+    mapped = {column.label: column.canonical_field for column in result.source_tables[0].columns}
     assert mapped["Procedure Ref."] == "service_code"
 
     unrelated = reconstruct_ocr_rows(
@@ -273,8 +271,7 @@ def test_hospital_header_alias_maps_an_exact_unseen_column() -> None:
     )
     assert unrelated.rows[0].candidate.service_code is None
     unrelated_columns = {
-        column.label: column.canonical_field
-        for column in unrelated.source_tables[0].columns
+        column.label: column.canonical_field for column in unrelated.source_tables[0].columns
     }
     assert unrelated_columns["Procedure Ref."] is None
 
@@ -316,9 +313,7 @@ def test_clean_description_collapses_a_grounded_ocr_suffix_echo(
     printed_description: str,
     expected: str,
 ) -> None:
-    description, service_date, request_no = _clean_description(
-        printed_description
-    )
+    description, service_date, request_no = _clean_description(printed_description)
 
     assert description == expected
     assert service_date is None
@@ -335,9 +330,7 @@ def test_clean_description_collapses_a_grounded_ocr_suffix_echo(
 def test_clean_description_preserves_legitimate_repeated_phrases(
     printed_description: str,
 ) -> None:
-    description, service_date, request_no = _clean_description(
-        printed_description
-    )
+    description, service_date, request_no = _clean_description(printed_description)
 
     assert description == printed_description
     assert service_date is None
@@ -445,11 +438,7 @@ def test_multiline_description_cells_use_top_to_bottom_reading_order() -> None:
         if column.canonical_field == "description"
     )
     assert [
-        next(
-            cell.raw_value
-            for cell in row.cells
-            if cell.column_id == description_column.id
-        )
+        next(cell.raw_value for cell in row.cells if cell.column_id == description_column.id)
         for row in result.source_tables[0].rows
     ] == expected
 
@@ -711,8 +700,7 @@ def test_staggered_amount_rs_unit_days_header_keeps_rate_before_total() -> None:
     assert result.rows[0].candidate.quantity == Decimal("1")
     assert result.rows[0].candidate.amount == Decimal("300.00")
     assert [
-        (column.label, column.canonical_field)
-        for column in result.source_tables[0].columns
+        (column.label, column.canonical_field) for column in result.source_tables[0].columns
     ] == [
         ("Sr.N", None),
         ("Particular", "description"),
@@ -741,10 +729,7 @@ def test_amount_rs_unit_days_without_total_remains_amount_and_quantity() -> None
     assert result.rows[0].candidate.rate is None
     assert result.rows[0].candidate.quantity == Decimal("2")
     assert result.rows[0].candidate.amount == Decimal("1000.00")
-    assert any(
-        column.canonical_field == "net_amount"
-        for column in result.source_tables[0].columns
-    )
+    assert any(column.canonical_field == "net_amount" for column in result.source_tables[0].columns)
 
 
 def test_financial_row_with_blank_particular_uses_grounded_serial_description() -> None:
@@ -865,9 +850,7 @@ def test_slanted_serial_descriptions_start_distinct_financial_rows() -> None:
         ("1 ZEPOXIN INJ", Decimal("53.30"), Decimal("1"), Decimal("53.30")),
         ("2 ONDET 2ML", Decimal("12.72"), Decimal("2"), Decimal("25.44")),
     ]
-    assert "quantity_derived_from_rate_amount" in (
-        result.rows[1].candidate.validation_flags
-    )
+    assert "quantity_derived_from_rate_amount" in (result.rows[1].candidate.validation_flags)
 
 
 def test_blank_quantity_is_derived_only_from_exact_line_arithmetic() -> None:
@@ -891,9 +874,7 @@ def test_blank_quantity_is_derived_only_from_exact_line_arithmetic() -> None:
     assert len(result.rows) == 1
     candidate = result.rows[0].candidate
     assert candidate.quantity == Decimal("2")
-    assert "quantity_derived_from_rate_amount" in (
-        candidate.validation_flags
-    )
+    assert "quantity_derived_from_rate_amount" in (candidate.validation_flags)
     assert set(result.rows[0].field_token_ids["quantity"]) == {
         "token-5",
         "token-6",
@@ -921,9 +902,7 @@ def test_added_to_bill_footer_does_not_extend_last_description() -> None:
         box=(40, 20, 980, 130),
     )
 
-    assert [item.candidate.description for item in result.rows] == [
-        "22 DECMAX 4MG TABLET"
-    ]
+    assert [item.candidate.description for item in result.rows] == ["22 DECMAX 4MG TABLET"]
     assert len(result.source_tables[0].rows) == 1
     description_column = next(
         column
@@ -1058,9 +1037,7 @@ def test_source_table_excludes_distant_text_beyond_final_column_boundary() -> No
         for column in result.source_tables[0].columns
         if column.canonical_field == "net_amount"
     )
-    cells = {
-        cell.column_id: cell for cell in result.source_tables[0].rows[0].cells
-    }
+    cells = {cell.column_id: cell for cell in result.source_tables[0].rows[0].cells}
     assert cells[total_column.id].raw_value == "2,000"
     assert result.rows[0].candidate.amount == Decimal("2000")
 
@@ -1087,9 +1064,7 @@ def test_source_table_keeps_shifted_value_within_final_lane_tolerance() -> None:
         for column in result.source_tables[0].columns
         if column.canonical_field == "net_amount"
     )
-    cells = {
-        cell.column_id: cell for cell in result.source_tables[0].rows[0].cells
-    }
+    cells = {cell.column_id: cell for cell in result.source_tables[0].rows[0].cells}
     assert cells[total_column.id].raw_value == "2,000"
     assert result.rows[0].candidate.amount == Decimal("2000")
 
@@ -1116,9 +1091,7 @@ def test_source_table_keeps_shifted_outer_date_within_structured_tolerance() -> 
         for column in result.source_tables[0].columns
         if column.canonical_field == "service_date_raw"
     )
-    cells = {
-        cell.column_id: cell for cell in result.source_tables[0].rows[0].cells
-    }
+    cells = {cell.column_id: cell for cell in result.source_tables[0].rows[0].cells}
     assert cells[date_column.id].raw_value == "15/07/2026"
     assert result.rows[0].candidate.service_date == "15/07/2026"
 
@@ -1258,15 +1231,11 @@ def test_unmapped_text_column_is_isolated_from_canonical_description() -> None:
         column for column in linked[0].columns if column.canonical_field == "description"
     )
     description_cell = next(
-        cell
-        for cell in linked[0].rows[0].cells
-        if cell.column_id == description_column.id
+        cell for cell in linked[0].rows[0].cells if cell.column_id == description_column.id
     )
-    assert {
-        token_id
-        for item in description_cell.evidence
-        for token_id in item.token_ids
-    } == {"token-3"}
+    assert {token_id for item in description_cell.evidence for token_id in item.token_ids} == {
+        "token-3"
+    }
 
 
 def test_unmapped_text_column_before_description_is_isolated() -> None:
@@ -1325,10 +1294,7 @@ def test_repeated_header_repartitions_unmapped_column_before_description() -> No
         "Procedure one",
         "Procedure two",
     ]
-    assert [
-        [cell.raw_value for cell in table.rows[0].cells]
-        for table in result.source_tables
-    ] == [
+    assert [[cell.raw_value for cell in table.rows[0].cells] for table in result.source_tables] == [
         ["Procedure one", "Cashless", "4,500.00"],
         ["Reimbursed", "Procedure two", "Cashless", "3,000.00"],
     ]
@@ -1455,25 +1421,19 @@ def test_source_tables_restart_at_arbitrary_header_after_valid_ledger() -> None:
     )
 
     assert len(result.source_tables) == 2
-    assert [
-        column.label for column in result.source_tables[1].columns
-    ] == [
+    assert [column.label for column in result.source_tables[1].columns] == [
         "Receipt No",
         "Receipt Date",
         "Card Charges",
         "Receipt Amount",
     ]
-    assert [
-        cell.raw_value for cell in result.source_tables[1].rows[0].cells
-    ] == [
+    assert [cell.raw_value for cell in result.source_tables[1].rows[0].cells] == [
         "OPA1/26/306 (EFT)",
         "23/05/2026 1:02PM",
         "0.00",
         "5000.00",
     ]
-    assert [
-        aligned.candidate.description for aligned in result.rows
-    ] == ["Suction Catheter"]
+    assert [aligned.candidate.description for aligned in result.rows] == ["Suction Catheter"]
 
 
 def test_arbitrary_data_rows_are_not_promoted_to_repeated_headers() -> None:
@@ -1509,10 +1469,7 @@ def test_arbitrary_data_rows_are_not_promoted_to_repeated_headers() -> None:
         "Column 2",
         "Column 3",
     ]
-    assert [
-        [cell.raw_value for cell in source_row.cells]
-        for source_row in table.rows
-    ] == [
+    assert [[cell.raw_value for cell in source_row.cells] for source_row in table.rows] == [
         ["S.19201", "CREDIT", "8292.77 CREDIT"],
         ["CURRENT", "SALES", "CREDIT"],
         ["S.19202", "CREDIT", "631.89"],
@@ -1548,8 +1505,7 @@ def test_headerish_nil_data_row_is_not_promoted_to_repeated_header() -> None:
 
     assert len(result.source_tables) == 1
     assert [
-        [cell.raw_value for cell in source_row.cells]
-        for source_row in result.source_tables[0].rows
+        [cell.raw_value for cell in source_row.cells] for source_row in result.source_tables[0].rows
     ] == [
         ["S.1", "CREDIT", "100.00"],
         ["SERVICE", "CREDIT", "NIL"],
@@ -1586,8 +1542,7 @@ def test_unicode_nil_data_row_is_not_promoted_to_repeated_header() -> None:
 
     assert len(result.source_tables) == 1
     assert [
-        [cell.raw_value for cell in source_row.cells]
-        for source_row in result.source_tables[0].rows
+        [cell.raw_value for cell in source_row.cells] for source_row in result.source_tables[0].rows
     ] == [
         ["सेवा", "उधार", "100.00"],
         ["दवा", "नकद", "शून्य"],
@@ -1669,8 +1624,8 @@ def test_merged_date_and_description_in_date_lane_is_grounded_and_split() -> Non
     )
     fragment_lookup = {item.token_id: item for item in fragments}
     token_lookup.update(fragment_lookup)
-    rematerialized, repeated_fragments, repeated_assignments = (
-        _materialize_printed_cell_fragments(materialized_tables, token_lookup)
+    rematerialized, repeated_fragments, repeated_assignments = _materialize_printed_cell_fragments(
+        materialized_tables, token_lookup
     )
     assert repeated_fragments == ()
     assert all(
@@ -1721,37 +1676,21 @@ def test_merged_date_and_description_in_date_lane_is_grounded_and_split() -> Non
     assert table.rows[0].canonical_row_id == str(canonical[0].id)
     cells_by_field = {
         column.canonical_field: next(
-            cell
-            for cell in table.rows[0].cells
-            if cell.column_id == column.id
+            cell for cell in table.rows[0].cells if cell.column_id == column.id
         )
         for column in table.columns
         if column.canonical_field is not None
     }
     assert cells_by_field["service_date_raw"].raw_value == "14/07/2026"
     assert cells_by_field["description"].raw_value == "NORMAL DELIVERY"
-    assert (
-        cells_by_field["service_date_raw"].validation_flags
-        == ("split_from_merged_ocr_token",)
-    )
-    assert (
-        cells_by_field["description"].validation_flags
-        == ("split_from_merged_ocr_token",)
-    )
+    assert cells_by_field["service_date_raw"].validation_flags == ("split_from_merged_ocr_token",)
+    assert cells_by_field["description"].validation_flags == ("split_from_merged_ocr_token",)
     assert cells_by_field["service_date_raw"].evidence
     assert cells_by_field["description"].evidence
-    assert cells_by_field["service_date_raw"].evidence[0].token_ids == (
-        date_fragment_id,
-    )
-    assert cells_by_field["description"].evidence[0].token_ids == (
-        description_fragment_id,
-    )
-    assert canonical[0].field_evidence["service_date"][0].token_ids == (
-        date_fragment_id,
-    )
-    assert canonical[0].field_evidence["description"][0].token_ids == (
-        description_fragment_id,
-    )
+    assert cells_by_field["service_date_raw"].evidence[0].token_ids == (date_fragment_id,)
+    assert cells_by_field["description"].evidence[0].token_ids == (description_fragment_id,)
+    assert canonical[0].field_evidence["service_date"][0].token_ids == (date_fragment_id,)
+    assert canonical[0].field_evidence["description"][0].token_ids == (description_fragment_id,)
 
 
 def test_slanted_rows_do_not_shift_total_amount_into_prior_charge() -> None:
@@ -1781,8 +1720,7 @@ def test_slanted_rows_do_not_shift_total_amount_into_prior_charge() -> None:
     )
 
     assert [
-        (aligned.candidate.description, aligned.candidate.amount)
-        for aligned in result.rows
+        (aligned.candidate.description, aligned.candidate.amount) for aligned in result.rows
     ] == [
         ("COMPLETE BLOOD COUNT(CBC)", Decimal("500.00")),
         ("RENAL FUNCTION TEST(RFT)", Decimal("1000.00")),
@@ -1795,11 +1733,9 @@ def test_slanted_rows_do_not_shift_total_amount_into_prior_charge() -> None:
     assert [
         cell.raw_value
         for source_row in result.source_tables[0].rows
-        if (cell := next(
-            item
-            for item in source_row.cells
-            if item.column_id == amount_column.id
-        )).raw_value
+        if (
+            cell := next(item for item in source_row.cells if item.column_id == amount_column.id)
+        ).raw_value
     ] == ["500.00", "1,000.00", "1,500.00"]
 
 
@@ -1845,21 +1781,12 @@ def test_separate_description_token_shifted_into_wide_date_lane_is_split() -> No
         for column in linked[0].columns
         if column.canonical_field is not None
     }
-    cells = {
-        cell.column_id: cell for cell in linked[0].rows[0].cells
-    }
+    cells = {cell.column_id: cell for cell in linked[0].rows[0].cells}
     assert linked[0].rows[0].canonical_row_id == str(canonical[0].id)
     assert cells[columns["service_date_raw"].id].raw_value == "27/06/2026"
-    assert (
-        cells[columns["description"].id].raw_value
-        == "PT INR - PROTHROMBIN TIME"
-    )
-    assert "split_from_merged_ocr_token" in (
-        cells[columns["service_date_raw"].id].validation_flags
-    )
-    assert "split_from_merged_ocr_token" in (
-        cells[columns["description"].id].validation_flags
-    )
+    assert cells[columns["description"].id].raw_value == "PT INR - PROTHROMBIN TIME"
+    assert "split_from_merged_ocr_token" in (cells[columns["service_date_raw"].id].validation_flags)
+    assert "split_from_merged_ocr_token" in (cells[columns["description"].id].validation_flags)
 
 
 @pytest.mark.parametrize(
@@ -1927,9 +1854,7 @@ def test_partial_description_in_date_lane_is_grounded_and_merged() -> None:
     assert table.rows[0].canonical_row_id == str(canonical[0].id)
     cells_by_field = {
         column.canonical_field: next(
-            cell
-            for cell in table.rows[0].cells
-            if cell.column_id == column.id
+            cell for cell in table.rows[0].cells if cell.column_id == column.id
         )
         for column in table.columns
         if column.canonical_field is not None
@@ -1968,11 +1893,7 @@ def test_request_prefix_in_date_lane_is_preserved_while_description_is_split(
         token(1, "Particulars", (350, 20, 520, 35)),
         token(2, "Net Amount", (900, 20, 970, 35)),
         token(3, date_cell_text, (80, 60, 330, 75)),
-        *(
-            (token(4, description_cell_text, (350, 60, 520, 75)),)
-            if description_cell_text
-            else ()
-        ),
+        *((token(4, description_cell_text, (350, 60, 520, 75)),) if description_cell_text else ()),
         token(5, "95000.00", (900, 60, 970, 75)),
     )
 
@@ -1999,9 +1920,7 @@ def test_request_prefix_in_date_lane_is_preserved_while_description_is_split(
     assert table.rows[0].canonical_row_id == str(canonical[0].id)
     cells_by_field = {
         column.canonical_field: next(
-            cell
-            for cell in table.rows[0].cells
-            if cell.column_id == column.id
+            cell for cell in table.rows[0].cells if cell.column_id == column.id
         )
         for column in table.columns
         if column.canonical_field is not None
@@ -2041,11 +1960,7 @@ def test_batch_suffix_in_date_lane_is_preserved_while_description_is_cleaned(
         token(1, "Particulars", (350, 20, 520, 35)),
         token(2, "Net Amount", (900, 20, 970, 35)),
         token(3, date_cell_text, (80, 60, 330, 75)),
-        *(
-            (token(4, description_cell_text, (350, 60, 520, 75)),)
-            if description_cell_text
-            else ()
-        ),
+        *((token(4, description_cell_text, (350, 60, 520, 75)),) if description_cell_text else ()),
         token(5, "95000.00", (900, 60, 970, 75)),
     )
 
@@ -2070,9 +1985,7 @@ def test_batch_suffix_in_date_lane_is_preserved_while_description_is_cleaned(
     assert table.rows[0].canonical_row_id == str(canonical[0].id)
     cells_by_field = {
         column.canonical_field: next(
-            cell
-            for cell in table.rows[0].cells
-            if cell.column_id == column.id
+            cell for cell in table.rows[0].cells if cell.column_id == column.id
         )
         for column in table.columns
         if column.canonical_field is not None
@@ -2114,10 +2027,9 @@ def test_merged_date_metadata_is_not_promoted_to_description(suffix: str) -> Non
     )
 
     assert result.rows == ()
-    assert [
-        [cell.raw_value for cell in row.cells]
-        for row in result.source_tables[0].rows
-    ] == [[f"14/07/2026 {suffix}", None, "95000.00"]]
+    assert [[cell.raw_value for cell in row.cells] for row in result.source_tables[0].rows] == [
+        [f"14/07/2026 {suffix}", None, "95000.00"]
+    ]
 
 
 @pytest.mark.parametrize(
@@ -2179,12 +2091,9 @@ def test_source_table_synthesizes_grounded_columns_without_a_header() -> None:
         "Column 3",
     ]
     assert all(
-        "synthetic_header" in column.validation_flags
-        for column in result.source_tables[0].columns
+        "synthetic_header" in column.validation_flags for column in result.source_tables[0].columns
     )
-    assert [
-        [cell.raw_value for cell in row.cells] for row in result.source_tables[0].rows
-    ] == [
+    assert [[cell.raw_value for cell in row.cells] for row in result.source_tables[0].rows] == [
         ["Procedure", "10", "4,500.00"],
         ["Medicine", "20", "2,000.00"],
     ]
@@ -2233,22 +2142,15 @@ def test_headerless_source_date_lane_recovers_grounded_canonical_dates() -> None
         "2026-07-28",
     ]
     assert all(
-        "service_date_recovered_from_source_cell" in row.validation_flags
-        for row in recovered
+        "service_date_recovered_from_source_cell" in row.validation_flags for row in recovered
     )
     date_column = next(
-        column
-        for column in linked[0].columns
-        if column.canonical_field == "service_date_raw"
+        column for column in linked[0].columns if column.canonical_field == "service_date_raw"
     )
     assert date_column.label == "Date"
     assert "inferred_column_role" in date_column.validation_flags
     assert [
-        next(
-            cell.raw_value
-            for cell in source_row.cells
-            if cell.column_id == date_column.id
-        )
+        next(cell.raw_value for cell in source_row.cells if cell.column_id == date_column.id)
         for source_row in linked[0].rows
         if source_row.canonical_row_id is not None
     ] == ["27/07/2026", "28/07/2026"]
@@ -2295,8 +2197,7 @@ def test_headerless_date_lane_displays_date_merged_into_another_cell() -> None:
         for table in result.source_tables
         for row in table.rows
         for cell in row.cells
-        if cell.raw_value
-        == "15/07/2026 16:17:00 - MNEIPI/101 Item Two"
+        if cell.raw_value == "15/07/2026 16:17:00 - MNEIPI/101 Item Two"
     )
     columns = (
         SourceColumn(
@@ -2333,14 +2234,8 @@ def test_headerless_date_lane_displays_date_merged_into_another_cell() -> None:
     cells = {cell.column_id: cell for cell in split}
     assert cells["date"].raw_value == "15/07/2026 16:17:00"
     assert cells["date"].evidence
-    assert (
-        "split_from_merged_ocr_token"
-        in cells["date"].validation_flags
-    )
-    assert (
-        cells["printed"].raw_value
-        == "15/07/2026 16:17:00 - MNEIPI/101 Item Two"
-    )
+    assert "split_from_merged_ocr_token" in cells["date"].validation_flags
+    assert cells["printed"].raw_value == "15/07/2026 16:17:00 - MNEIPI/101 Item Two"
 
 
 def test_grounded_date_lane_corrects_conflated_expiry_and_service_dates() -> None:
@@ -2379,10 +2274,7 @@ def test_grounded_date_lane_corrects_conflated_expiry_and_service_dates() -> Non
 
     assert recovered[0].service_date_raw == "27/07/2026"
     assert recovered[0].service_date_iso == "2026-07-27"
-    assert (
-        "service_date_corrected_from_source_cell"
-        in recovered[0].validation_flags
-    )
+    assert "service_date_corrected_from_source_cell" in recovered[0].validation_flags
     assert {
         token_id
         for evidence in recovered[0].field_evidence["service_date"]
@@ -2523,10 +2415,7 @@ def test_sale_date_line_applies_only_within_its_grounded_item_group() -> None:
         "2026-06-04",
         "2026-06-04",
     ]
-    assert all(
-        "service_date_inherited_from_group" in row.validation_flags
-        for row in recovered
-    )
+    assert all("service_date_inherited_from_group" in row.validation_flags for row in recovered)
 
 
 def test_source_table_skips_title_before_headerless_rows() -> None:
@@ -2553,9 +2442,7 @@ def test_source_table_skips_title_before_headerless_rows() -> None:
         "Column 2",
         "Column 3",
     ]
-    assert [
-        [cell.raw_value for cell in row.cells] for row in result.source_tables[0].rows
-    ] == [
+    assert [[cell.raw_value for cell in row.cells] for row in result.source_tables[0].rows] == [
         ["Procedure", "10", "4,500.00"],
         ["Medicine", "20", "2,000.00"],
     ]
@@ -2581,12 +2468,9 @@ def test_alphanumeric_first_data_line_is_not_promoted_to_header() -> None:
     )
 
     assert all(
-        "synthetic_header" in column.validation_flags
-        for column in result.source_tables[0].columns
+        "synthetic_header" in column.validation_flags for column in result.source_tables[0].columns
     )
-    assert result.source_tables[0].rows[0].cells[0].raw_value == (
-        "MKDIPI/2616051"
-    )
+    assert result.source_tables[0].rows[0].cells[0].raw_value == ("MKDIPI/2616051")
 
 
 def test_cash_summary_title_is_not_promoted_to_source_columns() -> None:
@@ -2748,7 +2632,44 @@ def test_bare_amount_received_form_remains_unresolved() -> None:
 
     assert len(result.rows) == 1
     assert result.rows[0].candidate.role is RowRole.UNRESOLVED
+
+
+def test_issuerless_explicit_payment_receipt_remains_unresolved() -> None:
+    result = reconstruct_ocr_rows(
+        (
+            token(0, "Receipt", (100, 20, 300, 40)),
+            token(1, "Payment Mode Cash", (100, 55, 450, 75)),
+            token(2, "Total Amount", (100, 90, 350, 110)),
+            token(3, "Rs. 1500", (800, 90, 950, 110)),
+        ),
+        page_number=1,
+        table_id="p1-t1",
+        box=(0, 0, 1000, 140),
+    )
+
+    assert result.rows[0].candidate.role is RowRole.UNRESOLVED
+    assert result.rows[0].candidate.amount == Decimal("1500")
     assert result.diagnostics["financial_form_classification"] == "ambiguous_receipt"
+
+
+def test_issuerless_cash_settlement_receipt_remains_unresolved() -> None:
+    result = reconstruct_ocr_rows(
+        (
+            token(0, "Receipt", (100, 20, 300, 40)),
+            token(1, "Payment Mode Cash", (100, 50, 450, 70)),
+            token(2, "Settlement", (100, 80, 350, 100)),
+            token(3, "Total Amount", (100, 110, 350, 130)),
+            token(4, "Rs. 1500", (800, 110, 950, 130)),
+        ),
+        page_number=1,
+        table_id="p1-t1",
+        box=(0, 0, 1000, 150),
+    )
+
+    assert result.rows[0].candidate.role is RowRole.UNRESOLVED
+    assert result.diagnostics["financial_form_classification"] == (
+        "ambiguous_receipt"
+    )
 
 
 def test_merged_date_description_is_recovered_even_when_ocr_box_stays_in_date_lane() -> None:
@@ -2941,9 +2862,7 @@ def test_header_does_not_absorb_redundant_adjacent_bill_date_metadata() -> None:
         "Disc Amt",
         "Net Amt",
     ]
-    assert [
-        column.canonical_field for column in result.source_tables[0].columns
-    ] == [
+    assert [column.canonical_field for column in result.source_tables[0].columns] == [
         "service_date_raw",
         "description",
         "quantity",
@@ -2951,9 +2870,7 @@ def test_header_does_not_absorb_redundant_adjacent_bill_date_metadata() -> None:
         "discount",
         "net_amount",
     ]
-    assert result.source_tables[0].columns[0].canonical_field == (
-        "service_date_raw"
-    )
+    assert result.source_tables[0].columns[0].canonical_field == ("service_date_raw")
     canonical = canonicalize_rows(
         "d" * 64,
         1,
@@ -2962,9 +2879,7 @@ def test_header_does_not_absorb_redundant_adjacent_bill_date_metadata() -> None:
         result.rows,
     )
     linked = _link_source_tables(result.source_tables, canonical)
-    cells = {
-        cell.column_id: cell for cell in linked[0].rows[0].cells
-    }
+    cells = {cell.column_id: cell for cell in linked[0].rows[0].cells}
     assert cells[linked[0].columns[0].id].raw_value == "27/06/2026"
     assert linked[0].rows[0].canonical_row_id == str(canonical[0].id)
 
@@ -3109,19 +3024,13 @@ def test_repeated_header_ignores_numeric_section_preamble() -> None:
     assert result.diagnostics["header_segments"] == 2
     repeated = result.source_tables[1]
     description_column = next(
-        column
-        for column in repeated.columns
-        if column.canonical_field == "description"
+        column for column in repeated.columns if column.canonical_field == "description"
     )
     cells = {cell.column_id: cell for cell in repeated.rows[-1].cells}
     assert description_column.label == "Service Name (Notes)"
-    assert cells[description_column.id].raw_value == (
-        "IP VISIT CHARGE(ICU) (Dr. SWAPNIL JAISWAL)"
-    )
+    assert cells[description_column.id].raw_value == ("IP VISIT CHARGE(ICU) (Dr. SWAPNIL JAISWAL)")
     room_rent = next(
-        row
-        for row in result.rows
-        if row.candidate.description.startswith("Room Rent")
+        row for row in result.rows if row.candidate.description.startswith("Room Rent")
     )
     assert room_rent.candidate.quantity == Decimal("2")
 
@@ -3159,9 +3068,7 @@ def test_quantity_with_printed_days_unit_is_canonical_numeric_quantity() -> None
     )
 
     room_rent = next(
-        row
-        for row in result.rows
-        if row.candidate.description.startswith("Room Rent")
+        row for row in result.rows if row.candidate.description.startswith("Room Rent")
     )
     assert room_rent.candidate.quantity == Decimal("2")
     table = next(
@@ -3170,16 +3077,13 @@ def test_quantity_with_printed_days_unit_is_canonical_numeric_quantity() -> None
         if any(column.canonical_field == "quantity" for column in table.columns)
     )
     quantity_column = next(
-        column
-        for column in table.columns
-        if column.canonical_field == "quantity"
+        column for column in table.columns if column.canonical_field == "quantity"
     )
     quantity_cell = next(
         cell
         for printed_row in table.rows
         for cell in printed_row.cells
-        if cell.column_id == quantity_column.id
-        and cell.raw_value == "2 Days"
+        if cell.column_id == quantity_column.id and cell.raw_value == "2 Days"
     )
     assert quantity_cell.raw_value == "2 Days"
 
@@ -3211,11 +3115,7 @@ def test_vertically_split_decimal_suffix_stays_in_one_numeric_cell() -> None:
         box=(100, 1100, 2380, 3250),
     )
 
-    row = next(
-        row
-        for row in result.rows
-        if row.candidate.description == "MEDICINE CHARGES"
-    )
+    row = next(row for row in result.rows if row.candidate.description == "MEDICINE CHARGES")
     assert row.candidate.rate == Decimal("19720.96")
     assert row.candidate.quantity == Decimal("1")
     assert row.candidate.amount == Decimal("19720.96")
@@ -3467,15 +3367,11 @@ def test_printed_connector_merges_grounded_canonical_and_source_rows() -> None:
         column for column in source_table.columns if column.canonical_field == "description"
     )
     description_cell = next(
-        cell
-        for cell in source_table.rows[0].cells
-        if cell.column_id == description_column.id
+        cell for cell in source_table.rows[0].cells if cell.column_id == description_column.id
     )
     assert description_cell.raw_value == expected
     assert {"token-2", "token-4"} <= {
-        token_id
-        for evidence in description_cell.evidence
-        for token_id in evidence.token_ids
+        token_id for evidence in description_cell.evidence for token_id in evidence.token_ids
     }
 
 
@@ -3584,7 +3480,10 @@ def test_demographic_fragments_and_payments_are_not_detail_rows() -> None:
     )
     assert payment_result.schema is not None
     assert payment_result.schema.table_type is TableType.PAYMENT
-    assert {row.candidate.role for row in payment_result.rows} == {RowRole.PAYMENT}
+    assert {row.candidate.role for row in payment_result.rows} == {RowRole.UNRESOLVED}
+    assert payment_result.diagnostics["financial_form_classification"] == (
+        "ambiguous_receipt"
+    )
 
 
 def test_document_totals_and_advance_are_not_detail_rows() -> None:
@@ -3791,20 +3690,12 @@ def test_invalid_stamp_text_is_not_published_as_a_missing_service_code() -> None
     gloves = next(row for row in canonical if row.description == "Gloves Sterile 7")
     assert gloves.service_code is None
     code_column = next(
-        column
-        for column in linked[0].columns
-        if column.canonical_field == "service_code"
+        column for column in linked[0].columns if column.canonical_field == "service_code"
     )
     gloves_source_row = next(
-        row
-        for row in linked[0].rows
-        if row.canonical_row_id == str(gloves.id)
+        row for row in linked[0].rows if row.canonical_row_id == str(gloves.id)
     )
-    code_cell = next(
-        cell
-        for cell in gloves_source_row.cells
-        if cell.column_id == code_column.id
-    )
+    code_cell = next(cell for cell in gloves_source_row.cells if cell.column_id == code_column.id)
     assert code_cell.raw_value is None
     assert code_cell.evidence == ()
     assert "excluded_oversized_overlay" in code_cell.validation_flags
@@ -3887,19 +3778,13 @@ def test_invalid_stamp_text_is_not_published_as_a_missing_request_number(
     gloves = next(row for row in canonical if row.description == "Gloves Sterile 7")
     assert gloves.request_no is None
     request_column = next(
-        column
-        for column in linked[0].columns
-        if column.canonical_field == "request_no"
+        column for column in linked[0].columns if column.canonical_field == "request_no"
     )
     gloves_source_row = next(
-        row
-        for row in linked[0].rows
-        if row.canonical_row_id == str(gloves.id)
+        row for row in linked[0].rows if row.canonical_row_id == str(gloves.id)
     )
     request_cell = next(
-        cell
-        for cell in gloves_source_row.cells
-        if cell.column_id == request_column.id
+        cell for cell in gloves_source_row.cells if cell.column_id == request_column.id
     )
     assert request_cell.raw_value is None
     assert request_cell.evidence == ()
@@ -3952,19 +3837,13 @@ def test_plausible_slanted_request_number_remains_for_strict_validation(
     gloves = next(row for row in canonical if row.description == "Gloves Sterile 7")
     assert gloves.request_no is None
     request_column = next(
-        column
-        for column in linked[0].columns
-        if column.canonical_field == "request_no"
+        column for column in linked[0].columns if column.canonical_field == "request_no"
     )
     gloves_source_row = next(
-        row
-        for row in linked[0].rows
-        if row.canonical_row_id == str(gloves.id)
+        row for row in linked[0].rows if row.canonical_row_id == str(gloves.id)
     )
     request_cell = next(
-        cell
-        for cell in gloves_source_row.cells
-        if cell.column_id == request_column.id
+        cell for cell in gloves_source_row.cells if cell.column_id == request_column.id
     )
     assert request_cell.raw_value == printed_request
     assert request_cell.evidence
@@ -4008,16 +3887,10 @@ def test_financial_row_values_survive_surrounding_cross_column_overlay() -> None
     assert gloves.request_no is None
     assert gloves.hsn_code is None
     gloves_source_row = next(
-        row
-        for row in linked[0].rows
-        if row.canonical_row_id == str(gloves.id)
+        row for row in linked[0].rows if row.canonical_row_id == str(gloves.id)
     )
-    columns_by_field = {
-        column.canonical_field: column for column in linked[0].columns
-    }
-    cells_by_column = {
-        cell.column_id: cell for cell in gloves_source_row.cells
-    }
+    columns_by_field = {column.canonical_field: column for column in linked[0].columns}
+    cells_by_column = {cell.column_id: cell for cell in gloves_source_row.cells}
     request_cell = cells_by_column[columns_by_field["request_no"].id]
     hsn_cell = cells_by_column[columns_by_field["hsn_code"].id]
     assert request_cell.raw_value == "REQ 150."
@@ -4110,9 +3983,7 @@ def test_wide_date_cell_extracts_grounded_date_and_request_prefix() -> None:
         if column.canonical_field == "service_date_raw"
     )
     date_cell = next(
-        cell
-        for cell in result.source_tables[0].rows[0].cells
-        if cell.column_id == date_column.id
+        cell for cell in result.source_tables[0].rows[0].cells if cell.column_id == date_column.id
     )
     request_column = next(
         column
@@ -4251,10 +4122,7 @@ def test_printed_summary_synthesizes_all_repeated_unlabeled_amount_lanes() -> No
         "Column 5",
         "Column 6",
     ]
-    assert [
-        [cell.raw_value for cell in row.cells]
-        for row in table.rows
-    ] == [
+    assert [[cell.raw_value for cell in row.cells] for row in table.rows] == [
         [
             "Total Cash Sales",
             "0.00",
@@ -4288,9 +4156,7 @@ def test_printed_summary_synthesizes_all_repeated_unlabeled_amount_lanes() -> No
         result.rows,
     )
     linked = _link_source_tables(result.source_tables, canonical)
-    assert [row.canonical_row_id for row in linked[0].rows] == [
-        str(row.id) for row in canonical
-    ]
+    assert [row.canonical_row_id for row in linked[0].rows] == [str(row.id) for row in canonical]
 
 
 @pytest.mark.parametrize("gross_center", (760, 770, 774))
@@ -4365,19 +4231,10 @@ def test_shifted_rightmost_net_lane_does_not_create_a_synthetic_column() -> None
     )
 
     table = result.source_tables[0]
-    assert all(
-        column.validation_flags != ("synthetic_header",)
-        for column in table.columns
-    )
-    net_column = next(
-        column for column in table.columns if column.canonical_field == "net_amount"
-    )
+    assert all(column.validation_flags != ("synthetic_header",) for column in table.columns)
+    net_column = next(column for column in table.columns if column.canonical_field == "net_amount")
     assert [
-        next(
-            cell.raw_value
-            for cell in source_row.cells
-            if cell.column_id == net_column.id
-        )
+        next(cell.raw_value for cell in source_row.cells if cell.column_id == net_column.id)
         for source_row in table.rows
     ] == ["100.00", "200.00", "300.00"]
 
@@ -4432,10 +4289,7 @@ def test_left_aligned_total_header_uses_repeated_right_aligned_value_lane() -> N
         "CHARGES",
         "TOTAL",
     ]
-    assert [
-        [cell.raw_value for cell in row.cells]
-        for row in table.rows
-    ] == [
+    assert [[cell.raw_value for cell in row.cells] for row in table.rows] == [
         ["Registration Charges", "1", "500.00", "500.00"],
         ["Single Room A/C", "4", "2500.00", "10000.00"],
         ["Lactation Counselling", "1", "1500.00", "1500.00"],
@@ -4543,7 +4397,8 @@ def test_left_aligned_total_header_rejects_ambiguous_right_side_lanes() -> None:
 
     assert result.diagnostics["column_centers"]["amount"] < 0.86
     assert all(
-        row.candidate.amount not in {
+        row.candidate.amount
+        not in {
             Decimal("50.00"),
             Decimal("100.00"),
             Decimal("150.00"),
@@ -4638,7 +4493,8 @@ def test_left_aligned_total_header_rejects_mixed_arithmetic_exterior_lane() -> N
 
     assert result.diagnostics["column_centers"]["amount"] < 0.86
     assert all(
-        row.candidate.amount not in {
+        row.candidate.amount
+        not in {
             Decimal("100"),
             Decimal("200"),
             *(Decimal(str(9000 + index)) for index in range(3, 11)),
@@ -4739,20 +4595,12 @@ def test_plausible_unparsed_service_code_remains_for_strict_validation(
     gloves = next(row for row in canonical if row.description == "Gloves Sterile 7")
     assert gloves.service_code is None
     code_column = next(
-        column
-        for column in linked[0].columns
-        if column.canonical_field == "service_code"
+        column for column in linked[0].columns if column.canonical_field == "service_code"
     )
     gloves_source_row = next(
-        row
-        for row in linked[0].rows
-        if row.canonical_row_id == str(gloves.id)
+        row for row in linked[0].rows if row.canonical_row_id == str(gloves.id)
     )
-    code_cell = next(
-        cell
-        for cell in gloves_source_row.cells
-        if cell.column_id == code_column.id
-    )
+    code_cell = next(cell for cell in gloves_source_row.cells if cell.column_id == code_column.id)
     assert code_cell.raw_value == printed_code
     assert code_cell.evidence
     assert "excluded_oversized_overlay" not in code_cell.validation_flags
@@ -4795,20 +4643,12 @@ def test_rotated_stamp_cannot_erase_an_aligned_code_in_the_same_cell(
     gloves = next(row for row in canonical if row.description == "Gloves Sterile 7")
     assert gloves.service_code is None
     code_column = next(
-        column
-        for column in linked[0].columns
-        if column.canonical_field == "service_code"
+        column for column in linked[0].columns if column.canonical_field == "service_code"
     )
     gloves_source_row = next(
-        row
-        for row in linked[0].rows
-        if row.canonical_row_id == str(gloves.id)
+        row for row in linked[0].rows if row.canonical_row_id == str(gloves.id)
     )
-    code_cell = next(
-        cell
-        for cell in gloves_source_row.cells
-        if cell.column_id == code_column.id
-    )
+    code_cell = next(cell for cell in gloves_source_row.cells if cell.column_id == code_column.id)
     assert printed_code in (code_cell.raw_value or "")
     assert code_cell.evidence
     assert "excluded_oversized_overlay" not in code_cell.validation_flags
@@ -4857,20 +4697,14 @@ def test_overlay_filter_resolves_reordered_source_cells_by_column_id() -> None:
 
     gloves = next(row for row in canonical if row.description == "Gloves Sterile 7")
     gloves_source_row = next(
-        row
-        for row in linked[0].rows
-        if row.canonical_row_id == str(gloves.id)
+        row for row in linked[0].rows if row.canonical_row_id == str(gloves.id)
     )
     cells = {cell.column_id: cell for cell in gloves_source_row.cells}
     description_column = next(
-        column
-        for column in linked[0].columns
-        if column.canonical_field == "description"
+        column for column in linked[0].columns if column.canonical_field == "description"
     )
     code_column = next(
-        column
-        for column in linked[0].columns
-        if column.canonical_field == "service_code"
+        column for column in linked[0].columns if column.canonical_field == "service_code"
     )
     assert cells[description_column.id].raw_value == "Gloves Sterile 7"
     assert cells[code_column.id].raw_value is None
@@ -4957,15 +4791,12 @@ def test_description_before_subtotal_extends_previous_serial_row() -> None:
     linked = _link_source_tables(result.source_tables, canonical)
     linked_row = next(row for row in linked[0].rows if row.canonical_row_id is not None)
     description_column = next(
-        column
-        for column in linked[0].columns
-        if column.canonical_field == "description"
+        column for column in linked[0].columns if column.canonical_field == "description"
     )
-    assert next(
-        cell.raw_value
-        for cell in linked_row.cells
-        if cell.column_id == description_column.id
-    ) == "Package(IPD) - Coronary Angiography (CAG)"
+    assert (
+        next(cell.raw_value for cell in linked_row.cells if cell.column_id == description_column.id)
+        == "Package(IPD) - Coronary Angiography (CAG)"
+    )
 
 
 def test_nonanchored_note_before_total_stays_separate_in_printed_table() -> None:
@@ -4994,21 +4825,13 @@ def test_nonanchored_note_before_total_stays_separate_in_printed_table() -> None
     )
     linked = _link_source_tables(result.source_tables, canonical)
     description_column = next(
-        column
-        for column in linked[0].columns
-        if column.canonical_field == "description"
+        column for column in linked[0].columns if column.canonical_field == "description"
     )
     printed_descriptions = [
-        next(
-            cell.raw_value
-            for cell in source_row.cells
-            if cell.column_id == description_column.id
-        )
+        next(cell.raw_value for cell in source_row.cells if cell.column_id == description_column.id)
         for source_row in linked[0].rows
         if any(
-            cell.raw_value
-            for cell in source_row.cells
-            if cell.column_id == description_column.id
+            cell.raw_value for cell in source_row.cells if cell.column_id == description_column.id
         )
     ]
 
@@ -5100,9 +4923,7 @@ def test_printed_table_stops_at_explicit_bill_page_footer(
     assert len(table.rows) == 1
     values = {
         column.label: next(
-            cell.raw_value
-            for cell in table.rows[0].cells
-            if cell.column_id == column.id
+            cell.raw_value for cell in table.rows[0].cells if cell.column_id == column.id
         )
         for column in table.columns
     }
@@ -5111,9 +4932,9 @@ def test_printed_table_stops_at_explicit_bill_page_footer(
         "Amount": "300.00",
         "Unit/Days": "1",
     }
-    assert [
-        (row.candidate.description, row.candidate.amount) for row in result.rows
-    ] == [("Registration", Decimal("300.00"))]
+    assert [(row.candidate.description, row.candidate.amount) for row in result.rows] == [
+        ("Registration", Decimal("300.00"))
+    ]
 
 
 @pytest.mark.parametrize(
@@ -5159,11 +4980,7 @@ def test_payment_heading_ends_pending_charge_before_polluted_summary(
         token(10, "Others-ENEMA PROCEDURE", (100, 100, 430, 115)),
         token(11, margin_text, margin_box),
         *payment_heading,
-        *(
-            (token(19, payment_amount, (890, 130, 960, 145)),)
-            if payment_amount is not None
-            else ()
-        ),
+        *((token(19, payment_amount, (890, 130, 960, 145)),) if payment_amount is not None else ()),
         token(13, "70855", (0, 160, 50, 175)),
         token(14, "Total Bill Amount", (650, 160, 830, 175)),
         token(15, "1,03,276.00", (880, 160, 970, 175)),
@@ -5188,16 +5005,13 @@ def test_payment_heading_ends_pending_charge_before_polluted_summary(
     )
     linked = _link_source_tables(result.source_tables, canonical)
     description_column = next(
-        column
-        for column in linked[0].columns
-        if column.canonical_field == "description"
+        column for column in linked[0].columns if column.canonical_field == "description"
     )
     unpriced_row = next(
         row
         for row in linked[0].rows
         if any(
-            cell.column_id == description_column.id
-            and cell.raw_value == "Others-ENEMA PROCEDURE"
+            cell.column_id == description_column.id and cell.raw_value == "Others-ENEMA PROCEDURE"
             for cell in row.cells
         )
     )
@@ -5221,9 +5035,7 @@ def test_headerless_inherited_schema_uses_description_lane_for_payment_footer() 
         box=(40, 20, 1000, 100),
     )
     continuation = tuple(
-        value.model_copy(
-            update={"page_number": 2, "token_id": f"p2-{value.token_id}"}
-        )
+        value.model_copy(update={"page_number": 2, "token_id": f"p2-{value.token_id}"})
         for value in (
             token(8, "Registration", (100, 30, 360, 45)),
             token(9, "300.00", (620, 30, 700, 45)),
@@ -5340,14 +5152,10 @@ def test_connector_before_payment_heading_keeps_linked_printed_description(
     )
     linked = _link_source_tables(result.source_tables, canonical)
     description_column = next(
-        column
-        for column in linked[0].columns
-        if column.canonical_field == "description"
+        column for column in linked[0].columns if column.canonical_field == "description"
     )
     charge_source_row = next(
-        row
-        for row in linked[0].rows
-        if row.canonical_row_id == str(canonical[0].id)
+        row for row in linked[0].rows if row.canonical_row_id == str(canonical[0].id)
     )
     printed_description = next(
         cell.raw_value
@@ -5358,9 +5166,7 @@ def test_connector_before_payment_heading_keeps_linked_printed_description(
     assert printed_description.rstrip(" -") == canonical[0].description
     assert footer_text not in printed_description
     payment_source_row = next(
-        row
-        for row in linked[0].rows
-        if any(cell.raw_value == footer_text for cell in row.cells)
+        row for row in linked[0].rows if any(cell.raw_value == footer_text for cell in row.cells)
     )
     assert payment_source_row.canonical_row_id is None
 
@@ -5523,12 +5329,9 @@ def test_rows_before_later_section_header_inherit_the_prior_page_schema() -> Non
         Decimal("5.00"),
         Decimal("1.00"),
     ]
-    assert len({table.id for table in second.source_tables}) == len(
-        second.source_tables
-    )
+    assert len({table.id for table in second.source_tables}) == len(second.source_tables)
     assert any(
-        "pre_header_continuation" in table.validation_flags
-        for table in second.source_tables
+        "pre_header_continuation" in table.validation_flags for table in second.source_tables
     )
 
 
@@ -5558,22 +5361,16 @@ def test_leading_dash_suffixed_date_is_folded_into_linked_source_row() -> None:
     )
     linked = _link_source_tables(result.source_tables, canonical)
     date_column = next(
-        column
-        for column in linked[0].columns
-        if column.canonical_field == "service_date_raw"
+        column for column in linked[0].columns if column.canonical_field == "service_date_raw"
     )
     source_row = next(row for row in linked[0].rows if row.canonical_row_id)
-    date_cell = next(
-        cell for cell in source_row.cells if cell.column_id == date_column.id
-    )
+    date_cell = next(cell for cell in source_row.cells if cell.column_id == date_column.id)
     canonical_date_ids = {
         token_id
         for item in canonical[0].field_evidence["service_date"]
         for token_id in item.token_ids
     }
-    source_date_ids = {
-        token_id for item in date_cell.evidence for token_id in item.token_ids
-    }
+    source_date_ids = {token_id for item in date_cell.evidence for token_id in item.token_ids}
 
     assert canonical[0].service_date_raw == "20/01/2026 - 21/01/2026"
     assert date_cell.raw_value == "20/01/2026 - 21/01/2026"
@@ -5598,9 +5395,7 @@ def test_date_only_line_can_ground_following_row_without_current_date_token() ->
     )
 
     assert len(result.rows) == 1
-    assert result.rows[0].candidate.description == (
-        "Package Name: Coronary Angiography"
-    )
+    assert result.rows[0].candidate.description == ("Package Name: Coronary Angiography")
     assert result.rows[0].candidate.service_date == "20/01/2026"
     assert result.rows[0].candidate.amount == Decimal("11457.00")
     assert set(result.rows[0].field_token_ids["service_date"]) == {"token-3"}
@@ -5744,8 +5539,7 @@ def test_pharmacy_expiry_date_does_not_replace_left_transaction_date(
         token(15, "250", (930, 70, 965, 85)),
         token(
             16,
-            f"10/07/2026{timestamp_separator}02:49 am "
-            f"{request_prefix}261015228{request_suffix}",
+            f"10/07/2026{timestamp_separator}02:49 am {request_prefix}261015228{request_suffix}",
             (80, 100, 290, 115),
         ),
         token(18, "Betadine Scrub 50 ML", (320, 100, 465, 115)),
@@ -5791,15 +5585,11 @@ def test_pharmacy_expiry_date_does_not_replace_left_transaction_date(
     }
     first_cells = {
         column.canonical_field: next(
-            cell
-            for cell in linked[0].rows[0].cells
-            if cell.column_id == column.id
+            cell for cell in linked[0].rows[0].cells if cell.column_id == column.id
         )
         for column in columns_by_field.values()
     }
-    assert first_cells["service_date_raw"].raw_value == (
-        f"10/07/2026{timestamp_separator}02:48 am"
-    )
+    assert first_cells["service_date_raw"].raw_value == (f"10/07/2026{timestamp_separator}02:48 am")
     assert first_cells["request_no"].raw_value == f"{request_prefix}261015227"
     assert first_cells["description"].raw_value == "Patient Coat"
     assert {
@@ -5817,11 +5607,7 @@ def test_pharmacy_expiry_date_does_not_replace_left_transaction_date(
     )
     if merged_right == 850:
         assert all(
-            {
-                token_id
-                for evidence in cell.evidence
-                for token_id in evidence.token_ids
-            }
+            {token_id for evidence in cell.evidence for token_id in evidence.token_ids}
             == {"token-9"}
             for cell in (
                 first_cells["service_date_raw"],
@@ -5837,35 +5623,25 @@ def test_pharmacy_expiry_date_does_not_replace_left_transaction_date(
                 first_cells["description"],
             )
         )
-        batch_column = next(
-            column for column in linked[0].columns if column.label == "Batch No"
-        )
+        batch_column = next(column for column in linked[0].columns if column.label == "Batch No")
         batch_cell = next(
-            cell
-            for cell in linked[0].rows[0].cells
-            if cell.column_id == batch_column.id
+            cell for cell in linked[0].rows[0].cells if cell.column_id == batch_column.id
         )
         assert batch_cell.raw_value == "62104070"
         assert {
-            token_id
-            for evidence in batch_cell.evidence
-            for token_id in evidence.token_ids
+            token_id for evidence in batch_cell.evidence for token_id in evidence.token_ids
         } == {"token-12"}
-        assert min(
-            point.x
-            for evidence in batch_cell.evidence
-            for point in evidence.polygon.points
-        ) == 500
-        assert max(
-            point.x
-            for evidence in batch_cell.evidence
-            for point in evidence.polygon.points
-        ) == 570
+        assert (
+            min(point.x for evidence in batch_cell.evidence for point in evidence.polygon.points)
+            == 500
+        )
+        assert (
+            max(point.x for evidence in batch_cell.evidence for point in evidence.polygon.points)
+            == 570
+        )
     second_cells = {
         column.canonical_field: next(
-            cell
-            for cell in linked[0].rows[1].cells
-            if cell.column_id == column.id
+            cell for cell in linked[0].rows[1].cells if cell.column_id == column.id
         )
         for column in columns_by_field.values()
     }
@@ -5921,13 +5697,8 @@ def test_linked_pharmacy_row_splits_quantity_merged_with_expiry(
         for column in linked[0].columns
         if column.canonical_field is not None
     }
-    linked_cells = {
-        cell.column_id: cell
-        for cell in linked[0].rows[0].cells
-    }
-    expiry_column = next(
-        column for column in linked[0].columns if column.label == "Expiry"
-    )
+    linked_cells = {cell.column_id: cell for cell in linked[0].rows[0].cells}
+    expiry_column = next(column for column in linked[0].columns if column.label == "Expiry")
     quantity_cell = linked_cells[columns_by_field["quantity"].id]
     expiry_cell = linked_cells[expiry_column.id]
 
@@ -5935,11 +5706,9 @@ def test_linked_pharmacy_row_splits_quantity_merged_with_expiry(
     assert quantity_cell.raw_value == quantity
     assert expiry_cell.raw_value == "Aug/2028"
     assert quantity_cell.validation_flags == ("split_from_merged_ocr_token",)
-    assert {
-        token_id
-        for evidence in quantity_cell.evidence
-        for token_id in evidence.token_ids
-    } == {"token-8"}
+    assert {token_id for evidence in quantity_cell.evidence for token_id in evidence.token_ids} == {
+        "token-8"
+    }
 
 
 def test_linked_pharmacy_row_consolidates_grounded_adjacent_description() -> None:
@@ -5981,9 +5750,7 @@ def test_linked_pharmacy_row_consolidates_grounded_adjacent_description() -> Non
     linked = _link_source_tables(result.source_tables, canonical)
 
     assert len(canonical) == 1
-    linked_row = next(
-        row for row in linked[0].rows if row.canonical_row_id is not None
-    )
+    linked_row = next(row for row in linked[0].rows if row.canonical_row_id is not None)
     donor_row = linked[0].rows[0]
     columns = {
         column.canonical_field: column
@@ -5995,24 +5762,14 @@ def test_linked_pharmacy_row_consolidates_grounded_adjacent_description() -> Non
     description = linked_cells[columns["description"].id]
     donor_description = donor_cells[columns["description"].id]
 
-    assert linked_cells[columns["service_date_raw"].id].raw_value == (
-        "12/07/2026,06:00 pm"
-    )
+    assert linked_cells[columns["service_date_raw"].id].raw_value == ("12/07/2026,06:00 pm")
     assert linked_cells[columns["request_no"].id].raw_value == "PI262015226"
     assert description.raw_value == "Easyadlide Skin"
-    assert {
-        token_id
-        for item in description.evidence
-        for token_id in item.token_ids
-    } == {"token-9"}
-    assert "redistributed_from_adjacent_source_row" in (
-        description.validation_flags
-    )
+    assert {token_id for item in description.evidence for token_id in item.token_ids} == {"token-9"}
+    assert "redistributed_from_adjacent_source_row" in (description.validation_flags)
     assert donor_description.raw_value is None
     assert not donor_description.evidence
-    assert "redistributed_to_linked_source_row" in (
-        donor_description.validation_flags
-    )
+    assert "redistributed_to_linked_source_row" in (donor_description.validation_flags)
 
 
 def test_linked_row_does_not_guess_between_adjacent_description_donors() -> None:
@@ -6045,32 +5802,18 @@ def test_linked_row_does_not_guess_between_adjacent_description_donors() -> None
             "order": 2,
         }
     )
-    ambiguous_table = source_table.model_copy(
-        update={"rows": (donor, financial, duplicate_donor)}
-    )
+    ambiguous_table = source_table.model_copy(update={"rows": (donor, financial, duplicate_donor)})
 
     linked = _link_source_tables((ambiguous_table,), canonical)
 
-    linked_row = next(
-        row for row in linked[0].rows if row.canonical_row_id is not None
-    )
+    linked_row = next(row for row in linked[0].rows if row.canonical_row_id is not None)
     description_column = next(
-        column
-        for column in linked[0].columns
-        if column.canonical_field == "description"
+        column for column in linked[0].columns if column.canonical_field == "description"
     )
-    description = next(
-        cell
-        for cell in linked_row.cells
-        if cell.column_id == description_column.id
-    )
+    description = next(cell for cell in linked_row.cells if cell.column_id == description_column.id)
     assert description.raw_value is None
     assert all(
-        next(
-            cell
-            for cell in source_row.cells
-            if cell.column_id == description_column.id
-        ).raw_value
+        next(cell for cell in source_row.cells if cell.column_id == description_column.id).raw_value
         == "Grounded Item"
         for source_row in (linked[0].rows[0], linked[0].rows[2])
     )
@@ -6112,20 +5855,14 @@ def test_pharmacy_description_continuation_in_same_lane_is_grounded() -> None:
     )
     linked = _link_source_tables(result.source_tables, canonical)
     description_column = next(
-        column
-        for column in linked[0].columns
-        if column.canonical_field == "description"
+        column for column in linked[0].columns if column.canonical_field == "description"
     )
     description_cell = next(
-        cell
-        for cell in linked[0].rows[0].cells
-        if cell.column_id == description_column.id
+        cell for cell in linked[0].rows[0].cells if cell.column_id == description_column.id
     )
     assert description_cell.raw_value == "Betadine Scrub 50 ML"
     assert {
-        token_id
-        for evidence in description_cell.evidence
-        for token_id in evidence.token_ids
+        token_id for evidence in description_cell.evidence for token_id in evidence.token_ids
     } == {"token-4", "token-8"}
     assert linked[0].rows[0].canonical_row_id == str(canonical[0].id)
 
@@ -6260,9 +5997,7 @@ def test_pharmacy_return_section_continues_to_the_next_page_table() -> None:
     )
 
     assert first_page.schema.in_return_section
-    assert second_page.rows[0].candidate.validation_flags == (
-        "positive_amount_in_return_section",
-    )
+    assert second_page.rows[0].candidate.validation_flags == ("positive_amount_in_return_section",)
     assert normal_page.rows[0].candidate.validation_flags == ()
 
 
@@ -6359,20 +6094,14 @@ def test_pharmacy_description_wrap_inside_numeric_row_envelope_is_grounded() -> 
     )
     linked = _link_source_tables(result.source_tables, canonical)
     description_column = next(
-        column
-        for column in linked[0].columns
-        if column.canonical_field == "description"
+        column for column in linked[0].columns if column.canonical_field == "description"
     )
     description_cell = next(
-        cell
-        for cell in linked[0].rows[0].cells
-        if cell.column_id == description_column.id
+        cell for cell in linked[0].rows[0].cells if cell.column_id == description_column.id
     )
     assert description_cell.raw_value == "Dispovan 10Ml Syringe"
     assert {
-        token_id
-        for evidence in description_cell.evidence
-        for token_id in evidence.token_ids
+        token_id for evidence in description_cell.evidence for token_id in evidence.token_ids
     } == {"token-5", "token-10"}
     assert linked[0].rows[0].canonical_row_id == str(canonical[0].id)
 
@@ -6466,11 +6195,7 @@ def test_bill_total_in_quantity_lane_does_not_consume_pending_description(
         if column.canonical_field == "description"
     )
     assert [
-        next(
-            cell.raw_value
-            for cell in row.cells
-            if cell.column_id == description_column.id
-        )
+        next(cell.raw_value for cell in row.cells if cell.column_id == description_column.id)
         for row in result.source_tables[0].rows
     ] == ["Dispovan 1ML", "Unlinked text", printed_total_description]
 
@@ -6776,7 +6501,5 @@ def test_claim_policy_grid_is_metadata_not_a_charge_ledger() -> None:
         box=(80, 15, 900, 95),
     )
 
-    assert {table.table_type for table in result.source_tables} == {
-        TableType.METADATA
-    }
+    assert {table.table_type for table in result.source_tables} == {TableType.METADATA}
     assert all(row.candidate.role is RowRole.UNRESOLVED for row in result.rows)

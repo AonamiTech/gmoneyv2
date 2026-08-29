@@ -26,7 +26,7 @@ type Job = {
   hospital_confidence: number | null;
   hospital_name_source: "machine" | "reviewer" | null;
   validation_status?: "passed" | "needs_review" | "not_applicable" | null;
-  certification_status?: "passed" | "needs_review" | "legacy_uncertified" | null;
+  certification_status?: "passed" | "needs_review" | "legacy_uncertified" | "invalid" | null;
   validation_issue_count?: number | null;
   validation_issue_codes?: string[] | null;
   error: string | null;
@@ -206,6 +206,14 @@ type ReviewSummary = {
   hospital: Hospital | null;
   hospital_id: string | null;
   approval: { status: string; approved_at: string; review_revision: number } | null;
+  approval_effective: boolean;
+  approval_blockers: string[];
+  export_eligible: boolean;
+};
+type ValidationReport = {
+  validation_version: string;
+  status: "passed" | "needs_review" | "failed";
+  issues: ReviewIssue[];
 };
 type AliasCandidate = {
   candidate_id: string;
@@ -442,6 +450,7 @@ export default function Home() {
   const [rowsResult, setRowsResult] = useState<RowsResult | null>(null);
   const [sourceTablesResult, setSourceTablesResult] = useState<SourceTablesResult | null>(null);
   const [review, setReview] = useState<ReviewSummary | null>(null);
+  const [failedValidation, setFailedValidation] = useState<ValidationReport | null>(null);
   const [selectedRowId, setSelectedRowId] = useState<string | null>(null);
   const [selectedSourceRowId, setSelectedSourceRowId] = useState<string | null>(null);
   const [issueAnchor, setIssueAnchor] = useState<{
@@ -724,6 +733,7 @@ export default function Home() {
     setRowsResult(null);
     setSourceTablesResult(null);
     setReview(null);
+    setFailedValidation(null);
     setOffset(0);
     setQuery("");
     setDisposition("active");
@@ -746,6 +756,18 @@ export default function Home() {
     setAliasSelected(new Set());
     setHospitalAliases([]);
   }, [selectedJobId]);
+
+  useEffect(() => {
+    if (!selectedJob || selectedJob.status !== "failed") {
+      setFailedValidation(null);
+      return;
+    }
+    void request<ValidationReport>(
+      `/api/v2/documents/${selectedJob.id}/validation`,
+    )
+      .then(setFailedValidation)
+      .catch(() => setFailedValidation(null));
+  }, [selectedJob]);
 
   useEffect(() => {
     setBulkRowIds(new Set());
@@ -1566,6 +1588,20 @@ export default function Home() {
                   <span>{selectedJob.pages ? `page ${selectedJob.page} of ${selectedJob.pages}` : "preparing pages"}</span>
                 </div>
                 {selectedJob.error && <p className="error-note">{selectedJob.error}</p>}
+                {selectedJob.status === "failed" && failedValidation?.issues.map((issue) => (
+                  <div className="issue-card open" key={issue.id}>
+                    <span>{issue.page_number ? `p.${issue.page_number}` : "doc"}</span>
+                    <div>
+                      <b>{issue.message ?? issue.code ?? "Extraction validation failed"}</b>
+                      <small>{[
+                        issue.table_id,
+                        issue.source_row_id ? `printed ${issue.source_row_id}` : null,
+                        issue.canonical_row_id ? `row ${issue.canonical_row_id}` : null,
+                        issue.field ? `field ${issue.field}` : null,
+                      ].filter(Boolean).join(" · ") || "fatal validation report"}</small>
+                    </div>
+                  </div>
+                ))}
                 {(selectedJob.status === "queued" || selectedJob.status === "processing") && (
                   <button className="text-action abort-action" disabled={abortingJobIds.has(selectedJob.id)} onClick={() => void abortJob(selectedJob)}>
                     {abortingJobIds.has(selectedJob.id) ? "Aborting and deleting…" : "Abort this bill"}
@@ -1579,7 +1615,17 @@ export default function Home() {
               <section className="workspace">
                 {selectedJob.status === "needs_review" && (
                   <p className="error-note" role="alert">
-                    Extraction needs review · {selectedJob.validation_issue_count ?? review.issues_open} semantic issue{(selectedJob.validation_issue_count ?? review.issues_open) === 1 ? "" : "s"}. {review.approval ? "The reviewer resolved the evidence and sealed this document." : "Approval and export remain blocked until the evidence is resolved."}
+                    Extraction needs review · {selectedJob.validation_issue_count ?? review.issues_open} semantic issue{(selectedJob.validation_issue_count ?? review.issues_open) === 1 ? "" : "s"}. {review.approval_effective ? "The reviewer resolved the evidence and sealed this document." : "Approval and export remain blocked until the evidence is resolved."}
+                  </p>
+                )}
+                {selectedJob.certification_status === "legacy_uncertified" && (
+                  <p className="error-note" role="alert">
+                    Legacy uncertified extraction · reprocessing is required before approval or export.
+                  </p>
+                )}
+                {selectedJob.certification_status === "invalid" && (
+                  <p className="error-note" role="alert">
+                    Certification invalid · the source or evidence inventory changed. Approval and export are disabled until validated reprocessing.
                   </p>
                 )}
                 <div className="workspace-head">
@@ -1602,7 +1648,7 @@ export default function Home() {
                     <span><b>{review.rows_modified}</b> corrected</span>
                     <span className={review.issues_open ? "warn" : ""}><b>{review.issues_open}</b> open issues</span>
                     <span className={review.rows_pending ? "warn" : ""}><b>{review.rows_pending}</b> pending</span>
-                    <span className={review.approval ? "approved" : ""}><b>{review.approval ? "✓" : "—"}</b> {review.approval ? "approved" : "draft"}</span>
+                    <span className={review.approval_effective ? "approved" : ""}><b>{review.approval_effective ? "✓" : "—"}</b> {review.approval_effective ? "approved" : "draft"}</span>
                   </div>
                 </div>
 
@@ -2079,10 +2125,10 @@ export default function Home() {
                   </div>
                   <div className="approval-card">
                     <p className="folio">06 / Approval & export</p>
-                    {review.approval ? (
+                    {review.approval_effective && review.approval ? (
                       <><h3>Review sealed.</h3><p>Approved at {new Date(review.approval.approved_at).toLocaleString()}.</p><div className="export-grid"><a href={`/api/v2/documents/${selectedJob.id}/exports/csv`}>CSV ↗</a><a href={`/api/v2/documents/${selectedJob.id}/exports/json`}>JSON ↗</a><a href={`/api/v2/documents/${selectedJob.id}/exports/evidence.zip`}>Evidence ZIP ↗</a></div></>
                     ) : (
-                      <><h3>Machine draft.</h3><p>Approval requires zero pending rows, zero open structural issues, and grounded description and amount evidence.</p><button className="approve-button" onClick={() => void approve()}>Approve reviewed ledger →</button></>
+                      <><h3>Machine draft.</h3><p>{review.approval_blockers.includes("legacy_uncertified") ? "This extraction must be reprocessed and certified before approval or export." : "Approval requires zero pending rows, zero open structural issues, and grounded description and amount evidence."}</p>{!review.approval_blockers.includes("legacy_uncertified") && <button className="approve-button" onClick={() => void approve()}>Approve reviewed ledger →</button>}</>
                     )}
                   </div>
                 </div>

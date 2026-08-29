@@ -210,6 +210,19 @@ class RecoveryTargetRecord(ContractModel):
     removed_issue_ids: tuple[str, ...] = ()
     remaining_issue_ids: tuple[str, ...] = ()
     new_issue_ids: tuple[str, ...] = ()
+    baseline_financial_inventory_sha256: str | None = Field(
+        default=None, pattern=r"^[a-f0-9]{64}$"
+    )
+    candidate_financial_inventory_sha256: str | None = Field(
+        default=None, pattern=r"^[a-f0-9]{64}$"
+    )
+    selected_financial_inventory_sha256: str | None = Field(
+        default=None, pattern=r"^[a-f0-9]{64}$"
+    )
+    baseline_financial_row_count: int | None = Field(default=None, ge=0)
+    candidate_financial_row_count: int | None = Field(default=None, ge=0)
+    preserved_financial_row_count: int | None = Field(default=None, ge=0)
+    added_financial_row_count: int | None = Field(default=None, ge=0)
 
 
 class RecoveryMetadata(ContractModel):
@@ -452,7 +465,7 @@ class ExtractionResultV5(ContractModel):
     """Complete extractor/publication envelope accepted by the safety gate."""
 
     output_version: Literal["offline_accuracy_spine_v5"]
-    contract_revision: Literal[2]
+    contract_revision: Literal[2, 3]
     document_total_version: str
     document_totals_version: str
     document_total: DocumentTotal | None

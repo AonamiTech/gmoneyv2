@@ -438,6 +438,24 @@ class AliasTransactionCoordinator:
             lambda: self.store.mutate_review(job_id, expected_revision, mutation),
         )
 
+    def mutate_review_with_workspace(
+        self,
+        job_id: str,
+        expected_revision: int,
+        mutation: Callable[
+            [dict[str, Any], dict[str, Any], dict[str, Any]],
+            dict[str, Any],
+        ],
+    ) -> dict[str, Any]:
+        return self.run_job_operation(
+            job_id,
+            lambda: self.store.mutate_review_with_workspace(
+                job_id,
+                expected_revision,
+                mutation,
+            ),
+        )
+
     def mutate_review_and_registry(
         self,
         job_id: str,

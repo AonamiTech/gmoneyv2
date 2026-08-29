@@ -30,6 +30,32 @@ on ports 8100 and 8111. This is not a production PHI deployment.
 
 ## Release command
 
+### Mandatory rollback capture
+
+Before building or replacing any application container, capture the exact
+currently running release. This is an availability rollback point; it is not
+accuracy-certified unless its frozen corpus report passed.
+
+```bash
+rollback_dir="/home/ubuntu/gmoneyv2-releases/pre-${GMONEY_IMAGE_TAG}"
+install -d -m 700 "$rollback_dir"
+docker compose -f compose.demo.yaml -f compose.gpu.yaml ps -q \
+  api frontend worker > "$rollback_dir/container-ids.txt"
+while read -r container_id; do docker inspect "$container_id"; done \
+  < "$rollback_dir/container-ids.txt" > "$rollback_dir/containers.jsonl"
+image_ids="$({ while read -r container_id; do docker inspect -f '{{.Image}}' "$container_id"; done; } \
+  < "$rollback_dir/container-ids.txt" | sort -u)"
+docker image save -o "$rollback_dir/application-images.tar" $image_ids
+tar --xattrs --acls -C /home/ubuntu -czf "$rollback_dir/runtime-backup.tar.gz" \
+  gmoneyv2-runtime/jobs gmoneyv2-runtime/config gmoneyv2-runtime/profiles
+sha256sum "$rollback_dir/application-images.tar" \
+  "$rollback_dir/runtime-backup.tar.gz" > "$rollback_dir/SHA256SUMS"
+```
+
+Do not prune images, remove application tags, or delete this backup until the
+replacement and following release have both been certified. Rebuilding a
+deleted historical commit is not an exact image rollback.
+
 From the release directory on the GPU host:
 
 ```bash
@@ -74,6 +100,75 @@ The verifier independently parses the worker timestamp and compares its age with
 the maximum age and future-skew limits reported by readiness. A response that
 merely claims `ready` cannot attest a stale, timezone-naive, malformed, or
 future-dated heartbeat.
+
+### Mandatory frozen corpus gate
+
+The authoritative client archive remains outside Git. Seal it by content hash;
+the generated manifest contains no client filenames. Detailed expectations are
+also keyed only by source SHA-256.
+
+```bash
+gmoney-release-corpus seal \
+  --cohort "production14=/secure/client-corpus/production14:14" \
+  --cohort "passing36=/secure/client-corpus/passing36:36" \
+  --cohort "staging159=/secure/client-corpus/staging159:159" \
+  --baseline-data-root /secure/client-corpus/baseline-runtime \
+  --gold /secure/client-corpus/audited-gold-by-sha256.json \
+  --release-revision "$GMONEY_BUILD_REVISION" \
+  --api-image-digest "$GMONEY_API_IMAGE_DIGEST" \
+  --frontend-image-digest "$GMONEY_FRONTEND_IMAGE_DIGEST" \
+  --worker-image-digest "$GMONEY_WORKER_IMAGE_DIGEST" \
+  --output "/home/ubuntu/gmoneyv2-releases/$GMONEY_IMAGE_TAG/corpus-manifest.json"
+```
+
+Process the sealed sources with the candidate images into a clean candidate
+data root, then evaluate it:
+
+```bash
+gmoney-release-corpus evaluate \
+  --manifest "/home/ubuntu/gmoneyv2-releases/$GMONEY_IMAGE_TAG/corpus-manifest.json" \
+  --source-root "production14=/secure/client-corpus/production14" \
+  --source-root "passing36=/secure/client-corpus/passing36" \
+  --source-root "staging159=/secure/client-corpus/staging159" \
+  --data-root /home/ubuntu/gmoneyv2-candidate-runtime \
+  --release-revision "$GMONEY_BUILD_REVISION" \
+  --api-image-digest "$GMONEY_API_IMAGE_DIGEST" \
+  --frontend-image-digest "$GMONEY_FRONTEND_IMAGE_DIGEST" \
+  --worker-image-digest "$GMONEY_WORKER_IMAGE_DIGEST" \
+  --output "/home/ubuntu/gmoneyv2-releases/$GMONEY_IMAGE_TAG/corpus-report.json"
+```
+
+The v2 evaluator rejects unknown manifest fields and duplicate hashes, requires
+an audited gold fingerprint for every document and a baseline snapshot for all
+36 known-passing documents, and compares exact canonical rows/evidence, Printed
+tables/columns/links, dates, receipts, totals, issues, recovery metadata, and
+provider usage. It also binds the report to the candidate commit and immutable
+image digest. Missing any one of the three exact cohorts blocks deployment.
+
+### Explicit historical v5 recertification
+
+First produce a read-only plan. This does not recover, migrate, or publish any
+workspace file:
+
+```bash
+gmoney-recertify \
+  --data-root /home/ubuntu/gmoneyv2-runtime \
+  --output /home/ubuntu/gmoneyv2-releases/recertification-plan.json
+```
+
+Review the plan, then apply that exact digest-bound file:
+
+```bash
+gmoney-recertify \
+  --data-root /home/ubuntu/gmoneyv2-runtime \
+  --apply-from /home/ubuntu/gmoneyv2-releases/recertification-plan.json \
+  --output /home/ubuntu/gmoneyv2-releases/recertification-report.json
+```
+
+Applying publishes a fresh validation report and certification and clears any
+old approval in the same publication transaction. Revision-2 jobs that used
+recovery are reported as `reprocess_required`; they are never recertified from
+insufficient historical recovery audit data.
 
 The base demo always binds host port `3100`. If the cloud firewall only admits
 standard HTTP, set `GMONEY_PUBLIC_HTTP_PORT=80` to add a second binding while
@@ -148,3 +243,11 @@ command. The API and worker retain read-only profile mounts.
 - No container is OOM-killed or restarted, no fatal/error marker appears in
   application logs, and at least 10 GiB remains free after images/models/build
   cache cleanup.
+- The frozen 14/36/159 corpus report has `passed=true` for the exact candidate
+  image revision.
+- After cutover, upload a production canary whose visible filename begins with
+  `[CANARY]`. Retain its source, result, validation report, page evidence, and
+  logs for the normal 30-day retention period; do not manually delete it.
+- Keep both the captured operational images and candidate images. Cleanup is
+  permitted only after the next release is certified and its rollback archive
+  has been restore-tested.

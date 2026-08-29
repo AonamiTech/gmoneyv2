@@ -3622,6 +3622,9 @@ def test_reprocess_preserves_job_and_review_with_backup(tmp_path: Path) -> None:
     assert summary["reprocessed"] == 1
     assert store.read(job_id)["row_count"] == 2
     current = json.loads((store.job_dir(job_id) / "result.json").read_text())
+    assert json.loads(
+        (store.job_dir(job_id) / "validation.json").read_text()
+    ) == current["semantic_validation"]
     assert [item["id"] for item in current["rows"]] == [
         fixture_row_id("new-row"),
         fixture_row_id("information-row"),
@@ -3638,6 +3641,7 @@ def test_reprocess_preserves_job_and_review_with_backup(tmp_path: Path) -> None:
     rolled_back = rollback_jobs(root=tmp_path, backup_batch=backup.parent)
     assert rolled_back["restored"] == 1
     assert json.loads((store.job_dir(job_id) / "result.json").read_text()) == old_result
+    assert not (store.job_dir(job_id) / "validation.json").exists()
     assert store.read_review(job_id)["revision"] == 1
     displaced = Path(rolled_back["displaced_root"])
     assert displaced.parent == store.jobs_root / ".reprocess-rollback-current"

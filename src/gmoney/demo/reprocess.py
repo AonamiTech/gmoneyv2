@@ -1470,12 +1470,15 @@ def _cutover_job(
     commit_marker: Path,
 ) -> Path:
     job_dir = store.job_dir(prepared.job_id)
-    certified_result, certified_state = store._certify_result_unlocked(
+    certified_result, certified_validation, certified_state = (
+        store._certify_result_unlocked(
         prepared.job_id,
         prepared.new_result,
         artifact_root=prepared.stage_dir / "artifacts",
+        )
     )
     _atomic_json(prepared.stage_dir / "result.json", certified_result)
+    _atomic_json(prepared.stage_dir / "validation.json", certified_validation)
     backup_dir = backup_root / prepared.job_id
     journal_path = job_dir / ".cutover.json"
 
@@ -1512,11 +1515,18 @@ def _cutover_job(
         shutil.copy2(job_dir / "state.json", backup_dir / "state.json")
         if (job_dir / "review.json").is_file():
             shutil.copy2(job_dir / "review.json", backup_dir / "review.json")
+        if (job_dir / "validation.json").is_file():
+            shutil.copy2(job_dir / "validation.json", backup_dir / "validation.json")
 
         (job_dir / "artifacts").replace(backup_dir / "artifacts")
         (prepared.stage_dir / "artifacts").replace(job_dir / "artifacts")
         (job_dir / "result.json").replace(backup_dir / "result.json")
         (prepared.stage_dir / "result.json").replace(job_dir / "result.json")
+        if (job_dir / "validation.json").is_file():
+            (job_dir / "validation.json").unlink()
+        (prepared.stage_dir / "validation.json").replace(
+            job_dir / "validation.json"
+        )
         _atomic_json(job_dir / "review.json", prepared.migrated_review)
         # The batch coordinator already holds this job's exclusive lock.  Use
         # the raw state primitives so cutover cannot recursively flock the
@@ -1533,6 +1543,10 @@ def _cutover_job(
         try:
             restore_path("result.json")
             restore_path("artifacts")
+            if (backup_dir / "validation.json").is_file():
+                restore_path("validation.json")
+            elif (job_dir / "validation.json").is_file():
+                (job_dir / "validation.json").unlink()
             _atomic_json(
                 job_dir / "state.json",
                 json.loads((backup_dir / "state.json").read_text()),
@@ -1577,6 +1591,10 @@ def _rollback_cutover_job(
 
     restore_path("result.json")
     restore_path("artifacts")
+    if (backup_dir / "validation.json").is_file():
+        restore_path("validation.json")
+    elif (job_dir / "validation.json").is_file():
+        (job_dir / "validation.json").unlink()
     _atomic_json(
         job_dir / "state.json",
         json.loads((backup_dir / "state.json").read_text()),
@@ -2485,6 +2503,11 @@ def rollback_jobs(*, root: Path, backup_batch: Path) -> dict[str, Any]:
                         job_dir / "review.json",
                         item.displaced_dir / "review.json",
                     )
+                if (job_dir / "validation.json").is_file():
+                    shutil.copy2(
+                        job_dir / "validation.json",
+                        item.displaced_dir / "validation.json",
+                    )
             for item in rollback_jobs:
                 _atomic_json(
                     store.job_dir(item.job_id) / ".cutover.json",
@@ -2505,12 +2528,20 @@ def rollback_jobs(*, root: Path, backup_batch: Path) -> dict[str, Any]:
                 (job_dir / "result.json").replace(
                     item.displaced_dir / "result.json"
                 )
+                if (job_dir / "validation.json").is_file():
+                    (job_dir / "validation.json").replace(
+                        item.displaced_dir / "validation.json"
+                    )
                 (item.backup_dir / "artifacts").replace(
                     job_dir / "artifacts"
                 )
                 (item.backup_dir / "result.json").replace(
                     job_dir / "result.json"
                 )
+                if (item.backup_dir / "validation.json").is_file():
+                    (item.backup_dir / "validation.json").replace(
+                        job_dir / "validation.json"
+                    )
                 _atomic_json(
                     job_dir / "state.json",
                     json.loads((item.backup_dir / "state.json").read_text()),

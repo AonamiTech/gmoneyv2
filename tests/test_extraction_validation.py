@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+from dataclasses import replace
 from pathlib import Path
 from uuid import uuid4
 
@@ -28,6 +29,9 @@ from gmoney.extraction.offline import (
     OfflineExtractor,
     PageExtractionUnit,
     TableExtractionUnit,
+    _financial_inventory_matches,
+    _merge_targeted_page_units,
+    _recovery_preserves_grounded_charges,
 )
 from gmoney.extraction.validation import validate_extraction_result
 
@@ -63,9 +67,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, dict[str, object]]:
         artifact_sha256=page_sha,
         token_ids=("description-token", "amount-token"),
     )
-    description_evidence = evidence.model_copy(
-        update={"token_ids": ("description-fragment",)}
-    )
+    description_evidence = evidence.model_copy(update={"token_ids": ("description-fragment",)})
     amount_evidence = evidence.model_copy(update={"token_ids": ("amount-fragment",)})
     row_anchor = "row-" + "a" * 24
     table_anchor = "table-" + "b" * 24
@@ -299,9 +301,7 @@ def test_informational_row_cannot_publish_money(tmp_path: Path) -> None:
 
     report = validate_extraction_result(source, result, artifact_root)
 
-    issue = next(
-        item for item in report.issues if item.code == "informational_row_has_money"
-    )
+    issue = next(item for item in report.issues if item.code == "informational_row_has_money")
     assert issue.canonical_row_id == str(published.id)
     assert issue.field == "net_amount"
 
@@ -423,9 +423,7 @@ def test_malformed_nested_payloads_return_fatal_reports(
     report = validate_extraction_result(source, result, artifact_root)
 
     assert report.status == "failed"
-    assert "extraction_result_contract_invalid" in {
-        issue.code for issue in report.issues
-    }
+    assert "extraction_result_contract_invalid" in {issue.code for issue in report.issues}
 
 
 @pytest.mark.parametrize(
@@ -446,9 +444,7 @@ def test_non_object_nested_entries_fail_closed_without_throwing(
     report = validate_extraction_result(source, result, artifact_root)
 
     assert report.status == "failed"
-    assert {issue.code for issue in report.issues} == {
-        "extraction_result_contract_invalid"
-    }
+    assert {issue.code for issue in report.issues} == {"extraction_result_contract_invalid"}
 
 
 def test_primary_total_and_page_assets_are_decoded_by_the_envelope(
@@ -497,12 +493,8 @@ def test_evidence_token_text_must_support_published_values(
 ) -> None:
     source, artifact_root, result = _fixture(tmp_path)
     fragment_id = token_id.replace("-token", "-fragment")
-    parent = next(
-        token for token in result["token_manifest"] if token["token_id"] == token_id
-    )
-    fragment = next(
-        token for token in result["token_manifest"] if token["token_id"] == fragment_id
-    )
+    parent = next(token for token in result["token_manifest"] if token["token_id"] == token_id)
+    fragment = next(token for token in result["token_manifest"] if token["token_id"] == fragment_id)
     parent["text"] = replacement
     fragment["text"] = replacement
     fragment["character_end"] = len(replacement)
@@ -562,12 +554,8 @@ def test_unlocatable_table_recovery_keeps_exact_diagnostic_inventory(
     report = validate_extraction_result(source, result, artifact_root)
 
     assert report.status == "needs_review"
-    assert "recovery_target_not_located" in {
-        issue.code for issue in report.issues
-    }
-    assert "page_diagnostic_inventory_incomplete" not in {
-        issue.code for issue in report.issues
-    }
+    assert "recovery_target_not_located" in {issue.code for issue in report.issues}
+    assert "page_diagnostic_inventory_incomplete" not in {issue.code for issue in report.issues}
 
 
 def test_recovery_token_retains_crop_identity_and_page_transform(
@@ -593,9 +581,7 @@ def test_recovery_token_retains_crop_identity_and_page_transform(
     assert report.status == "passed"
     token["source_artifact_sha256"] = "f" * 64
     failed = validate_extraction_result(source, result, artifact_root)
-    assert "recovery_token_provenance_invalid" in {
-        issue.code for issue in failed.issues
-    }
+    assert "recovery_token_provenance_invalid" in {issue.code for issue in failed.issues}
 
 
 def _draft_from_result(result: dict[str, object]) -> ExtractionDraft:
@@ -605,9 +591,7 @@ def _draft_from_result(result: dict[str, object]) -> ExtractionDraft:
             page_number=table.page_number,
             table_id=table.table_id,
             source_table=table,
-            row_candidates=tuple(
-                row for row in envelope.rows if row.table_id == table.table_id
-            ),
+            row_candidates=tuple(row for row in envelope.rows if row.table_id == table.table_id),
             crop_relative_path=None,
             crop_box=None,
             diagnostics=tuple(
@@ -632,9 +616,7 @@ def _draft_from_result(result: dict[str, object]) -> ExtractionDraft:
         token_manifest=envelope.token_manifest,
         table_units=table_units,
         unassigned_row_candidates=(),
-        diagnostics=tuple(
-            item.model_dump(mode="json") for item in envelope.diagnostics
-        ),
+        diagnostics=tuple(item.model_dump(mode="json") for item in envelope.diagnostics),
         total_candidates=tuple(
             DocumentTotalCandidate(
                 total=item.total,
@@ -658,8 +640,7 @@ def _draft_from_result(result: dict[str, object]) -> ExtractionDraft:
         profile_registry_revision=envelope.profile_registry_revision,
         applied_alias_ids=envelope.applied_alias_ids,
         suppressed_repeated_source_tables=tuple(
-            (item.page_number, item.table_id)
-            for item in envelope.suppressed_repeated_source_tables
+            (item.page_number, item.table_id) for item in envelope.suppressed_repeated_source_tables
         ),
         recovery_metadata=envelope.recovery.model_dump(mode="json"),
     )
@@ -737,9 +718,7 @@ def test_recover_draft_requires_semantic_improvement_and_preserves_charges(
             alias_registry_revision=candidate.alias_registry_revision,
             profile_registry_revision=candidate.profile_registry_revision,
             applied_alias_ids=candidate.applied_alias_ids,
-            suppressed_repeated_source_tables=(
-                candidate.suppressed_repeated_source_tables
-            ),
+            suppressed_repeated_source_tables=(candidate.suppressed_repeated_source_tables),
             recovery_metadata=candidate.recovery_metadata,
         )
         return candidate.result
@@ -754,9 +733,10 @@ def test_recover_draft_requires_semantic_improvement_and_preserves_charges(
 
     assert recovered.result["recovery"]["targets"][0]["selected"] == "candidate"
     assert recovered.page_units[0].token_manifest[0].text == "Consultation"
-    assert recovered.page_units[0].page_asset.relative_path.startswith("recovery/")
+    assert recovered.page_units[0].page_asset is baseline.page_units[0].page_asset
+    assert recovered.page_units[0].token_manifest[0].artifact_relative_path.startswith("recovery/")
     assert (
-        artifact_root / recovered.page_units[0].page_asset.relative_path
+        artifact_root / recovered.page_units[0].token_manifest[0].artifact_relative_path
     ).is_file()
 
     unsafe_result = json.loads(json.dumps(candidate_result))
@@ -779,9 +759,7 @@ def test_recover_draft_requires_semantic_improvement_and_preserves_charges(
             alias_registry_revision=unsafe.alias_registry_revision,
             profile_registry_revision=unsafe.profile_registry_revision,
             applied_alias_ids=unsafe.applied_alias_ids,
-            suppressed_repeated_source_tables=(
-                unsafe.suppressed_repeated_source_tables
-            ),
+            suppressed_repeated_source_tables=(unsafe.suppressed_repeated_source_tables),
             recovery_metadata=unsafe.recovery_metadata,
         )
         return unsafe.result
@@ -797,7 +775,7 @@ def test_recover_draft_requires_semantic_improvement_and_preserves_charges(
     target = declined.result["recovery"]["targets"][0]
     assert target["selected"] == "baseline"
     assert target["status"] == "recovery_no_safe_improvement"
-    assert not declined.page_units[0].page_asset.relative_path.startswith("recovery/")
+    assert declined.page_units[0].page_asset is baseline.page_units[0].page_asset
 
 
 def test_recovery_cannot_move_a_blocker_to_another_row(
@@ -821,8 +799,7 @@ def test_recovery_cannot_move_a_blocker_to_another_row(
         if isinstance(value, dict):
             if isinstance(value.get("token_ids"), list):
                 value["token_ids"] = [
-                    replacements.get(token_id, token_id)
-                    for token_id in value["token_ids"]
+                    replacements.get(token_id, token_id) for token_id in value["token_ids"]
                 ]
             for nested in value.values():
                 replace_token_ids(nested)
@@ -934,9 +911,237 @@ def test_unique_document_final_context_requires_primary_total(tmp_path: Path) ->
     report = validate_extraction_result(source, result, artifact_root)
 
     assert report.status == "needs_review"
-    assert "primary_total_missing_for_unique_context" in {
-        issue.code for issue in report.issues
+    assert "primary_total_missing_for_unique_context" in {issue.code for issue in report.issues}
+
+
+def test_unique_raw_document_final_context_cannot_be_omitted(
+    tmp_path: Path,
+) -> None:
+    source, artifact_root, result = _fixture(tmp_path)
+    evidence = result["rows"][0]["evidence"][0]
+    raw_total = {
+        "amount_raw": "100.00",
+        "amount": "100.00",
+        "label": "Net Bill Amount",
+        "scope": "document",
+        "page_number": 1,
+        "evidence": evidence,
+        "confidence": 0.99,
+        "context_id": "p1:summary:document_final:o1",
+        "context_kind": "document_final",
     }
+    result["raw_total_candidates"] = [
+        {
+            "candidate_id": "total-candidate-1",
+            "total": raw_total,
+            "label_priority": 5,
+            "vertical_position": 190.0,
+            "local_context": "Net Bill Amount",
+            "page_number": 1,
+            "table_id": "p1-t1",
+            "table_anchor": "table-" + "b" * 24,
+            "region_kind": "table",
+            "summary_block_ordinal": 1,
+            "context_evidence": [evidence],
+        }
+    ]
+    result["document_totals"] = []
+    result["document_total"] = None
+
+    report = validate_extraction_result(source, result, artifact_root)
+
+    assert report.status == "needs_review"
+    assert "raw_document_final_total_omitted" in {issue.code for issue in report.issues}
+
+
+def test_raw_total_candidate_and_context_evidence_are_validated(
+    tmp_path: Path,
+) -> None:
+    source, artifact_root, result = _fixture(tmp_path)
+    evidence = json.loads(json.dumps(result["rows"][0]["evidence"][0]))
+    evidence["token_ids"] = ["nonexistent-total-token"]
+    total = {
+        "amount_raw": "100.00",
+        "amount": "100.00",
+        "label": "Net Bill Amount",
+        "scope": "document",
+        "page_number": 1,
+        "evidence": evidence,
+        "confidence": 0.99,
+        "context_id": "p1:summary:document_final:o1",
+        "context_kind": "document_final",
+    }
+    result["raw_total_candidates"] = [
+        {
+            "candidate_id": "corrupt-total-candidate",
+            "total": total,
+            "label_priority": 5,
+            "vertical_position": 190.0,
+            "local_context": "Net Bill Amount",
+            "page_number": 1,
+            "table_id": "p1-t1",
+            "table_anchor": "table-" + "b" * 24,
+            "region_kind": "table",
+            "summary_block_ordinal": 1,
+            "context_evidence": [evidence],
+        }
+    ]
+
+    report = validate_extraction_result(source, result, artifact_root)
+
+    assert report.status == "failed"
+    matching = [issue for issue in report.issues if issue.code == "evidence_artifact_mismatch"]
+    assert {issue.field for issue in matching} == {
+        "raw_total_candidates.total.evidence",
+        "raw_total_candidates.context_evidence",
+    }
+
+
+def test_recovery_cannot_delete_an_unlinked_financial_printed_row(
+    tmp_path: Path,
+) -> None:
+    _source, _artifact_root, result = _fixture(tmp_path)
+    unlinked = json.loads(json.dumps(result["source_tables"][0]["rows"][0]))
+    unlinked.update(
+        id="p1-t1-s1-r-unlinked",
+        order=1,
+        canonical_row_id=None,
+        row_anchor="row-" + "d" * 24,
+    )
+    result["source_tables"][0]["rows"].append(unlinked)
+    baseline = _draft_from_result(result)
+    candidate_result = json.loads(json.dumps(result))
+    candidate_result["source_tables"][0]["rows"] = candidate_result["source_tables"][0]["rows"][:1]
+    candidate = _draft_from_result(candidate_result)
+
+    assert not _recovery_preserves_grounded_charges(
+        baseline,
+        candidate,
+        ((1, "p1-t1"),),
+        {},
+    )
+
+
+def test_financial_inventory_allows_link_creation_without_token_id_identity() -> None:
+    baseline = (
+        {
+            "page_number": 1,
+            "table_id": "p1-t1",
+            "table_anchor": "table-anchor",
+            "row_anchor": "row-anchor",
+            "source_row_id": "baseline-source",
+            "canonical_row_id": None,
+            "description": "consultation",
+            "bounds": (10.0, 10.0, 90.0, 30.0),
+            "fields": {
+                "net_amount": {
+                    "value": "100.00",
+                    "lineage_sha256": "same-root-lineage",
+                    "grounding_strength": 1,
+                }
+            },
+        },
+    )
+    candidate = (
+        {
+            **baseline[0],
+            "source_row_id": "new-source-id",
+            "canonical_row_id": "new-canonical-link",
+        },
+    )
+
+    safe, preserved, added = _financial_inventory_matches(baseline, candidate, {})
+
+    assert safe is True
+    assert preserved == 1
+    assert added == 0
+
+
+def test_financial_inventory_rejects_deleting_linked_row_with_missing_amount() -> None:
+    baseline = (
+        {
+            "page_number": 1,
+            "table_id": "p1-t1",
+            "table_anchor": "table-anchor",
+            "row_anchor": "row-anchor",
+            "source_row_id": "source-row",
+            "canonical_row_id": "canonical-with-missing-amount",
+            "canonical_amount_missing": True,
+            "description": "consultation",
+            "bounds": (10.0, 10.0, 90.0, 30.0),
+            "fields": {
+                "net_amount": {
+                    "value": "100.00",
+                    "lineage_sha256": "grounded-lineage",
+                    "grounding_strength": 1,
+                }
+            },
+        },
+    )
+
+    safe, preserved, added = _financial_inventory_matches(baseline, (), {})
+
+    assert safe is False
+    assert preserved == 0
+    assert added == 0
+
+
+def test_targeted_page_merge_preserves_untargeted_raw_unit_byte_identity(
+    tmp_path: Path,
+) -> None:
+    _source, _artifact_root, result = _fixture(tmp_path)
+    baseline = _draft_from_result(result)
+    first = baseline.page_units[0]
+    second = replace(
+        first,
+        page_asset=first.page_asset.model_copy(update={"page_number": 2}),
+        provider_usage={"initial": {"paddle_calls": 7}},
+    )
+    recovered_first = replace(
+        first,
+        provider_usage={"recovery": {"paddle_calls": 1}},
+    )
+
+    merged = _merge_targeted_page_units(
+        (first, second),
+        (recovered_first,),
+        ((1, "p1-t1"),),
+    )
+
+    assert merged[0] is not recovered_first
+    assert merged[0].table_units[0] is recovered_first.table_units[0]
+    assert merged[0].page_asset is first.page_asset
+    assert merged[0].residual_digest() == first.residual_digest()
+    assert merged[1] is second
+    assert merged[1].raw_digest() == second.raw_digest()
+
+
+def test_table_target_preserves_sibling_table_on_same_page_byte_for_byte(
+    tmp_path: Path,
+) -> None:
+    _source, _artifact_root, result = _fixture(tmp_path)
+    draft = _draft_from_result(result)
+    page = draft.page_units[0]
+    first_table = page.table_units[0]
+    sibling_source = first_table.source_table.model_copy(
+        update={"id": "p1-t2-source", "table_id": "p1-t2"}, deep=True
+    )
+    sibling = replace(
+        first_table,
+        table_id="p1-t2",
+        source_table=sibling_source,
+        provider_usage={"initial": {"paddle_calls": 2}},
+    )
+    baseline_page = replace(page, table_units=(first_table, sibling))
+    recovered_first = replace(first_table, provider_usage={"recovery": {"paddle_calls": 1}})
+    unsafe_sibling = replace(sibling, provider_usage={"recovery": {"paddle_calls": 99}})
+    candidate_page = replace(page, table_units=(recovered_first, unsafe_sibling))
+
+    merged = _merge_targeted_page_units((baseline_page,), (candidate_page,), ((1, "p1-t1"),))
+
+    assert merged[0].table_units[0] is recovered_first
+    assert merged[0].table_units[1] is sibling
+    assert merged[0].table_units[1].raw_digest() == sibling.raw_digest()
 
 
 def test_recovery_provider_usage_is_separate_and_gemini_free(tmp_path: Path) -> None:
@@ -959,8 +1164,9 @@ JSON_VALUES = st.recursive(
     | st.integers()
     | st.floats(allow_nan=False, allow_infinity=False)
     | st.text(max_size=40),
-    lambda children: st.lists(children, max_size=5)
-    | st.dictionaries(st.text(max_size=20), children, max_size=5),
+    lambda children: (
+        st.lists(children, max_size=5) | st.dictionaries(st.text(max_size=20), children, max_size=5)
+    ),
     max_leaves=30,
 )
 

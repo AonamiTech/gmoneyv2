@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -102,6 +103,7 @@ def _extract_and_publish(
     except ExtractionAborted:
         return None
     source = directory / "source.pdf"
+    result["source_sha256"] = hashlib.sha256(source.read_bytes()).hexdigest()
     report = validate_extraction_result(source, result, directory / "artifacts")
     recovery_attempted = False
     if not report.fatal and report.recovery_targets:
@@ -125,8 +127,7 @@ def _extract_and_publish(
         if int(recovery_usage.get("gemini_calls") or 0) != 0:
             raise RuntimeError("targeted_recovery_invoked_gemini")
         report = validate_extraction_result(source, result, directory / "artifacts")
-    if report.fatal:
-        raise ExtractionIntegrityError(report)
+    result["source_sha256"] = hashlib.sha256(source.read_bytes()).hexdigest()
     result["source_name"] = state["original_name"]
     result["worker_release_revision"] = build_revision()
     result["semantic_validation"] = report.model_dump(mode="json")
@@ -169,9 +170,7 @@ def _run_job(
             AliasTransactionCoordinator(store, alias_registry)
             if alias_registry is not None
             else None,
-            JsonProfileRepository(profile_registry)
-            if profile_registry is not None
-            else None,
+            JsonProfileRepository(profile_registry) if profile_registry is not None else None,
         )
     extractor_options: dict[str, Any] = {
         "paddle_device": paddle_device,
@@ -256,9 +255,7 @@ def _runtime_identity_snapshots(
     profile_repository: JsonProfileRepository | None,
 ) -> RuntimeIdentitySnapshot:
     if profile_repository is not None and alias_coordinator is not None:
-        profiles, aliases, identities = alias_coordinator.identity_snapshots(
-            profile_repository
-        )
+        profiles, aliases, identities = alias_coordinator.identity_snapshots(profile_repository)
         return RuntimeIdentitySnapshot(aliases, profiles, identities)
     if profile_repository is not None:
         with profile_repository.locked_snapshot() as profile_snapshot:
@@ -268,11 +265,7 @@ def _runtime_identity_snapshots(
                 profile_snapshot.model_copy(deep=True),
                 identities,
             )
-    aliases = (
-        alias_coordinator.registry_snapshot()
-        if alias_coordinator is not None
-        else None
-    )
+    aliases = alias_coordinator.registry_snapshot() if alias_coordinator is not None else None
     return RuntimeIdentitySnapshot(aliases, None, None)
 
 
@@ -373,9 +366,7 @@ def run_worker_loop(
     )
     futures: dict[Future[dict[str, Any] | None], str] = {}
     last_cleanup = 0.0
-    runtime_registries_available = (
-        alias_coordinator is None and profile_repository is None
-    )
+    runtime_registries_available = alias_coordinator is None and profile_repository is None
     registry_error: str | None = None
     next_registry_probe = 0.0
     draining = False
@@ -468,9 +459,7 @@ def run_worker_loop(
             if alias_coordinator is not None or profile_repository is not None:
                 cleanup_due = now - last_cleanup >= 300
                 should_probe = (
-                    not runtime_registries_available
-                    or bool(store.queued())
-                    or cleanup_due
+                    not runtime_registries_available or bool(store.queued()) or cleanup_due
                 )
                 if should_probe and now >= next_registry_probe:
                     registry_error, observed_snapshot = _probe_runtime_registries(
@@ -486,9 +475,7 @@ def run_worker_loop(
                         else None
                     )
                     next_registry_probe = (
-                        0.0
-                        if runtime_registries_available
-                        else now + alias_retry_seconds
+                        0.0 if runtime_registries_available else now + alias_retry_seconds
                     )
                 elif not runtime_registries_available and registry_error is not None:
                     _fail_queued_for_registry_outage(
@@ -556,10 +543,7 @@ def run_worker_loop(
                             identity_snapshot,
                         )
                     except Exception as error:
-                        if (
-                            not store.requeue_claimed(job_id)
-                            and store.abort_requested(job_id)
-                        ):
+                        if not store.requeue_claimed(job_id) and store.abort_requested(job_id):
                             store.finalize_abort(job_id)
                         fatal_error = error
                         draining = True
@@ -639,13 +623,9 @@ def main() -> None:
         concurrency=int(os.environ.get("GMONEY_WORKER_CONCURRENCY", "3")),
         retention_hours=int(os.environ.get("GMONEY_RETENTION_HOURS", "720")),
         alias_registry=(Path(alias_registry_value) if alias_registry_value else None),
-        profile_registry=(
-            Path(profile_registry_value) if profile_registry_value else None
-        ),
+        profile_registry=(Path(profile_registry_value) if profile_registry_value else None),
         worker_status_path=(
-            Path(value)
-            if (value := os.environ.get("GMONEY_WORKER_STATUS_PATH"))
-            else None
+            Path(value) if (value := os.environ.get("GMONEY_WORKER_STATUS_PATH")) else None
         ),
         stop_requested=stop_event.is_set,
     )

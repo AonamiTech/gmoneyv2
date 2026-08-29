@@ -96,9 +96,7 @@ _MATCHED_HEADER_ALIAS_IDS: ContextVar[set[str] | None] = ContextVar(
 )
 
 
-def set_header_aliases(
-    aliases: dict[str, str], alias_ids: dict[str, str] | None = None
-) -> None:
+def set_header_aliases(aliases: dict[str, str], alias_ids: dict[str, str] | None = None) -> None:
     """Set exact, process-local aliases for the current synchronous extraction job."""
     _ACTIVE_HEADER_ALIASES.set(dict(aliases))
     _ACTIVE_HEADER_ALIAS_IDS.set(dict(alias_ids or {}))
@@ -107,6 +105,7 @@ def set_header_aliases(
 
 def matched_header_alias_ids() -> tuple[str, ...]:
     return tuple(sorted(_MATCHED_HEADER_ALIAS_IDS.get() or ()))
+
 
 RAW_HEADER_TERMS = frozenset(
     {
@@ -176,9 +175,7 @@ REQUEST_PREFIX = re.compile(
     r"^[A-Z][A-Z0-9-]{2,}/[A-Z0-9-]+\s*",
     re.IGNORECASE,
 )
-COMPACT_REQUEST_PREFIX = re.compile(
-    r"^(?=[A-Z|]*[A-Z])[A-Z|]{1,5}\d{5,20}(?=\s|[.,;:]|$)\s*"
-)
+COMPACT_REQUEST_PREFIX = re.compile(r"^(?=[A-Z|]*[A-Z])[A-Z|]{1,5}\d{5,20}(?=\s|[.,;:]|$)\s*")
 BATCH_SUFFIX = re.compile(
     r"\s*(?:\[?\s*(?:B\.?\s*No|Batch|Exp(?:iry)?\s*Date)\s*[:.-].*)$",
     re.IGNORECASE,
@@ -346,10 +343,8 @@ def _lines(tokens: tuple[OcrToken, ...]) -> tuple[OcrLine, ...]:
             )
             if (
                 suffix_top >= decimal_bottom - 2.0
-                and abs(suffix_right - decimal_right)
-                <= max(8.0, decimal_width * 0.12)
-                and suffix_left
-                >= decimal_right - max(36.0, decimal_width * 0.32)
+                and abs(suffix_right - decimal_right) <= max(8.0, decimal_width * 0.12)
+                and suffix_left >= decimal_right - max(36.0, decimal_width * 0.32)
             ):
                 return True
         return False
@@ -371,17 +366,12 @@ def _lines(tokens: tuple[OcrToken, ...]) -> tuple[OcrLine, ...]:
         )
         token_left, _, token_right, _ = _bounds(token)
         token_starts_printed_row = bool(
-            re.match(r"^\s*\d+[.)]?\s+\S", token.text)
-            and re.search(r"[A-Za-z]", token.text)
+            re.match(r"^\s*\d+[.)]?\s+\S", token.text) and re.search(r"[A-Za-z]", token.text)
         )
-        current_has_numeric = any(
-            parse_decimal(item.text) is not None for item in current
-        )
+        current_has_numeric = any(parse_decimal(item.text) is not None for item in current)
         same_lane_conflict = any(
             not is_vertical_decimal_suffix_pair(existing, token)
-            and
-            min(token_right, existing_right)
-            - max(token_left, existing_left)
+            and min(token_right, existing_right) - max(token_left, existing_left)
             >= min(
                 max(1.0, token_right - token_left),
                 max(1.0, existing_right - existing_left),
@@ -390,10 +380,7 @@ def _lines(tokens: tuple[OcrToken, ...]) -> tuple[OcrLine, ...]:
             and abs(_center_y(token) - _center_y(existing))
             > max(4.0, min(_height(token), _height(existing)) * 0.3)
             and (
-                (
-                    parse_decimal(token.text) is not None
-                    and parse_decimal(existing.text) is not None
-                )
+                (parse_decimal(token.text) is not None and parse_decimal(existing.text) is not None)
                 or (
                     token_starts_printed_row
                     and current_has_numeric
@@ -404,10 +391,7 @@ def _lines(tokens: tuple[OcrToken, ...]) -> tuple[OcrLine, ...]:
             for existing in current
             for existing_left, _, existing_right, _ in (_bounds(existing),)
         )
-        if (
-            abs(_center_y(token) - current_y) <= effective_tolerance
-            and not same_lane_conflict
-        ):
+        if abs(_center_y(token) - current_y) <= effective_tolerance and not same_lane_conflict:
             current.append(token)
         else:
             grouped.append([token])
@@ -609,11 +593,7 @@ def _header_roles(line: OcrLine) -> dict[str, OcrToken]:
     service_date = roles.get("service_date")
     ordered_header_tokens = tuple(sorted(line.tokens, key=_center_x))
     split_expiry_phrase = False
-    if (
-        expiry is not None
-        and service_date is not None
-        and expiry.token_id != service_date.token_id
-    ):
+    if expiry is not None and service_date is not None and expiry.token_id != service_date.token_id:
         service_index = next(
             (
                 index
@@ -630,20 +610,14 @@ def _header_roles(line: OcrLine) -> dict[str, OcrToken]:
             ),
             None,
         )
-        if (
-            service_index is not None
-            and expiry_index is not None
-            and service_index < expiry_index
-        ):
+        if service_index is not None and expiry_index is not None and service_index < expiry_index:
             split_expiry_phrase = bool(
                 re.fullmatch(
                     r"date\s+of\s+(?:expiry|exp)",
                     _normalize(
                         " ".join(
                             token.text
-                            for token in ordered_header_tokens[
-                                service_index : expiry_index + 1
-                            ]
+                            for token in ordered_header_tokens[service_index : expiry_index + 1]
                         )
                     ),
                 )
@@ -653,8 +627,7 @@ def _header_roles(line: OcrLine) -> dict[str, OcrToken]:
         and service_date is not None
         and (
             split_expiry_phrase
-            or
-            (
+            or (
                 expiry.token_id == service_date.token_id
                 and (
                     "expiry" in _normalize(expiry.text)
@@ -663,8 +636,7 @@ def _header_roles(line: OcrLine) -> dict[str, OcrToken]:
             )
             or (
                 _center_x(service_date) >= _center_x(expiry)
-                and _normalize(service_date.text)
-                in {"date", "expiry date", "exp date"}
+                and _normalize(service_date.text) in {"date", "expiry date", "exp date"}
             )
         )
     ):
@@ -731,9 +703,7 @@ def _contains_total_value(line: OcrLine) -> bool:
 def _header_lines_are_adjacent(previous: OcrLine, current: OcrLine) -> bool:
     previous_bottom = max(_bounds(token)[3] for token in previous.tokens)
     current_top = min(_bounds(token)[1] for token in current.tokens)
-    typical_height = median(
-        _height(token) for line in (previous, current) for token in line.tokens
-    )
+    typical_height = median(_height(token) for line in (previous, current) for token in line.tokens)
     return current_top - previous_bottom <= max(8.0, typical_height * 1.5)
 
 
@@ -809,9 +779,7 @@ def _header_blocks(lines: tuple[OcrLine, ...]) -> tuple[HeaderBlock, ...]:
         if not _header_roles(lines[start]) and not (start_words and start_words <= fragment_words):
             continue
         for end in range(start, min(len(lines), start + 3)):
-            if end > start and not _header_lines_are_adjacent(
-                lines[end - 1], lines[end]
-            ):
+            if end > start and not _header_lines_are_adjacent(lines[end - 1], lines[end]):
                 break
             if _contains_total_value(lines[end]):
                 break
@@ -827,16 +795,10 @@ def _header_blocks(lines: tuple[OcrLine, ...]) -> tuple[HeaderBlock, ...]:
                 roles = _merge_header_roles(roles, incoming_roles)
             if not _valid_header(roles):
                 continue
-            normalized = _normalize(
-                " ".join(
-                    line.text for line in lines[block_start : end + 1]
-                )
-            )
+            normalized = _normalize(" ".join(line.text for line in lines[block_start : end + 1]))
             if normalized.startswith(("total for", "sub total", "subtotal", "grand total")):
                 continue
-            candidates.append(
-                HeaderBlock(start=block_start, end=end, roles=dict(roles))
-            )
+            candidates.append(HeaderBlock(start=block_start, end=end, roles=dict(roles)))
             break
     selected: list[HeaderBlock] = []
     for candidate in candidates:
@@ -894,9 +856,7 @@ def _snap_amount_to_stable_lane(
     nearby = min(stable_centers, key=lambda center: abs(center - labeled_amount))
     if abs(nearby - labeled_amount) <= 0.06:
         return nearby
-    rightward_centers = tuple(
-        center for center in stable_centers if center > labeled_amount
-    )
+    rightward_centers = tuple(center for center in stable_centers if center > labeled_amount)
     if (
         printed_header_centers
         and labeled_amount >= max(printed_header_centers) - 0.015
@@ -928,34 +888,22 @@ def _wide_amount_snap_has_arithmetic_proof(
     quantity_header_center = (_center_x(quantity) - left) / width
     amount_header_center = (_center_x(amount) - left) / width
     quantity_centers = tuple(
-        center
-        for center in stable_centers
-        if abs(center - quantity_header_center) <= 0.06
+        center for center in stable_centers if abs(center - quantity_header_center) <= 0.06
     )
-    rightward_centers = tuple(
-        center for center in stable_centers if center > amount_header_center
-    )
+    rightward_centers = tuple(center for center in stable_centers if center > amount_header_center)
     rate_centers = tuple(
         center
         for center in stable_centers
         if quantity_header_center + 0.04 < center < amount_header_center - 0.025
     )
-    if (
-        len(quantity_centers) != 1
-        or len(rate_centers) != 1
-        or len(rightward_centers) != 1
-    ):
+    if len(quantity_centers) != 1 or len(rate_centers) != 1 or len(rightward_centers) != 1:
         return False
 
     header_tokens = tuple(
-        token
-        for line in lines[block.start : block.end + 1]
-        for token in line.tokens
+        token for line in lines[block.start : block.end + 1] for token in line.tokens
     )
     if not any(
-        quantity_header_center
-        < (_center_x(token) - left) / width
-        < amount_header_center
+        quantity_header_center < (_center_x(token) - left) / width < amount_header_center
         and re.search(
             r"\b(?:charges?|rates?|prices?)\b",
             _normalize(token.text),
@@ -985,23 +933,16 @@ def _wide_amount_snap_has_arithmetic_proof(
             selected.append(
                 min(
                     candidates,
-                    key=lambda value: abs(
-                        ((_center_x(value.token) - left) / width) - center
-                    ),
+                    key=lambda value: abs(((_center_x(value.token) - left) / width) - center),
                 )
             )
         if len(selected) != 3:
             continue
-        identities = {
-            _numeric_identity(value.token, value.value)
-            for value in selected
-        }
+        identities = {_numeric_identity(value.token, value.value) for value in selected}
         if len(identities) != 3:
             continue
         comparable += 1
-        quantity_value, rate_value, total_value = (
-            value.value for value in selected
-        )
+        quantity_value, rate_value, total_value = (value.value for value in selected)
         if abs((quantity_value * rate_value) - total_value) <= Decimal("0.01"):
             matches += 1
     minimum_support = max(2, round(len(lines[block.end + 1 :]) * 0.1))
@@ -1065,9 +1006,7 @@ def _source_evidence(
     )
     if not originals:
         return ()
-    unique = tuple(
-        {token.token_id: token for token in originals}.values()
-    )
+    unique = tuple({token.token_id: token for token in originals}.values())
     return tuple(
         EvidenceRef(
             page_number=token.page_number,
@@ -1138,10 +1077,8 @@ def _missing_numeric_column_centers(
         )
         if neighbors is None and not all_columns_unmapped:
             continue
-        if (
-            neighbors is not None
-            and abs(center - (neighbors[0] + neighbors[1]) / 2)
-            > width * (0.04 if all_columns_unmapped else 0.03)
+        if neighbors is not None and abs(center - (neighbors[0] + neighbors[1]) / 2) > width * (
+            0.04 if all_columns_unmapped else 0.03
         ):
             continue
         missing.append(center)
@@ -1196,8 +1133,7 @@ def _source_columns(
             end=data_end,
             existing_centers=tuple(entry[0] for entry in entries),
             all_columns_unmapped=all(
-                canonical_field is None
-                for _, _, canonical_field, _ in entries
+                canonical_field is None for _, _, canonical_field, _ in entries
             ),
             width=width,
         )
@@ -1215,9 +1151,7 @@ def _source_columns(
                 order=order,
                 canonical_field=canonical_field,
                 evidence=(
-                    ()
-                    if token is None
-                    else _source_evidence((token,), original_by_id, table_id)
+                    () if token is None else _source_evidence((token,), original_by_id, table_id)
                 ),
                 validation_flags=("synthetic_header",) if synthetic else (),
             )
@@ -1230,10 +1164,7 @@ def _is_printed_table_footer(line: OcrLine) -> bool:
     normalized = _normalize(line.text)
     if re.search(r"\bpage \d+(?: of)? \d+\b", normalized):
         return True
-    return (
-        "this bill was created using" in normalized
-        or "added to bill" in normalized
-    )
+    return "this bill was created using" in normalized or "added to bill" in normalized
 
 
 def _source_rows(
@@ -1262,24 +1193,18 @@ def _source_rows(
     left_tolerance = edge_tolerances.get(columns[0].canonical_field, 0.08)
     right_tolerance = edge_tolerances.get(columns[-1].canonical_field, 0.08)
     outer_left = (
-        centers[0]
-        - max((centers[1] - centers[0]) / 2, width * left_tolerance)
+        centers[0] - max((centers[1] - centers[0]) / 2, width * left_tolerance)
         if len(centers) > 1
         else float("-inf")
     )
     outer_right = (
-        centers[-1]
-        + max((centers[-1] - centers[-2]) / 2, width * right_tolerance)
+        centers[-1] + max((centers[-1] - centers[-2]) / 2, width * right_tolerance)
         if len(centers) > 1
         else float("inf")
     )
     output: list[SourceRow] = []
     description_index = next(
-        (
-            index
-            for index, column in enumerate(columns)
-            if column.canonical_field == "description"
-        ),
+        (index for index, column in enumerate(columns) if column.canonical_field == "description"),
         None,
     )
     financial_indexes = tuple(
@@ -1344,11 +1269,7 @@ def _source_rows(
                 raw_value = (
                     current.raw_value
                     if same_value
-                    else " ".join(
-                        value
-                        for value in (prefix.raw_value, current.raw_value)
-                        if value
-                    )
+                    else " ".join(value for value in (prefix.raw_value, current.raw_value) if value)
                 )
                 cells[index] = current.model_copy(
                     update={
@@ -1359,11 +1280,7 @@ def _source_rows(
                 )
             pending_prefix = None
             populated = tuple(index for index, cell in enumerate(cells) if cell.raw_value)
-        if (
-            output
-            and description_index is not None
-            and populated == (description_index,)
-        ):
+        if output and description_index is not None and populated == (description_index,):
             previous_cells = list(output[-1].cells)
             previous_description = previous_cells[description_index]
             continuation = cells[description_index]
@@ -1381,17 +1298,13 @@ def _source_rows(
                 if token_id in original_by_id
             ]
             description_cell_max = (
-                (centers[description_index] + centers[description_index + 1])
-                / (2 * width)
+                (centers[description_index] + centers[description_index + 1]) / (2 * width)
                 if description_index + 1 < len(centers)
                 else None
             )
             wrapped_pharmacy_description = bool(
                 table_type is TableType.PHARMACY
-                and any(
-                    previous_cells[index].raw_value
-                    for index in financial_indexes
-                )
+                and any(previous_cells[index].raw_value for index in financial_indexes)
                 and _wrapped_description_line_is_proven(
                     previous_description_tokens,
                     list(line.tokens),
@@ -1412,11 +1325,7 @@ def _source_rows(
                     )
                     or (
                         table_type is not TableType.PHARMACY
-                        and
-                        any(
-                            previous_cells[index].raw_value
-                            for index in financial_indexes
-                        )
+                        and any(previous_cells[index].raw_value for index in financial_indexes)
                         and line_index + 1 < end
                         and _is_structural_total_line(lines[line_index + 1])
                         and min(_bounds(token)[0] for token in line.tokens)
@@ -1427,9 +1336,7 @@ def _source_rows(
             ):
                 previous_cells[description_index] = previous_description.model_copy(
                     update={
-                        "raw_value": (
-                            f"{previous_description.raw_value} {continuation.raw_value}"
-                        ),
+                        "raw_value": (f"{previous_description.raw_value} {continuation.raw_value}"),
                         "evidence": (
                             *previous_description.evidence,
                             *continuation.evidence,
@@ -1525,15 +1432,12 @@ def _raw_source_headers(
             continue
         roles = _header_roles(line)
         recognized_roles = {
-            SOURCE_CANONICAL_FIELDS[role]
-            for role in roles
-            if role in SOURCE_CANONICAL_FIELDS
+            SOURCE_CANONICAL_FIELDS[role] for role in roles if role in SOURCE_CANONICAL_FIELDS
         }
         explicit_receipt_header = bool(
             len(recognized_roles) >= 2
             and len(header_tokens) >= 4
-            and {"receipt", "payment", "advance"}
-            & set(_normalize(line.text).split())
+            and {"receipt", "payment", "advance"} & set(_normalize(line.text).split())
         )
         following = lines[index + 1 : min(len(lines), index + 4)]
         candidates = [
@@ -1555,8 +1459,7 @@ def _raw_source_headers(
         aligned_data_rows = sum(value >= 2 for value in aligned_by_row)
         normalized_words = set(_normalize(line.text).split())
         signature = tuple(
-            re.sub(r"\s+", " ", token.text.casefold()).strip()
-            for token in header_tokens
+            re.sub(r"\s+", " ", token.text.casefold()).strip() for token in header_tokens
         )
         is_repeated_signature = bool(
             primary_signature
@@ -1619,8 +1522,7 @@ def _synthetic_source_table(
             _numeric_tokens(line)
             or any(DATE_SPAN.search(token.text) for token in line.tokens)
             or any(
-                re.search(r"(?<!\d)\d[\d,]*\.\d{1,4}(?!\d)", token.text)
-                for token in line.tokens
+                re.search(r"(?<!\d)\d[\d,]*\.\d{1,4}(?!\d)", token.text) for token in line.tokens
             )
         )
     )
@@ -1629,9 +1531,7 @@ def _synthetic_source_table(
     first_data_index = candidate_lines[0][0]
     while first_data_index > 0:
         previous = lines[first_data_index - 1]
-        previous_tokens = tuple(
-            token for token in previous.tokens if token.text.strip()
-        )
+        previous_tokens = tuple(token for token in previous.tokens if token.text.strip())
         if (
             len(previous_tokens) != 1
             or DATE_PREFIX.fullmatch(previous_tokens[0].text.strip()) is None
@@ -1639,11 +1539,7 @@ def _synthetic_source_table(
             break
         first_data_index -= 1
     data_lines = tuple(line for index, line in indexed_lines if index >= first_data_index)
-    centers = [
-        _center_x(token)
-        for token in candidate_lines[0][1].tokens
-        if token.text.strip()
-    ]
+    centers = [_center_x(token) for token in candidate_lines[0][1].tokens if token.text.strip()]
     if len(centers) < 2:
         return ()
     for _, line in candidate_lines[1:]:
@@ -1724,7 +1620,7 @@ def _prepare_source_table_financial_cells(table: SourceTable) -> SourceTable:
                 if cell.column_id
                 in {
                     date_column.id,
-                    *( (description_column.id,) if description_column is not None else () ),
+                    *((description_column.id,) if description_column is not None else ()),
                 }
             )
             merged_cell = next(
@@ -1753,9 +1649,7 @@ def _prepare_source_table_financial_cells(table: SourceTable) -> SourceTable:
                 suffix += 1
             insert_at = date_column.order + 1
             columns = [
-                column.model_copy(
-                    update={"order": column.order + (column.order >= insert_at)}
-                )
+                column.model_copy(update={"order": column.order + (column.order >= insert_at)})
                 for column in columns
             ]
             columns.insert(
@@ -1770,9 +1664,7 @@ def _prepare_source_table_financial_cells(table: SourceTable) -> SourceTable:
                 ),
             )
     columns = tuple(columns)
-    financial = tuple(
-        column for column in columns if column.canonical_field in financial_fields
-    )
+    financial = tuple(column for column in columns if column.canonical_field in financial_fields)
     split_rows: list[SourceRow] = []
     for row in table.rows:
         cells = {cell.column_id: cell for cell in row.cells}
@@ -1784,30 +1676,18 @@ def _prepare_source_table_financial_cells(table: SourceTable) -> SourceTable:
                 validation_flags=("empty_cell",),
             )
         date_column = next(
-            (
-                column
-                for column in columns
-                if column.canonical_field == "service_date_raw"
-            ),
+            (column for column in columns if column.canonical_field == "service_date_raw"),
             None,
         )
         description_column = next(
-            (
-                column
-                for column in columns
-                if column.canonical_field == "description"
-            ),
+            (column for column in columns if column.canonical_field == "description"),
             None,
         )
         if date_column is not None and description_column is not None:
             date_cell = cells[date_column.id]
             description_cell = cells[description_column.id]
             request_column = next(
-                (
-                    column
-                    for column in columns
-                    if column.canonical_field == "request_no"
-                ),
+                (column for column in columns if column.canonical_field == "request_no"),
                 None,
             )
             date_donors = tuple(cells[column.id] for column in columns)
@@ -1857,36 +1737,25 @@ def _prepare_source_table_financial_cells(table: SourceTable) -> SourceTable:
                     description=remainder,
                 )
                 is not None
-                and (
-                    (request_column is not None and request_value)
-                    or admissible_description
-                )
+                and ((request_column is not None and request_value) or admissible_description)
             ):
                 split_flag = "split_from_merged_ocr_token"
                 ordered_evidence = tuple(
                     sorted(
                         merged_date_cell.evidence,
-                        key=lambda item: min(
-                            point.x for point in item.polygon.points
-                        ),
+                        key=lambda item: min(point.x for point in item.polygon.points),
                     )
                 )
                 if len(ordered_evidence) > 1:
                     date_evidence = ordered_evidence[:1]
                     first_right = max(
-                        point.x
-                        for item in date_evidence
-                        for point in item.polygon.points
+                        point.x for item in date_evidence for point in item.polygon.points
                     )
                     next_left = min(
-                        point.x
-                        for item in ordered_evidence[1:]
-                        for point in item.polygon.points
+                        point.x for item in ordered_evidence[1:] for point in item.polygon.points
                     )
                     remainder_evidence = (
-                        ordered_evidence
-                        if first_right >= next_left
-                        else ordered_evidence[1:]
+                        ordered_evidence if first_right >= next_left else ordered_evidence[1:]
                     )
                 else:
                     # A genuinely merged OCR token grounds both fragments.
@@ -1911,10 +1780,7 @@ def _prepare_source_table_financial_cells(table: SourceTable) -> SourceTable:
                 )
                 if request_column is not None and request_value:
                     request_cell = cells[request_column.id]
-                    if (
-                        not request_cell.raw_value
-                        or merged_date_cell is request_cell
-                    ):
+                    if not request_cell.raw_value or merged_date_cell is request_cell:
                         cells[request_column.id] = request_cell.model_copy(
                             update={
                                 "raw_value": request_value,
@@ -1933,9 +1799,7 @@ def _prepare_source_table_financial_cells(table: SourceTable) -> SourceTable:
                                 ),
                             }
                         )
-                if (
-                    admissible_description
-                ):
+                if admissible_description:
                     existing_description = (
                         ""
                         if merged_date_cell is description_cell
@@ -1945,22 +1809,14 @@ def _prepare_source_table_financial_cells(table: SourceTable) -> SourceTable:
                     donor_is_mapped_fragment = merged_date_cell.column_id in {
                         date_column.id,
                         description_column.id,
-                        *(
-                            (request_column.id,)
-                            if request_column is not None
-                            else ()
-                        ),
+                        *((request_column.id,) if request_column is not None else ()),
                     }
                     if (
                         not donor_is_mapped_fragment
                         and existing_description
-                        and remainder.casefold().startswith(
-                            existing_description.casefold()
-                        )
+                        and remainder.casefold().startswith(existing_description.casefold())
                     ):
-                        donor_residual = remainder[
-                            len(existing_description) :
-                        ].strip(" .-:;,|")
+                        donor_residual = remainder[len(existing_description) :].strip(" .-:;,|")
                         remainder = existing_description
                     merged_description = " ".join(
                         part for part in (remainder, existing_description) if part
@@ -1975,8 +1831,7 @@ def _prepare_source_table_financial_cells(table: SourceTable) -> SourceTable:
                                     (
                                         *(
                                             date_evidence
-                                            if not donor_is_mapped_fragment
-                                            and existing_description
+                                            if not donor_is_mapped_fragment and existing_description
                                             else remainder_evidence
                                         ),
                                         *description_cell.evidence,
@@ -2003,30 +1858,24 @@ def _prepare_source_table_financial_cells(table: SourceTable) -> SourceTable:
                             if donor_residual and len(ordered_evidence) > 1
                             else ()
                         )
-                        cells[merged_date_cell.column_id] = (
-                            merged_date_cell.model_copy(
-                                update={
-                                    "raw_value": donor_residual or None,
-                                    "evidence": donor_evidence,
-                                    "validation_flags": tuple(
-                                        dict.fromkeys(
-                                            (
-                                                *(
-                                                    flag
-                                                    for flag in merged_date_cell.validation_flags
-                                                    if flag != "empty_cell"
-                                                ),
-                                                split_flag,
-                                                *(
-                                                    ()
-                                                    if donor_residual
-                                                    else ("empty_cell",)
-                                                ),
-                                            )
+                        cells[merged_date_cell.column_id] = merged_date_cell.model_copy(
+                            update={
+                                "raw_value": donor_residual or None,
+                                "evidence": donor_evidence,
+                                "validation_flags": tuple(
+                                    dict.fromkeys(
+                                        (
+                                            *(
+                                                flag
+                                                for flag in merged_date_cell.validation_flags
+                                                if flag != "empty_cell"
+                                            ),
+                                            split_flag,
+                                            *(() if donor_residual else ("empty_cell",)),
                                         )
-                                    ),
-                                }
-                            )
+                                    )
+                                ),
+                            }
                         )
 
         for target_column in financial:
@@ -2034,11 +1883,7 @@ def _prepare_source_table_financial_cells(table: SourceTable) -> SourceTable:
             if target_cell.raw_value or target_column.order < 1:
                 continue
             donor_column = next(
-                (
-                    column
-                    for column in columns
-                    if column.order == target_column.order - 1
-                ),
+                (column for column in columns if column.order == target_column.order - 1),
                 None,
             )
             if donor_column is None:
@@ -2087,9 +1932,7 @@ def _prepare_source_table_financial_cells(table: SourceTable) -> SourceTable:
                 raw,
             )
             if concatenated_money is not None:
-                fragments = tuple(
-                    concatenated_money.group(name) for name in ("first", "second")
-                )
+                fragments = tuple(concatenated_money.group(name) for name in ("first", "second"))
                 residual = ""
             else:
                 fragments = tuple(
@@ -2116,30 +1959,19 @@ def _prepare_source_table_financial_cells(table: SourceTable) -> SourceTable:
             )
             if not windows:
                 continue
-            merged_order = next(
-                column.order for column in columns if column.id == merged.column_id
-            )
+            merged_order = next(column.order for column in columns if column.id == merged.column_id)
             ranked = sorted(
                 windows,
                 key=lambda window: (
                     min(abs(column.order - merged_order) for column in window),
-                    abs(
-                        sum(column.order for column in window) / len(window)
-                        - merged_order
-                    ),
+                    abs(sum(column.order for column in window) / len(window) - merged_order),
                 ),
             )
             if len(ranked) > 1 and (
                 min(abs(column.order - merged_order) for column in ranked[0])
                 == min(abs(column.order - merged_order) for column in ranked[1])
-                and abs(
-                    sum(column.order for column in ranked[0]) / len(ranked[0])
-                    - merged_order
-                )
-                == abs(
-                    sum(column.order for column in ranked[1]) / len(ranked[1])
-                    - merged_order
-                )
+                and abs(sum(column.order for column in ranked[0]) / len(ranked[0]) - merged_order)
+                == abs(sum(column.order for column in ranked[1]) / len(ranked[1]) - merged_order)
             ):
                 continue
             window = ranked[0]
@@ -2168,9 +2000,7 @@ def _prepare_source_table_financial_cells(table: SourceTable) -> SourceTable:
                     }
                 )
         split_rows.append(
-            row.model_copy(
-                update={"cells": tuple(cells[column.id] for column in columns)}
-            )
+            row.model_copy(update={"cells": tuple(cells[column.id] for column in columns)})
         )
 
     def financial_lane_value(raw_value: str | None) -> tuple[bool, bool]:
@@ -2200,35 +2030,26 @@ def _prepare_source_table_financial_cells(table: SourceTable) -> SourceTable:
             if cell.column_id == column.id
         )
         numeric_support[column.id] = sum(eligible for eligible, _ in classifications)
-        explicit_money_support[column.id] = any(
-            explicit for _, explicit in classifications
-        )
+        explicit_money_support[column.id] = any(explicit for _, explicit in classifications)
     inferred_columns = tuple(
         column.model_copy(
             update={
                 "validation_flags": tuple(
-                    dict.fromkeys(
-                        (*column.validation_flags, "inferred_financial_lane")
-                    )
+                    dict.fromkeys((*column.validation_flags, "inferred_financial_lane"))
                 )
             }
         )
         if (
             column.canonical_field is None
             and column.order >= max(1, len(columns) // 2)
-            and (
-                numeric_support[column.id] >= 2
-                or explicit_money_support[column.id]
-            )
+            and (numeric_support[column.id] >= 2 or explicit_money_support[column.id])
         )
         else column
         for column in columns
     )
     table_flags = table.validation_flags
     if synthetic_request_id is not None:
-        table_flags = tuple(
-            dict.fromkeys((*table_flags, "synthetic_request_column"))
-        )
+        table_flags = tuple(dict.fromkeys((*table_flags, "synthetic_request_column")))
     return table.model_copy(
         update={
             "columns": inferred_columns,
@@ -2243,11 +2064,7 @@ def _consume_normalized_source_fragments(
     tables: tuple[SourceTable, ...],
 ) -> tuple[AlignedLedgerRow, ...]:
     """Make candidates and Printed cells consume one final OCR representation."""
-    source_rows = tuple(
-        (table, source_row)
-        for table in tables
-        for source_row in table.rows
-    )
+    source_rows = tuple((table, source_row) for table in tables for source_row in table.rows)
     output: list[AlignedLedgerRow] = []
     for aligned in rows:
         aligned_ids = set(aligned.evidence_token_ids)
@@ -2270,9 +2087,7 @@ def _consume_normalized_source_fragments(
             key=lambda item: item[0],
             reverse=True,
         )
-        if not scored or scored[0][0] == 0 or (
-            len(scored) > 1 and scored[0][0] == scored[1][0]
-        ):
+        if not scored or scored[0][0] == 0 or (len(scored) > 1 and scored[0][0] == scored[1][0]):
             output.append(aligned)
             continue
         _, table, source_row = scored[0]
@@ -2322,9 +2137,7 @@ def _consume_normalized_source_fragments(
             elif field == "service_date_raw":
                 existing_date = aligned.candidate.service_date
                 date_match = DATE_SPAN.search(raw)
-                value = existing_date or (
-                    date_match.group(0) if date_match is not None else None
-                )
+                value = existing_date or (date_match.group(0) if date_match is not None else None)
             elif field == "quantity":
                 value = parse_quantity(raw)
             elif field in {
@@ -2339,9 +2152,7 @@ def _consume_normalized_source_fragments(
             candidate_updates[candidate_field] = value
             token_updates[evidence_field] = tuple(
                 dict.fromkeys(
-                    token_id
-                    for evidence in cell.evidence
-                    for token_id in evidence.token_ids
+                    token_id for evidence in cell.evidence for token_id in evidence.token_ids
                 )
             )
         output.append(
@@ -2366,9 +2177,7 @@ def _grounded_receipt_form(
     ordered = tuple(sorted(tokens, key=lambda item: (_bounds(item)[1], _bounds(item)[0])))
     normalized = " ".join(_normalize(token.text) for token in ordered)
     has_receipt_title = any("receipt" in _normalize(token.text) for token in ordered)
-    has_received_label = any(
-        "amount received" in _normalize(token.text) for token in ordered
-    )
+    has_received_label = any("amount received" in _normalize(token.text) for token in ordered)
     reference_tokens = tuple(
         token
         for token in ordered
@@ -2397,10 +2206,7 @@ def _grounded_receipt_form(
     if (
         not (has_receipt_title or has_received_label)
         or not amount_tokens
-        or not (
-            amount_label_tokens
-            or (has_receipt_title and reference_tokens)
-        )
+        or not (amount_label_tokens or (has_receipt_title and reference_tokens))
     ):
         return None
     amount_token = max(
@@ -2441,9 +2247,7 @@ def _grounded_receipt_form(
             for candidate in ordered
             if candidate is not token
             and _bounds(candidate)[0] >= label_right - 2
-            and min(label_bottom, _bounds(candidate)[3])
-            - max(label_top, _bounds(candidate)[1])
-            > 0
+            and min(label_bottom, _bounds(candidate)[3]) - max(label_top, _bounds(candidate)[1]) > 0
             and not DATE_SPAN.search(candidate.text)
             and parse_decimal(candidate.text) is None
             and bool(re.fullmatch(r"[a-z0-9][a-z0-9/-]{1,}", candidate.text.strip(), re.I))
@@ -2454,8 +2258,7 @@ def _grounded_receipt_form(
             if candidate is not token
             and _bounds(candidate)[1] >= label_bottom
             and _bounds(candidate)[1] - label_bottom <= max(20.0, _height(token) * 2.0)
-            and abs(_bounds(candidate)[0] - label_left)
-            <= max(30.0, label_right - label_left)
+            and abs(_bounds(candidate)[0] - label_left) <= max(30.0, label_right - label_left)
             and not DATE_SPAN.search(candidate.text)
             and parse_decimal(candidate.text) is None
             and bool(re.fullmatch(r"[a-z0-9][a-z0-9/-]{1,}", candidate.text.strip(), re.I))
@@ -2521,12 +2324,14 @@ def _grounded_receipt_form(
         ),
         None,
     )
-    # A grounded payment/refund form is explicitly non-ledger even when the
-    # issuer is absent.  A potentially billable receipt, however, remains
-    # unresolved until a real issuer is grounded.
-    ambiguous = not issuer_raw and not explicit_payment
-    role = RowRole.UNRESOLVED if ambiguous else (
-        RowRole.PAYMENT if explicit_payment else RowRole.DETAIL
+    # Wording such as payment mode, refund, or settlement cannot prove that an
+    # issuerless financial form is non-billable.  Every issuerless receipt must
+    # remain unresolved until a grounded issuer identifies the form's owner.
+    ambiguous = not issuer_raw
+    role = (
+        RowRole.UNRESOLVED
+        if ambiguous
+        else (RowRole.PAYMENT if explicit_payment else RowRole.DETAIL)
     )
     description_tokens = tuple(
         token
@@ -2554,9 +2359,7 @@ def _grounded_receipt_form(
         "amount": (amount_token.token_id,),
     }
     if reference_raw:
-        field_tokens["request_no"] = tuple(
-            token.token_id for token in reference_evidence
-        )
+        field_tokens["request_no"] = tuple(token.token_id for token in reference_evidence)
     service_date = date_token.text.strip() if date_token is not None else None
     if date_token is not None:
         field_tokens["service_date"] = (date_token.token_id,)
@@ -2624,9 +2427,7 @@ def _grounded_receipt_form(
             canonical_field=canonical_field,
             validation_flags=("synthetic_header",),
         )
-        for index, (column_id, label, canonical_field, _raw, _tokens) in enumerate(
-            column_specs
-        )
+        for index, (column_id, label, canonical_field, _raw, _tokens) in enumerate(column_specs)
     )
     cells = tuple(
         SourceCell(
@@ -2646,14 +2447,20 @@ def _grounded_receipt_form(
         rows=(SourceRow(id=f"{table_id}-receipt-s1-r1", order=0, cells=cells),),
         validation_flags=("grounded_receipt_form",),
     )
-    classification = "ambiguous_receipt" if ambiguous else (
-        "payment_receipt" if explicit_payment else "supporting_charge_receipt"
+    classification = (
+        "ambiguous_receipt"
+        if ambiguous
+        else ("payment_receipt" if explicit_payment else "supporting_charge_receipt")
     )
-    return aligned, source_table, {
-        "financial_form_suspected": True,
-        "financial_form_classification": classification,
-        "financial_form_classification_evidence": evidence_tokens,
-    }
+    return (
+        aligned,
+        source_table,
+        {
+            "financial_form_suspected": True,
+            "financial_form_classification": classification,
+            "financial_form_classification_evidence": evidence_tokens,
+        },
+    )
 
 
 def _description_lane(
@@ -2695,11 +2502,7 @@ def _description_lane(
             min(stable_centers, default=0.02) + 0.015
             if description_center is None
             else max(
-                (
-                    center
-                    for center in stable_centers
-                    if center < description_center - 0.04
-                ),
+                (center for center in stable_centers if center < description_center - 0.04),
                 default=-0.015,
             )
             + 0.015
@@ -2776,15 +2579,9 @@ def _wrapped_description_line_is_proven(
             normalized_continuation,
         )
     )
-    previous_left = min(
-        (_bounds(token)[0] - left) / width for token in previous_tokens
-    )
-    previous_right = max(
-        (_bounds(token)[2] - left) / width for token in previous_tokens
-    )
-    continuation_left = min(
-        (_bounds(token)[0] - left) / width for token in continuation_tokens
-    )
+    previous_left = min((_bounds(token)[0] - left) / width for token in previous_tokens)
+    previous_right = max((_bounds(token)[2] - left) / width for token in previous_tokens)
+    continuation_left = min((_bounds(token)[0] - left) / width for token in continuation_tokens)
     if is_unit_suffix and (
         previous_right >= description_cell_max - 0.02
         and abs(continuation_left - previous_left) <= 0.03
@@ -2792,9 +2589,7 @@ def _wrapped_description_line_is_proven(
         return True
     previous_description_ids = {token.token_id for token in previous_tokens}
     other_row_tokens = tuple(
-        token
-        for token in previous_row_tokens
-        if token.token_id not in previous_description_ids
+        token for token in previous_row_tokens if token.token_id not in previous_description_ids
     )
     if not other_row_tokens:
         return False
@@ -2810,8 +2605,7 @@ def _wrapped_description_line_is_proven(
     return (
         abs(continuation_left - previous_left) <= 0.03
         and continuation_top > previous_top
-        and continuation_top
-        <= max(_bounds(token)[3] for token in other_row_tokens)
+        and continuation_top <= max(_bounds(token)[3] for token in other_row_tokens)
         and continuation_top - previous_bottom <= line_height * 1.5
     )
 
@@ -2879,9 +2673,7 @@ def _merge_vertical_decimal_suffixes(
                             }
                         ),
                         value=combined_value,
-                        token_ids=tuple(
-                            dict.fromkeys((*first.token_ids, *second.token_ids))
-                        ),
+                        token_ids=tuple(dict.fromkeys((*first.token_ids, *second.token_ids))),
                     ),
                 )
             )
@@ -2909,9 +2701,7 @@ def _numeric_tokens(line: OcrLine) -> list[NumericValue]:
         )
         if merged_quantity_amount is not None:
             for group in ("quantity", "amount"):
-                parsed = parse_decimal(
-                    merged_quantity_amount.group(group)
-                )
+                parsed = parse_decimal(merged_quantity_amount.group(group))
                 if parsed is None:
                     continue
                 output.append(
@@ -3046,10 +2836,7 @@ def _stable_numeric_centers(
 ) -> tuple[float, ...]:
     centers: list[float] = []
     for line in lines:
-        centers.extend(
-            (_center_x(value.token) - left) / width
-            for value in _numeric_tokens(line)
-        )
+        centers.extend((_center_x(value.token) - left) / width for value in _numeric_tokens(line))
     clusters: list[list[float]] = []
     for center in sorted(centers):
         matching = next(
@@ -3163,9 +2950,10 @@ def _classify_table(
     ):
         return TableType.PAYMENT
     laboratory_terms = ("test name", "pathology", "laboratory", "investigation")
-    if any(term in normalized_header for term in laboratory_terms) or sum(
-        normalized.count(term) for term in laboratory_terms
-    ) >= 2:
+    if (
+        any(term in normalized_header for term in laboratory_terms)
+        or sum(normalized.count(term) for term in laboratory_terms) >= 2
+    ):
         return TableType.LABORATORY
     if has_serial and row_count <= 20 and "particular" in normalized:
         return TableType.CATEGORY_SUMMARY
@@ -3212,14 +3000,8 @@ def _collapse_description_phrase_echo(raw: str) -> str:
         normalized_left = _normalize(left)
         normalized_right = _normalize(right)
         confusable_separator = any(
-            (
-                not _normalize(left_word)
-                and _normalize(right_word) in {"1", "i", "l"}
-            )
-            or (
-                not _normalize(right_word)
-                and _normalize(left_word) in {"1", "i", "l"}
-            )
+            (not _normalize(left_word) and _normalize(right_word) in {"1", "i", "l"})
+            or (not _normalize(right_word) and _normalize(left_word) in {"1", "i", "l"})
             for left_word, right_word in zip(
                 words[:midpoint],
                 words[midpoint:],
@@ -3238,44 +3020,33 @@ def _collapse_description_phrase_echo(raw: str) -> str:
             return left
 
     normalized_word_matches = tuple(
-        match
-        for match in re.finditer(r"[A-Za-z0-9#]+", raw)
-        if _normalize(match.group())
+        match for match in re.finditer(r"[A-Za-z0-9#]+", raw) if _normalize(match.group())
     )
-    normalized_words = tuple(
-        _normalize(match.group()) for match in normalized_word_matches
-    )
+    normalized_words = tuple(_normalize(match.group()) for match in normalized_word_matches)
     normalized_midpoint = len(normalized_words) // 2
     if (
         len(normalized_words) >= 4
         and len(normalized_words) % 2 == 0
-        and normalized_words[:normalized_midpoint]
-        == normalized_words[normalized_midpoint:]
+        and normalized_words[:normalized_midpoint] == normalized_words[normalized_midpoint:]
     ):
         separator = raw[
-            normalized_word_matches[normalized_midpoint - 1].end() :
-            normalized_word_matches[normalized_midpoint].start()
+            normalized_word_matches[normalized_midpoint - 1].end() : normalized_word_matches[
+                normalized_midpoint
+            ].start()
         ]
         if separator and not re.search(r"[A-Za-z0-9#]", separator):
-            return raw[
-                : normalized_word_matches[normalized_midpoint - 1].end()
-            ].rstrip(" -:.;,[]")
+            return raw[: normalized_word_matches[normalized_midpoint - 1].end()].rstrip(" -:.;,[]")
     for echo_length in range(len(normalized_words) // 2, 1, -1):
-        intervening_matches = normalized_word_matches[
-            echo_length:-echo_length
-        ]
+        intervening_matches = normalized_word_matches[echo_length:-echo_length]
         if (
             len(normalized_words) > echo_length * 2
-            and normalized_words[:echo_length]
-            == normalized_words[-echo_length:]
+            and normalized_words[:echo_length] == normalized_words[-echo_length:]
             and any(
                 any(character.isdigit() for character in match.group())
                 for match in intervening_matches
             )
         ):
-            return raw[: normalized_word_matches[-echo_length].start()].rstrip(
-                " -:[]"
-            )
+            return raw[: normalized_word_matches[-echo_length].start()].rstrip(" -:[]")
     return raw
 
 
@@ -3432,9 +3203,8 @@ def _split_merged_serial_description(value: str) -> tuple[str, str] | None:
     if match is None:
         return None
     description = match.group("description").strip()
-    if (
-        not re.search(r"[A-Za-z]", description)
-        or not _is_admissible_merged_date_description(description)
+    if not re.search(r"[A-Za-z]", description) or not _is_admissible_merged_date_description(
+        description
     ):
         return None
     return match.group("serial"), description
@@ -3496,38 +3266,24 @@ def _is_total_description(normalized: str) -> bool:
 
 
 def _is_structural_total_line(line: OcrLine) -> bool:
-    ordered_tokens = tuple(
-        token for token in line.tokens if token.text.strip()
-    )
+    ordered_tokens = tuple(token for token in line.tokens if token.text.strip())
     structural_labels = {"bill total", "sub total", "subtotal", "total"}
     for start in range(len(ordered_tokens)):
-        if any(
-            not _is_rotated_text(token)
-            for token in ordered_tokens[:start]
-        ):
+        if any(not _is_rotated_text(token) for token in ordered_tokens[:start]):
             continue
         for stop in range(start + 1, min(len(ordered_tokens), start + 2) + 1):
-            candidate = _normalize(
-                " ".join(token.text for token in ordered_tokens[start:stop])
-            )
+            candidate = _normalize(" ".join(token.text for token in ordered_tokens[start:stop]))
             if candidate not in structural_labels:
                 continue
             if all(
-                _is_rotated_text(token)
-                or parse_decimal(token.text) is not None
+                _is_rotated_text(token) or parse_decimal(token.text) is not None
                 for token in ordered_tokens[stop:]
             ):
                 return True
-    non_rotated_tokens = tuple(
-        token for token in line.tokens if not _is_rotated_text(token)
-    )
+    non_rotated_tokens = tuple(token for token in line.tokens if not _is_rotated_text(token))
     structural_tokens = non_rotated_tokens or line.tokens
     normalized = _normalize(
-        " ".join(
-            token.text.strip()
-            for token in structural_tokens
-            if token.text.strip()
-        )
+        " ".join(token.text.strip() for token in structural_tokens if token.text.strip())
     )
     if _is_total_description(normalized):
         return True
@@ -3556,19 +3312,22 @@ def _is_payment_footer_description(text: str) -> bool:
     if subject not in {"payment", "receipt", "settlement"}:
         return False
     qualifiers = set(words[1:])
-    return bool(
-        {
-            "breakup",
-            "detail",
-            "details",
-            "history",
-            "information",
-            "mode",
-            "status",
-            "summary",
-        }
-        & qualifiers
-    ) or {"break", "up"} <= qualifiers
+    return (
+        bool(
+            {
+                "breakup",
+                "detail",
+                "details",
+                "history",
+                "information",
+                "mode",
+                "status",
+                "summary",
+            }
+            & qualifiers
+        )
+        or {"break", "up"} <= qualifiers
+    )
 
 
 def _payment_footer_heading_tokens(line: OcrLine) -> tuple[OcrToken, ...]:
@@ -3656,9 +3415,7 @@ def _payment_footer_heading_tokens(line: OcrLine) -> tuple[OcrToken, ...]:
     for start in range(len(tokens)):
         for length in range(1, min(3, len(tokens) - start) + 1):
             candidate = tokens[start : start + length]
-            words_by_token = tuple(
-                _normalize(token.text).split() for token in candidate
-            )
+            words_by_token = tuple(_normalize(token.text).split() for token in candidate)
             words = [word for token_words in words_by_token for word in token_words]
             heading_start = exact_heading_start(words)
             if heading_start is None:
@@ -3718,11 +3475,7 @@ def _clip_description_words_to_lane(
         word
         for word in words
         if minimum
-        <= (
-            token_left
-            + token_width * ((word.start() + word.end()) / 2) / text_length
-            - left
-        )
+        <= (token_left + token_width * ((word.start() + word.end()) / 2) / text_length - left)
         / width
         < maximum
     )
@@ -3771,38 +3524,23 @@ def _closest_field_token(
         return None
 
     def valid(token: OcrToken) -> bool:
-        return not _is_header_token(token) and _structured_field_value_is_valid(
-            role, token.text
-        )
+        return not _is_header_token(token) and _structured_field_value_is_valid(role, token.text)
 
     center_cluster_tolerance = 0.025
     left_neighbor = max(
-        (
-            center
-            for center in printed_centers
-            if center < target - center_cluster_tolerance
-        ),
+        (center for center in printed_centers if center < target - center_cluster_tolerance),
         default=None,
     )
     right_neighbor = min(
-        (
-            center
-            for center in printed_centers
-            if center > target + center_cluster_tolerance
-        ),
+        (center for center in printed_centers if center > target + center_cluster_tolerance),
         default=None,
     )
-    minimum = (
-        (left_neighbor + target) / 2 if left_neighbor is not None else 0.0
-    )
-    maximum = (
-        (target + right_neighbor) / 2 if right_neighbor is not None else 1.0
-    )
+    minimum = (left_neighbor + target) / 2 if left_neighbor is not None else 0.0
+    maximum = (target + right_neighbor) / 2 if right_neighbor is not None else 1.0
     candidates = [
         token
         for token in line.tokens
-        if valid(token)
-        and minimum <= (_center_x(token) - left) / width < maximum
+        if valid(token) and minimum <= (_center_x(token) - left) / width < maximum
     ]
     if not candidates:
         return None
@@ -3903,9 +3641,7 @@ def _closest_numeric(
     used: set[tuple[str, float, Decimal]],
 ) -> NumericValue | None:
     available = [
-        value
-        for value in numeric
-        if _numeric_identity(value.token, value.value) not in used
+        value for value in numeric if _numeric_identity(value.token, value.value) not in used
     ]
     if not available:
         return None
@@ -3952,15 +3688,9 @@ def _refine_continuation_schema_from_rows(
     ):
         centers["amount"] = amount_center
 
-    if (
-        amount_center is not None
-        and "rate" in centers
-        and "quantity" in centers
-    ):
+    if amount_center is not None and "rate" in centers and "quantity" in centers:
         non_amount_centers = tuple(
-            center
-            for center in stable_centers
-            if abs(center - amount_center) > 0.035
+            center for center in stable_centers if abs(center - amount_center) > 0.035
         )
         rate_precedes_quantity = centers["rate"] < centers["quantity"]
         candidates: list[tuple[int, float, float]] = []
@@ -4006,8 +3736,7 @@ def _refine_continuation_schema_from_rows(
                     if quantity_pair is None:
                         continue
                     if any(
-                        abs(((_center_x(pair.token) - left) / width) - target)
-                        > 0.04
+                        abs(((_center_x(pair.token) - left) / width) - target) > 0.04
                         for pair, target in (
                             (amount_pair, amount_center),
                             (rate_pair, rate_center),
@@ -4019,9 +3748,7 @@ def _refine_continuation_schema_from_rows(
                     expected = rate_pair.value * quantity_pair.value
                     if abs(expected - abs(amount_pair.value)) <= Decimal("0.01"):
                         arithmetic_matches += 1
-                candidates.append(
-                    (arithmetic_matches, rate_center, quantity_center)
-                )
+                candidates.append((arithmetic_matches, rate_center, quantity_center))
         if candidates:
             matches, rate_center, quantity_center = max(candidates)
             minimum_support = max(2, (len(rows) + 1) // 2)
@@ -4037,11 +3764,7 @@ def _refine_continuation_schema_from_rows(
         )
         for row in rows
     )
-    grounded_date_centers = tuple(
-        median(values)
-        for values in date_centers_by_row
-        if values
-    )
+    grounded_date_centers = tuple(median(values) for values in date_centers_by_row if values)
     if len(grounded_date_centers) >= max(2, (len(rows) + 1) // 2):
         centers["service_date"] = median(grounded_date_centers)
 
@@ -4105,14 +3828,12 @@ def reconstruct_ocr_rows(
                 for line in lines[:header_start]
                 if len(line.tokens) >= 3
                 and any(
-                    abs(((_center_x(value.token) - left) / width) - amount_center)
-                    <= 0.05
+                    abs(((_center_x(value.token) - left) / width) - amount_center) <= 0.05
                     for value in _numeric_tokens(line)
                 )
                 and any(
                     re.search(r"[A-Za-z]", token.text)
-                    and abs(((_center_x(token) - left) / width) - description_center)
-                    <= 0.16
+                    and abs(((_center_x(token) - left) / width) - description_center) <= 0.16
                     for token in line.tokens
                 )
             )
@@ -4124,16 +3845,10 @@ def reconstruct_ocr_rows(
                     width=width,
                 )
                 pre_header_ids = {
-                    token.token_id
-                    for line in pre_header_rows
-                    for token in line.tokens
+                    token.token_id for line in pre_header_rows for token in line.tokens
                 }
                 pre_header_reconstruction = reconstruct_ocr_rows(
-                    tuple(
-                        token
-                        for token in original_scoped
-                        if token.token_id in pre_header_ids
-                    ),
+                    tuple(token for token in original_scoped if token.token_id in pre_header_ids),
                     page_number=page_number,
                     table_id=table_id,
                     box=box,
@@ -4150,19 +3865,14 @@ def reconstruct_ocr_rows(
             if index > header_index and _valid_header_line(lines[index], roles)
         )
     raw_source_headers = _raw_source_headers(lines, width)
-    recognized_source_headers = (
-        (primary_header, *repeated_header_blocks)
-        if header_valid
-        else ()
-    )
+    recognized_source_headers = (primary_header, *repeated_header_blocks) if header_valid else ()
     arbitrary_source_headers = tuple(
         block
         for block in raw_source_headers
         if header_valid
         and block.start > header_index
         and not any(
-            block.start <= recognized.end
-            and block.end >= recognized.start
+            block.start <= recognized.end and block.end >= recognized.start
             for recognized in recognized_source_headers
         )
     )
@@ -4239,16 +3949,14 @@ def reconstruct_ocr_rows(
     summary_lines = [values for line in data_lines if len(values := _numeric_tokens(line)) >= 3]
     zero_tail_summary = bool(
         len(summary_lines) >= 5
-        and sum(values[-1].value == 0 for values in summary_lines) / len(summary_lines)
-        >= 0.7
+        and sum(values[-1].value == 0 for values in summary_lines) / len(summary_lines) >= 0.7
         and sum(any(value.value != 0 for value in values[:-1]) for values in summary_lines)
         / len(summary_lines)
         >= 0.7
     )
     table_text = " ".join(line.text for line in lines)
     header_text = " ".join(
-        line.text
-        for line in (lines[header_start : header_index + 1] if header_valid else ())
+        line.text for line in (lines[header_start : header_index + 1] if header_valid else ())
     )
     table_type = _classify_table(
         table_text,
@@ -4265,39 +3973,31 @@ def reconstruct_ocr_rows(
             for candidate in reversed(prior_schemas)
             if 0 <= page_number - candidate.source_page <= 1
             and candidate.orientation == orientation
-            and (
-                candidate.source_page != page_number
-                or candidate.source_table == table_id
-            )
+            and (candidate.source_page != page_number or candidate.source_table == table_id)
             and (
                 candidate.source_page == page_number
                 or current_table_slot is None
                 or (
-                    (prior_slot := re.search(
-                        r"(?:^|-)t(?P<slot>\d+)$",
-                        candidate.source_table,
-                    ))
+                    (
+                        prior_slot := re.search(
+                            r"(?:^|-)t(?P<slot>\d+)$",
+                            candidate.source_table,
+                        )
+                    )
                     is None
                 )
                 or prior_slot.group("slot") == current_table_slot.group("slot")
             )
             and "amount" in candidate.column_centers
             and "amount" in column_centers
-            and abs(
-                candidate.column_centers["amount"]
-                - column_centers["amount"]
-            )
-            <= 0.05
+            and abs(candidate.column_centers["amount"] - column_centers["amount"]) <= 0.05
         ),
         None,
     )
     is_pharmacy_table = (
         table_type is TableType.PHARMACY
         or "pharmacy" in _normalize(table_text).split()
-        or bool(
-            continuation_schema
-            and continuation_schema.in_return_section
-        )
+        or bool(continuation_schema and continuation_schema.in_return_section)
     )
     has_tax_columns = bool(re.search(r"\b(?:gst|tax)\b", _normalize(table_text)))
     header_ids = tuple(
@@ -4338,22 +4038,14 @@ def reconstruct_ocr_rows(
         description_header_centers,
     )
     aligned: list[AlignedLedgerRow] = list(
-        pre_header_reconstruction.rows
-        if pre_header_reconstruction is not None
-        else ()
+        pre_header_reconstruction.rows if pre_header_reconstruction is not None else ()
     )
-    aligned_description_raw: list[str] = [
-        row.candidate.description or ""
-        for row in aligned
-    ]
+    aligned_description_raw: list[str] = [row.candidate.description or "" for row in aligned]
     pending_description_tokens: list[OcrToken] = []
     pending_service_date: str | None = None
     pending_service_date_ids: tuple[str, ...] = ()
     current_section: str | None = None
-    in_return_section = bool(
-        continuation_schema
-        and continuation_schema.in_return_section
-    )
+    in_return_section = bool(continuation_schema and continuation_schema.in_return_section)
 
     def updated_return_section_state(
         current: bool,
@@ -4395,14 +4087,8 @@ def reconstruct_ocr_rows(
         description_center = column_centers.get("description")
         if description_center is None:
             return False
-        continuation_left = min(
-            (_bounds(token)[0] - left) / width for token in continuation_tokens
-        )
-        anchored = (
-            description_min - 0.03
-            <= continuation_left
-            <= description_center + 0.08
-        )
+        continuation_left = min((_bounds(token)[0] - left) / width for token in continuation_tokens)
+        anchored = description_min - 0.03 <= continuation_left <= description_center + 0.08
         if not anchored:
             return False
         if _is_description_continuation(
@@ -4422,9 +4108,7 @@ def reconstruct_ocr_rows(
             for token_id in aligned[-1].evidence_token_ids
             if token_id in original_by_id
         ]
-        previous_left = min(
-            (_bounds(token)[0] - left) / width for token in previous_tokens
-        )
+        previous_left = min((_bounds(token)[0] - left) / width for token in previous_tokens)
         if table_type is TableType.PHARMACY:
             return _wrapped_description_line_is_proven(
                 previous_tokens,
@@ -4626,15 +4310,10 @@ def reconstruct_ocr_rows(
                 continue
             merged_description, embedded_date, _ = _clean_description(token.text)
             grounded_request = structured_values.get("request_no")
-            if (
-                grounded_request
-                and merged_description.casefold().startswith(
-                    grounded_request.casefold()
-                )
+            if grounded_request and merged_description.casefold().startswith(
+                grounded_request.casefold()
             ):
-                merged_description = merged_description[
-                    len(grounded_request) :
-                ].lstrip(" -:")
+                merged_description = merged_description[len(grounded_request) :].lstrip(" -:")
             if (
                 merged_description
                 and embedded_date
@@ -4645,20 +4324,14 @@ def reconstruct_ocr_rows(
                 )
         if structured_values.get("service_date") and service_date_ids:
             grounded_date_tokens = tuple(
-                token
-                for token in line.tokens
-                if token.token_id in service_date_ids
+                token for token in line.tokens if token.token_id in service_date_ids
             )
             if grounded_date_tokens:
                 grounded_date_right = max(
-                    (_bounds(token)[2] - left) / width
-                    for token in grounded_date_tokens
+                    (_bounds(token)[2] - left) / width for token in grounded_date_tokens
                 )
                 for token in line.tokens:
-                    if (
-                        token.token_id in reserved_ids
-                        or _is_header_token(token)
-                    ):
+                    if token.token_id in reserved_ids or _is_header_token(token):
                         continue
                     token_left, _, _, _ = _bounds(token)
                     relative_left = (token_left - left) / width
@@ -4670,14 +4343,9 @@ def reconstruct_ocr_rows(
                         or relative_left - grounded_date_right > 0.12
                     ):
                         continue
-                    shifted_description, embedded_date, _ = _clean_description(
-                        token.text
-                    )
-                    if (
-                        embedded_date is None
-                        and _is_admissible_merged_date_description(
-                            shifted_description
-                        )
+                    shifted_description, embedded_date, _ = _clean_description(token.text)
+                    if embedded_date is None and _is_admissible_merged_date_description(
+                        shifted_description
                     ):
                         line_description_tokens.append(
                             token.model_copy(update={"text": shifted_description})
@@ -4694,15 +4362,10 @@ def reconstruct_ocr_rows(
             if (
                 description_cell_max is not None
                 and relative_center >= description_cell_max
-                and (
-                    table_type is not TableType.PHARMACY
-                    or token_left >= description_cell_max
-                )
+                and (table_type is not TableType.PHARMACY or token_left >= description_cell_max)
             ):
                 continue
-            description_clip_max = (
-                description_max - 0.03 if description_max is not None else None
-            )
+            description_clip_max = description_max - 0.03 if description_max is not None else None
             adjacent_right_tokens: tuple[OcrToken, ...] = ()
             if table_type is TableType.PHARMACY:
                 if description_cell_max is not None:
@@ -4717,8 +4380,7 @@ def reconstruct_ocr_rows(
                     (
                         center
                         for center in description_header_centers
-                        if description_center is not None
-                        and center > description_center + 0.04
+                        if description_center is not None and center > description_center + 0.04
                     ),
                     default=None,
                 )
@@ -4726,8 +4388,7 @@ def reconstruct_ocr_rows(
                     (
                         center
                         for center in description_header_centers
-                        if next_printed_center is not None
-                        and center > next_printed_center + 0.025
+                        if next_printed_center is not None and center > next_printed_center + 0.025
                     ),
                     default=1.0,
                 )
@@ -4794,15 +4455,8 @@ def reconstruct_ocr_rows(
             footer_right = max(_bounds(token)[2] for token in footer_tokens)
             footer_center = ((footer_left + footer_right) / 2 - left) / width
             footer_is_in_description_cell = (
-                (
-                    description_cell_min is None
-                    or footer_center >= description_cell_min
-                )
-                and (
-                    description_cell_max is None
-                    or footer_center < description_cell_max
-                )
-            )
+                description_cell_min is None or footer_center >= description_cell_min
+            ) and (description_cell_max is None or footer_center < description_cell_max)
             if not footer_is_in_description_cell:
                 pending_description_tokens = []
                 pending_service_date = None
@@ -4811,16 +4465,11 @@ def reconstruct_ocr_rows(
 
         if _is_structural_total_line(line):
             if pending_description_tokens and aligned:
-                continuation_raw = " ".join(
-                    token.text for token in pending_description_tokens
-                )
+                continuation_raw = " ".join(token.text for token in pending_description_tokens)
                 continuation_text, _, _ = _clean_description(continuation_raw)
-                if (
-                    continuation_text
-                    and pending_description_is_proven_continuation(
-                        pending_description_tokens,
-                        continuation_raw,
-                    )
+                if continuation_text and pending_description_is_proven_continuation(
+                    pending_description_tokens,
+                    continuation_raw,
                 ):
                     extend_previous_description(
                         pending_description_tokens,
@@ -4897,9 +4546,7 @@ def reconstruct_ocr_rows(
             # Defer deciding whether a text-only line is a section label or a
             # description split from its numeric row until the following line.
             if line_description_tokens:
-                continuation_raw = " ".join(
-                    token.text for token in line_description_tokens
-                )
+                continuation_raw = " ".join(token.text for token in line_description_tokens)
                 continuation_text, _, _ = _clean_description(continuation_raw)
                 if (
                     aligned
@@ -4948,36 +4595,21 @@ def reconstruct_ocr_rows(
             merged_serial_descriptions = tuple(
                 (token, split)
                 for token in line.tokens
-                if (
-                    split := _split_merged_serial_description(token.text)
-                )
+                if (split := _split_merged_serial_description(token.text))
                 and serial_center is not None
                 and description_cell_min is not None
-                and abs(((_bounds(token)[0] - left) / width) - serial_center)
-                <= 0.08
+                and abs(((_bounds(token)[0] - left) / width) - serial_center) <= 0.08
                 and ((_bounds(token)[0] - left) / width)
                 < description_cell_min
                 < ((_bounds(token)[2] - left) / width)
             )
             if len(merged_serial_descriptions) == 1:
-                merged_token, (_, printed_description) = (
-                    merged_serial_descriptions[0]
-                )
-                description_tokens = [
-                    merged_token.model_copy(
-                        update={"text": printed_description}
-                    )
-                ]
+                merged_token, (_, printed_description) = merged_serial_descriptions[0]
+                description_tokens = [merged_token.model_copy(update={"text": printed_description})]
                 description_text = printed_description
-                description, embedded_date, embedded_request = (
-                    _clean_description(description_text)
-                )
-                service_date = (
-                    structured_values.get("service_date") or embedded_date
-                )
-                request_no = (
-                    structured_values.get("request_no") or embedded_request
-                )
+                description, embedded_date, embedded_request = _clean_description(description_text)
+                service_date = structured_values.get("service_date") or embedded_date
+                request_no = structured_values.get("request_no") or embedded_request
             serial_token = (
                 min(
                     (
@@ -4985,9 +4617,7 @@ def reconstruct_ocr_rows(
                         for token in line.tokens
                         if re.fullmatch(r"\d+[.)]?", token.text.strip())
                     ),
-                    key=lambda token: abs(
-                        ((_center_x(token) - left) / width) - serial_center
-                    ),
+                    key=lambda token: abs(((_center_x(token) - left) / width) - serial_center),
                     default=None,
                 )
                 if serial_center is not None
@@ -4996,11 +4626,7 @@ def reconstruct_ocr_rows(
             if not description:
                 if (
                     serial_token is None
-                    or abs(
-                        ((_center_x(serial_token) - left) / width)
-                        - serial_center
-                    )
-                    > 0.06
+                    or abs(((_center_x(serial_token) - left) / width) - serial_center) > 0.06
                 ):
                     continue
                 description_tokens = [serial_token]
@@ -5067,9 +4693,7 @@ def reconstruct_ocr_rows(
         ):
             quantity_target = column_centers["quantity"]
             assigned_token_ids = {
-                token_id
-                for token_ids in field_tokens.values()
-                for token_id in token_ids
+                token_id for token_ids in field_tokens.values() for token_id in token_ids
             }
             punctuated_quantities = tuple(
                 (token, parsed)
@@ -5077,27 +4701,17 @@ def reconstruct_ocr_rows(
                 if token.token_id not in assigned_token_ids
                 and parse_decimal(token.text) is None
                 and (parsed := parse_quantity(token.text)) is not None
-                and abs(
-                    ((_center_x(token) - left) / width)
-                    - quantity_target
-                )
-                <= 0.06
+                and abs(((_center_x(token) - left) / width) - quantity_target) <= 0.06
             )
             if len(punctuated_quantities) == 1:
                 quantity_token, quantity_value = punctuated_quantities[0]
                 expected_amount = quantity_value * values["rate"]
                 if values["discount"] is not None:
                     expected_amount -= values["discount"]
-                compared_amount = (
-                    abs(amount)
-                    if amount < 0 <= expected_amount
-                    else amount
-                )
+                compared_amount = abs(amount) if amount < 0 <= expected_amount else amount
                 if abs(expected_amount - compared_amount) <= Decimal("0.01"):
                     values["quantity"] = quantity_value
-                    field_tokens["quantity"] = (
-                        quantity_token.token_id,
-                    )
+                    field_tokens["quantity"] = (quantity_token.token_id,)
 
         if (
             "quantity" in column_centers
@@ -5108,9 +4722,7 @@ def reconstruct_ocr_rows(
         ):
             quantity_target = column_centers["quantity"]
             assigned_token_ids = {
-                token_id
-                for token_ids in field_tokens.values()
-                for token_id in token_ids
+                token_id for token_ids in field_tokens.values() for token_id in token_ids
             }
             unreadable_quantity_tokens = tuple(
                 token
@@ -5119,11 +4731,7 @@ def reconstruct_ocr_rows(
                 and token.text.strip()
                 and not _is_header_token(token)
                 and parse_quantity(token.text) is None
-                and abs(
-                    ((_center_x(token) - left) / width)
-                    - quantity_target
-                )
-                <= 0.06
+                and abs(((_center_x(token) - left) / width) - quantity_target) <= 0.06
             )
             adjusted_amount = abs(amount)
             if values["discount"] is not None:
@@ -5133,17 +4741,13 @@ def reconstruct_ocr_rows(
                 len(unreadable_quantity_tokens) <= 1
                 and derived_quantity > 0
                 and derived_quantity <= Decimal("100000")
-                and derived_quantity
-                == derived_quantity.to_integral_value()
-                and values["rate"] * derived_quantity
-                == adjusted_amount
+                and derived_quantity == derived_quantity.to_integral_value()
+                and values["rate"] * derived_quantity == adjusted_amount
             ):
                 values["quantity"] = derived_quantity
                 field_tokens["quantity"] = tuple(
                     dict.fromkeys(
-                        (
-                            unreadable_quantity_tokens[0].token_id,
-                        )
+                        (unreadable_quantity_tokens[0].token_id,)
                         if unreadable_quantity_tokens
                         else (
                             *field_tokens.get("rate", ()),
@@ -5200,9 +4804,7 @@ def reconstruct_ocr_rows(
             if values["discount"] is not None:
                 expected_amount -= values["discount"]
             compared_amount = (
-                abs(amount)
-                if role is RowRole.REFUND and amount < 0 <= expected_amount
-                else amount
+                abs(amount) if role is RowRole.REFUND and amount < 0 <= expected_amount else amount
             )
             if abs(expected_amount - compared_amount) > Decimal("0.01"):
                 validation_flags.append("line_arithmetic_mismatch")
@@ -5211,9 +4813,7 @@ def reconstruct_ocr_rows(
             if values["discount"] is not None:
                 expected_amount -= values["discount"]
             compared_amount = (
-                abs(amount)
-                if role is RowRole.REFUND and amount < 0 <= expected_amount
-                else amount
+                abs(amount) if role is RowRole.REFUND and amount < 0 <= expected_amount else amount
             )
             if abs(expected_amount - compared_amount) > Decimal("0.01"):
                 validation_flags.append("line_arithmetic_mismatch")
@@ -5247,9 +4847,7 @@ def reconstruct_ocr_rows(
         )
 
     source_header = (
-        primary_header
-        if header_valid
-        else (raw_source_headers[0] if raw_source_headers else None)
+        primary_header if header_valid else (raw_source_headers[0] if raw_source_headers else None)
     )
     if header_valid:
         source_repeated_headers = tuple(
@@ -5294,9 +4892,7 @@ def reconstruct_ocr_rows(
                     for row in table.rows
                 ),
                 "validation_flags": tuple(
-                    dict.fromkeys(
-                        (*table.validation_flags, "pre_header_continuation")
-                    )
+                    dict.fromkeys((*table.validation_flags, "pre_header_continuation"))
                 ),
             }
         )
@@ -5336,9 +4932,7 @@ def reconstruct_ocr_rows(
     return ReconstructionResult(
         rows=normalized_rows,
         schema=(
-            replace(schema, in_return_section=in_return_section)
-            if schema is not None
-            else None
+            replace(schema, in_return_section=in_return_section) if schema is not None else None
         ),
         diagnostics={
             "ocr_token_count": len(scoped),

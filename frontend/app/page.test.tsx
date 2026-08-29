@@ -14,6 +14,7 @@ const job = {
   hospital_name: "Test Hospital",
   hospital_confidence: 0.99,
   hospital_name_source: "machine",
+  certification_status: "passed",
   error: null,
   created_at: "2026-07-23T00:00:00Z",
   updated_at: "2026-07-23T00:00:00Z",
@@ -93,7 +94,11 @@ const review = {
   issues_open: 0,
   issues: [],
   hospital: null,
+  hospital_id: null,
   approval: null,
+  approval_effective: false,
+  approval_blockers: [],
+  export_eligible: false,
 };
 
 const sourceTables = {
@@ -193,6 +198,7 @@ async function openBill() {
 describe("evidence page navigation", () => {
   let activeRequests = 0;
   let activeJobOverride: Record<string, unknown> | null = null;
+  let historyJobOverride: Record<string, unknown> | null = null;
   let historyHospitalName: string | null = "Test Hospital";
   let abortRequests = 0;
   let bulkPayload: Record<string, unknown> | null = null;
@@ -201,6 +207,11 @@ describe("evidence page navigation", () => {
   let aliasApplyPayload: Record<string, unknown> | null = null;
   let hospitalLinkPayload: Record<string, unknown> | null = null;
   let reviewPayload: Record<string, unknown> = structuredClone(review);
+  let validationPayload: Record<string, unknown> = {
+    validation_version: "extraction_validation_v5",
+    status: "failed",
+    issues: [],
+  };
   let normalizedRowsPayload = structuredClone(rowsResult);
   let sourcePayload: Omit<typeof sourceTables, "unavailable_reason"> & {
     unavailable_reason: "legacy_result" | "no_source_tables" | null;
@@ -210,6 +221,7 @@ describe("evidence page navigation", () => {
     vi.useFakeTimers();
     activeRequests = 0;
     activeJobOverride = null;
+    historyJobOverride = null;
     historyHospitalName = "Test Hospital";
     abortRequests = 0;
     bulkPayload = null;
@@ -218,6 +230,11 @@ describe("evidence page navigation", () => {
     aliasApplyPayload = null;
     hospitalLinkPayload = null;
     reviewPayload = structuredClone(review);
+    validationPayload = {
+      validation_version: "extraction_validation_v5",
+      status: "failed",
+      issues: [],
+    };
     normalizedRowsPayload = structuredClone(rowsResult);
     sourcePayload = structuredClone(sourceTables);
     vi.stubGlobal(
@@ -258,7 +275,10 @@ describe("evidence page navigation", () => {
             offset: 0,
             limit: 50,
             has_more: false,
-            documents: [{ ...job, hospital_name: historyHospitalName }],
+            documents: [
+              historyJobOverride
+              ?? { ...job, hospital_name: historyHospitalName },
+            ],
           });
         }
         if (url.endsWith("/abort")) {
@@ -330,6 +350,9 @@ describe("evidence page navigation", () => {
         if (url.includes("/rows?")) return json(structuredClone(normalizedRowsPayload));
         if (url.endsWith("/review")) {
           return json({ ...structuredClone(reviewPayload), hospital_id: reviewHospitalId });
+        }
+        if (url.endsWith("/validation")) {
+          return json(structuredClone(validationPayload));
         }
         throw new Error(`Unexpected request: ${url}`);
       }),
@@ -644,6 +667,88 @@ describe("evidence page navigation", () => {
 
     expect(screen.getAllByText("Hospital not identified").length).toBeGreaterThan(0);
     expect(screen.getAllByText("bill.pdf").length).toBeGreaterThan(0);
+  });
+
+  test("legacy approvals are shown as ineffective and exports stay hidden", async () => {
+    historyJobOverride = {
+      ...job,
+      certification_status: "legacy_uncertified",
+    };
+    reviewPayload = {
+      ...structuredClone(review),
+      approval: {
+        status: "approved",
+        approved_at: "2026-08-01T00:00:00Z",
+        review_revision: 1,
+      },
+      approval_effective: false,
+      approval_blockers: ["legacy_uncertified"],
+      export_eligible: false,
+    };
+
+    render(<Home />);
+    await advance(250);
+    await openBill();
+
+    expect(screen.getByText(/Legacy uncertified extraction/)).toBeInTheDocument();
+    expect(screen.getByText(/must be reprocessed and certified/)).toBeInTheDocument();
+    expect(screen.queryByText("Review sealed.")).not.toBeInTheDocument();
+    expect(screen.queryByText("CSV ↗")).not.toBeInTheDocument();
+  });
+
+  test("tampered certification is visibly blocked", async () => {
+    historyJobOverride = {
+      ...job,
+      certification_status: "invalid",
+    };
+    reviewPayload = {
+      ...structuredClone(review),
+      approval_effective: false,
+      approval_blockers: ["certification_invalid"],
+      export_eligible: false,
+    };
+
+    render(<Home />);
+    await advance(250);
+    await openBill();
+
+    expect(screen.getByText(/Certification invalid/)).toBeInTheDocument();
+    expect(screen.queryByText("CSV ↗")).not.toBeInTheDocument();
+  });
+
+  test("failed extraction displays its retained structured validation report", async () => {
+    historyJobOverride = {
+      ...job,
+      status: "failed",
+      certification_status: null,
+      error: "extraction_integrity_failed",
+    };
+    validationPayload = {
+      validation_version: "extraction_validation_v5",
+      status: "failed",
+      issues: [{
+        id: "fatal-envelope",
+        code: "extraction_result_contract_invalid",
+        severity: "fatal",
+        message: "The extraction envelope is invalid",
+        page_number: null,
+        table_id: null,
+        source_row_id: null,
+        canonical_row_id: null,
+        field: "rows",
+        reason_codes: [],
+        status: "open",
+        resolution_reason: null,
+      }],
+    };
+
+    render(<Home />);
+    await advance(250);
+    await openBill();
+    await advance(250);
+
+    expect(screen.getByText("The extraction envelope is invalid")).toBeInTheDocument();
+    expect(screen.getByText("field rows")).toBeInTheDocument();
   });
 
   test("opens on the dashboard even when completed history exists", async () => {

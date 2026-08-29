@@ -26,20 +26,36 @@ class PublicationCheckpoint(StrEnum):
     AFTER_TARGET_RESULT_FSYNC = "after_file_fsync:.publish-result.json"
     BEFORE_TARGET_STATE_FSYNC = "before_file_fsync:.publish-state.json"
     AFTER_TARGET_STATE_FSYNC = "after_file_fsync:.publish-state.json"
+    BEFORE_TARGET_VALIDATION_FSYNC = "before_file_fsync:.publish-validation.json"
+    AFTER_TARGET_VALIDATION_FSYNC = "after_file_fsync:.publish-validation.json"
+    BEFORE_TARGET_REVIEW_FSYNC = "before_file_fsync:.publish-review.json"
+    AFTER_TARGET_REVIEW_FSYNC = "after_file_fsync:.publish-review.json"
     BEFORE_BASE_RESULT_FSYNC = "before_file_fsync:.publish-base-result.json"
     AFTER_BASE_RESULT_FSYNC = "after_file_fsync:.publish-base-result.json"
     BEFORE_BASE_STATE_FSYNC = "before_file_fsync:.publish-base-state.json"
     AFTER_BASE_STATE_FSYNC = "after_file_fsync:.publish-base-state.json"
+    BEFORE_BASE_VALIDATION_FSYNC = "before_file_fsync:.publish-base-validation.json"
+    AFTER_BASE_VALIDATION_FSYNC = "after_file_fsync:.publish-base-validation.json"
+    BEFORE_BASE_REVIEW_FSYNC = "before_file_fsync:.publish-base-review.json"
+    AFTER_BASE_REVIEW_FSYNC = "after_file_fsync:.publish-base-review.json"
     BEFORE_JOURNAL_FSYNC = "before_file_fsync:.publish-operation.json"
     AFTER_JOURNAL_FSYNC = "after_file_fsync:.publish-operation.json"
     BEFORE_TARGET_RESULT_STAGED = "before_target_result_staged"
     AFTER_TARGET_RESULT_STAGED = "after_target_result_staged"
     BEFORE_TARGET_STATE_STAGED = "before_target_state_staged"
     AFTER_TARGET_STATE_STAGED = "after_target_state_staged"
+    BEFORE_TARGET_VALIDATION_STAGED = "before_target_validation_staged"
+    AFTER_TARGET_VALIDATION_STAGED = "after_target_validation_staged"
+    BEFORE_TARGET_REVIEW_STAGED = "before_target_review_staged"
+    AFTER_TARGET_REVIEW_STAGED = "after_target_review_staged"
     BEFORE_BASE_RESULT_STAGED = "before_base_result_staged"
     AFTER_BASE_RESULT_STAGED = "after_base_result_staged"
     BEFORE_BASE_STATE_STAGED = "before_base_state_staged"
     AFTER_BASE_STATE_STAGED = "after_base_state_staged"
+    BEFORE_BASE_VALIDATION_STAGED = "before_base_validation_staged"
+    AFTER_BASE_VALIDATION_STAGED = "after_base_validation_staged"
+    BEFORE_BASE_REVIEW_STAGED = "before_base_review_staged"
+    AFTER_BASE_REVIEW_STAGED = "after_base_review_staged"
     BEFORE_JOURNAL_STAGED = "before_journal_staged"
     BEFORE_JOURNAL_DIRECTORY_FSYNC = "before_journal_directory_fsync"
     AFTER_JOURNAL_DIRECTORY_FSYNC = "after_journal_directory_fsync"
@@ -50,6 +66,16 @@ class PublicationCheckpoint(StrEnum):
     AFTER_RESULT_REPLACE_DIRECTORY_FSYNC = "after_result_replace_directory_fsync"
     AFTER_RESULT_REPLACED = "after_result_replaced"
     RESULT_REPLACED = "result_replaced"
+    BEFORE_VALIDATION_REPLACED = "before_validation_replaced"
+    BEFORE_VALIDATION_REPLACE_DIRECTORY_FSYNC = "before_validation_replace_directory_fsync"
+    AFTER_VALIDATION_REPLACE_DIRECTORY_FSYNC = "after_validation_replace_directory_fsync"
+    AFTER_VALIDATION_REPLACED = "after_validation_replaced"
+    VALIDATION_REPLACED = "validation_replaced"
+    BEFORE_REVIEW_REPLACED = "before_review_replaced"
+    BEFORE_REVIEW_REPLACE_DIRECTORY_FSYNC = "before_review_replace_directory_fsync"
+    AFTER_REVIEW_REPLACE_DIRECTORY_FSYNC = "after_review_replace_directory_fsync"
+    AFTER_REVIEW_REPLACED = "after_review_replaced"
+    REVIEW_REPLACED = "review_replaced"
     BEFORE_STATE_REPLACED = "before_state_replaced"
     BEFORE_STATE_REPLACE_DIRECTORY_FSYNC = "before_state_replace_directory_fsync"
     AFTER_STATE_REPLACE_DIRECTORY_FSYNC = "after_state_replace_directory_fsync"
@@ -59,6 +85,10 @@ class PublicationCheckpoint(StrEnum):
     AFTER_CLEANUP_BASE_RESULT = "after_cleanup:.publish-base-result.json"
     BEFORE_CLEANUP_BASE_STATE = "before_cleanup:.publish-base-state.json"
     AFTER_CLEANUP_BASE_STATE = "after_cleanup:.publish-base-state.json"
+    BEFORE_CLEANUP_BASE_VALIDATION = "before_cleanup:.publish-base-validation.json"
+    AFTER_CLEANUP_BASE_VALIDATION = "after_cleanup:.publish-base-validation.json"
+    BEFORE_CLEANUP_BASE_REVIEW = "before_cleanup:.publish-base-review.json"
+    AFTER_CLEANUP_BASE_REVIEW = "after_cleanup:.publish-base-review.json"
     BEFORE_CLEANUP_STAGE_DIRECTORY_FSYNC = "before_cleanup_stage_directory_fsync"
     AFTER_CLEANUP_STAGE_DIRECTORY_FSYNC = "after_cleanup_stage_directory_fsync"
     BEFORE_CLEANUP_JOURNAL = "before_cleanup:.publish-operation.json"
@@ -75,6 +105,14 @@ class PublicationCheckpoint(StrEnum):
     AFTER_ORPHAN_CLEANUP_BASE_RESULT = "after_orphan_cleanup:.publish-base-result.json"
     BEFORE_ORPHAN_CLEANUP_BASE_STATE = "before_orphan_cleanup:.publish-base-state.json"
     AFTER_ORPHAN_CLEANUP_BASE_STATE = "after_orphan_cleanup:.publish-base-state.json"
+    BEFORE_ORPHAN_CLEANUP_TARGET_VALIDATION = "before_orphan_cleanup:.publish-validation.json"
+    AFTER_ORPHAN_CLEANUP_TARGET_VALIDATION = "after_orphan_cleanup:.publish-validation.json"
+    BEFORE_ORPHAN_CLEANUP_BASE_VALIDATION = "before_orphan_cleanup:.publish-base-validation.json"
+    AFTER_ORPHAN_CLEANUP_BASE_VALIDATION = "after_orphan_cleanup:.publish-base-validation.json"
+    BEFORE_ORPHAN_CLEANUP_TARGET_REVIEW = "before_orphan_cleanup:.publish-review.json"
+    AFTER_ORPHAN_CLEANUP_TARGET_REVIEW = "after_orphan_cleanup:.publish-review.json"
+    BEFORE_ORPHAN_CLEANUP_BASE_REVIEW = "before_orphan_cleanup:.publish-base-review.json"
+    AFTER_ORPHAN_CLEANUP_BASE_REVIEW = "after_orphan_cleanup:.publish-base-review.json"
 
 
 def is_gpu_device(value: str) -> bool:
@@ -194,37 +232,56 @@ class JobStore:
         state = self._read_state_unlocked(job_id)
         certification = state.get("certification")
         valid = False
-        if isinstance(certification, dict):
+        certification_status = "legacy_uncertified"
+        if (
+            isinstance(certification, dict)
+            and certification.get("certification_version") == "job_certification_v2"
+        ):
+            certification_status = "invalid"
             result_path = self.job_dir(job_id) / "result.json"
+            validation_path = self.job_dir(job_id) / "validation.json"
             try:
-                self._require_regular_file(result_path, "invalid_live_result")
-                result_bytes = result_path.read_bytes()
+                result_bytes = self._regular_file_bytes(result_path, "invalid_live_result")
                 result = json.loads(result_bytes)
                 report = result.get("semantic_validation")
+                persisted_report = json.loads(
+                    self._regular_file_bytes(validation_path, "invalid_live_validation")
+                )
                 report_payload = json.dumps(
                     report,
                     sort_keys=True,
                     separators=(",", ":"),
                 ).encode()
-                valid = bool(
-                    certification.get("output_version")
-                    == "offline_accuracy_spine_v5"
-                    == result.get("output_version")
-                    and certification.get("contract_revision")
-                    == 2
-                    == result.get("contract_revision")
-                    and certification.get("result_sha256")
-                    == hashlib.sha256(result_bytes).hexdigest()
-                    and certification.get("report_sha256")
-                    == hashlib.sha256(report_payload).hexdigest()
-                    and isinstance(report, dict)
-                    and report.get("status") == state.get("validation_status")
-                    and report.get("validation_version")
-                    == certification.get("validation_version")
+                expected = self._certification_v2_unlocked(
+                    job_id,
+                    result,
+                    result_bytes,
+                    report,
+                    report_payload,
                 )
-            except (OSError, TypeError, ValueError, json.JSONDecodeError, JobTransactionError):
+                valid = bool(
+                    certification == expected
+                    and certification.get("output_version") == "offline_accuracy_spine_v5"
+                    and isinstance(report, dict)
+                    and persisted_report == report
+                    and report.get("status") == state.get("validation_status")
+                    and certification.get("report_sha256") == state.get("validation_report_sha256")
+                )
+                if valid:
+                    certification_status = "certified"
+            except (
+                OSError,
+                TypeError,
+                ValueError,
+                json.JSONDecodeError,
+                JobTransactionError,
+            ):
                 valid = False
-        return {**state, "_certification_valid": valid}
+        return {
+            **state,
+            "_certification_valid": valid,
+            "_certification_status": certification_status,
+        }
 
     def _write_state_unlocked(self, job_id: str, state: dict[str, Any]) -> None:
         directory = self.job_dir(job_id)
@@ -281,6 +338,145 @@ class JobStore:
                 digest.update(chunk)
         return digest.hexdigest()
 
+    @staticmethod
+    def _canonical_sha256(payload: object) -> str:
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+
+    def _regular_file_bytes(self, path: Path, error: str) -> bytes:
+        self._require_regular_file(path, error)
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(path, flags)
+            with os.fdopen(descriptor, "rb") as source:
+                if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                    raise JobTransactionError(error)
+                return source.read()
+        except OSError as failure:
+            raise JobTransactionError(error) from failure
+
+    def _contained_file_bytes(
+        self,
+        root: Path,
+        relative: Path,
+        error: str,
+    ) -> bytes:
+        if relative.is_absolute() or ".." in relative.parts:
+            raise JobTransactionError(error)
+        try:
+            root_mode = root.lstat().st_mode
+        except OSError as failure:
+            raise JobTransactionError(error) from failure
+        if not stat.S_ISDIR(root_mode) or stat.S_ISLNK(root_mode):
+            raise JobTransactionError(error)
+        current = root
+        for part in relative.parts[:-1]:
+            current /= part
+            try:
+                mode = current.lstat().st_mode
+            except OSError as failure:
+                raise JobTransactionError(error) from failure
+            if not stat.S_ISDIR(mode) or stat.S_ISLNK(mode):
+                raise JobTransactionError(error)
+        return self._regular_file_bytes(root / relative, error)
+
+    def _artifact_inventory_unlocked(
+        self,
+        job_id: str,
+        result: dict[str, Any],
+        artifact_root: Path | None = None,
+    ) -> tuple[list[dict[str, Any]], str]:
+        root = artifact_root or self.job_dir(job_id) / "artifacts"
+        expected: dict[str, str] = {}
+
+        def add(relative: object, digest: object) -> None:
+            if not isinstance(relative, str) or not relative.strip():
+                return
+            if not isinstance(digest, str) or len(digest) != 64:
+                raise JobTransactionError("invalid_artifact_inventory")
+            normalized = Path(relative)
+            if normalized.is_absolute() or ".." in normalized.parts:
+                raise JobTransactionError("invalid_artifact_inventory")
+            key = normalized.as_posix()
+            previous = expected.setdefault(key, digest)
+            if previous != digest:
+                raise JobTransactionError("artifact_digest_conflict")
+
+        for asset in result.get("page_assets") or ():
+            if isinstance(asset, dict):
+                add(asset.get("relative_path"), asset.get("artifact_sha256"))
+        for token in result.get("token_manifest") or ():
+            if not isinstance(token, dict):
+                continue
+            add(token.get("artifact_relative_path"), token.get("artifact_sha256"))
+            add(
+                token.get("source_artifact_relative_path"),
+                token.get("source_artifact_sha256"),
+            )
+        for diagnostic in result.get("diagnostics") or ():
+            if isinstance(diagnostic, dict):
+                add(
+                    diagnostic.get("crop_relative_path"),
+                    diagnostic.get("crop_sha256"),
+                )
+
+        inventory: list[dict[str, Any]] = []
+        for relative, expected_digest in sorted(expected.items()):
+            content = self._contained_file_bytes(
+                root,
+                Path(relative),
+                "invalid_certification_artifact",
+            )
+            actual = hashlib.sha256(content).hexdigest()
+            if actual != expected_digest:
+                raise JobTransactionError("certification_artifact_digest_mismatch")
+            inventory.append(
+                {
+                    "relative_path": relative,
+                    "sha256": actual,
+                    "size": len(content),
+                }
+            )
+        return inventory, self._canonical_sha256(inventory)
+
+    def _certification_v2_unlocked(
+        self,
+        job_id: str,
+        result: dict[str, Any],
+        result_bytes: bytes,
+        report: dict[str, Any],
+        report_payload: bytes,
+        *,
+        artifact_root: Path | None = None,
+    ) -> dict[str, Any]:
+        source = self._contained_file_bytes(
+            self.job_dir(job_id),
+            Path("source.pdf"),
+            "invalid_certification_source",
+        )
+        source_sha256 = hashlib.sha256(source).hexdigest()
+        if result.get("source_sha256") != source_sha256:
+            raise JobTransactionError("certification_source_digest_mismatch")
+        _inventory, inventory_sha256 = self._artifact_inventory_unlocked(
+            job_id, result, artifact_root
+        )
+        certification = {
+            "certification_version": "job_certification_v2",
+            "output_version": result.get("output_version"),
+            "contract_revision": result.get("contract_revision"),
+            "validation_version": report.get("validation_version"),
+            "worker_release_revision": result.get("worker_release_revision"),
+            "result_sha256": hashlib.sha256(result_bytes).hexdigest(),
+            "report_sha256": hashlib.sha256(report_payload).hexdigest(),
+            "source_sha256": source_sha256,
+            "artifact_inventory_sha256": inventory_sha256,
+        }
+        certification["certification_sha256"] = self._canonical_sha256(certification)
+        return certification
+
     def _publication_checkpoint(self, phase: PublicationCheckpoint | str) -> None:
         """Crash-injection boundary used by process-level transaction tests."""
 
@@ -305,8 +501,7 @@ class JobStore:
                 directory = self.job_dir(job_id)
                 return bool(
                     (directory / self.abort_marker_name).is_file()
-                    or self._read_state_unlocked(job_id).get("status")
-                    == CANCELLING_STATUS
+                    or self._read_state_unlocked(job_id).get("status") == CANCELLING_STATUS
                 )
         except (FileNotFoundError, KeyError):
             return True
@@ -395,64 +590,237 @@ class JobStore:
     def _certify_result_unlocked(
         self,
         job_id: str,
-        candidate_result: dict[str, Any],
+        candidate_result: object,
         *,
         artifact_root: Path | None = None,
-    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        publish_fatal_report: bool = False,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
         from gmoney.extraction.validation import (
             ValidationStatus,
             validate_extraction_result,
         )
 
         directory = self.job_dir(job_id)
-        result = json.loads(json.dumps(candidate_result))
-        result.pop("semantic_validation", None)
+        try:
+            validation_input = json.loads(json.dumps(candidate_result))
+        except (TypeError, ValueError, OverflowError):
+            validation_input = {"publication_error": "candidate_is_not_json"}
+        if isinstance(validation_input, dict):
+            validation_input.pop("semantic_validation", None)
         report = validate_extraction_result(
             directory / "source.pdf",
-            result,
+            validation_input,
             artifact_root or directory / "artifacts",
         )
-        if report.fatal:
+        if report.fatal and not publish_fatal_report:
             raise PublicationValidationError(report)
-        result["semantic_validation"] = report.model_dump(mode="json")
+        report_json = report.model_dump(mode="json")
+        if report.fatal:
+            candidate_mapping = candidate_result if isinstance(candidate_result, dict) else {}
+            result = {
+                "output_version": "extraction_failure_v1",
+                "document_id": (
+                    candidate_mapping.get("document_id")
+                    if isinstance(candidate_mapping.get("document_id"), str)
+                    else job_id
+                ),
+                "source_name": (
+                    candidate_mapping.get("source_name")
+                    if isinstance(candidate_mapping.get("source_name"), str)
+                    else None
+                ),
+                "semantic_validation": report_json,
+            }
+        else:
+            if not isinstance(validation_input, dict):
+                raise PublicationValidationError(report)
+            result = validation_input
+            result["semantic_validation"] = report_json
         serialized = (json.dumps(result, indent=2, sort_keys=True) + "\n").encode()
         report_payload = json.dumps(
-            report.model_dump(mode="json"),
+            report_json,
             sort_keys=True,
             separators=(",", ":"),
         ).encode()
         hospital = result.get("hospital") or {}
+        candidate_mapping = candidate_result if isinstance(candidate_result, dict) else {}
+        pages = candidate_mapping.get("pages")
+        page_count = pages if type(pages) is int and pages >= 0 else 0
+        rows = candidate_mapping.get("rows")
+        row_count = len(rows) if isinstance(rows, list) else 0
+        certification = None
+        if not report.fatal:
+            certification = self._certification_v2_unlocked(
+                job_id,
+                result,
+                serialized,
+                report_json,
+                report_payload,
+                artifact_root=artifact_root,
+            )
         state_fields = {
             "status": (
-                "complete"
-                if report.status is ValidationStatus.PASSED
-                else "needs_review"
+                "failed"
+                if report.fatal
+                else ("complete" if report.status is ValidationStatus.PASSED else "needs_review")
             ),
-            "error": None,
-            "page": int(result.get("pages") or 0),
-            "pages": int(result.get("pages") or 0),
-            "row_count": len(result.get("rows") or ()),
+            "error": "extraction_integrity_failed" if report.fatal else None,
+            "page": page_count,
+            "pages": page_count,
+            "row_count": row_count,
             "hospital_name": hospital.get("name"),
             "hospital_confidence": hospital.get("confidence"),
             "validation_status": report.status.value,
             "validation_issue_count": len(report.issues),
-            "validation_issue_codes": list(
-                dict.fromkeys(issue.code for issue in report.issues)
-            ),
-            "certification": {
-                "output_version": result.get("output_version"),
-                "contract_revision": result.get("contract_revision"),
-                "validation_version": report.validation_version,
-                "result_sha256": hashlib.sha256(serialized).hexdigest(),
-                "report_sha256": hashlib.sha256(report_payload).hexdigest(),
-            },
+            "validation_issue_codes": list(dict.fromkeys(issue.code for issue in report.issues)),
+            "validation_report_sha256": hashlib.sha256(report_payload).hexdigest(),
+            "certification": (certification),
         }
-        return result, state_fields
+        return result, report_json, state_fields
+
+    def _publish_validated_files_unlocked(
+        self,
+        job_id: str,
+        state: dict[str, Any],
+        result: dict[str, Any],
+        validation: dict[str, Any],
+        state_fields: dict[str, Any],
+        *,
+        review: dict[str, Any] | None = None,
+    ) -> None:
+        """Journal and replace result, validation report, and state as one outcome."""
+
+        directory = self.job_dir(job_id)
+        paths = {
+            "journal": directory / ".publish-operation.json",
+            "target_result": directory / ".publish-result.json",
+            "target_validation": directory / ".publish-validation.json",
+            "target_state": directory / ".publish-state.json",
+            "base_result": directory / ".publish-base-result.json",
+            "base_validation": directory / ".publish-base-validation.json",
+            "base_state": directory / ".publish-base-state.json",
+            "target_review": directory / ".publish-review.json",
+            "base_review": directory / ".publish-base-review.json",
+        }
+        if any(path.exists() or path.is_symlink() for path in paths.values()):
+            raise JobTransactionError("publication_recovery_required")
+        target_state = {**state, **state_fields, "updated_at": utc_now()}
+        self._publication_checkpoint("before_target_result_staged")
+        self._durable_json(paths["target_result"], result)
+        self._publication_checkpoint("after_target_result_staged")
+        self._publication_checkpoint("before_target_validation_staged")
+        self._durable_json(paths["target_validation"], validation)
+        self._publication_checkpoint("after_target_validation_staged")
+        self._publication_checkpoint("before_target_state_staged")
+        self._durable_json(paths["target_state"], target_state)
+        self._publication_checkpoint("after_target_state_staged")
+        if review is not None:
+            self._publication_checkpoint("before_target_review_staged")
+            self._durable_json(paths["target_review"], review)
+            self._publication_checkpoint("after_target_review_staged")
+
+        live_state = directory / "state.json"
+        self._publication_checkpoint("before_base_state_staged")
+        self._require_regular_file(live_state, "invalid_live_state")
+        self._durable_bytes(paths["base_state"], live_state.read_bytes())
+        self._publication_checkpoint("after_base_state_staged")
+
+        live_result = directory / "result.json"
+        base_result_exists = live_result.exists() or live_result.is_symlink()
+        if base_result_exists:
+            self._require_regular_file(live_result, "invalid_live_result")
+            self._publication_checkpoint("before_base_result_staged")
+            self._durable_bytes(paths["base_result"], live_result.read_bytes())
+            self._publication_checkpoint("after_base_result_staged")
+
+        live_validation = directory / "validation.json"
+        base_validation_exists = live_validation.exists() or live_validation.is_symlink()
+        if base_validation_exists:
+            self._require_regular_file(live_validation, "invalid_live_validation")
+            self._publication_checkpoint("before_base_validation_staged")
+            self._durable_bytes(paths["base_validation"], live_validation.read_bytes())
+            self._publication_checkpoint("after_base_validation_staged")
+
+        live_review = directory / "review.json"
+        base_review_exists = live_review.exists() or live_review.is_symlink()
+        if review is not None and base_review_exists:
+            self._require_regular_file(live_review, "invalid_live_review")
+            self._publication_checkpoint("before_base_review_staged")
+            self._durable_bytes(paths["base_review"], live_review.read_bytes())
+            self._publication_checkpoint("after_base_review_staged")
+
+        journal = {
+            "version": "job_publication_v4" if review is not None else "job_publication_v3",
+            "job_id": job_id,
+            "base_result_exists": base_result_exists,
+            "base_result_sha256": (
+                self._file_sha256(paths["base_result"]) if base_result_exists else None
+            ),
+            "base_validation_exists": base_validation_exists,
+            "base_validation_sha256": (
+                self._file_sha256(paths["base_validation"]) if base_validation_exists else None
+            ),
+            "base_state_sha256": self._file_sha256(paths["base_state"]),
+            "target_result_sha256": self._file_sha256(paths["target_result"]),
+            "target_validation_sha256": self._file_sha256(paths["target_validation"]),
+            "target_state_sha256": self._file_sha256(paths["target_state"]),
+            "base_review_exists": base_review_exists if review is not None else None,
+            "base_review_sha256": (
+                self._file_sha256(paths["base_review"])
+                if review is not None and base_review_exists
+                else None
+            ),
+            "target_review_sha256": (
+                self._file_sha256(paths["target_review"]) if review is not None else None
+            ),
+            "created_at": utc_now(),
+        }
+        self._publication_checkpoint("before_journal_staged")
+        self._durable_json(paths["journal"], journal)
+        self._publication_checkpoint("before_journal_directory_fsync")
+        self._fsync_directory(directory)
+        self._publication_checkpoint("after_journal_directory_fsync")
+        self._publication_checkpoint("after_journal_staged")
+        self._publication_checkpoint("journal_persisted")
+
+        self._publication_checkpoint("before_result_replaced")
+        paths["target_result"].replace(live_result)
+        self._publication_checkpoint("before_result_replace_directory_fsync")
+        self._fsync_directory(directory)
+        self._publication_checkpoint("after_result_replace_directory_fsync")
+        self._publication_checkpoint("after_result_replaced")
+        self._publication_checkpoint("result_replaced")
+
+        self._publication_checkpoint("before_validation_replaced")
+        paths["target_validation"].replace(live_validation)
+        self._publication_checkpoint("before_validation_replace_directory_fsync")
+        self._fsync_directory(directory)
+        self._publication_checkpoint("after_validation_replace_directory_fsync")
+        self._publication_checkpoint("after_validation_replaced")
+        self._publication_checkpoint("validation_replaced")
+
+        if review is not None:
+            self._publication_checkpoint("before_review_replaced")
+            paths["target_review"].replace(live_review)
+            self._publication_checkpoint("before_review_replace_directory_fsync")
+            self._fsync_directory(directory)
+            self._publication_checkpoint("after_review_replace_directory_fsync")
+            self._publication_checkpoint("after_review_replaced")
+            self._publication_checkpoint("review_replaced")
+
+        self._publication_checkpoint("before_state_replaced")
+        paths["target_state"].replace(live_state)
+        self._publication_checkpoint("before_state_replace_directory_fsync")
+        self._fsync_directory(directory)
+        self._publication_checkpoint("after_state_replace_directory_fsync")
+        self._publication_checkpoint("after_state_replaced")
+        self._publication_checkpoint("state_replaced")
+        self._cleanup_publication_unlocked(directory)
 
     def publish_processing_outcome(
         self,
         job_id: str,
-        candidate_result: dict[str, Any],
+        candidate_result: object,
     ) -> bool:
         """Validate, derive state, and publish a result/state pair atomically."""
         with self.job_lock(job_id, exclusive=True):
@@ -464,80 +832,18 @@ class JobStore:
                 or (directory / self.abort_marker_name).is_file()
             ):
                 return False
-            result, certified_state = self._certify_result_unlocked(
-                job_id, candidate_result
+            result, validation, certified_state = self._certify_result_unlocked(
+                job_id,
+                candidate_result,
+                publish_fatal_report=True,
             )
-            paths = {
-                "journal": directory / ".publish-operation.json",
-                "target_result": directory / ".publish-result.json",
-                "target_state": directory / ".publish-state.json",
-                "base_result": directory / ".publish-base-result.json",
-                "base_state": directory / ".publish-base-state.json",
-            }
-            if any(path.exists() or path.is_symlink() for path in paths.values()):
-                raise JobTransactionError("publication_recovery_required")
-            target_state = {
-                **state,
-                **certified_state,
-                "updated_at": utc_now(),
-            }
-            self._publication_checkpoint("before_target_result_staged")
-            self._durable_json(paths["target_result"], result)
-            self._publication_checkpoint("after_target_result_staged")
-            self._publication_checkpoint("before_target_state_staged")
-            self._durable_json(paths["target_state"], target_state)
-            self._publication_checkpoint("after_target_state_staged")
-            self._publication_checkpoint("before_base_state_staged")
-            live_state = directory / "state.json"
-            self._require_regular_file(live_state, "invalid_live_state")
-            self._durable_bytes(paths["base_state"], live_state.read_bytes())
-            self._publication_checkpoint("after_base_state_staged")
-            live_result = directory / "result.json"
-            if live_result.exists() or live_result.is_symlink():
-                self._require_regular_file(live_result, "invalid_live_result")
-                base_result_exists = True
-            else:
-                base_result_exists = False
-            if base_result_exists:
-                self._publication_checkpoint("before_base_result_staged")
-                self._durable_bytes(paths["base_result"], live_result.read_bytes())
-                self._publication_checkpoint("after_base_result_staged")
-            journal = {
-                "version": "job_publication_v2",
-                "job_id": job_id,
-                "base_result_exists": base_result_exists,
-                "base_result_sha256": (
-                    self._file_sha256(paths["base_result"])
-                    if base_result_exists
-                    else None
-                ),
-                "base_state_sha256": self._file_sha256(paths["base_state"]),
-                "target_result_sha256": self._file_sha256(paths["target_result"]),
-                "target_state_sha256": self._file_sha256(paths["target_state"]),
-                "created_at": utc_now(),
-            }
-            self._publication_checkpoint("before_journal_staged")
-            self._durable_json(paths["journal"], journal)
-            self._publication_checkpoint("before_journal_directory_fsync")
-            self._fsync_directory(directory)
-            self._publication_checkpoint("after_journal_directory_fsync")
-            self._publication_checkpoint("after_journal_staged")
-            self._publication_checkpoint("journal_persisted")
-            self._publication_checkpoint("before_result_replaced")
-            paths["target_result"].replace(live_result)
-            self._publication_checkpoint("before_result_replace_directory_fsync")
-            self._fsync_directory(directory)
-            self._publication_checkpoint("after_result_replace_directory_fsync")
-            self._publication_checkpoint("after_result_replaced")
-            self._publication_checkpoint("result_replaced")
-            self._publication_checkpoint("before_state_replaced")
-            paths["target_state"].replace(directory / "state.json")
-            self._publication_checkpoint("before_state_replace_directory_fsync")
-            self._fsync_directory(directory)
-            self._publication_checkpoint("after_state_replace_directory_fsync")
-            self._publication_checkpoint("after_state_replaced")
-            self._publication_checkpoint("state_replaced")
-            self._cleanup_publication_unlocked(directory)
+            self._publish_validated_files_unlocked(
+                job_id,
+                state,
+                result,
+                validation,
+                certified_state,
+            )
             return True
 
     def fail_processing(self, job_id: str, error: str) -> bool:
@@ -559,6 +865,7 @@ class JobStore:
         candidate_result: dict[str, Any],
         *,
         expected_result_sha256: str,
+        expected_certification_sha256: str | None = None,
     ) -> bool:
         """CAS-validate and publish a reprojection of a completed result."""
         with self.job_lock(job_id, exclusive=True):
@@ -572,70 +879,47 @@ class JobStore:
             self._require_regular_file(live_result, "invalid_live_result")
             if self._file_sha256(live_result) != expected_result_sha256:
                 raise JobTransactionError("maintenance_result_changed")
-            result, certified_state = self._certify_result_unlocked(
+            result, validation, certified_state = self._certify_result_unlocked(
                 job_id, candidate_result
             )
-            paths = {
-                "journal": directory / ".publish-operation.json",
-                "target_result": directory / ".publish-result.json",
-                "target_state": directory / ".publish-state.json",
-                "base_result": directory / ".publish-base-result.json",
-                "base_state": directory / ".publish-base-state.json",
-            }
-            if any(path.exists() or path.is_symlink() for path in paths.values()):
-                raise JobTransactionError("publication_recovery_required")
-            target_state = {
-                **state,
-                **certified_state,
-                "updated_at": utc_now(),
-            }
-            self._publication_checkpoint("before_target_result_staged")
-            self._durable_json(paths["target_result"], result)
-            self._publication_checkpoint("after_target_result_staged")
-            self._publication_checkpoint("before_target_state_staged")
-            self._durable_json(paths["target_state"], target_state)
-            self._publication_checkpoint("after_target_state_staged")
-            self._publication_checkpoint("before_base_state_staged")
-            self._require_regular_file(directory / "state.json", "invalid_live_state")
-            self._durable_bytes(
-                paths["base_state"], (directory / "state.json").read_bytes()
+            if (
+                expected_certification_sha256 is not None
+                and (certified_state.get("certification") or {}).get(
+                    "certification_sha256"
+                )
+                != expected_certification_sha256
+            ):
+                raise JobTransactionError("maintenance_certification_changed")
+            review = self._read_review_unlocked(job_id)
+            next_revision = int(review.get("revision") or 0) + 1
+            previous_approval = review.get("approval")
+            review["revision"] = next_revision
+            review["updated_at"] = utc_now()
+            review["approval"] = None
+            review.setdefault("events", []).append(
+                {
+                    "revision": next_revision,
+                    "action": "maintenance_result_published",
+                    "target_id": job_id,
+                    "reviewer": "system-maintenance",
+                    "reason": "Validated maintenance publication",
+                    "changes": {
+                        "approval_cleared": previous_approval is not None,
+                        "certification_sha256": (certified_state.get("certification") or {}).get(
+                            "certification_sha256"
+                        ),
+                    },
+                    "timestamp": utc_now(),
+                }
             )
-            self._publication_checkpoint("after_base_state_staged")
-            self._publication_checkpoint("before_base_result_staged")
-            self._durable_bytes(paths["base_result"], live_result.read_bytes())
-            self._publication_checkpoint("after_base_result_staged")
-            journal = {
-                "version": "job_publication_v2",
-                "job_id": job_id,
-                "base_result_exists": True,
-                "base_result_sha256": self._file_sha256(paths["base_result"]),
-                "base_state_sha256": self._file_sha256(paths["base_state"]),
-                "target_result_sha256": self._file_sha256(paths["target_result"]),
-                "target_state_sha256": self._file_sha256(paths["target_state"]),
-                "created_at": utc_now(),
-            }
-            self._publication_checkpoint("before_journal_staged")
-            self._durable_json(paths["journal"], journal)
-            self._publication_checkpoint("before_journal_directory_fsync")
-            self._fsync_directory(directory)
-            self._publication_checkpoint("after_journal_directory_fsync")
-            self._publication_checkpoint("after_journal_staged")
-            self._publication_checkpoint("journal_persisted")
-            self._publication_checkpoint("before_result_replaced")
-            paths["target_result"].replace(live_result)
-            self._publication_checkpoint("before_result_replace_directory_fsync")
-            self._fsync_directory(directory)
-            self._publication_checkpoint("after_result_replace_directory_fsync")
-            self._publication_checkpoint("after_result_replaced")
-            self._publication_checkpoint("result_replaced")
-            self._publication_checkpoint("before_state_replaced")
-            paths["target_state"].replace(directory / "state.json")
-            self._publication_checkpoint("before_state_replace_directory_fsync")
-            self._fsync_directory(directory)
-            self._publication_checkpoint("after_state_replace_directory_fsync")
-            self._publication_checkpoint("after_state_replaced")
-            self._publication_checkpoint("state_replaced")
-            self._cleanup_publication_unlocked(directory)
+            self._publish_validated_files_unlocked(
+                job_id,
+                state,
+                result,
+                validation,
+                certified_state,
+                review=review,
+            )
             return True
 
     def finalize_abort(self, job_id: str) -> bool:
@@ -702,9 +986,13 @@ class JobStore:
     def _cleanup_publication_unlocked(self, directory: Path) -> None:
         for name in (
             ".publish-result.json",
+            ".publish-validation.json",
             ".publish-state.json",
             ".publish-base-result.json",
+            ".publish-base-validation.json",
             ".publish-base-state.json",
+            ".publish-review.json",
+            ".publish-base-review.json",
         ):
             path = directory / name
             if path.exists() or path.is_symlink():
@@ -716,8 +1004,7 @@ class JobStore:
         self._fsync_directory(directory)
         self._publication_checkpoint("after_cleanup_stage_directory_fsync")
         if any(
-            path.exists() or path.is_symlink()
-            for path in self._publication_stage_paths(directory)
+            path.exists() or path.is_symlink() for path in self._publication_stage_paths(directory)
         ):
             raise JobTransactionError("publication_stage_cleanup_incomplete")
         journal = directory / ".publish-operation.json"
@@ -736,9 +1023,13 @@ class JobStore:
             directory / name
             for name in (
                 ".publish-result.json",
+                ".publish-validation.json",
                 ".publish-state.json",
                 ".publish-base-result.json",
+                ".publish-base-validation.json",
                 ".publish-base-state.json",
+                ".publish-review.json",
+                ".publish-base-review.json",
             )
         )
 
@@ -809,18 +1100,40 @@ class JobStore:
         except (OSError, json.JSONDecodeError) as error:
             raise JobTransactionError("invalid_publication_journal") from error
         if (
-            journal.get("version") not in {"job_publication_v1", "job_publication_v2"}
+            journal.get("version")
+            not in {
+                "job_publication_v1",
+                "job_publication_v2",
+                "job_publication_v3",
+                "job_publication_v4",
+            }
             or journal.get("job_id") != job_id
             or type(journal.get("base_result_exists")) is not bool
+            or (
+                journal.get("version") in {"job_publication_v3", "job_publication_v4"}
+                and type(journal.get("base_validation_exists")) is not bool
+            )
+            or (
+                journal.get("version") == "job_publication_v4"
+                and type(journal.get("base_review_exists")) is not bool
+            )
         ):
             raise JobTransactionError("unsupported_publication_journal")
         target_result = directory / ".publish-result.json"
+        target_validation = directory / ".publish-validation.json"
         target_state = directory / ".publish-state.json"
         live_result = directory / "result.json"
+        live_validation = directory / "validation.json"
         live_state = directory / "state.json"
+        target_review = directory / ".publish-review.json"
+        live_review = directory / "review.json"
         self._require_regular_file(live_state, "invalid_live_state")
         if live_result.exists() or live_result.is_symlink():
             self._require_regular_file(live_result, "invalid_live_result")
+        if live_validation.exists() or live_validation.is_symlink():
+            self._require_regular_file(live_validation, "invalid_live_validation")
+        if live_review.exists() or live_review.is_symlink():
+            self._require_regular_file(live_review, "invalid_live_review")
 
         def matches(path: Path, expected: object) -> bool:
             if not isinstance(expected, str):
@@ -831,35 +1144,47 @@ class JobStore:
             return self._file_sha256(path) == expected
 
         result_digest = journal.get("target_result_sha256")
+        validation_digest = journal.get("target_validation_sha256")
         state_digest = journal.get("target_state_sha256")
         base_result_digest = journal.get("base_result_sha256")
+        base_validation_digest = journal.get("base_validation_sha256")
         base_state_digest = journal.get("base_state_sha256")
-        if journal.get("version") == "job_publication_v2" and (
+        version = journal.get("version")
+        if version in {"job_publication_v2", "job_publication_v3", "job_publication_v4"} and (
             not isinstance(state_digest, str)
             or not isinstance(result_digest, str)
             or not isinstance(base_state_digest, str)
-            or (
-                journal["base_result_exists"]
-                and not isinstance(base_result_digest, str)
-            )
-            or (
-                not journal["base_result_exists"]
-                and base_result_digest is not None
-            )
+            or (journal["base_result_exists"] and not isinstance(base_result_digest, str))
+            or (not journal["base_result_exists"] and base_result_digest is not None)
+        ):
+            raise JobTransactionError("unsupported_publication_journal")
+        if version in {"job_publication_v3", "job_publication_v4"} and (
+            not isinstance(validation_digest, str)
+            or (journal["base_validation_exists"] and not isinstance(base_validation_digest, str))
+            or (not journal["base_validation_exists"] and base_validation_digest is not None)
+        ):
+            raise JobTransactionError("unsupported_publication_journal")
+        review_digest = journal.get("target_review_sha256")
+        base_review_digest = journal.get("base_review_sha256")
+        if version == "job_publication_v4" and (
+            not isinstance(review_digest, str)
+            or (journal["base_review_exists"] and not isinstance(base_review_digest, str))
+            or (not journal["base_review_exists"] and base_review_digest is not None)
         ):
             raise JobTransactionError("unsupported_publication_journal")
         aborting = (directory / self.abort_marker_name).is_file()
         if aborting:
-            if journal.get("version") == "job_publication_v2" and not (
-                matches(live_state, base_state_digest)
-                or matches(live_state, state_digest)
-            ):
+            if version in {
+                "job_publication_v2",
+                "job_publication_v3",
+                "job_publication_v4",
+            } and not (matches(live_state, base_state_digest) or matches(live_state, state_digest)):
                 raise JobTransactionError("publication_live_state_digest_mismatch")
             base_result = directory / ".publish-base-result.json"
             if journal["base_result_exists"]:
                 if not (
                     matches(base_result, base_result_digest)
-                    if journal.get("version") == "job_publication_v2"
+                    if version in {"job_publication_v2", "job_publication_v3", "job_publication_v4"}
                     else base_result.is_file() and not base_result.is_symlink()
                 ):
                     raise JobTransactionError("publication_base_result_missing")
@@ -868,10 +1193,30 @@ class JobStore:
                 if not matches(live_result, result_digest):
                     raise JobTransactionError("publication_live_result_digest_mismatch")
                 live_result.unlink()
+            if version in {"job_publication_v3", "job_publication_v4"}:
+                base_validation = directory / ".publish-base-validation.json"
+                if journal["base_validation_exists"]:
+                    if not matches(base_validation, base_validation_digest):
+                        raise JobTransactionError("publication_base_validation_missing")
+                    base_validation.replace(live_validation)
+                elif live_validation.exists() or live_validation.is_symlink():
+                    if not matches(live_validation, validation_digest):
+                        raise JobTransactionError("publication_live_validation_digest_mismatch")
+                    live_validation.unlink()
+            if version == "job_publication_v4":
+                base_review = directory / ".publish-base-review.json"
+                if journal["base_review_exists"]:
+                    if not matches(base_review, base_review_digest):
+                        raise JobTransactionError("publication_base_review_missing")
+                    base_review.replace(live_review)
+                elif live_review.exists() or live_review.is_symlink():
+                    if not matches(live_review, review_digest):
+                        raise JobTransactionError("publication_live_review_digest_mismatch")
+                    live_review.unlink()
             base_state = directory / ".publish-base-state.json"
             if not (
                 matches(base_state, base_state_digest)
-                if journal.get("version") == "job_publication_v2"
+                if version in {"job_publication_v2", "job_publication_v3", "job_publication_v4"}
                 else base_state.is_file() and not base_state.is_symlink()
             ):
                 raise JobTransactionError("publication_base_state_missing")
@@ -880,7 +1225,7 @@ class JobStore:
             return
 
         if not matches(live_result, result_digest):
-            if journal.get("version") == "job_publication_v2":
+            if version in {"job_publication_v2", "job_publication_v3", "job_publication_v4"}:
                 live_is_base = (
                     matches(live_result, base_result_digest)
                     if journal["base_result_exists"]
@@ -892,11 +1237,38 @@ class JobStore:
                 raise JobTransactionError("publication_target_result_missing")
             target_result.replace(live_result)
             self._fsync_directory(directory)
+        if version in {"job_publication_v3", "job_publication_v4"} and not matches(
+            live_validation, validation_digest
+        ):
+            live_is_base = (
+                matches(live_validation, base_validation_digest)
+                if journal["base_validation_exists"]
+                else not (live_validation.exists() or live_validation.is_symlink())
+            )
+            if not live_is_base:
+                raise JobTransactionError("publication_live_validation_digest_mismatch")
+            if not matches(target_validation, validation_digest):
+                raise JobTransactionError("publication_target_validation_missing")
+            target_validation.replace(live_validation)
+            self._fsync_directory(directory)
+        if version == "job_publication_v4" and not matches(live_review, review_digest):
+            live_is_base = (
+                matches(live_review, base_review_digest)
+                if journal["base_review_exists"]
+                else not (live_review.exists() or live_review.is_symlink())
+            )
+            if not live_is_base:
+                raise JobTransactionError("publication_live_review_digest_mismatch")
+            if not matches(target_review, review_digest):
+                raise JobTransactionError("publication_target_review_missing")
+            target_review.replace(live_review)
+            self._fsync_directory(directory)
         if not matches(live_state, state_digest):
-            if (
-                journal.get("version") == "job_publication_v2"
-                and not matches(live_state, base_state_digest)
-            ):
+            if version in {
+                "job_publication_v2",
+                "job_publication_v3",
+                "job_publication_v4",
+            } and not matches(live_state, base_state_digest):
                 raise JobTransactionError("publication_live_state_digest_mismatch")
             if not matches(target_state, state_digest):
                 raise JobTransactionError("publication_target_state_missing")
@@ -920,6 +1292,22 @@ class JobStore:
             self._require_regular_file(path, "invalid_live_result")
             return json.loads(path.read_text())
 
+    def read_validation(self, job_id: str) -> dict[str, Any]:
+        with self.job_lock(job_id, exclusive=True):
+            self._recover_publication_unlocked(job_id)
+            self._require_stable_workspace(job_id)
+            path = self.job_dir(job_id) / "validation.json"
+            if not (path.exists() or path.is_symlink()):
+                raise JobTransactionError("validation_report_unavailable")
+            self._require_regular_file(path, "invalid_live_validation")
+            try:
+                payload = json.loads(path.read_text())
+            except (OSError, json.JSONDecodeError) as error:
+                raise JobTransactionError("invalid_live_validation") from error
+            if not isinstance(payload, dict):
+                raise JobTransactionError("invalid_live_validation")
+            return payload
+
     @contextmanager
     def locked_workspace(
         self, job_id: str
@@ -927,7 +1315,7 @@ class JobStore:
         with self.job_lock(job_id, exclusive=True):
             self._recover_publication_unlocked(job_id)
             self._require_stable_workspace(job_id)
-            state = self._read_state_unlocked(job_id)
+            state = self._state_with_certification_unlocked(job_id)
             result_path = self.job_dir(job_id) / "result.json"
             if not (result_path.exists() or result_path.is_symlink()):
                 raise JobTransactionError("extraction_result_unavailable")
@@ -936,15 +1324,11 @@ class JobStore:
             review = self._read_review_unlocked(job_id)
             yield state, result, review
 
-    def read_workspace(
-        self, job_id: str
-    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    def read_workspace(self, job_id: str) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
         with self.locked_workspace(job_id) as workspace:
             return workspace
 
-    def read_page_bytes(
-        self, job_id: str, page_number: int
-    ) -> tuple[dict[str, Any], bytes]:
+    def read_page_bytes(self, job_id: str, page_number: int) -> tuple[dict[str, Any], bytes]:
         with self.job_lock(job_id, exclusive=True):
             self._recover_publication_unlocked(job_id)
             self._require_stable_workspace(job_id)
@@ -991,6 +1375,40 @@ class JobStore:
             temporary.replace(path)
             return updated
 
+    def mutate_review_with_workspace(
+        self,
+        job_id: str,
+        expected_revision: int,
+        mutation: Callable[
+            [dict[str, Any], dict[str, Any], dict[str, Any]],
+            dict[str, Any],
+        ],
+    ) -> dict[str, Any]:
+        """Mutate review against one locked result/certification snapshot."""
+
+        with self.job_lock(job_id, exclusive=True):
+            self._recover_publication_unlocked(job_id)
+            self._require_stable_workspace(job_id)
+            state = self._state_with_certification_unlocked(job_id)
+            result_path = self.job_dir(job_id) / "result.json"
+            self._require_regular_file(result_path, "invalid_live_result")
+            result = json.loads(result_path.read_text())
+            current = self._read_review_unlocked(job_id)
+            if current["revision"] != expected_revision:
+                raise ReviewRevisionConflict(current["revision"])
+            updated = mutation(
+                json.loads(json.dumps(current)),
+                state,
+                result,
+            )
+            updated["revision"] = current["revision"] + 1
+            updated["updated_at"] = utc_now()
+            path = self.job_dir(job_id) / "review.json"
+            temporary = path.with_name(f"review.{os.getpid()}.tmp")
+            temporary.write_text(json.dumps(updated, indent=2, sort_keys=True) + "\n")
+            temporary.replace(path)
+            return updated
+
     @staticmethod
     def _restore_payload(path: Path, payload: dict[str, Any]) -> None:
         temporary = path.with_name(f"{path.name}.{os.getpid()}.recovery.tmp")
@@ -1003,19 +1421,14 @@ class JobStore:
         if not journal_path.is_file():
             return
         journal = json.loads(journal_path.read_text())
-        if (
-            journal.get("version") != "job_cutover_v1"
-            or journal.get("job_id") != job_id
-        ):
+        if journal.get("version") != "job_cutover_v1" or journal.get("job_id") != job_id:
             raise JobTransactionError("unsupported_cutover_journal")
         stage_dir = Path(str(journal["stage_dir"]))
         backup_dir = Path(str(journal["backup_dir"]))
         if stage_dir.name != job_id or backup_dir.name != job_id:
             raise JobTransactionError("invalid_cutover_journal_paths")
         commit_marker = (
-            Path(str(journal["commit_marker"]))
-            if journal.get("commit_marker")
-            else None
+            Path(str(journal["commit_marker"])) if journal.get("commit_marker") else None
         )
         if commit_marker is not None and commit_marker.is_file():
             journal_path.unlink()
@@ -1038,6 +1451,10 @@ class JobStore:
 
         restore_path("result.json")
         restore_path("artifacts")
+        if (backup_dir / "validation.json").is_file():
+            restore_path("validation.json")
+        elif (job_dir / "validation.json").is_file():
+            (job_dir / "validation.json").unlink()
         state_backup = backup_dir / "state.json"
         if state_backup.is_file():
             self._restore_payload(
@@ -1060,10 +1477,7 @@ class JobStore:
         job_id: str,
         journal: dict[str, Any],
     ) -> None:
-        if (
-            journal.get("version") != "job_rollback_v1"
-            or journal.get("job_id") != job_id
-        ):
+        if journal.get("version") != "job_rollback_v1" or journal.get("job_id") != job_id:
             raise JobTransactionError("unsupported_cutover_journal")
         job_dir = self.job_dir(job_id)
         backup_dir = Path(str(journal["backup_dir"]))
@@ -1076,7 +1490,7 @@ class JobStore:
         ):
             raise JobTransactionError("invalid_cutover_journal_paths")
 
-        for name in ("result.json", "artifacts"):
+        for name in ("result.json", "validation.json", "artifacts"):
             live = job_dir / name
             backup = backup_dir / name
             displaced = displaced_dir / name
@@ -1109,9 +1523,7 @@ class JobStore:
         journals: list[tuple[str, Path, dict[str, Any]]],
     ) -> None:
         ordered = sorted(journals, key=lambda item: item[0])
-        commit_markers = {
-            str(journal.get("commit_marker")) for _, _, journal in ordered
-        }
+        commit_markers = {str(journal.get("commit_marker")) for _, _, journal in ordered}
         if len(commit_markers) != 1:
             raise JobTransactionError("inconsistent_rollback_batch")
         commit_marker = Path(commit_markers.pop())
@@ -1122,10 +1534,7 @@ class JobStore:
                 current = json.loads(journal_path.read_text())
                 if current != journal:
                     raise JobTransactionError("cutover_journal_changed")
-                if (
-                    current.get("version") != "job_rollback_v1"
-                    or current.get("job_id") != job_id
-                ):
+                if current.get("version") != "job_rollback_v1" or current.get("job_id") != job_id:
                     raise JobTransactionError("unsupported_cutover_journal")
             if commit_marker.is_file():
                 for _, journal_path, _ in ordered:
@@ -1181,9 +1590,7 @@ class JobStore:
             job_id = directory.name
             with self.job_lock(job_id, exclusive=True):
                 self._recover_publication_unlocked(job_id)
-        rollback_batches: dict[
-            str, list[tuple[str, Path, dict[str, Any]]]
-        ] = {}
+        rollback_batches: dict[str, list[tuple[str, Path, dict[str, Any]]]] = {}
         for journal_path in self.jobs_root.glob("*/.cutover.json"):
             job_id = journal_path.parent.name
             journal = json.loads(journal_path.read_text())
