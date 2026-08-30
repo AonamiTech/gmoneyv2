@@ -35,6 +35,7 @@ from gmoney.extraction.offline import (
     _flag_possible_supporting_receipt_duplicates,
     _materialize_printed_cell_fragments,
     _needs_full_page_financial_recovery,
+    _normalize_public_diagnostic,
     _populate_grounded_service_date_cell,
     _recover_grounded_service_dates,
     _recovery_prior_schemas,
@@ -1824,6 +1825,23 @@ def test_reused_fragment_adds_the_current_table_owner() -> None:
     assert len(updated_fragments) == 1
     assert updated_fragments[0].token_id == fragment.token_id
     assert updated_fragments[0].table_ids == ("p1-t1", "p1-t2")
+
+
+def test_unpublished_table_attempt_becomes_a_page_diagnostic() -> None:
+    diagnostic = {
+        "page_number": 3,
+        "table_id": "p3-t9",
+        "status": "extracted",
+        "candidate_count": 0,
+    }
+
+    normalized = _normalize_public_diagnostic(diagnostic, ())
+
+    assert normalized["diagnostic_kind"] == "page"
+    assert normalized["attempted_table_id"] == "p3-t9"
+    assert "table_id" not in normalized
+    assert "source_table_id" not in normalized
+    assert normalized["diagnostic_id"].startswith("p3-p3-t9-")
 
 
 def test_slanted_rows_do_not_shift_total_amount_into_prior_charge() -> None:

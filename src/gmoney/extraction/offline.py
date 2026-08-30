@@ -4940,6 +4940,45 @@ def _declined_recovery_draft(
     )
 
 
+def _normalize_public_diagnostic(
+    diagnostic: dict[str, Any],
+    source_tables: Collection[SourceTable],
+) -> dict[str, Any]:
+    payload = dict(diagnostic)
+    payload.setdefault("diagnostic_kind", "table" if payload.get("table_id") else "page")
+    payload.setdefault(
+        "diagnostic_id",
+        f"p{int(payload.get('page_number') or 1)}-"
+        f"{payload.get('table_id') or 'page'}-"
+        f"{_stable_payload_digest(payload)[:12]}",
+    )
+    if payload.get("diagnostic_kind") != "table":
+        return payload
+    if not payload.get("source_table_id"):
+        matching_table = next(
+            (
+                table
+                for table in source_tables
+                if table.page_number == int(payload.get("page_number") or 0)
+                and table.table_id == payload.get("table_id")
+            ),
+            None,
+        )
+        if matching_table is not None:
+            payload["source_table_id"] = matching_table.id
+    if payload.get("table_id") and payload.get("source_table_id"):
+        return payload
+
+    attempted_table_id = payload.pop("table_id", None)
+    attempted_source_table_id = payload.pop("source_table_id", None)
+    payload["diagnostic_kind"] = "page"
+    if attempted_table_id:
+        payload["attempted_table_id"] = attempted_table_id
+    if attempted_source_table_id:
+        payload["attempted_source_table_id"] = attempted_source_table_id
+    return payload
+
+
 class OfflineExtractor:
     def __init__(
         self,
@@ -6945,26 +6984,10 @@ class OfflineExtractor:
         token_manifest_by_id.update({item.token_id: item for item in printed_fragments})
         token_manifest = tuple(token_manifest_by_id.values())
 
-        normalized_diagnostics: list[dict[str, Any]] = []
-        for diagnostic in diagnostics:
-            payload = dict(diagnostic)
-            payload.setdefault("diagnostic_kind", "table" if payload.get("table_id") else "page")
-            payload.setdefault(
-                "diagnostic_id",
-                f"p{int(payload.get('page_number') or 1)}-"
-                f"{payload.get('table_id') or 'page'}-"
-                f"{_stable_payload_digest(payload)[:12]}",
-            )
-            if payload.get("diagnostic_kind") == "table" and not payload.get("source_table_id"):
-                matching_tables = tuple(
-                    table
-                    for table in source_tables
-                    if table.page_number == int(payload.get("page_number") or 0)
-                    and table.table_id == payload.get("table_id")
-                )
-                if matching_tables:
-                    payload["source_table_id"] = matching_tables[0].id
-            normalized_diagnostics.append(payload)
+        normalized_diagnostics = [
+            _normalize_public_diagnostic(diagnostic, source_tables)
+            for diagnostic in diagnostics
+        ]
         diagnostic_source_table_ids = {
             str(item.get("source_table_id"))
             for item in normalized_diagnostics
