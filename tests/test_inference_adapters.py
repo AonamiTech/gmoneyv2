@@ -5,7 +5,12 @@ import httpx
 import pytest
 
 from gmoney.inference.contracts import InferenceRequest
-from gmoney.inference.paddle import PaddleOcrV6Adapter, PaddleOcrVlAdapter, _require_output
+from gmoney.inference.paddle import (
+    PaddleDocOrientationAdapter,
+    PaddleOcrV6Adapter,
+    PaddleOcrVlAdapter,
+    _require_output,
+)
 
 
 def test_empty_model_output_is_never_a_success() -> None:
@@ -49,3 +54,22 @@ def test_adapter_device_is_forwarded_and_recorded(monkeypatch) -> None:
     assert captured["device"] == "gpu:0"
     assert adapter.spec.device == "gpu:0"
     assert PaddleOcrVlAdapter(device="cuda:0").spec.device == "cuda:0"
+
+
+def test_orientation_adapter_is_explicitly_kept_on_cpu(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeOrientation:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "paddleocr",
+        SimpleNamespace(DocImgOrientationClassification=FakeOrientation),
+    )
+
+    adapter = PaddleDocOrientationAdapter(device="cpu")
+
+    assert captured == {"model_name": "PP-LCNet_x1_0_doc_ori", "device": "cpu"}
+    assert adapter.spec.device == "cpu"

@@ -69,6 +69,7 @@ def render_pdf_region(
     *,
     source_dpi: int = 300,
     output_dpi: int = 400,
+    source_size: tuple[int, int] | None = None,
 ) -> CropResult:
     """Rerender one PDF region at higher resolution with an invertible transform."""
     document = fitz.open(source)
@@ -91,9 +92,12 @@ def render_pdf_region(
         temporary = output.with_name(f".{output.stem}.tmp{output.suffix}")
         pixmap.save(temporary)
         temporary.replace(output)
-        page_rect = page.rect
-        source_width = round(page_rect.width * source_dpi / 72)
-        source_height = round(page_rect.height * source_dpi / 72)
+        if source_size is None:
+            page_rect = page.rect
+            source_width = round(page_rect.width * source_dpi / 72)
+            source_height = round(page_rect.height * source_dpi / 72)
+        else:
+            source_width, source_height = source_size
     finally:
         document.close()
     scale = output_dpi / source_dpi

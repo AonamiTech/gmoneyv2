@@ -38,6 +38,42 @@ def _require_output(output: list[Any], model_name: str) -> list[Any]:
     return output
 
 
+class PaddleDocOrientationAdapter:
+    spec = ModelSpec(
+        kind=ModelKind.ORIENTATION,
+        provider="paddleocr",
+        model_name="PP-LCNet_x1_0_doc_ori",
+        model_version="PP-LCNet_x1_0_doc_ori",
+        backend="paddle",
+        device="cpu",
+    )
+
+    def __init__(self, device: str = "cpu") -> None:
+        from paddleocr import DocImgOrientationClassification
+
+        self.spec = type(self).spec.model_copy(update={"device": device})
+        self._model = DocImgOrientationClassification(
+            model_name=self.spec.model_name,
+            device=device,
+        )
+
+    def predict(self, request: InferenceRequest) -> InferenceResponse:
+        started = time.perf_counter()
+        output = _require_output(
+            list(self._model.predict(str(Path(request.image_path)))),
+            self.spec.model_name,
+        )
+        elapsed = round((time.perf_counter() - started) * 1000)
+        return InferenceResponse(
+            request_id=request.request_id,
+            spec=self.spec,
+            output={"pages": _jsonable(output)},
+            latency_ms=elapsed,
+            peak_rss_bytes=psutil.Process().memory_info().rss,
+            memory_scope="process",
+        )
+
+
 class PaddleOcrV6Adapter:
     spec = ModelSpec(
         kind=ModelKind.OCR,

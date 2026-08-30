@@ -5,6 +5,7 @@ import fitz
 import numpy as np
 import pytest
 
+from gmoney.contracts.evidence import PageAsset, PageQuality, PageQualityFlag
 from gmoney.evaluation.corpus import sha256_file
 from gmoney.geometry.crop import (
     color_overlay_suppressed_variant,
@@ -12,6 +13,7 @@ from gmoney.geometry.crop import (
     render_pdf_region,
 )
 from gmoney.geometry.normalize import normalize_page
+from gmoney.geometry.preprocess import detect_page_quadrilateral, prepare_page_candidates
 from gmoney.geometry.quality import estimate_skew
 from gmoney.geometry.render import render_pdf
 from gmoney.geometry.transform import (
@@ -173,3 +175,85 @@ def test_normalization_applies_page_orientation_before_deskew(tmp_path: Path) ->
     assert result.transform.derived_width == 300
     assert result.transform.derived_height == 200
     assert result.transform.operations == ("orientation:90", "rotate:2.000000")
+
+
+def test_page_quadrilateral_detector_is_conservative_and_reports_keystone(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "photo.png"
+    image = np.zeros((1000, 800, 3), dtype=np.uint8)
+    physical_page = np.asarray(((35, 45), (770, 80), (720, 960), (60, 915)))
+    cv2.fillConvexPoly(image, physical_page, (255, 255, 255))
+    cv2.polylines(image, (physical_page,), True, (20, 20, 20), 5)
+    assert cv2.imwrite(str(path), image)
+
+    points, confidence, keystone = detect_page_quadrilateral(path)
+
+    assert points is not None
+    assert confidence >= 0.85
+    assert keystone >= 0.02
+
+
+def test_camera_candidate_composes_400dpi_transform_back_to_raw_page(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.pdf"
+    document = fitz.open()
+    page = document.new_page(width=144, height=192)
+    page.insert_text((12, 30), "DESCRIPTION AMOUNT")
+    document.save(source)
+    document.close()
+
+    artifact_root = tmp_path / "artifacts"
+    raw_path = artifact_root / "pages" / "raw.png"
+    raw_path.parent.mkdir(parents=True)
+    raw = np.full((800, 600, 3), 255, dtype=np.uint8)
+    assert cv2.imwrite(str(raw_path), raw)
+    raw_hash = sha256_file(raw_path)
+    page_asset = PageAsset(
+        document_sha256=sha256_file(source),
+        page_number=1,
+        artifact_sha256=raw_hash,
+        relative_path="raw.png",
+        width=600,
+        height=800,
+        dpi=300,
+        renderer="test",
+        renderer_version="1",
+    )
+    quality = PageQuality(
+        page_number=1,
+        artifact_sha256=raw_hash,
+        width=600,
+        height=800,
+        dpi=300,
+        mean_luminance=246,
+        contrast_stddev=40,
+        laplacian_variance=100,
+        edge_density=0.05,
+        estimated_skew_degrees=0,
+        flags=(PageQualityFlag.OVEREXPOSED,),
+    )
+
+    candidates = prepare_page_candidates(
+        source_pdf=source,
+        raw_path=raw_path,
+        raw_relative_path="pages/raw.png",
+        page=page_asset,
+        quality=quality,
+        artifact_root=artifact_root,
+        orientation_degrees=0,
+        orientation_confidence=1,
+    )
+
+    camera = next(item for item in candidates if item.contract.variant.value == "camera_400")
+    raw_points = ((0.0, 0.0), (600.0, 800.0), (120.0, 240.0))
+    restored = apply_matrix(
+        camera.contract.transform.inverse_matrix,
+        apply_matrix(camera.contract.transform.forward_matrix, raw_points),
+    )
+    for expected, actual in zip(raw_points, restored, strict=True):
+        assert actual == pytest.approx(expected)
+    assert camera.path.exists()
+    assert not (camera.path.parent / "page-400.png").exists()
+    assert not (camera.path.parent / "geometry-400.png").exists()

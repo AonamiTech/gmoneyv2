@@ -4,10 +4,12 @@
 certified. Earlier results remain readable as legacy, uncertified history and
 must be reprocessed before approval or export.
 
-New publications require `contract_revision: 2`. Revision 2 adds stable
-geometry anchors, typed derived-field provenance, complete token-fragment
-lineage, and the raw total-candidate contexts required for safe totals-only
-maintenance. Revisionless and revision-1 v5 results remain uncertified.
+New full extractions publish `contract_revision: 4`. Revision 4 retains the
+revision-2 geometry, token-lineage, and totals guarantees plus revision-3
+targeted-recovery audit metadata. It adds one quality-routed preprocessing
+record per page. Revision-2 and revision-3 results remain readable for
+historical recovery and recertification; revisionless and revision-1 v5
+results remain uncertified.
 
 The complete top-level result is decoded by `ExtractionResultV5` before any
 semantic validation. Malformed nested values therefore produce fatal,
@@ -18,8 +20,14 @@ field-addressed validation issues instead of parser exceptions.
 - Every page publishes a complete rendered-page asset.
 - Every evidence token exists in the token manifest and its text supports the
   Printed or canonical value that cites it.
-- Recovery tokens retain their crop artifact, crop-space polygon, dimensions,
-  page-space polygon, and crop-to-page transform.
+- OCR tokens produced from normalized pages or recovery crops retain their
+  derivative artifact, derivative-space polygon, dimensions, page-space
+  polygon, and derivative-to-page transform.
+- Each page preprocessing record retains the canonical raw page, every tested
+  derivative, quality metrics, routing reasons, inference metrics, the selected
+  variant, and an invertible transform whose round trip stays within two
+  pixels. Raw remains selected unless a derivative safely improves structural
+  and reconstructed financial evidence.
 - Typed fragments retain their parent token and exact character span.
 - Page and source-table diagnostic inventories are exact; duplicate and orphan
   diagnostics are fatal.

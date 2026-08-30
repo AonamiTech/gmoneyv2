@@ -408,6 +408,15 @@ class JobStore:
         for asset in result.get("page_assets") or ():
             if isinstance(asset, dict):
                 add(asset.get("relative_path"), asset.get("artifact_sha256"))
+        for record in result.get("page_preprocessing") or ():
+            if not isinstance(record, dict):
+                continue
+            for candidate in record.get("candidates") or ():
+                if isinstance(candidate, dict):
+                    add(
+                        candidate.get("artifact_relative_path"),
+                        candidate.get("artifact_sha256"),
+                    )
         for token in result.get("token_manifest") or ():
             if not isinstance(token, dict):
                 continue

@@ -55,22 +55,21 @@ def render_pdf(source: Path, artifact_root: Path, dpi: int = 300) -> RenderManif
                 pixmap.save(temporary)
                 temporary.replace(output)
             artifact_hash = sha256_file(output)
-            with fitz.open(source) as verification_document:
-                rect = verification_document[index].rect
+            quality = assess_quality(output, page_number, dpi)
             pages.append(
                 PageAsset(
                     document_sha256=before_hash,
                     page_number=page_number,
                     artifact_sha256=artifact_hash,
                     relative_path=str(output.relative_to(artifact_root)),
-                    width=round(rect.width * scale),
-                    height=round(rect.height * scale),
+                    width=quality.width,
+                    height=quality.height,
                     dpi=dpi,
                     renderer="PyMuPDF",
                     renderer_version=RENDERER_VERSION,
                 )
             )
-            qualities.append(assess_quality(output, page_number, dpi))
+            qualities.append(quality)
     if sha256_file(source) != before_hash or source.stat().st_size != source_size:
         raise RuntimeError("source PDF changed during rendering")
     manifest = RenderManifest(

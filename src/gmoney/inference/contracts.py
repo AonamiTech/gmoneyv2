@@ -9,6 +9,7 @@ from gmoney.contracts.common import ContractModel
 
 
 class ModelKind(StrEnum):
+    ORIENTATION = "orientation"
     OCR = "ocr"
     LAYOUT = "layout"
     TABLE = "table"

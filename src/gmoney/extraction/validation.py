@@ -25,6 +25,7 @@ from gmoney.contracts.extraction import (
 from gmoney.evaluation.corpus import sha256_file
 from gmoney.extraction.date_context import service_date_from_context
 from gmoney.extraction.typed_values import parse_decimal, parse_quantity, parse_service_date
+from gmoney.geometry.transform import apply_matrix
 
 VALIDATION_VERSION = "extraction_validation_v5_r3"
 SUPPORTED_OUTPUT_VERSION = "offline_accuracy_spine_v5"
@@ -209,7 +210,7 @@ def _validate_provider_and_recovery_metadata(
             )
         )
     for target in targets:
-        revision_three = result.get("contract_revision") == 3
+        revision_three = result.get("contract_revision") in {3, 4}
         if not isinstance(target, dict) or (
             type(target.get("page_number")) is not int
             or target["page_number"] < 1
@@ -1765,6 +1766,54 @@ def _validate_extraction_result(
                     )
                 )
 
+    for record in result.get("page_preprocessing") or []:
+        page_number = int(record.get("page_number") or 0)
+        for candidate in record.get("candidates") or []:
+            relative = Path(str(candidate.get("artifact_relative_path") or ""))
+            unresolved = artifact_root / relative
+            path = unresolved.resolve()
+            transform = candidate.get("transform") or {}
+            source_width = float(transform.get("source_width") or 0)
+            source_height = float(transform.get("source_height") or 0)
+            corners = (
+                (0.0, 0.0),
+                (source_width, 0.0),
+                (source_width, source_height),
+                (0.0, source_height),
+            )
+            transform_valid = False
+            try:
+                derived = apply_matrix(transform["forward_matrix"], corners)
+                restored = apply_matrix(transform["inverse_matrix"], derived)
+                transform_valid = all(
+                    abs(actual_x - expected_x) <= 2.0
+                    and abs(actual_y - expected_y) <= 2.0
+                    for (actual_x, actual_y), (expected_x, expected_y) in zip(
+                        restored,
+                        corners,
+                        strict=True,
+                    )
+                )
+            except (KeyError, TypeError, ValueError):
+                transform_valid = False
+            if (
+                relative.is_absolute()
+                or artifact_root.resolve() not in path.parents
+                or not unresolved.is_file()
+                or _path_uses_symlink(unresolved, artifact_root)
+                or sha256_file(path) != candidate.get("artifact_sha256")
+                or not transform_valid
+            ):
+                issues.append(
+                    _issue(
+                        "page_preprocessing_artifact_invalid",
+                        ValidationSeverity.FATAL,
+                        "Page preprocessing artifact or reversible transform is invalid",
+                        page_number=page_number or None,
+                        field="page_preprocessing",
+                    )
+                )
+
     token_manifest: dict[str, TokenManifestEntry] = {}
     token_payloads = result.get("token_manifest")
     if not isinstance(token_payloads, list):
@@ -1844,13 +1893,13 @@ def _validate_extraction_result(
             source_path = source_unresolved.resolve()
             source_points = token.source_polygon.points if token.source_polygon else ()
             matrix = token.source_to_page_matrix or ()
-            transformed = tuple(
-                (
-                    matrix[0][0] * point.x + matrix[0][1] * point.y + matrix[0][2],
-                    matrix[1][0] * point.x + matrix[1][1] * point.y + matrix[1][2],
+            try:
+                transformed = apply_matrix(
+                    matrix,
+                    ((point.x, point.y) for point in source_points),
                 )
-                for point in source_points
-            )
+            except (TypeError, ValueError):
+                transformed = ()
             provenance_valid = bool(
                 not source_relative.is_absolute()
                 and artifact_root.resolve() in source_path.parents
@@ -1864,7 +1913,8 @@ def _validate_extraction_result(
                 )
                 and len(transformed) == len(points)
                 and all(
-                    abs(actual_x - expected.x) <= 1.0 and abs(actual_y - expected.y) <= 1.0
+                    abs(max(0.0, actual_x) - expected.x) <= 1.0
+                    and abs(max(0.0, actual_y) - expected.y) <= 1.0
                     for (actual_x, actual_y), expected in zip(transformed, points, strict=True)
                 )
             )

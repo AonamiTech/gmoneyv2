@@ -10,6 +10,7 @@ from gmoney.contracts.evidence import TransformChain
 from gmoney.evaluation.corpus import sha256_file
 from gmoney.geometry.transform import (
     Matrix,
+    apply_matrix,
     compose,
     identity,
     invert,
@@ -78,7 +79,14 @@ def normalize_page(
     if perspective_source is not None:
         if len(perspective_source) != 4:
             raise ValueError("perspective source must contain four ordered corners")
-        source_points = np.asarray(perspective_source, dtype=np.float32)
+        # The public contract expresses perspective corners in the original
+        # rendered-page coordinate space.  Orientation and fine rotation have
+        # already changed the active image, so project the corners through the
+        # accumulated transform before estimating the final homography.
+        source_points = np.asarray(
+            apply_matrix(forward, perspective_source),
+            dtype=np.float32,
+        )
         destination_points = np.asarray(
             (
                 (0, 0),

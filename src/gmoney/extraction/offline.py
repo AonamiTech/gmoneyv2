@@ -18,7 +18,17 @@ from uuid import uuid4
 import cv2
 import typer
 
-from gmoney.contracts.evidence import OcrToken, PageAsset, Point, Polygon
+from gmoney.contracts.evidence import (
+    OcrToken,
+    PageAsset,
+    PagePreprocessingRecord,
+    PageQuality,
+    Point,
+    Polygon,
+    PreprocessingCandidate,
+    PreprocessingVariant,
+    TransformChain,
+)
 from gmoney.contracts.extraction import (
     CanonicalRow,
     DerivedFieldProvenance,
@@ -104,7 +114,15 @@ from gmoney.geometry.crop import (
     crop_region,
     render_pdf_region,
 )
+from gmoney.geometry.preprocess import PreparedPageCandidate, prepare_page_candidates
 from gmoney.geometry.render import render_pdf
+from gmoney.geometry.transform import (
+    Matrix,
+    apply_matrix,
+)
+from gmoney.geometry.transform import (
+    identity as transform_identity,
+)
 from gmoney.inference.contracts import InferenceRequest, InferenceResponse
 from gmoney.inference.gemini import (
     AdjudicationAdapter,
@@ -115,6 +133,7 @@ from gmoney.inference.gemini import (
 from gmoney.inference.ocr_table_fallback import propose_tables_from_ocr
 from gmoney.inference.paddle import (
     PaddleDocLayoutV3Adapter,
+    PaddleDocOrientationAdapter,
     PaddleOcrV6Adapter,
     PaddleOcrVlAdapter,
 )
@@ -140,6 +159,20 @@ class TableWork:
     crop_path: Path
     crop_sha256: str
     box: tuple[int, int, int, int]
+
+
+@dataclass(frozen=True)
+class PageInferenceBundle:
+    candidate: PreparedPageCandidate
+    ocr_response: InferenceResponse
+    ocr_cache_hit: bool
+    layout_response: InferenceResponse
+    layout_cache_hit: bool
+    tokens: tuple[OcrToken, ...]
+    source_tokens: tuple[OcrToken, ...]
+    layout_boxes: tuple[tuple[int, int, int, int], ...]
+    geometry_boxes: tuple[tuple[int, int, int, int], ...]
+    reconstruction_score: tuple[int, ...]
 
 
 def _recovery_prior_schemas(
@@ -223,16 +256,227 @@ def _cached_prediction(
     return response, False
 
 
-def _layout_boxes(output: dict[str, Any]) -> list[tuple[int, int, int, int]]:
+def _mapped_box(
+    box: Collection[float],
+    transform: Matrix,
+) -> tuple[int, int, int, int]:
+    left, top, right, bottom = (float(value) for value in box)
+    points = apply_matrix(
+        transform,
+        ((left, top), (right, top), (right, bottom), (left, bottom)),
+    )
+    return (
+        round(min(point[0] for point in points)),
+        round(min(point[1] for point in points)),
+        round(max(point[0] for point in points)),
+        round(max(point[1] for point in points)),
+    )
+
+
+def _layout_boxes(
+    output: dict[str, Any],
+    to_page: Matrix | None = None,
+) -> list[tuple[int, int, int, int]]:
     pages = output.get("pages") or []
     if not pages:
         return []
     boxes = pages[0].get("res", {}).get("boxes") or []
+    transform = to_page or (
+        (1.0, 0.0, 0.0),
+        (0.0, 1.0, 0.0),
+        (0.0, 0.0, 1.0),
+    )
     return [
-        tuple(round(value) for value in box["coordinate"])
+        _mapped_box(box["coordinate"], transform)
         for box in boxes
         if box.get("label") == "table" and float(box.get("score") or 0) >= 0.3
     ]
+
+
+def _ocr_geometry_boxes(
+    output: dict[str, Any],
+    to_page: Matrix,
+) -> list[tuple[int, int, int, int]]:
+    result = (output.get("pages") or [{}])[0].get("res") or {}
+    proposals = propose_tables_from_ocr(
+        result.get("rec_boxes") or [],
+        result.get("rec_texts") or [],
+    )
+    return [_mapped_box(proposal.box, to_page) for proposal in proposals]
+
+
+def _orientation_correction(output: dict[str, Any]) -> tuple[int, float]:
+    result = (output.get("pages") or [{}])[0].get("res") or {}
+    labels = result.get("label_names") or []
+    scores = result.get("scores") or []
+    if not labels or not scores:
+        return 0, 0.0
+    try:
+        predicted = int(str(labels[0])) % 360
+        confidence = float(scores[0])
+    except (TypeError, ValueError):
+        return 0, 0.0
+    if predicted not in {0, 90, 180, 270}:
+        return 0, confidence
+    # Paddle applies positive OpenCV angles (counter-clockwise in image
+    # coordinates); right_angle_rotation uses the inverse image convention.
+    return (-predicted) % 360, confidence
+
+
+_FINANCIAL_TOKEN = re.compile(
+    r"(?:₹|\brs\.?\s*)?[-+]?\d[\d,]*(?:\.\d{1,2})?(?:\s*/-)?",
+    re.IGNORECASE,
+)
+
+
+def _candidate_metrics(bundle: PageInferenceBundle) -> tuple[int, float, int, int]:
+    token_count = len(bundle.tokens)
+    confidence = float(median(token.confidence for token in bundle.tokens)) if bundle.tokens else 0
+    financial_count = sum(
+        bool(_FINANCIAL_TOKEN.fullmatch(token.text.strip())) for token in bundle.tokens
+    )
+    table_count = len(_merge_table_boxes(list(bundle.layout_boxes), list(bundle.geometry_boxes)))
+    return token_count, confidence, financial_count, table_count
+
+
+def _select_page_inference(
+    bundles: tuple[PageInferenceBundle, ...],
+) -> tuple[PageInferenceBundle, tuple[PreprocessingCandidate, ...]]:
+    raw = bundles[0]
+    raw_tokens, raw_confidence, raw_financial, raw_tables = _candidate_metrics(raw)
+    raw_reconstruction = raw.reconstruction_score
+    safe: list[PageInferenceBundle] = []
+    for bundle in bundles[1:]:
+        tokens, confidence, financial, tables = _candidate_metrics(bundle)
+        retains_text = raw_tokens < 10 or tokens >= max(1, round(raw_tokens * 0.90))
+        retains_confidence = confidence >= raw_confidence - 0.03
+        retains_financial = financial >= raw_financial
+        retains_tables = tables >= raw_tables
+        retains_reconstruction = bundle.reconstruction_score >= raw_reconstruction
+        improves = bool(
+            bundle.reconstruction_score > raw_reconstruction
+            or tables > raw_tables
+            or financial > raw_financial
+            or (tokens >= raw_tokens + max(3, round(raw_tokens * 0.10)))
+            or confidence >= raw_confidence + 0.05
+        )
+        if (
+            retains_text
+            and retains_confidence
+            and retains_financial
+            and retains_tables
+            and retains_reconstruction
+            and improves
+        ):
+            safe.append(bundle)
+    selected = max(
+        safe,
+        key=lambda bundle: (
+            bundle.reconstruction_score,
+            _candidate_metrics(bundle)[3],
+            _candidate_metrics(bundle)[2],
+            _candidate_metrics(bundle)[0],
+            _candidate_metrics(bundle)[1],
+            -list(PreprocessingVariant).index(bundle.candidate.contract.variant),
+        ),
+        default=raw,
+    )
+    annotated: list[PreprocessingCandidate] = []
+    for bundle in bundles:
+        token_count, confidence, financial_count, table_count = _candidate_metrics(bundle)
+        is_selected = bundle is selected
+        annotated.append(
+            bundle.candidate.contract.model_copy(
+                update={
+                    "selected": is_selected,
+                    "selection_reason": (
+                        "selected_safe_structural_improvement"
+                        if is_selected and bundle is not raw
+                        else (
+                            "selected_raw_no_safe_improvement"
+                            if is_selected
+                            else "rejected_no_safe_structural_improvement"
+                        )
+                    ),
+                    "ocr_token_count": token_count,
+                    "ocr_median_confidence": confidence,
+                    "financial_token_count": financial_count,
+                    "table_proposal_count": table_count,
+                    "reconstruction_score": bundle.reconstruction_score,
+                    "ocr_latency_ms": bundle.ocr_response.latency_ms,
+                    "layout_latency_ms": bundle.layout_response.latency_ms,
+                }
+            )
+        )
+    return selected, tuple(annotated)
+
+
+def _raw_only_preprocessing_record(
+    page: PageAsset,
+    quality: PageQuality,
+    raw_relative_path: str,
+) -> PagePreprocessingRecord:
+    """Upgrade an untouched historical page without claiming new inference."""
+    matrix = transform_identity()
+    candidate = PreprocessingCandidate(
+        variant=PreprocessingVariant.RAW,
+        artifact_sha256=page.artifact_sha256,
+        artifact_relative_path=raw_relative_path,
+        width=page.width,
+        height=page.height,
+        dpi=page.dpi,
+        transform=TransformChain(
+            page_number=page.page_number,
+            source_width=page.width,
+            source_height=page.height,
+            derived_width=page.width,
+            derived_height=page.height,
+            forward_matrix=matrix,
+            inverse_matrix=matrix,
+        ),
+        quality=quality,
+        selected=True,
+        selection_reason="selected_raw_historical_compatibility",
+    )
+    return PagePreprocessingRecord(
+        page_number=page.page_number,
+        raw_artifact_sha256=page.artifact_sha256,
+        raw_artifact_relative_path=raw_relative_path,
+        raw_quality=quality,
+        candidates=(candidate,),
+        selected_variant=PreprocessingVariant.RAW,
+    )
+
+
+def _page_token_manifest_entry(
+    token: OcrToken,
+    *,
+    artifact_relative_path: str,
+    table_ids: tuple[str, ...] = (),
+    source: tuple[OcrToken, PreprocessingCandidate] | None = None,
+) -> TokenManifestEntry:
+    source_fields: dict[str, Any] = {}
+    if source is not None:
+        source_token, candidate = source
+        source_fields = {
+            "source_artifact_sha256": candidate.artifact_sha256,
+            "source_artifact_relative_path": candidate.artifact_relative_path,
+            "source_polygon": source_token.polygon,
+            "source_width": candidate.width,
+            "source_height": candidate.height,
+            "source_to_page_matrix": candidate.transform.inverse_matrix,
+        }
+    return TokenManifestEntry(
+        token_id=token.token_id,
+        page_number=token.page_number,
+        table_ids=table_ids,
+        text=token.text,
+        polygon=token.polygon,
+        artifact_sha256=token.artifact_sha256,
+        artifact_relative_path=artifact_relative_path,
+        confidence=token.confidence,
+        **source_fields,
+    )
 
 
 def _needs_full_page_financial_recovery(tokens: tuple[OcrToken, ...]) -> bool:
@@ -3747,6 +3991,7 @@ class PageExtractionUnit:
     diagnostics: tuple[dict[str, Any], ...]
     total_candidates: tuple[DocumentTotalCandidate, ...]
     provider_usage: dict[str, Any]
+    preprocessing: PagePreprocessingRecord | None = None
 
     @property
     def source_tables(self) -> tuple[SourceTable, ...]:
@@ -3779,6 +4024,9 @@ class PageExtractionUnit:
                 for item in self.total_candidates
             ],
             "provider_usage": self.provider_usage,
+            "preprocessing": (
+                self.preprocessing.model_dump(mode="json") if self.preprocessing else None
+            ),
         }
         return _stable_payload_digest(payload)
 
@@ -3809,6 +4057,9 @@ class PageExtractionUnit:
                 if item.total.evidence.table_id is None
             ],
             "provider_usage": self.provider_usage,
+            "preprocessing": (
+                self.preprocessing.model_dump(mode="json") if self.preprocessing else None
+            ),
         }
         return _stable_payload_digest(payload)
 
@@ -3861,6 +4112,27 @@ def _prefix_recovery_page_units(
                 token_manifest=token_manifest,
                 table_units=table_units,
                 diagnostics=tuple(diagnostic(item) for item in unit.diagnostics),
+                preprocessing=(
+                    unit.preprocessing.model_copy(
+                        update={
+                            "raw_artifact_relative_path": relative(
+                                unit.preprocessing.raw_artifact_relative_path
+                            ),
+                            "candidates": tuple(
+                                candidate.model_copy(
+                                    update={
+                                        "artifact_relative_path": relative(
+                                            candidate.artifact_relative_path
+                                        )
+                                    }
+                                )
+                                for candidate in unit.preprocessing.candidates
+                            ),
+                        }
+                    )
+                    if unit.preprocessing is not None
+                    else None
+                ),
             )
         )
     return tuple(output)
@@ -3891,6 +4163,8 @@ def _merge_targeted_page_units(
         total_candidates = list(unit.total_candidates)
         unassigned_rows = unit.unassigned_row_candidates
         provider_usage = unit.provider_usage
+        preprocessing = unit.preprocessing
+        ocr_tokens = unit.ocr_tokens
 
         for table_id in sorted(
             (value for value in targets if value is not None),
@@ -3936,6 +4210,8 @@ def _merge_targeted_page_units(
         if None in targets:
             unassigned_rows = candidate.unassigned_row_candidates
             provider_usage = candidate.provider_usage
+            preprocessing = candidate.preprocessing
+            ocr_tokens = candidate.ocr_tokens
             diagnostics = [item for item in diagnostics if item.get("table_id")] + [
                 deepcopy(item) for item in candidate.diagnostics if not item.get("table_id")
             ]
@@ -3962,6 +4238,8 @@ def _merge_targeted_page_units(
             diagnostics=tuple(diagnostics),
             total_candidates=tuple(total_candidates),
             provider_usage=provider_usage,
+            preprocessing=preprocessing,
+            ocr_tokens=ocr_tokens,
         )
 
     return tuple(merge_page(unit) for unit in baseline)
@@ -4055,9 +4333,13 @@ def _project_extraction_draft(draft: ExtractionDraft) -> dict[str, Any]:
     )
     token_manifest = tuple(token_lookup.values())
     diagnostics = [deepcopy(item) for unit in draft.page_units for item in unit.diagnostics]
+    projected_preprocessing = tuple(
+        unit.preprocessing for unit in draft.page_units if unit.preprocessing is not None
+    )
+    has_complete_preprocessing = len(projected_preprocessing) == len(draft.page_units)
     result: dict[str, Any] = {
         "output_version": "offline_accuracy_spine_v5",
-        "contract_revision": 3,
+        "contract_revision": 4 if has_complete_preprocessing else 3,
         "document_total_version": DOCUMENT_TOTAL_VERSION,
         "document_totals_version": DOCUMENT_TOTALS_VERSION,
         "document_total": (document_total.model_dump(mode="json") if document_total else None),
@@ -4073,6 +4355,9 @@ def _project_extraction_draft(draft: ExtractionDraft) -> dict[str, Any]:
         "source_name": draft.source_name,
         "pages": len(draft.page_units),
         "page_assets": [unit.page_asset.model_dump(mode="json") for unit in draft.page_units],
+        "page_preprocessing": [
+            record.model_dump(mode="json") for record in projected_preprocessing
+        ],
         "source_tables": [table.model_dump(mode="json") for table in source_tables],
         "token_manifest": [token.model_dump(mode="json") for token in token_manifest],
         "suppressed_repeated_source_tables": [
@@ -4668,6 +4953,7 @@ class OfflineExtractor:
             )
         self.ocr = PaddleOcrV6Adapter(device=paddle_device)
         self.layout = PaddleDocLayoutV3Adapter(device=paddle_device)
+        self.orientation = PaddleDocOrientationAdapter(device="cpu")
         self.vl = PaddleOcrVlAdapter(base_url=vl_url, device=vl_device)
         self.profile_registry_revision: int | None = None
         if profiles is not None:
@@ -5414,6 +5700,10 @@ class OfflineExtractor:
             for unit in (baseline_draft.page_units if baseline_draft else ())
             for token in unit.token_manifest
         )
+        baseline_units_by_page = {
+            unit.page_asset.page_number: unit
+            for unit in (baseline_draft.page_units if baseline_draft else ())
+        }
         targeted_pages = {page_number for page_number, _table_id in recovery_target_set}
         if baseline_draft is not None:
             for unit in baseline_draft.page_units:
@@ -5446,16 +5736,32 @@ class OfflineExtractor:
         gemini_cost = Decimal("0")
         gemini_provider_disabled_reason: str | None = None
         page_tokens: dict[int, tuple[OcrToken, ...]] = {}
+        page_token_sources: dict[str, tuple[OcrToken, PreprocessingCandidate]] = {}
+        page_preprocessing: dict[int, PagePreprocessingRecord] = {}
+        quality_by_page = {quality.page_number: quality for quality in manifest.quality}
         recovery_token_manifest: dict[str, TokenManifestEntry] = {}
         precanonical_fragment_manifest: dict[str, TokenManifestEntry] = {}
         for page_asset in manifest.pages:
             abort_checkpoint()
+            page_path = artifact_root / "pages" / page_asset.relative_path
+            raw_relative_path = str(Path("pages") / page_asset.relative_path)
             page_targets = {
                 table_id
                 for page_number, table_id in recovery_target_set
                 if page_number == page_asset.page_number
             }
             if baseline_draft is not None and not page_targets:
+                baseline_preprocessing = baseline_units_by_page[
+                    page_asset.page_number
+                ].preprocessing
+                page_preprocessing[page_asset.page_number] = (
+                    baseline_preprocessing
+                    or _raw_only_preprocessing_record(
+                        page_asset,
+                        quality_by_page[page_asset.page_number],
+                        raw_relative_path,
+                    )
+                )
                 all_rows.extend(
                     row for row in baseline_rows if row.page_number == page_asset.page_number
                 )
@@ -5491,24 +5797,166 @@ class OfflineExtractor:
                     if diagnostic.get("page_number") == page_asset.page_number
                     and diagnostic.get("table_id") not in page_targets
                 )
-            page_path = artifact_root / "pages" / page_asset.relative_path
-            ocr_request = InferenceRequest(
+            orientation_request = InferenceRequest(
                 request_id=str(uuid4()),
                 artifact_sha256=page_asset.artifact_sha256,
                 image_path=str(page_path.resolve()),
                 page_number=page_asset.page_number,
             )
-            ocr_response, ocr_cache_hit = _cached_prediction(
-                artifact_root / "inference" / f"page-{page_asset.page_number}.ocr.json",
-                ocr_request,
-                self.ocr,
+            orientation_response, orientation_cache_hit = _cached_prediction(
+                artifact_root / "inference" / f"page-{page_asset.page_number}.orientation.json",
+                orientation_request,
+                self.orientation,
             )
-            abort_checkpoint()
-            tokens = paddle_ocr_tokens(
-                ocr_response.output,
-                page_asset.page_number,
-                page_asset.artifact_sha256,
+            orientation_degrees, orientation_confidence = _orientation_correction(
+                orientation_response.output
             )
+            prepared_candidates = prepare_page_candidates(
+                source_pdf=source,
+                raw_path=page_path,
+                raw_relative_path=raw_relative_path,
+                page=page_asset,
+                quality=quality_by_page[page_asset.page_number],
+                artifact_root=artifact_root,
+                orientation_degrees=orientation_degrees,
+                orientation_confidence=orientation_confidence,
+            )
+            bundles: list[PageInferenceBundle] = []
+            for prepared in prepared_candidates:
+                variant_suffix = (
+                    ""
+                    if prepared.contract.variant is PreprocessingVariant.RAW
+                    else f".{prepared.contract.variant.value}"
+                )
+                ocr_request = InferenceRequest(
+                    request_id=str(uuid4()),
+                    artifact_sha256=prepared.contract.artifact_sha256,
+                    image_path=str(prepared.path.resolve()),
+                    page_number=page_asset.page_number,
+                    options={"preprocessing_policy": "camera_preprocessing_v1"},
+                )
+                ocr_response, ocr_cache_hit = _cached_prediction(
+                    artifact_root
+                    / "inference"
+                    / f"page-{page_asset.page_number}{variant_suffix}.ocr.json",
+                    ocr_request,
+                    self.ocr,
+                )
+                abort_checkpoint()
+                source_tokens = paddle_ocr_tokens(
+                    ocr_response.output,
+                    page_asset.page_number,
+                    prepared.contract.artifact_sha256,
+                )
+                tokens = paddle_ocr_tokens(
+                    ocr_response.output,
+                    page_asset.page_number,
+                    page_asset.artifact_sha256,
+                    crop_to_page=prepared.contract.transform.inverse_matrix,
+                )
+                if prepared.contract.variant is not PreprocessingVariant.RAW:
+                    in_bounds_pairs = tuple(
+                        (token, source_token)
+                        for token, source_token in zip(tokens, source_tokens, strict=True)
+                        if all(
+                            point.x <= page_asset.width and point.y <= page_asset.height
+                            for point in token.polygon.points
+                        )
+                    )
+                    tokens = tuple(token for token, _source_token in in_bounds_pairs)
+                    source_tokens = tuple(source_token for _token, source_token in in_bounds_pairs)
+                layout_request = InferenceRequest(
+                    request_id=str(uuid4()),
+                    artifact_sha256=prepared.contract.artifact_sha256,
+                    image_path=str(prepared.path.resolve()),
+                    page_number=page_asset.page_number,
+                    options={"preprocessing_policy": "camera_preprocessing_v1"},
+                )
+                layout_response, layout_cache_hit = _cached_prediction(
+                    artifact_root
+                    / "inference"
+                    / f"page-{page_asset.page_number}{variant_suffix}.layout.json",
+                    layout_request,
+                    self.layout,
+                )
+                abort_checkpoint()
+                to_page = prepared.contract.transform.inverse_matrix
+                mapped_layout_boxes = tuple(
+                    box
+                    for box in _layout_boxes(layout_response.output, to_page=to_page)
+                    if box[2] > 0
+                    and box[3] > 0
+                    and box[0] < page_asset.width
+                    and box[1] < page_asset.height
+                )
+                mapped_geometry_boxes = tuple(
+                    box
+                    for box in _ocr_geometry_boxes(ocr_response.output, to_page)
+                    if box[2] > 0
+                    and box[3] > 0
+                    and box[0] < page_asset.width
+                    and box[1] < page_asset.height
+                )
+                bundles.append(
+                    PageInferenceBundle(
+                        candidate=prepared,
+                        ocr_response=ocr_response,
+                        ocr_cache_hit=ocr_cache_hit,
+                        layout_response=layout_response,
+                        layout_cache_hit=layout_cache_hit,
+                        tokens=tokens,
+                        source_tokens=source_tokens,
+                        layout_boxes=mapped_layout_boxes,
+                        geometry_boxes=mapped_geometry_boxes,
+                        reconstruction_score=reconstruction_quality(
+                            reconstruct_ocr_rows(
+                                tokens,
+                                page_number=page_asset.page_number,
+                                table_id=(f"p{page_asset.page_number}-preprocessing-probe"),
+                                box=(0, 0, page_asset.width, page_asset.height),
+                                prior_schemas=tuple(schema_states),
+                            )
+                        ),
+                    )
+                )
+            selected_bundle, annotated_candidates = _select_page_inference(tuple(bundles))
+            selected_candidate = next(
+                candidate for candidate in annotated_candidates if candidate.selected
+            )
+            page_preprocessing[page_asset.page_number] = PagePreprocessingRecord(
+                page_number=page_asset.page_number,
+                raw_artifact_sha256=page_asset.artifact_sha256,
+                raw_artifact_relative_path=raw_relative_path,
+                raw_quality=quality_by_page[page_asset.page_number],
+                orientation_degrees=orientation_degrees,
+                orientation_confidence=orientation_confidence,
+                candidates=annotated_candidates,
+                selected_variant=selected_candidate.variant,
+            )
+            preprocessing_diagnostic = {
+                "preprocessing_policy": "camera_preprocessing_v1",
+                "preprocessing_selected_variant": selected_candidate.variant.value,
+                "preprocessing_candidate_count": len(annotated_candidates),
+                "preprocessing_artifact_sha256": selected_candidate.artifact_sha256,
+                "preprocessing_artifact_relative_path": (selected_candidate.artifact_relative_path),
+                "preprocessing_operations": selected_candidate.transform.operations,
+                "preprocessing_quality_before": quality_by_page[page_asset.page_number].model_dump(
+                    mode="json"
+                ),
+                "preprocessing_quality_after": selected_candidate.quality.model_dump(mode="json"),
+                "orientation_degrees": orientation_degrees,
+                "orientation_confidence": orientation_confidence,
+                "orientation_latency_ms": orientation_response.latency_ms,
+                "orientation_cache_hit": orientation_cache_hit,
+            }
+            tokens = selected_bundle.tokens
+            if selected_candidate.variant is not PreprocessingVariant.RAW:
+                for token, source_token in zip(
+                    selected_bundle.tokens,
+                    selected_bundle.source_tokens,
+                    strict=True,
+                ):
+                    page_token_sources[token.token_id] = (source_token, selected_candidate)
             page_tokens[page_asset.page_number] = tokens
             document_total_candidates.extend(extract_document_total_candidates(tokens))
             if page_asset.page_number == 1:
@@ -5544,27 +5992,12 @@ class OfflineExtractor:
                             if alias["canonical_field"] in CANONICAL_TO_HEADER_ROLE
                         },
                     )
-            layout_request = InferenceRequest(
-                request_id=str(uuid4()),
-                artifact_sha256=page_asset.artifact_sha256,
-                image_path=str(page_path.resolve()),
-                page_number=page_asset.page_number,
-            )
-            layout_response, layout_cache_hit = _cached_prediction(
-                artifact_root / "inference" / f"page-{page_asset.page_number}.layout.json",
-                layout_request,
-                self.layout,
-            )
-            abort_checkpoint()
-            layout_boxes = _layout_boxes(layout_response.output)
-            result = (ocr_response.output.get("pages") or [{}])[0].get("res") or {}
-            proposals = propose_tables_from_ocr(
-                result.get("rec_boxes") or [],
-                result.get("rec_texts") or [],
-            )
-            geometry_boxes = [
-                tuple(round(value) for value in proposal.box) for proposal in proposals
-            ]
+            ocr_response = selected_bundle.ocr_response
+            ocr_cache_hit = selected_bundle.ocr_cache_hit
+            layout_response = selected_bundle.layout_response
+            layout_cache_hit = selected_bundle.layout_cache_hit
+            layout_boxes = list(selected_bundle.layout_boxes)
+            geometry_boxes = list(selected_bundle.geometry_boxes)
             boxes = _merge_table_boxes(layout_boxes, geometry_boxes)
             route = (
                 "layout+ocr_geometry"
@@ -5688,6 +6121,7 @@ class OfflineExtractor:
                             "table_count": 0,
                             "status": "no_table_detected",
                             "financial_form_suspected": False,
+                            **preprocessing_diagnostic,
                             **(no_table_assessment or {}),
                         }
                     )
@@ -6336,6 +6770,7 @@ class OfflineExtractor:
                         "candidate_count": candidate_count,
                         "canonical_count": len(parsed_rows),
                         "status": recovery_selection_status or "extracted",
+                        **preprocessing_diagnostic,
                         "phase3_route": route_decision.model_dump(mode="json"),
                         "profile_match": (
                             profile_match.model_dump(mode="json") if profile_match else None
@@ -6385,14 +6820,10 @@ class OfflineExtractor:
         token_lookup = {item.token_id: item for item in baseline_token_manifest}
         token_lookup.update(
             {
-                token.token_id: TokenManifestEntry(
-                    token_id=token.token_id,
-                    page_number=token.page_number,
-                    text=token.text,
-                    polygon=token.polygon,
-                    artifact_sha256=token.artifact_sha256,
+                token.token_id: _page_token_manifest_entry(
+                    token,
                     artifact_relative_path=relative_by_page[token.page_number],
-                    confidence=token.confidence,
+                    source=page_token_sources.get(token.token_id),
                 )
                 for tokens in page_tokens.values()
                 for token in tokens
@@ -6480,15 +6911,11 @@ class OfflineExtractor:
         token_manifest_by_id = {item.token_id: item for item in baseline_token_manifest}
         token_manifest_by_id.update(
             {
-                token.token_id: TokenManifestEntry(
-                    token_id=token.token_id,
-                    page_number=token.page_number,
+                token.token_id: _page_token_manifest_entry(
+                    token,
                     table_ids=tuple(sorted(table_ids_by_token.get(token.token_id, ()))),
-                    text=token.text,
-                    polygon=token.polygon,
-                    artifact_sha256=token.artifact_sha256,
                     artifact_relative_path=relative_by_page[token.page_number],
-                    confidence=token.confidence,
+                    source=page_token_sources.get(token.token_id),
                 )
                 for page_number in sorted(page_tokens)
                 for token in page_tokens[page_number]
@@ -6577,9 +7004,20 @@ class OfflineExtractor:
             source_tables,
             diagnostics,
         )
+        published_preprocessing = tuple(
+            page_preprocessing.get(page.page_number)
+            or (
+                baseline_units_by_page[page.page_number].preprocessing
+                if page.page_number in baseline_units_by_page
+                else None
+            )
+            for page in manifest.pages
+        )
+        if any(record is None for record in published_preprocessing):
+            raise RuntimeError("page_preprocessing_record_missing")
         result = {
             "output_version": "offline_accuracy_spine_v5",
-            "contract_revision": 2,
+            "contract_revision": 4,
             "document_total_version": DOCUMENT_TOTAL_VERSION,
             "document_totals_version": DOCUMENT_TOTALS_VERSION,
             "document_total": (
@@ -6618,6 +7056,11 @@ class OfflineExtractor:
                 }
                 for page in manifest.pages
             ],
+            "page_preprocessing": [
+                record.model_dump(mode="json")
+                for record in published_preprocessing
+                if record is not None
+            ],
             "source_tables": [table.model_dump(mode="json") for table in source_tables],
             "token_manifest": [item.model_dump(mode="json") for item in token_manifest],
             "suppressed_repeated_source_tables": [
@@ -6634,10 +7077,7 @@ class OfflineExtractor:
             "recovery": recovery_metadata,
         }
         if _draft_sink is not None:
-            baseline_units = {
-                unit.page_asset.page_number: unit
-                for unit in (baseline_draft.page_units if baseline_draft else ())
-            }
+            baseline_units = baseline_units_by_page
             page_units: list[PageExtractionUnit] = []
             for page in manifest.pages:
                 published_asset = page.model_copy(
@@ -6723,6 +7163,14 @@ class OfflineExtractor:
                         diagnostics=page_diagnostics,
                         total_candidates=page_totals,
                         provider_usage=provider_usage,
+                        preprocessing=(
+                            page_preprocessing.get(page.page_number)
+                            or (
+                                baseline_units[page.page_number].preprocessing
+                                if page.page_number in baseline_units
+                                else None
+                            )
+                        ),
                     )
                 )
             _draft_sink["page_units"] = tuple(page_units)

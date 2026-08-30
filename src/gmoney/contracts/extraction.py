@@ -5,7 +5,7 @@ from typing import Any, Literal
 from pydantic import ConfigDict, Field, field_validator, model_validator
 
 from gmoney.contracts.common import ContractModel, VersionedContract
-from gmoney.contracts.evidence import PageAsset, Polygon
+from gmoney.contracts.evidence import PageAsset, PagePreprocessingRecord, Polygon
 
 
 class RowRole(StrEnum):
@@ -103,11 +103,10 @@ class TokenManifestEntry(ContractModel):
     character_end: int | None = Field(default=None, ge=0)
     fragment_role: str | None = None
     # Evidence polygons are always expressed in rendered-page coordinates.  For
-    # recovery OCR, retain the artifact and transform that produced those page
-    # coordinates instead of pretending that the page image was OCR'd.
-    source_artifact_sha256: str | None = Field(
-        default=None, pattern=r"^[a-f0-9]{64}$"
-    )
+    # normalized or recovery OCR, retain the derivative artifact and transform
+    # that produced those page coordinates instead of pretending that the raw
+    # page image was OCR'd.
+    source_artifact_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
     source_artifact_relative_path: str | None = None
     source_polygon: Polygon | None = None
     source_width: int | None = Field(default=None, gt=0)
@@ -203,22 +202,16 @@ class RecoveryTargetRecord(ContractModel):
         "recovery_no_safe_improvement",
     ]
     baseline_unit_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
-    candidate_unit_sha256: str | None = Field(
-        default=None, pattern=r"^[a-f0-9]{64}$"
-    )
+    candidate_unit_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
     selected_unit_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     removed_issue_ids: tuple[str, ...] = ()
     remaining_issue_ids: tuple[str, ...] = ()
     new_issue_ids: tuple[str, ...] = ()
-    baseline_financial_inventory_sha256: str | None = Field(
-        default=None, pattern=r"^[a-f0-9]{64}$"
-    )
+    baseline_financial_inventory_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
     candidate_financial_inventory_sha256: str | None = Field(
         default=None, pattern=r"^[a-f0-9]{64}$"
     )
-    selected_financial_inventory_sha256: str | None = Field(
-        default=None, pattern=r"^[a-f0-9]{64}$"
-    )
+    selected_financial_inventory_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
     baseline_financial_row_count: int | None = Field(default=None, ge=0)
     candidate_financial_row_count: int | None = Field(default=None, ge=0)
     preserved_financial_row_count: int | None = Field(default=None, ge=0)
@@ -228,9 +221,7 @@ class RecoveryTargetRecord(ContractModel):
 class RecoveryMetadata(ContractModel):
     attempted: bool
     targets: tuple[RecoveryTargetRecord, ...]
-    untargeted_units_sha256: str | None = Field(
-        default=None, pattern=r"^[a-f0-9]{64}$"
-    )
+    untargeted_units_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
 
     @model_validator(mode="after")
     def require_attempt_metadata(self) -> "RecoveryMetadata":
@@ -270,9 +261,7 @@ class ExtractionDiagnostic(ContractModel):
             self.table_id is not None or self.source_table_id is not None
         ):
             raise ValueError("page diagnostics cannot identify a table")
-        if self.diagnostic_kind == "table" and (
-            not self.table_id or not self.source_table_id
-        ):
+        if self.diagnostic_kind == "table" and (not self.table_id or not self.source_table_id):
             raise ValueError("table diagnostics require logical and source table IDs")
         if (self.crop_relative_path is None) != (self.crop_sha256 is None):
             raise ValueError("diagnostic crop path and hash must be paired")
@@ -306,8 +295,10 @@ class SourceCell(ContractModel):
 
     @model_validator(mode="after")
     def require_grounded_value(self) -> "SourceCell":
-        if self.raw_value and self.raw_value.strip() and not any(
-            item.token_ids for item in self.evidence
+        if (
+            self.raw_value
+            and self.raw_value.strip()
+            and not any(item.token_ids for item in self.evidence)
         ):
             raise ValueError("non-empty source cell requires grounded OCR evidence")
         return self
@@ -465,7 +456,7 @@ class ExtractionResultV5(ContractModel):
     """Complete extractor/publication envelope accepted by the safety gate."""
 
     output_version: Literal["offline_accuracy_spine_v5"]
-    contract_revision: Literal[2, 3]
+    contract_revision: Literal[2, 3, 4]
     document_total_version: str
     document_totals_version: str
     document_total: DocumentTotal | None
@@ -481,6 +472,7 @@ class ExtractionResultV5(ContractModel):
     source_name: str
     pages: int = Field(ge=1)
     page_assets: tuple[PageAsset, ...]
+    page_preprocessing: tuple[PagePreprocessingRecord, ...] = ()
     source_tables: tuple[SourceTable, ...]
     token_manifest: tuple[TokenManifestEntry, ...]
     suppressed_repeated_source_tables: tuple[SuppressedSourceTable, ...] = ()
@@ -492,3 +484,32 @@ class ExtractionResultV5(ContractModel):
     worker_release_revision: str | None = None
     semantic_validation: dict[str, Any] | None = None
     validation_recovery_attempted: bool | None = None
+
+    @model_validator(mode="after")
+    def require_revision_four_preprocessing(self) -> "ExtractionResultV5":
+        if self.contract_revision == 4:
+            expected = tuple(asset.page_number for asset in self.page_assets)
+            observed = tuple(record.page_number for record in self.page_preprocessing)
+            if observed != expected:
+                raise ValueError(
+                    "revision 4 preprocessing records must match page assets in page order"
+                )
+            for asset, record in zip(
+                self.page_assets,
+                self.page_preprocessing,
+                strict=True,
+            ):
+                if (
+                    record.raw_artifact_sha256 != asset.artifact_sha256
+                    or record.raw_artifact_relative_path != asset.relative_path
+                    or (
+                        record.raw_quality.width,
+                        record.raw_quality.height,
+                        record.raw_quality.dpi,
+                    )
+                    != (asset.width, asset.height, asset.dpi)
+                ):
+                    raise ValueError("preprocessing raw artifact does not match page asset")
+        elif self.page_preprocessing:
+            raise ValueError("preprocessing records require contract revision 4")
+        return self

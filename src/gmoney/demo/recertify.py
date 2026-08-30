@@ -72,7 +72,7 @@ def plan_recertification(
                 ):
                     entry["eligibility"] = "reprocess_required"
                     entry["reason"] = "revision_2_recovery_audit_incomplete"
-                elif result.get("contract_revision") not in {2, 3}:
+                elif result.get("contract_revision") not in {2, 3, 4}:
                     entry["reason"] = "unsupported_contract_revision"
                 else:
                     candidate = json.loads(json.dumps(result))

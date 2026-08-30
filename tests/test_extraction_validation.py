@@ -584,6 +584,61 @@ def test_recovery_token_retains_crop_identity_and_page_transform(
     assert "recovery_token_provenance_invalid" in {issue.code for issue in failed.issues}
 
 
+def test_revision_four_preprocessing_raw_page_must_match_page_asset(
+    tmp_path: Path,
+) -> None:
+    _source, _artifact_root, result = _fixture(tmp_path)
+    asset = result["page_assets"][0]
+    page_sha = asset["artifact_sha256"]
+    quality = {
+        "page_number": 1,
+        "artifact_sha256": page_sha,
+        "width": 100,
+        "height": 200,
+        "dpi": 300,
+        "mean_luminance": 200,
+        "contrast_stddev": 40,
+        "laplacian_variance": 100,
+        "edge_density": 0.05,
+        "estimated_skew_degrees": 0,
+    }
+    transform = {
+        "page_number": 1,
+        "source_width": 100,
+        "source_height": 200,
+        "derived_width": 100,
+        "derived_height": 200,
+        "forward_matrix": ((1, 0, 0), (0, 1, 0), (0, 0, 1)),
+        "inverse_matrix": ((1, 0, 0), (0, 1, 0), (0, 0, 1)),
+    }
+    result["contract_revision"] = 4
+    result["page_preprocessing"] = [
+        {
+            "page_number": 1,
+            "raw_artifact_sha256": page_sha,
+            "raw_artifact_relative_path": "pages/not-the-page-asset.png",
+            "raw_quality": quality,
+            "candidates": [
+                {
+                    "variant": "raw",
+                    "artifact_sha256": page_sha,
+                    "artifact_relative_path": "pages/not-the-page-asset.png",
+                    "width": 100,
+                    "height": 200,
+                    "dpi": 300,
+                    "transform": transform,
+                    "quality": quality,
+                    "selected": True,
+                }
+            ],
+            "selected_variant": "raw",
+        }
+    ]
+
+    with pytest.raises(ValueError, match="does not match page asset"):
+        ExtractionResultV5.model_validate(result)
+
+
 def _draft_from_result(result: dict[str, object]) -> ExtractionDraft:
     envelope = ExtractionResultV5.model_validate(result)
     table_units = tuple(
