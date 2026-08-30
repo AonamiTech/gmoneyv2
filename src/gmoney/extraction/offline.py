@@ -3271,9 +3271,9 @@ def _materialize_printed_cell_fragments(
                 selected_spans: tuple[tuple[int, int], ...] | None = None
                 selected_parents: tuple[TokenManifestEntry, ...] = ()
                 fragment_polygon: Polygon | None = None
-                if parents and normalized(" ".join(item.text for item in parents)) == normalized(
-                    raw
-                ):
+                if len(parents) > 1 and normalized(
+                    " ".join(item.text for item in parents)
+                ) == normalized(raw):
                     selected_parents = parents
                     selected_spans = tuple((0, len(item.text)) for item in parents)
                     all_bounds = tuple(bounds(item.polygon) for item in parents)
@@ -3287,7 +3287,7 @@ def _materialize_printed_cell_fragments(
                     token = parents[0]
                     occurrences = tuple(
                         match.span()
-                        for match in re.finditer(re.escape(raw), token.text, re.IGNORECASE)
+                        for match in re.finditer(re.escape(raw), token.text)
                         if not any(
                             match.start() < used_end and match.end() > used_start
                             for used_start, used_end in occupied.get(token.token_id, ())

@@ -9,10 +9,13 @@ import pytest
 
 from gmoney.contracts.evidence import OcrToken, Point, Polygon
 from gmoney.contracts.extraction import (
+    EvidenceRef,
     ReceiptSourceMetadata,
     RowRole,
     SourceCell,
     SourceColumn,
+    SourceRow,
+    SourceTable,
     TableType,
     TokenManifestEntry,
 )
@@ -1693,6 +1696,64 @@ def test_merged_date_and_description_in_date_lane_is_grounded_and_split() -> Non
     assert canonical[0].field_evidence["description"][0].token_ids == (description_fragment_id,)
 
 
+def test_single_parent_fragment_uses_exact_span_when_parent_has_trailing_space() -> None:
+    parent_token = token(0, "Unmapped printed value ", (10, 10, 210, 30))
+    parent = TokenManifestEntry(
+        token_id=parent_token.token_id,
+        page_number=1,
+        text=parent_token.text,
+        polygon=parent_token.polygon,
+        artifact_sha256=parent_token.artifact_sha256,
+        artifact_relative_path="pages/page-1.png",
+        confidence=parent_token.confidence,
+    )
+    evidence = EvidenceRef(
+        page_number=1,
+        table_id="p1-t1",
+        polygon=parent.polygon,
+        artifact_sha256=parent.artifact_sha256,
+        token_ids=(parent.token_id,),
+    )
+    table = SourceTable(
+        id="p1-t1-s1",
+        page_number=1,
+        table_id="p1-t1",
+        columns=(
+            SourceColumn(
+                id="c5",
+                label="Other",
+                order=0,
+                evidence=(evidence,),
+            ),
+        ),
+        rows=(
+            SourceRow(
+                id="p1-t1-s1-r1",
+                order=0,
+                cells=(
+                    SourceCell(
+                        column_id="c5",
+                        raw_value="Unmapped printed value",
+                        evidence=(evidence,),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    materialized, fragments, _assignments = _materialize_printed_cell_fragments(
+        (table,),
+        {parent.token_id: parent},
+    )
+
+    assert len(fragments) == 1
+    fragment = fragments[0]
+    assert fragment.character_start == 0
+    assert fragment.character_end == len("Unmapped printed value")
+    assert parent.text[fragment.character_start : fragment.character_end] == fragment.text
+    assert "fragment_occurrence_ambiguous" not in materialized[0].rows[0].cells[0].validation_flags
+
+
 def test_slanted_rows_do_not_shift_total_amount_into_prior_charge() -> None:
     tokens = (
         token(0, "Service Name", (100, 10, 300, 30)),
@@ -2667,9 +2728,7 @@ def test_issuerless_cash_settlement_receipt_remains_unresolved() -> None:
     )
 
     assert result.rows[0].candidate.role is RowRole.UNRESOLVED
-    assert result.diagnostics["financial_form_classification"] == (
-        "ambiguous_receipt"
-    )
+    assert result.diagnostics["financial_form_classification"] == ("ambiguous_receipt")
 
 
 def test_merged_date_description_is_recovered_even_when_ocr_box_stays_in_date_lane() -> None:
@@ -3481,9 +3540,7 @@ def test_demographic_fragments_and_payments_are_not_detail_rows() -> None:
     assert payment_result.schema is not None
     assert payment_result.schema.table_type is TableType.PAYMENT
     assert {row.candidate.role for row in payment_result.rows} == {RowRole.UNRESOLVED}
-    assert payment_result.diagnostics["financial_form_classification"] == (
-        "ambiguous_receipt"
-    )
+    assert payment_result.diagnostics["financial_form_classification"] == ("ambiguous_receipt")
 
 
 def test_document_totals_and_advance_are_not_detail_rows() -> None:
