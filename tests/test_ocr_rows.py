@@ -1754,6 +1754,78 @@ def test_single_parent_fragment_uses_exact_span_when_parent_has_trailing_space()
     assert "fragment_occurrence_ambiguous" not in materialized[0].rows[0].cells[0].validation_flags
 
 
+def test_reused_fragment_adds_the_current_table_owner() -> None:
+    parent_token = token(0, "Debit", (10, 10, 80, 30))
+    parent = TokenManifestEntry(
+        token_id=parent_token.token_id,
+        page_number=1,
+        table_ids=("p1-t2",),
+        text=parent_token.text,
+        polygon=parent_token.polygon,
+        artifact_sha256=parent_token.artifact_sha256,
+        artifact_relative_path="pages/page-1.png",
+        confidence=parent_token.confidence,
+    )
+    fragment = TokenManifestEntry(
+        token_id="fragment-existing",
+        page_number=1,
+        table_ids=("p1-t2",),
+        text="Debit",
+        polygon=parent.polygon,
+        artifact_sha256=parent.artifact_sha256,
+        artifact_relative_path=parent.artifact_relative_path,
+        confidence=parent.confidence,
+        parent_token_id=parent.token_id,
+        character_start=0,
+        character_end=5,
+        fragment_role="description",
+    )
+    evidence = EvidenceRef(
+        page_number=1,
+        table_id="p1-t1",
+        polygon=fragment.polygon,
+        artifact_sha256=fragment.artifact_sha256,
+        token_ids=(fragment.token_id,),
+    )
+    table = SourceTable(
+        id="p1-t1-s1",
+        page_number=1,
+        table_id="p1-t1",
+        columns=(
+            SourceColumn(
+                id="description",
+                label="Description",
+                order=0,
+                canonical_field="description",
+                validation_flags=("synthetic_header",),
+            ),
+        ),
+        rows=(
+            SourceRow(
+                id="p1-t1-s1-r1",
+                order=0,
+                cells=(
+                    SourceCell(
+                        column_id="description",
+                        raw_value="Debit",
+                        evidence=(evidence,),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    materialized, updated_fragments, _assignments = _materialize_printed_cell_fragments(
+        (table,),
+        {parent.token_id: parent, fragment.token_id: fragment},
+    )
+
+    assert materialized[0].rows[0].cells[0].evidence == (evidence,)
+    assert len(updated_fragments) == 1
+    assert updated_fragments[0].token_id == fragment.token_id
+    assert updated_fragments[0].table_ids == ("p1-t1", "p1-t2")
+
+
 def test_slanted_rows_do_not_shift_total_amount_into_prior_charge() -> None:
     tokens = (
         token(0, "Service Name", (100, 10, 300, 30)),

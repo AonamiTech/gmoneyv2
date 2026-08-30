@@ -3248,6 +3248,25 @@ def _materialize_printed_cell_fragments(
                     and existing_fragment.fragment_role == aligned_role
                     and normalized(existing_fragment.text) == normalized(raw)
                 ):
+                    registered_fragment = fragments.get(
+                        existing_fragment.token_id,
+                        existing_fragment,
+                    )
+                    if table.table_id not in registered_fragment.table_ids:
+                        fragments[existing_fragment.token_id] = (
+                            registered_fragment.model_copy(
+                                update={
+                                    "table_ids": tuple(
+                                        sorted(
+                                            {
+                                                *registered_fragment.table_ids,
+                                                table.table_id,
+                                            }
+                                        )
+                                    )
+                                }
+                            )
+                        )
                     for parent_id in tuple(existing_fragment.parent_token_ids) or (
                         (existing_fragment.parent_token_id,)
                         if existing_fragment.parent_token_id
