@@ -1610,6 +1610,16 @@ def _validate_extraction_result(
     artifact_root: Path,
 ) -> ValidationReport:
     issues: list[ValidationIssue] = []
+    file_hashes: dict[Path, str] = {}
+
+    def cached_sha256_file(path: Path) -> str:
+        resolved = path.resolve()
+        digest = file_hashes.get(resolved)
+        if digest is None:
+            digest = sha256_file(resolved)
+            file_hashes[resolved] = digest
+        return digest
+
     if not isinstance(result, dict):
         return _report(
             [
@@ -1663,7 +1673,7 @@ def _validate_extraction_result(
             )
         )
     try:
-        source_sha256 = sha256_file(source)
+        source_sha256 = cached_sha256_file(source)
         with fitz.open(source) as document:
             source_pages = document.page_count
     except (OSError, RuntimeError, ValueError, fitz.FileDataError) as error:
@@ -1755,7 +1765,7 @@ def _validate_extraction_result(
                         field="page_assets",
                     )
                 )
-            elif sha256_file(path) != asset.get("artifact_sha256"):
+            elif cached_sha256_file(path) != asset.get("artifact_sha256"):
                 issues.append(
                     _issue(
                         "page_artifact_hash_mismatch",
@@ -1801,7 +1811,7 @@ def _validate_extraction_result(
                 or artifact_root.resolve() not in path.parents
                 or not unresolved.is_file()
                 or _path_uses_symlink(unresolved, artifact_root)
-                or sha256_file(path) != candidate.get("artifact_sha256")
+                or cached_sha256_file(path) != candidate.get("artifact_sha256")
                 or not transform_valid
             ):
                 issues.append(
@@ -1873,7 +1883,7 @@ def _validate_extraction_result(
             or artifact_root.resolve() not in path.parents
             or not unresolved.is_file()
             or _path_uses_symlink(unresolved, artifact_root)
-            or sha256_file(path) != token.artifact_sha256
+            or cached_sha256_file(path) != token.artifact_sha256
             or polygon_area <= 0
             or any(point.x > width or point.y > height for point in points)
         ):
@@ -1905,7 +1915,7 @@ def _validate_extraction_result(
                 and artifact_root.resolve() in source_path.parents
                 and source_unresolved.is_file()
                 and not _path_uses_symlink(source_unresolved, artifact_root)
-                and sha256_file(source_path) == token.source_artifact_sha256
+                and cached_sha256_file(source_path) == token.source_artifact_sha256
                 and source_points
                 and all(
                     point.x <= (token.source_width or 0) and point.y <= (token.source_height or 0)
@@ -2478,7 +2488,7 @@ def _validate_extraction_result(
                 and artifact_root.resolve() in resolved.parents
                 and unresolved.is_file()
                 and not _path_uses_symlink(unresolved, artifact_root)
-                and sha256_file(resolved) == crop_sha256
+                and cached_sha256_file(resolved) == crop_sha256
             )
             if not valid_crop:
                 issues.append(

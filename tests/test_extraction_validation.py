@@ -259,6 +259,30 @@ def test_validation_returns_a_complete_structured_report(tmp_path: Path) -> None
     assert failed.status == "failed"
 
 
+def test_validation_hashes_shared_artifacts_once_per_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, artifact_root, result = _fixture(tmp_path)
+    calls: list[Path] = []
+
+    def tracked_sha256_file(path: Path) -> str:
+        resolved = path.resolve()
+        calls.append(resolved)
+        return _sha(resolved.read_bytes())
+
+    monkeypatch.setattr(
+        "gmoney.extraction.validation.sha256_file",
+        tracked_sha256_file,
+    )
+
+    report = validate_extraction_result(source, result, artifact_root)
+
+    assert report.status == "passed"
+    assert calls.count(source.resolve()) == 1
+    assert calls.count((artifact_root / "pages" / "page-1.png").resolve()) == 1
+
+
 def test_linked_unmapped_financial_lane_is_not_invisible(tmp_path: Path) -> None:
     source, artifact_root, result = _fixture(tmp_path)
     table = SourceTable.model_validate(result["source_tables"][0])
