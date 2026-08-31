@@ -79,13 +79,36 @@ def test_terminal_pharmacy_tax_aggregate_is_not_treated_as_missing_detail() -> N
         rows=(linked, aggregate),
     )
 
+    trailing_total_id = str(uuid4())
+    trailing_total = SourceRow.model_construct(
+        id="trailing-total",
+        row_anchor="row-" + "d" * 24,
+        order=2,
+        canonical_row_id=trailing_total_id,
+        cells=(
+            SourceCell.model_construct(
+                column_id="description", raw_value="Grand Total", evidence=()
+            ),
+            SourceCell.model_construct(column_id="amount", raw_value="102.50", evidence=()),
+        ),
+    )
+    table = table.model_copy(update={"rows": (*table.rows, trailing_total)})
+
     assert _unlinked_financial_row_is_explained(
         table=table,
         source_tables=(table,),
         source_row=aggregate,
         cells={cell.column_id: cell for cell in aggregate.cells},
         financial_values=(("net_amount", Decimal("2.50")),),
-        canonical_rows={},
+        canonical_rows={
+            trailing_total_id: {
+                "role": "detail",
+                "quantity": None,
+                "rate": None,
+                "unit_price": None,
+                "net_amount": "102.50",
+            }
+        },
         result={},
     )
 
@@ -93,12 +116,8 @@ def test_terminal_pharmacy_tax_aggregate_is_not_treated_as_missing_detail() -> N
         update={
             "id": "unlinked-detail",
             "cells": (
-                SourceCell.model_construct(
-                    column_id="description", raw_value="", evidence=()
-                ),
-                SourceCell.model_construct(
-                    column_id="amount", raw_value="2.50", evidence=()
-                ),
+                SourceCell.model_construct(column_id="description", raw_value="", evidence=()),
+                SourceCell.model_construct(column_id="amount", raw_value="2.50", evidence=()),
             ),
         }
     )

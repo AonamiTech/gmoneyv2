@@ -1010,7 +1010,23 @@ def _unlinked_financial_row_is_explained(
         if candidate.id == source_row.id:
             source_row_seen = True
             continue
-        if source_row_seen and candidate.canonical_row_id is not None:
+        linked_canonical = (
+            canonical_rows.get(candidate.canonical_row_id)
+            if candidate.canonical_row_id is not None
+            else None
+        )
+        linked_pharmacy_detail = bool(
+            linked_canonical
+            and any(
+                linked_canonical.get(field) is not None
+                for field in ("quantity", "rate", "unit_price")
+            )
+        )
+        if (
+            source_row_seen
+            and candidate.canonical_row_id is not None
+            and (table.table_type.value != "pharmacy" or linked_pharmacy_detail)
+        ):
             linked_row_follows = True
             break
     pharmacy_aggregate_markers = {

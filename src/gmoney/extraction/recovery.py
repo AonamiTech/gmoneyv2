@@ -467,7 +467,10 @@ def safely_realigns_perspective_reconstruction(
         return False
     candidate_arithmetic = arithmetic_matches(candidate_rows)
     baseline_arithmetic = arithmetic_matches(baseline_rows)
-    if candidate_arithmetic / len(candidate_rows) < 0.95:
+    # MRP can be a pack price rather than the billed unit rate on some pharmacy
+    # lines. Require a strong table-wide correction without rejecting those
+    # legitimate packaging exceptions.
+    if candidate_arithmetic / len(candidate_rows) < 0.80:
         return False
     if candidate_arithmetic < baseline_arithmetic + 2:
         return False
