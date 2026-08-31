@@ -47,6 +47,7 @@ inference-gpu = [
 [project.scripts]
 gmoney-corpus = "gmoney.evaluation.corpus:app"
 gmoney-evaluate = "gmoney.evaluation.cli:app"
+gmoney-evaluate-fields = "gmoney.evaluation.field_cli:app"
 gmoney-geometry = "gmoney.geometry.cli:app"
 gmoney-benchmark = "gmoney.inference.benchmark:app"
 gmoney-layout-bakeoff = "gmoney.inference.layout_bakeoff:app"

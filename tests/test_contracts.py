@@ -10,7 +10,7 @@ from gmoney.contracts.extraction import (
     SourceTable,
     TokenManifestEntry,
 )
-from gmoney.contracts.gold import GoldAnnotation
+from gmoney.contracts.gold import GoldAnnotation, GoldSourceTable
 from gmoney.settings import Settings
 
 
@@ -48,6 +48,56 @@ def test_gold_amount_is_decimal() -> None:
         }
     )
     assert annotation.rows[0].amount == Decimal("10.25")
+
+
+def test_gold_v2_image_review_and_source_grid_are_strict() -> None:
+    annotation = GoldAnnotation.model_validate(
+        {
+            "annotation_version": "gold_annotation_v2",
+            "bill_file": "bill.pdf",
+            "document_sha256": "a" * 64,
+            "layout_family_id": "layout-a",
+            "image_review": {
+                "reviewer": "Codex",
+                "method": "codex_image_review",
+                "passes": 2,
+                "reviewed_at": "2026-08-31T00:00:00Z",
+                "page_asset_sha256": ["b" * 64],
+            },
+            "source_tables": [
+                {
+                    "page_number": 1,
+                    "table_id": "p1-t1",
+                    "columns": [{"id": "c1", "label": "Amount", "order": 0}],
+                    "rows": [{"order": 0, "cells": [{"column_id": "c1", "raw_value": "1"}]}],
+                }
+            ],
+            "rows": [{"page_number": 1, "description": "Test", "amount": "1"}],
+        }
+    )
+
+    assert annotation.image_review is not None
+    assert annotation.image_review.passes == 2
+    assert annotation.source_tables[0].columns[0].label == "Amount"
+
+
+def test_gold_source_grid_rejects_unreadable_asserted_value() -> None:
+    with pytest.raises(ValidationError, match="unreadable gold cells"):
+        GoldSourceTable.model_validate(
+            {
+                "page_number": 1,
+                "table_id": "p1-t1",
+                "columns": [{"id": "c1", "label": "Amount", "order": 0}],
+                "rows": [
+                    {
+                        "order": 0,
+                        "cells": [
+                            {"column_id": "c1", "raw_value": "guess", "readable": False}
+                        ],
+                    }
+                ],
+            }
+        )
 
 
 def test_non_empty_source_cell_requires_token_grounding() -> None:

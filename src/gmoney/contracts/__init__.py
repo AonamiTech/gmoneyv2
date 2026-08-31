@@ -22,7 +22,15 @@ from gmoney.contracts.extraction import (
     TableType,
     TokenManifestEntry,
 )
-from gmoney.contracts.gold import GoldAnnotation, GoldRow
+from gmoney.contracts.gold import (
+    GoldAnnotation,
+    GoldImageReview,
+    GoldRow,
+    GoldSourceCell,
+    GoldSourceColumn,
+    GoldSourceRow,
+    GoldSourceTable,
+)
 from gmoney.contracts.phase3 import (
     AdjudicationField,
     AdjudicationRequest,
@@ -58,7 +66,12 @@ __all__ = [
     "EvidenceRef",
     "ExtractionResultV5",
     "GoldAnnotation",
+    "GoldImageReview",
     "GoldRow",
+    "GoldSourceCell",
+    "GoldSourceColumn",
+    "GoldSourceRow",
+    "GoldSourceTable",
     "GeminiMode",
     "GeminiPromotionDecision",
     "LayoutObservation",
