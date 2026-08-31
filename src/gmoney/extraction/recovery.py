@@ -487,7 +487,7 @@ def safely_realigns_perspective_reconstruction(
                 previous[candidate_index - 1]
                 + int(_description_similarity(baseline_row, candidate_row) >= 0.75),
             )
-    if ordered_matches[-1] / len(baseline_rows) < 0.85:
+    if ordered_matches[-1] / len(baseline_rows) < 0.80:
         return False
     if _mapped_field_coverage(candidate) < _mapped_field_coverage(baseline):
         return False
