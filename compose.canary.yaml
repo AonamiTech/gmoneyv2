@@ -1,0 +1,23 @@
+name: gmoney-v2-canary
+
+services:
+  api:
+    ports: !reset
+      - "127.0.0.1:${GMONEY_CANARY_API_PORT:-18100}:8000"
+
+  worker:
+    depends_on: !reset {}
+    environment:
+      GMONEY_VL_URL: http://gmoney-v2-demo-paddleocr-vl-1:8111
+    networks:
+      - default
+      - live-inference
+
+  nginx:
+    ports: !reset
+      - "127.0.0.1:${GMONEY_CANARY_HTTP_PORT:-3110}:8080"
+
+networks:
+  live-inference:
+    external: true
+    name: gmoney-v2-demo_default

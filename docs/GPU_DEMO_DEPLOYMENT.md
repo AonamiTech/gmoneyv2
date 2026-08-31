@@ -30,6 +30,33 @@ on ports 8100 and 8111. This is not a production PHI deployment.
 
 ## Release command
 
+### Isolated candidate canary
+
+Before a production cutover, the application services can run against a clean
+candidate runtime without exposing another public endpoint or copying candidate
+jobs into production. The canary reuses the live digest-pinned VLM container so
+the single T4 does not load a second llama.cpp model stack. Start only the listed
+application services; the canary must not start its own `paddleocr-vl` service.
+
+```bash
+export GMONEY_DATA_ROOT=/home/ubuntu/gmoneyv2-candidate-runtime/$GMONEY_IMAGE_TAG
+export GMONEY_PROFILE_ROOT="$GMONEY_DATA_ROOT/profiles"
+export GMONEY_MODEL_ROOT=/home/ubuntu/gmoneyv2-runtime/model-cache
+export GMONEY_CANARY_HTTP_PORT=3110
+export GMONEY_CANARY_API_PORT=18100
+install -d -o 10001 -g 10001 \
+  "$GMONEY_DATA_ROOT/jobs" "$GMONEY_DATA_ROOT/config" "$GMONEY_PROFILE_ROOT"
+docker compose \
+  -f compose.demo.yaml -f compose.gpu.yaml -f compose.canary.yaml \
+  up -d --build --no-deps api frontend worker nginx
+curl --fail http://127.0.0.1:3110/api/v2/health/ready
+```
+
+The live stack must be idle before candidate inference starts. Process one
+candidate document at a time and pause the candidate worker if a live job
+arrives. Stop the canary with the same three Compose files; never use `down -v`
+because runtime data is bind-mounted and retained for the evaluation report.
+
 ### Mandatory rollback capture
 
 Before building or replacing any application container, capture the exact
