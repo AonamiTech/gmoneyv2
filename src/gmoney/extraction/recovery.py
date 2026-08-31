@@ -423,6 +423,74 @@ def safely_improves_reconstruction(
     return reconstruction_quality(candidate) > reconstruction_quality(baseline)
 
 
+def safely_realigns_perspective_reconstruction(
+    baseline: ReconstructionResult,
+    candidate: ReconstructionResult,
+) -> bool:
+    """Allow a rectified table to repair a demonstrable one-column row shift.
+
+    The ordinary recovery gate preserves grounded values exactly. That is the
+    right default, but a perspective-distorted ledger can ground every value in
+    the wrong neighboring row. This narrower gate requires the candidate to
+    preserve description order while establishing near-perfect printed
+    quantity × rate arithmetic across the table.
+    """
+    if baseline.schema is None or candidate.schema is None:
+        return False
+    if baseline.schema.table_type != candidate.schema.table_type:
+        return False
+    if candidate.diagnostics.get("terminal_reason") != baseline.diagnostics.get("terminal_reason"):
+        return False
+
+    def financial_rows(reconstruction: ReconstructionResult) -> tuple[AlignedLedgerRow, ...]:
+        return tuple(
+            row
+            for row in reconstruction.rows
+            if row.candidate.description
+            and row.candidate.quantity is not None
+            and row.candidate.rate is not None
+            and row.candidate.amount is not None
+            and row.evidence_token_ids
+            and row.evidence_box is not None
+        )
+
+    def arithmetic_matches(rows: tuple[AlignedLedgerRow, ...]) -> int:
+        return sum(
+            abs(row.candidate.quantity * row.candidate.rate - row.candidate.amount)
+            <= max(Decimal("0.02"), abs(row.candidate.amount) * Decimal("0.001"))
+            for row in rows
+        )
+
+    baseline_rows = financial_rows(baseline)
+    candidate_rows = financial_rows(candidate)
+    if len(baseline_rows) < 3 or len(candidate_rows) < len(baseline_rows):
+        return False
+    candidate_arithmetic = arithmetic_matches(candidate_rows)
+    baseline_arithmetic = arithmetic_matches(baseline_rows)
+    if candidate_arithmetic / len(candidate_rows) < 0.95:
+        return False
+    if candidate_arithmetic < baseline_arithmetic + 2:
+        return False
+
+    # Longest ordered description match. An inserted leading row is expected;
+    # reordered or unrelated content is not.
+    ordered_matches = [0] * (len(candidate_rows) + 1)
+    for baseline_row in baseline_rows:
+        previous = ordered_matches.copy()
+        for candidate_index, candidate_row in enumerate(candidate_rows, start=1):
+            ordered_matches[candidate_index] = max(
+                ordered_matches[candidate_index - 1],
+                previous[candidate_index],
+                previous[candidate_index - 1]
+                + int(_description_similarity(baseline_row, candidate_row) >= 0.75),
+            )
+    if ordered_matches[-1] / len(baseline_rows) < 0.85:
+        return False
+    if _mapped_field_coverage(candidate) < _mapped_field_coverage(baseline):
+        return False
+    return reconstruction_quality(candidate) > reconstruction_quality(baseline)
+
+
 def decide_recovery(
     reconstruction: ReconstructionResult,
     *,

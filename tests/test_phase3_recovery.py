@@ -40,6 +40,7 @@ from gmoney.extraction.recovery import (
     replace_tokens_in_regions,
     return_sign_recovery_targets,
     safely_improves_reconstruction,
+    safely_realigns_perspective_reconstruction,
 )
 from gmoney.extraction.rows import CandidateLedgerRow
 from gmoney.extraction.spatial import AlignedLedgerRow
@@ -223,6 +224,81 @@ def test_transformed_tokens_map_back_through_perspective_matrix() -> None:
     )[0]
     assert mapped.polygon.points[0] == Point(x=100, y=200)
     assert mapped.polygon.points[2] == Point(x=120, y=230)
+
+
+def test_perspective_recovery_can_safely_realign_shifted_financial_rows() -> None:
+    baseline = _reconstruction(
+        (
+            _aligned_row(
+                0,
+                description="Medicine A",
+                quantity=Decimal("1"),
+                rate=Decimal("20"),
+                amount=Decimal("10"),
+            ),
+            _aligned_row(
+                1,
+                description="Medicine B",
+                quantity=Decimal("2"),
+                rate=Decimal("30"),
+                amount=Decimal("20"),
+            ),
+            _aligned_row(
+                2,
+                description="Medicine C",
+                quantity=Decimal("3"),
+                rate=Decimal("40"),
+                amount=Decimal("30"),
+            ),
+        ),
+        table_type=TableType.PHARMACY,
+    )
+    candidate = _reconstruction(
+        (
+            _aligned_row(
+                0,
+                description="Recovered leading medicine",
+                quantity=Decimal("1"),
+                rate=Decimal("10"),
+                amount=Decimal("10"),
+            ),
+            _aligned_row(
+                1,
+                description="Medicine A",
+                quantity=Decimal("1"),
+                rate=Decimal("20"),
+                amount=Decimal("20"),
+            ),
+            _aligned_row(
+                2,
+                description="Medicine B",
+                quantity=Decimal("2"),
+                rate=Decimal("30"),
+                amount=Decimal("60"),
+            ),
+            _aligned_row(
+                3,
+                description="Medicine C",
+                quantity=Decimal("3"),
+                rate=Decimal("40"),
+                amount=Decimal("120"),
+            ),
+        ),
+        table_type=TableType.PHARMACY,
+    )
+
+    assert safely_realigns_perspective_reconstruction(baseline, candidate)
+    unrelated = replace(
+        candidate,
+        rows=tuple(
+            replace(
+                row,
+                candidate=replace(row.candidate, description=f"Unrelated {index}"),
+            )
+            for index, row in enumerate(candidate.rows)
+        ),
+    )
+    assert not safely_realigns_perspective_reconstruction(baseline, unrelated)
 
 
 def _evidence_at(

@@ -101,6 +101,7 @@ from gmoney.extraction.recovery import (
     replace_tokens_in_regions,
     return_sign_recovery_targets,
     safely_improves_reconstruction,
+    safely_realigns_perspective_reconstruction,
 )
 from gmoney.extraction.rows import extract_candidate_rows
 from gmoney.extraction.spatial import AlignedLedgerRow, align_candidate_rows
@@ -5728,7 +5729,13 @@ class OfflineExtractor:
                         )
                     )
         safe_candidates = [
-            item for item in reconstructed if safely_improves_reconstruction(baseline, item[-2])
+            item
+            for item in reconstructed
+            if safely_improves_reconstruction(baseline, item[-2])
+            or (
+                item[0].startswith("table_perspective")
+                and safely_realigns_perspective_reconstruction(baseline, item[-2])
+            )
         ]
         selected_item = max(
             safe_candidates,

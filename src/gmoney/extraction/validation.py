@@ -1016,6 +1016,7 @@ def _unlinked_financial_row_is_explained(
     pharmacy_aggregate_markers = {
         "cess",
         "cgst",
+        "discount",
         "gst",
         "igst",
         "rod",
@@ -1031,12 +1032,18 @@ def _unlinked_financial_row_is_explained(
         "rounding",
         "total",
     }
+    nonnumeric_summary_words = {
+        word for word in summary_words if not re.fullmatch(r"-?\d+(?:\.\d+)?", word)
+    }
+    grounded_total_or_zero = all(
+        value == 0 or value in total_amounts for _, value in financial_values
+    )
     if (
         table.table_type.value == "pharmacy"
         and not linked_row_follows
         and financial_values
-        and summary_words & pharmacy_aggregate_markers
-        and summary_words <= pharmacy_aggregate_words
+        and nonnumeric_summary_words & pharmacy_aggregate_markers
+        and (nonnumeric_summary_words <= pharmacy_aggregate_words or grounded_total_or_zero)
     ):
         return True
     if table.table_type.value == "pharmacy" and pharmacy_summary_sign and not linked_row_follows:
