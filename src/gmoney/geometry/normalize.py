@@ -26,6 +26,79 @@ class NormalizationResult:
     transform: TransformChain
 
 
+def normalize_quadrilateral_region(
+    source: Path,
+    output: Path,
+    page_number: int,
+    corners: tuple[tuple[float, float], ...],
+) -> NormalizationResult:
+    """Rectify one ordered source quadrilateral into a tightly cropped image."""
+    if len(corners) != 4:
+        raise ValueError("quadrilateral must contain four ordered corners")
+    image = cv2.imread(str(source), cv2.IMREAD_COLOR)
+    if image is None:
+        raise ValueError(f"cannot read page image: {source}")
+    height, width = image.shape[:2]
+    source_points = np.asarray(corners, dtype=np.float32)
+    top_left, top_right, bottom_right, bottom_left = source_points
+    derived_width = max(
+        1,
+        round(
+            max(
+                np.linalg.norm(top_right - top_left),
+                np.linalg.norm(bottom_right - bottom_left),
+            )
+        ),
+    )
+    derived_height = max(
+        1,
+        round(
+            max(
+                np.linalg.norm(bottom_left - top_left),
+                np.linalg.norm(bottom_right - top_right),
+            )
+        ),
+    )
+    destination_points = np.asarray(
+        (
+            (0, 0),
+            (derived_width - 1, 0),
+            (derived_width - 1, derived_height - 1),
+            (0, derived_height - 1),
+        ),
+        dtype=np.float32,
+    )
+    perspective = cv2.getPerspectiveTransform(source_points, destination_points)
+    forward: Matrix = tuple(tuple(float(value) for value in row) for row in perspective)
+    normalized = cv2.warpPerspective(
+        image,
+        perspective,
+        (derived_width, derived_height),
+        flags=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_name(f".{output.stem}.tmp{output.suffix}")
+    if not cv2.imwrite(str(temporary), normalized):
+        raise RuntimeError(f"failed to write normalized region: {temporary}")
+    temporary.replace(output)
+    transform = TransformChain(
+        page_number=page_number,
+        source_width=width,
+        source_height=height,
+        derived_width=derived_width,
+        derived_height=derived_height,
+        forward_matrix=forward,
+        inverse_matrix=invert(forward),
+        operations=("perspective_crop",),
+    )
+    return NormalizationResult(
+        output_path=output,
+        artifact_sha256=sha256_file(output),
+        transform=transform,
+    )
+
+
 def normalize_page(
     source: Path,
     output: Path,

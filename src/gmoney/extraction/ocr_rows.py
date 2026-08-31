@@ -64,6 +64,7 @@ HEADER_TERMS: dict[str, tuple[str, ...]] = {
     "quantity": ("quantity", "qty", "nos", "unit days", "units"),
     "rate": (
         "amount rs",
+        "mrp",
         "unit price",
         "unitprice",
         "unit rate",

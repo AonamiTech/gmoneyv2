@@ -12,8 +12,12 @@ from gmoney.geometry.crop import (
     crop_region,
     render_pdf_region,
 )
-from gmoney.geometry.normalize import normalize_page
-from gmoney.geometry.preprocess import detect_page_quadrilateral, prepare_page_candidates
+from gmoney.geometry.normalize import normalize_page, normalize_quadrilateral_region
+from gmoney.geometry.preprocess import (
+    detect_page_quadrilateral,
+    detect_table_quadrilateral,
+    prepare_page_candidates,
+)
 from gmoney.geometry.quality import estimate_skew
 from gmoney.geometry.render import render_pdf
 from gmoney.geometry.transform import (
@@ -192,6 +196,41 @@ def test_page_quadrilateral_detector_is_conservative_and_reports_keystone(
     assert points is not None
     assert confidence >= 0.85
     assert keystone >= 0.02
+
+
+def test_table_quadrilateral_detector_rectifies_divergent_ledger_rules(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "perspective-table.png"
+    image = np.full((800, 1200, 3), 255, dtype=np.uint8)
+    top_left = (0, 150)
+    top_right = (1199, 200)
+    bottom_left = (0, 700)
+    bottom_right = (1199, 660)
+    cv2.line(image, top_left, top_right, (0, 0, 0), 5)
+    cv2.line(image, bottom_left, bottom_right, (0, 0, 0), 5)
+    cv2.line(image, top_left, bottom_left, (0, 0, 0), 5)
+    cv2.line(image, top_right, bottom_right, (0, 0, 0), 5)
+    assert cv2.imwrite(str(source), image)
+
+    points, confidence, divergence = detect_table_quadrilateral(source)
+
+    assert points is not None
+    assert confidence >= 0.80
+    assert divergence >= 0.75
+    result = normalize_quadrilateral_region(
+        source,
+        tmp_path / "rectified-table.png",
+        1,
+        points,
+    )
+    restored = apply_matrix(
+        result.transform.inverse_matrix,
+        apply_matrix(result.transform.forward_matrix, points),
+    )
+    for expected, actual in zip(points, restored, strict=True):
+        assert actual == pytest.approx(expected)
+    assert result.transform.operations == ("perspective_crop",)
 
 
 def test_camera_candidate_composes_400dpi_transform_back_to_raw_page(

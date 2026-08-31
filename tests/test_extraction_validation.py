@@ -4,6 +4,7 @@ import hashlib
 import json
 import shutil
 from dataclasses import replace
+from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
 
@@ -21,6 +22,7 @@ from gmoney.contracts.extraction import (
     SourceColumn,
     SourceRow,
     SourceTable,
+    TableType,
 )
 from gmoney.demo.store import JobStore
 from gmoney.extraction.document_total import DocumentTotalCandidate
@@ -33,7 +35,83 @@ from gmoney.extraction.offline import (
     _merge_targeted_page_units,
     _recovery_preserves_grounded_charges,
 )
-from gmoney.extraction.validation import validate_extraction_result
+from gmoney.extraction.validation import (
+    _unlinked_financial_row_is_explained,
+    validate_extraction_result,
+)
+
+
+def test_terminal_pharmacy_tax_aggregate_is_not_treated_as_missing_detail() -> None:
+    columns = (
+        SourceColumn.model_construct(
+            id="description", label="Description", order=0, canonical_field="description"
+        ),
+        SourceColumn.model_construct(
+            id="amount", label="Amount", order=1, canonical_field="net_amount"
+        ),
+    )
+    linked = SourceRow.model_construct(
+        id="detail",
+        row_anchor="row-" + "a" * 24,
+        order=0,
+        canonical_row_id=str(uuid4()),
+        cells=(
+            SourceCell.model_construct(column_id="description", raw_value="Medicine", evidence=()),
+            SourceCell.model_construct(column_id="amount", raw_value="100.00", evidence=()),
+        ),
+    )
+    aggregate = SourceRow.model_construct(
+        id="tax",
+        row_anchor="row-" + "b" * 24,
+        order=1,
+        cells=(
+            SourceCell.model_construct(column_id="description", raw_value="CGST", evidence=()),
+            SourceCell.model_construct(column_id="amount", raw_value="2.50", evidence=()),
+        ),
+    )
+    table = SourceTable.model_construct(
+        id="p1-t1-s1",
+        page_number=1,
+        table_id="p1-t1",
+        table_anchor="table-" + "c" * 24,
+        table_type=TableType.PHARMACY,
+        columns=columns,
+        rows=(linked, aggregate),
+    )
+
+    assert _unlinked_financial_row_is_explained(
+        table=table,
+        source_tables=(table,),
+        source_row=aggregate,
+        cells={cell.column_id: cell for cell in aggregate.cells},
+        financial_values=(("net_amount", Decimal("2.50")),),
+        canonical_rows={},
+        result={},
+    )
+
+    numeric_detail = aggregate.model_copy(
+        update={
+            "id": "unlinked-detail",
+            "cells": (
+                SourceCell.model_construct(
+                    column_id="description", raw_value="", evidence=()
+                ),
+                SourceCell.model_construct(
+                    column_id="amount", raw_value="2.50", evidence=()
+                ),
+            ),
+        }
+    )
+    numeric_table = table.model_copy(update={"rows": (linked, numeric_detail)})
+    assert not _unlinked_financial_row_is_explained(
+        table=numeric_table,
+        source_tables=(numeric_table,),
+        source_row=numeric_detail,
+        cells={cell.column_id: cell for cell in numeric_detail.cells},
+        financial_values=(("net_amount", Decimal("2.50")),),
+        canonical_rows={},
+        result={},
+    )
 
 
 def _sha(value: bytes) -> str:

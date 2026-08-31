@@ -33,6 +33,7 @@ from gmoney.extraction.recovery import (
     is_implausibly_low_yield,
     map_crop_tokens_to_page,
     map_page_box_to_crop_pixels,
+    map_transformed_tokens_to_page,
     merge_recovery_tokens,
     needs_field_quality_recovery,
     reconstruction_quality,
@@ -74,9 +75,7 @@ def _aligned_row(
     role: RowRole = RowRole.DETAIL,
     table_type: TableType = TableType.ITEM_LEDGER,
 ) -> AlignedLedgerRow:
-    field_token_ids = {
-        field: (f"token-{source_row}-{field}",) for field in mapped_fields
-    }
+    field_token_ids = {field: (f"token-{source_row}-{field}",) for field in mapped_fields}
     return AlignedLedgerRow(
         candidate=CandidateLedgerRow(
             source_row=source_row,
@@ -121,9 +120,7 @@ def _source_table(*raw_values: str | None) -> SimpleNamespace:
     return SimpleNamespace(
         rows=(
             SimpleNamespace(
-                cells=tuple(
-                    SimpleNamespace(raw_value=raw_value) for raw_value in raw_values
-                )
+                cells=tuple(SimpleNamespace(raw_value=raw_value) for raw_value in raw_values)
             ),
         )
     )
@@ -199,6 +196,33 @@ def test_crop_tokens_map_back_to_original_page() -> None:
     assert mapped.token_id == "recovery:1"
     assert mapped.polygon.points[0] == Point(x=200, y=300)
     assert mapped.polygon.points[2] == Point(x=300, y=350)
+
+
+def test_transformed_tokens_map_back_through_perspective_matrix() -> None:
+    source = OcrToken(
+        token_id="1",
+        page_number=1,
+        text="Amount",
+        confidence=1,
+        polygon=Polygon(
+            points=(
+                Point(x=0, y=0),
+                Point(x=10, y=0),
+                Point(x=10, y=10),
+                Point(x=0, y=10),
+            )
+        ),
+        artifact_sha256="b" * 64,
+        model_name="test",
+        model_version="1",
+    )
+    mapped = map_transformed_tokens_to_page(
+        (source,),
+        ((2.0, 0.0, 100.0), (0.0, 3.0, 200.0), (0.0, 0.0, 1.0)),
+        "a" * 64,
+    )[0]
+    assert mapped.polygon.points[0] == Point(x=100, y=200)
+    assert mapped.polygon.points[2] == Point(x=120, y=230)
 
 
 def _evidence_at(
@@ -336,11 +360,7 @@ def _return_sign_recovery_baseline() -> ReconstructionResult:
         }
     )
     table = table.model_copy(
-        update={
-            "rows": (
-                table.rows[0].model_copy(update={"cells": tuple(first_cells)}),
-            )
-        }
+        update={"rows": (table.rows[0].model_copy(update={"cells": tuple(first_cells)}),)}
     )
     return ReconstructionResult(
         rows=(
@@ -416,11 +436,7 @@ def test_description_recovery_boundary_ignores_rotated_overlay_only_row() -> Non
         rows=(),
         schema=_schema(TableType.PHARMACY),
         diagnostics={"table_type": TableType.PHARMACY.value},
-        source_tables=(
-            table.model_copy(
-                update={"rows": (table.rows[0], overlay, target)}
-            ),
-        ),
+        source_tables=(table.model_copy(update={"rows": (table.rows[0], overlay, target)}),),
     )
 
     assert description_lane_recovery_regions(
@@ -432,9 +448,7 @@ def test_description_recovery_boundary_ignores_rotated_overlay_only_row() -> Non
 def test_first_description_recovery_band_stays_below_grounded_headers() -> None:
     table = _description_recovery_source_table()
     first_cells = list(table.rows[0].cells)
-    first_cells[0] = first_cells[0].model_copy(
-        update={"raw_value": None, "evidence": ()}
-    )
+    first_cells[0] = first_cells[0].model_copy(update={"raw_value": None, "evidence": ()})
     first_cells[1] = first_cells[1].model_copy(
         update={
             "evidence": _evidence_at(
@@ -451,11 +465,7 @@ def test_first_description_recovery_band_stays_below_grounded_headers() -> None:
         rows=(),
         schema=_schema(TableType.PHARMACY),
         diagnostics={"table_type": TableType.PHARMACY.value},
-        source_tables=(
-            table.model_copy(
-                update={"rows": (first_row, *table.rows[1:])}
-            ),
-        ),
+        source_tables=(table.model_copy(update={"rows": (first_row, *table.rows[1:])}),),
     )
 
     assert description_lane_recovery_regions(
@@ -475,9 +485,7 @@ def test_description_recovery_uses_parseable_gross_when_net_cell_is_blank() -> N
     )
     target_row = table.rows[1]
     target_cells = [
-        cell.model_copy(
-            update={"raw_value": None, "evidence": ()}
-        )
+        cell.model_copy(update={"raw_value": None, "evidence": ()})
         if cell.column_id == "total"
         else cell
         for cell in target_row.cells
@@ -529,9 +537,7 @@ def test_description_recovery_does_not_require_a_printed_quantity() -> None:
         rows=(),
         schema=_schema(TableType.PHARMACY),
         diagnostics={"table_type": TableType.PHARMACY.value},
-        source_tables=(
-            table.model_copy(update={"rows": (target_row,)}),
-        ),
+        source_tables=(table.model_copy(update={"rows": (target_row,)}),),
     )
 
     assert description_lane_recovery_regions(
@@ -744,9 +750,7 @@ def test_grounded_field_defects_route_to_local_validation_recovery(flag: str) ->
 
 
 def test_selected_profile_with_field_defects_still_routes_to_local_recovery() -> None:
-    reconstruction = _reconstruction(
-        (_aligned_row(0, flags=("missing_labeled_quantity",)),)
-    )
+    reconstruction = _reconstruction((_aligned_row(0, flags=("missing_labeled_quantity",)),))
     selected_profile = ProfileMatch(
         profile_key="hospital",
         profile_version=1,
@@ -780,9 +784,7 @@ def test_terminal_regions_ignore_field_quality_defects(table_type: TableType) ->
 
 
 def test_haemorrhoidectomy_anaesthetist_same_row_recovery_is_a_safe_improvement() -> None:
-    unchanged = tuple(
-        _aligned_row(index, description=f"Service {index}") for index in range(12)
-    )
+    unchanged = tuple(_aligned_row(index, description=f"Service {index}") for index in range(12))
     baseline = _reconstruction(
         (
             *unchanged,
@@ -941,9 +943,7 @@ def test_field_gain_on_one_row_cannot_hide_grounded_date_loss_on_another() -> No
 def test_incompatible_terminal_or_table_type_candidate_is_rejected(
     table_type: TableType,
 ) -> None:
-    baseline = _reconstruction(
-        (_aligned_row(0, flags=("missing_labeled_quantity",)),)
-    )
+    baseline = _reconstruction((_aligned_row(0, flags=("missing_labeled_quantity",)),))
     candidate = _reconstruction(
         (
             _aligned_row(
@@ -987,9 +987,7 @@ def test_incompatible_terminal_or_table_type_candidate_is_rejected(
 def test_validation_or_mapped_field_regression_cannot_replace_baseline(
     candidate: ReconstructionResult,
 ) -> None:
-    baseline = _reconstruction(
-        (_aligned_row(0, flags=("missing_labeled_quantity",)),)
-    )
+    baseline = _reconstruction((_aligned_row(0, flags=("missing_labeled_quantity",)),))
 
     assert not safely_improves_reconstruction(baseline, candidate)
 
@@ -1221,6 +1219,7 @@ def test_crop_recovery_isolates_and_ranks_grounded_variants(
             False,
         ),
     )
+
     def fake_paddle_tokens(output, page_number, artifact_sha256):
         if bad_first_variant and output["variant"] == "high_resolution":
             raise ValueError("bad high-resolution OCR payload")
@@ -1256,8 +1255,7 @@ def test_crop_recovery_isolates_and_ranks_grounded_variants(
     def fake_reconstruct(tokens, **kwargs):
         observed_token_batches.append(tokens)
         field_tokens = {
-            token.token_id.rsplit("-", maxsplit=1)[-1]: (token.token_id,)
-            for token in tokens
+            token.token_id.rsplit("-", maxsplit=1)[-1]: (token.token_id,) for token in tokens
         }
         quantity = Decimal(
             next(token.text for token in tokens if token.token_id.endswith("-quantity"))
@@ -1273,9 +1271,7 @@ def test_crop_recovery_isolates_and_ranks_grounded_variants(
                 mapped_fields=(),
             )
         else:
-            rate = Decimal(
-                next(token.text for token in tokens if token.token_id.endswith("-rate"))
-            )
+            rate = Decimal(next(token.text for token in tokens if token.token_id.endswith("-rate")))
             row = _aligned_row(
                 0,
                 quantity=quantity,
@@ -1288,9 +1284,7 @@ def test_crop_recovery_isolates_and_ranks_grounded_variants(
                     row,
                     field_token_ids=field_tokens,
                     evidence_token_ids=tuple(
-                        token_id
-                        for token_ids in field_tokens.values()
-                        for token_id in token_ids
+                        token_id for token_ids in field_tokens.values() for token_id in token_ids
                     ),
                 ),
             )
@@ -1326,21 +1320,13 @@ def test_crop_recovery_isolates_and_ranks_grounded_variants(
     assert [len(tokens) for tokens in observed_token_batches] == (
         [4] if bad_first_variant else [3, 4]
     )
-    observed_tokens = tuple(
-        token for tokens in observed_token_batches for token in tokens
-    )
+    observed_tokens = tuple(token for tokens in observed_token_batches for token in tokens)
     assert all(token.artifact_sha256 == page_artifact_sha256 for token in observed_tokens)
     assert all(token.token_id.startswith("recovery:") for token in observed_tokens)
-    assert recovered.rows[0].field_token_ids["quantity"] == (
-        "recovery:local-photometric-quantity",
-    )
-    crop_attempts = [
-        attempt for attempt in attempts if attempt.stage is RecoveryStage.CROP_OCR
-    ]
+    assert recovered.rows[0].field_token_ids["quantity"] == ("recovery:local-photometric-quantity",)
+    crop_attempts = [attempt for attempt in attempts if attempt.stage is RecoveryStage.CROP_OCR]
     assert [attempt.status for attempt in crop_attempts] == (
-        ["failed", "recovered"]
-        if bad_first_variant
-        else ["no_improvement", "recovered"]
+        ["failed", "recovered"] if bad_first_variant else ["no_improvement", "recovered"]
     )
     assert [attempt.accepted_rows for attempt in crop_attempts] == [0, 1]
 
@@ -1408,11 +1394,7 @@ def test_crop_recovery_uses_targeted_description_lane_for_grounded_financial_row
         "paddle_ocr_tokens",
         lambda output, page_number, artifact_sha256: (
             _ocr_token(
-                (
-                    "Ns 500ML"
-                    if output["variant"] == "description_lane"
-                    else "Emeset 2ML"
-                ),
+                ("Ns 500ML" if output["variant"] == "description_lane" else "Emeset 2ML"),
                 artifact_sha256,
                 (
                     "target-description"
@@ -1426,11 +1408,7 @@ def test_crop_recovery_uses_targeted_description_lane_for_grounded_financial_row
         offline_module.cv2,
         "imread",
         lambda path, mode: SimpleNamespace(
-            shape=(
-                (60, 300, 3)
-                if str(path).endswith("description-lane.png")
-                else (220, 800, 3)
-            )
+            shape=((60, 300, 3) if str(path).endswith("description-lane.png") else (220, 800, 3))
         ),
     )
 
@@ -1505,13 +1483,8 @@ def test_crop_recovery_uses_targeted_description_lane_for_grounded_financial_row
         for batch in reconstructed_token_batches
         if any("target-description" in token.token_id for token in batch)
     )
-    assert "page-baseline-amount" in {
-        token.token_id for token in targeted_batch
-    }
-    assert not any(
-        "full-description" in token.token_id
-        for token in targeted_batch
-    )
+    assert "page-baseline-amount" in {token.token_id for token in targeted_batch}
+    assert not any("full-description" in token.token_id for token in targeted_batch)
     assert any(
         attempt.status == "recovered"
         and attempt.reason == "input_variant:high_resolution+description_lane"
@@ -1543,9 +1516,7 @@ def test_crop_recovery_uses_800dpi_clahe_only_for_a_grounded_refund_sign(
         "clahe_variant",
         lambda source, output: SimpleNamespace(
             output_path=(
-                tmp_path / "sign-clahe.png"
-                if "800" in str(source)
-                else tmp_path / "high-clahe.png"
+                tmp_path / "sign-clahe.png" if "800" in str(source) else tmp_path / "high-clahe.png"
             ),
             artifact_sha256=("d" if "800" in str(source) else "e") * 64,
         ),
@@ -1562,11 +1533,7 @@ def test_crop_recovery_uses_800dpi_clahe_only_for_a_grounded_refund_sign(
         "paddle_ocr_tokens",
         lambda output, page_number, artifact_sha256: (
             _ocr_token(
-                (
-                    "-23.93"
-                    if output["variant"] == "return_sign_800dpi_clahe"
-                    else "23.93"
-                ),
+                ("-23.93" if output["variant"] == "return_sign_800dpi_clahe" else "23.93"),
                 artifact_sha256,
                 "local-amount",
             ),
@@ -1646,7 +1613,6 @@ def test_crop_recovery_uses_800dpi_clahe_only_for_a_grounded_refund_sign(
     )
     assert not any(token.text == "23.93" for token in sign_batch)
     assert any(
-        attempt.status == "recovered"
-        and "return_sign" in str(attempt.reason)
+        attempt.status == "recovered" and "return_sign" in str(attempt.reason)
         for attempt in attempts
     )

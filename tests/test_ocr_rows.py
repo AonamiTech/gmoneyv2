@@ -714,6 +714,29 @@ def test_staggered_amount_rs_unit_days_header_keeps_rate_before_total() -> None:
     ]
 
 
+def test_pharmacy_mrp_header_maps_to_unit_price() -> None:
+    result = reconstruct_ocr_rows(
+        (
+            token(0, "Product Name", (100, 30, 360, 45)),
+            token(1, "Qty", (520, 30, 560, 45)),
+            token(2, "MRP", (650, 30, 700, 45)),
+            token(3, "Amount", (850, 30, 930, 45)),
+            token(4, "Saline", (100, 70, 250, 85)),
+            token(5, "2", (530, 70, 545, 85)),
+            token(6, "21.00", (650, 70, 700, 85)),
+            token(7, "42.00", (850, 70, 915, 85)),
+        ),
+        page_number=1,
+        table_id="p1-t1",
+        box=(80, 20, 950, 110),
+    )
+
+    assert result.rows[0].candidate.rate == Decimal("21.00")
+    mrp = next(column for column in result.source_tables[0].columns if column.label == "MRP")
+    assert mrp.canonical_field == "unit_price"
+    assert "inferred_financial_lane" not in mrp.validation_flags
+
+
 def test_amount_rs_unit_days_without_total_remains_amount_and_quantity() -> None:
     tokens = (
         token(0, "Particular", (100, 30, 420, 45)),

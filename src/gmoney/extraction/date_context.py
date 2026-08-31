@@ -5,7 +5,8 @@ import re
 from gmoney.extraction.typed_values import parse_service_date
 
 DATE_FRAGMENT = re.compile(
-    r"(?<!\d)(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}[/-]\d{1,2}[/-]\d{1,2})(?!\d)"
+    r"(?<!\d)(?:\d{1,2}[/.\-]\d{1,2}[/.\-]\d{2,4}|"
+    r"\d{4}[/.\-]\d{1,2}[/.\-]\d{1,2})(?!\d)"
 )
 PRINTED_DATE_REQUEST_SUFFIX = re.compile(
     r"\s*[-:]?\s*[A-Z][A-Z0-9-]{2,}/[A-Z0-9-]+"

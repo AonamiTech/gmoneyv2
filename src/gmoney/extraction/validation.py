@@ -988,6 +988,7 @@ def _unlinked_financial_row_is_explained(
         for payload in (
             result.get("document_total"),
             *(result.get("document_totals") or []),
+            *(result.get("raw_total_candidates") or []),
         )
         if isinstance(payload, dict) and parse_decimal(str(payload.get("amount"))) is not None
     ]
@@ -1012,6 +1013,32 @@ def _unlinked_financial_row_is_explained(
         if source_row_seen and candidate.canonical_row_id is not None:
             linked_row_follows = True
             break
+    pharmacy_aggregate_markers = {
+        "cess",
+        "cgst",
+        "gst",
+        "igst",
+        "rod",
+        "sgst",
+        "tax",
+        "vat",
+    }
+    pharmacy_aggregate_words = pharmacy_aggregate_markers | {
+        "adjustment",
+        "amount",
+        "off",
+        "round",
+        "rounding",
+        "total",
+    }
+    if (
+        table.table_type.value == "pharmacy"
+        and not linked_row_follows
+        and financial_values
+        and summary_words & pharmacy_aggregate_markers
+        and summary_words <= pharmacy_aggregate_words
+    ):
+        return True
     if table.table_type.value == "pharmacy" and pharmacy_summary_sign and not linked_row_follows:
         table_index = next(
             index for index, candidate in enumerate(source_tables) if candidate is table
@@ -1796,8 +1823,7 @@ def _validate_extraction_result(
                 derived = apply_matrix(transform["forward_matrix"], corners)
                 restored = apply_matrix(transform["inverse_matrix"], derived)
                 transform_valid = all(
-                    abs(actual_x - expected_x) <= 2.0
-                    and abs(actual_y - expected_y) <= 2.0
+                    abs(actual_x - expected_x) <= 2.0 and abs(actual_y - expected_y) <= 2.0
                     for (actual_x, actual_y), (expected_x, expected_y) in zip(
                         restored,
                         corners,

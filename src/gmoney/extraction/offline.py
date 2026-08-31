@@ -94,6 +94,7 @@ from gmoney.extraction.recovery import (
     is_terminal_non_ledger,
     map_crop_tokens_to_page,
     map_page_box_to_crop_pixels,
+    map_transformed_tokens_to_page,
     merge_recovery_tokens,
     needs_field_quality_recovery,
     reconstruction_quality,
@@ -114,11 +115,17 @@ from gmoney.geometry.crop import (
     crop_region,
     render_pdf_region,
 )
-from gmoney.geometry.preprocess import PreparedPageCandidate, prepare_page_candidates
+from gmoney.geometry.normalize import normalize_quadrilateral_region
+from gmoney.geometry.preprocess import (
+    PreparedPageCandidate,
+    detect_table_quadrilateral,
+    prepare_page_candidates,
+)
 from gmoney.geometry.render import render_pdf
 from gmoney.geometry.transform import (
     Matrix,
     apply_matrix,
+    compose,
 )
 from gmoney.geometry.transform import (
     identity as transform_identity,
@@ -3253,19 +3260,17 @@ def _materialize_printed_cell_fragments(
                         existing_fragment,
                     )
                     if table.table_id not in registered_fragment.table_ids:
-                        fragments[existing_fragment.token_id] = (
-                            registered_fragment.model_copy(
-                                update={
-                                    "table_ids": tuple(
-                                        sorted(
-                                            {
-                                                *registered_fragment.table_ids,
-                                                table.table_id,
-                                            }
-                                        )
+                        fragments[existing_fragment.token_id] = registered_fragment.model_copy(
+                            update={
+                                "table_ids": tuple(
+                                    sorted(
+                                        {
+                                            *registered_fragment.table_ids,
+                                            table.table_id,
+                                        }
                                     )
-                                }
-                            )
+                                )
+                            }
                         )
                     for parent_id in tuple(existing_fragment.parent_token_ids) or (
                         (existing_fragment.parent_token_id,)
@@ -5137,6 +5142,7 @@ class OfflineExtractor:
                 high_resolution.output_path,
                 high_resolution.artifact_sha256,
                 f"{work.table_id}.400dpi.ocr.json",
+                getattr(getattr(high_resolution, "transform", None), "inverse_matrix", None),
             )
         ]
         try:
@@ -5166,6 +5172,51 @@ class OfflineExtractor:
                     photometric.output_path,
                     photometric.artifact_sha256,
                     f"{work.table_id}.400dpi-clahe.ocr.json",
+                    getattr(getattr(high_resolution, "transform", None), "inverse_matrix", None),
+                )
+            )
+        try:
+            table_quad, quad_confidence, angle_divergence = detect_table_quadrilateral(
+                high_resolution.output_path
+            )
+            if table_quad is not None and quad_confidence >= 0.80:
+                perspective = normalize_quadrilateral_region(
+                    high_resolution.output_path,
+                    artifact_root / "crops" / f"{work.table_id}-400dpi-perspective.png",
+                    work.page_number,
+                    table_quad,
+                )
+                perspective_to_page = compose(
+                    perspective.transform.inverse_matrix,
+                    high_resolution.transform.inverse_matrix,
+                )
+                assets.append(
+                    (
+                        "table_perspective",
+                        perspective.output_path,
+                        perspective.artifact_sha256,
+                        f"{work.table_id}.400dpi-perspective.ocr.json",
+                        perspective_to_page,
+                    )
+                )
+                attempts.append(
+                    RecoveryAttempt(
+                        stage=RecoveryStage.HIGH_RESOLUTION,
+                        artifact_sha256=perspective.artifact_sha256,
+                        status="prepared",
+                        reason=(
+                            "table_perspective:"
+                            f"confidence={quad_confidence:.3f}:"
+                            f"angle_divergence={angle_divergence:.3f}"
+                        ),
+                    )
+                )
+        except Exception as error:
+            attempts.append(
+                RecoveryAttempt(
+                    stage=RecoveryStage.HIGH_RESOLUTION,
+                    status="failed",
+                    reason=f"table_perspective:{type(error).__name__}",
                 )
             )
         reconstructed: list[
@@ -5188,14 +5239,19 @@ class OfflineExtractor:
             artifact_sha256: str,
             width: int,
             height: int,
-            page_box: tuple[int, int, int, int],
+            page_box: tuple[int, int, int, int] | None = None,
+            source_to_page_matrix: Matrix | None = None,
         ) -> tuple[TokenManifestEntry, ...]:
-            left, top, right, bottom = page_box
-            matrix = (
-                ((right - left) / max(1, width), 0.0, float(left)),
-                (0.0, (bottom - top) / max(1, height), float(top)),
-                (0.0, 0.0, 1.0),
-            )
+            matrix = source_to_page_matrix
+            if matrix is None:
+                if page_box is None:
+                    raise ValueError("page_box or source_to_page_matrix is required")
+                left, top, right, bottom = page_box
+                matrix = (
+                    ((right - left) / max(1, width), 0.0, float(left)),
+                    (0.0, (bottom - top) / max(1, height), float(top)),
+                    (0.0, 0.0, 1.0),
+                )
             return tuple(
                 TokenManifestEntry(
                     token_id=mapped.token_id,
@@ -5217,7 +5273,13 @@ class OfflineExtractor:
                 for local, mapped in zip(local_tokens, mapped_tokens, strict=True)
             )
 
-        for variant, image_path, artifact_sha256, cache_name in assets:
+        for (
+            variant,
+            image_path,
+            artifact_sha256,
+            cache_name,
+            source_to_page_matrix,
+        ) in assets:
             request = InferenceRequest(
                 request_id=str(uuid4()),
                 artifact_sha256=artifact_sha256,
@@ -5254,11 +5316,24 @@ class OfflineExtractor:
                 image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
                 if image is None:
                     raise ValueError(f"cannot read recovered crop: {image_path}")
-                mapped_tokens = map_crop_tokens_to_page(
+                if source_to_page_matrix is None:
+                    left, top, right, bottom = work.box
+                    source_to_page_matrix = (
+                        (
+                            (right - left) / max(1, image.shape[1]),
+                            0.0,
+                            float(left),
+                        ),
+                        (
+                            0.0,
+                            (bottom - top) / max(1, image.shape[0]),
+                            float(top),
+                        ),
+                        (0.0, 0.0, 1.0),
+                    )
+                mapped_tokens = map_transformed_tokens_to_page(
                     local_tokens,
-                    work.box,
-                    image.shape[1],
-                    image.shape[0],
+                    source_to_page_matrix,
                     page_artifact_sha256,
                 )
                 reconstruction = reconstruct_ocr_rows(
@@ -5295,7 +5370,7 @@ class OfflineExtractor:
                         artifact_sha256=artifact_sha256,
                         width=image.shape[1],
                         height=image.shape[0],
-                        page_box=work.box,
+                        source_to_page_matrix=source_to_page_matrix,
                     ),
                 )
             )
@@ -6985,8 +7060,7 @@ class OfflineExtractor:
         token_manifest = tuple(token_manifest_by_id.values())
 
         normalized_diagnostics = [
-            _normalize_public_diagnostic(diagnostic, source_tables)
-            for diagnostic in diagnostics
+            _normalize_public_diagnostic(diagnostic, source_tables) for diagnostic in diagnostics
         ]
         diagnostic_source_table_ids = {
             str(item.get("source_table_id"))

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import atan2, degrees, hypot
 from pathlib import Path
 
 import cv2
@@ -26,6 +27,7 @@ MIN_DESKEW_DEGREES = 0.75
 MAX_DESKEW_DEGREES = 15.0
 PERSPECTIVE_CONFIDENCE_THRESHOLD = 0.85
 MIN_KEYSTONE_SCORE = 0.02
+MIN_TABLE_PERSPECTIVE_ANGLE_DIVERGENCE = 0.75
 
 
 @dataclass(frozen=True)
@@ -123,6 +125,108 @@ def detect_page_quadrilateral(
     points, confidence, keystone = best
     restored = tuple((float(x / scale), float(y / scale)) for x, y in points)
     return restored, confidence, keystone
+
+
+def detect_table_quadrilateral(
+    image_path: Path,
+) -> tuple[tuple[tuple[float, float], ...] | None, float, float]:
+    """Detect a perspective-distorted ledger using supported horizontal rules.
+
+    Unlike physical-page detection, this deliberately ignores sheet contours.
+    It requires two long, dark, independently supported table rules whose slopes
+    diverge enough to justify a perspective warp.
+    """
+    image = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
+    if image is None:
+        raise ValueError(f"cannot read table image: {image_path}")
+    source_height, source_width = image.shape
+    scale = min(1.0, 1600.0 / max(source_height, source_width))
+    resized = (
+        cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+        if scale < 1.0
+        else image
+    )
+    height, width = resized.shape
+    blurred = cv2.GaussianBlur(resized, (3, 3), 0)
+    edges = cv2.Canny(blurred, 50, 150)
+    lines = cv2.HoughLinesP(
+        edges,
+        1,
+        np.pi / 720,
+        threshold=max(60, round(width * 0.05)),
+        minLineLength=max(80, round(width * 0.50)),
+        maxLineGap=max(8, round(width * 0.08)),
+    )
+    if lines is None:
+        return None, 0.0, 0.0
+
+    candidates: list[tuple[float, float, float, float]] = []
+    x_coordinates = np.arange(width)
+    for raw_line in lines[:, 0]:
+        x1, y1, x2, y2 = (float(value) for value in raw_line)
+        if abs(x2 - x1) < 1.0:
+            continue
+        angle = degrees(atan2(y2 - y1, x2 - x1))
+        length = hypot(x2 - x1, y2 - y1)
+        if abs(angle) > 10.0 or length < width * 0.50:
+            continue
+        slope = (y2 - y1) / (x2 - x1)
+        intercept = y1 - slope * x1
+        projected_y = np.rint(slope * x_coordinates + intercept).astype(int)
+        valid = (projected_y >= 2) & (projected_y < height - 2)
+        if int(valid.sum()) < width * 0.75:
+            continue
+        samples = []
+        for offset in range(-2, 3):
+            row = np.full(width, 255, dtype=np.uint8)
+            row[valid] = resized[projected_y[valid] + offset, x_coordinates[valid]]
+            samples.append(row)
+        dark_support = float(
+            ((np.min(np.stack(samples), axis=0) < 130) & valid).sum() / max(1, int(valid.sum()))
+        )
+        if dark_support < 0.65:
+            continue
+        midpoint = (slope * (width / 2) + intercept) / height
+        if not 0.01 <= midpoint <= 0.97:
+            continue
+        candidates.append((midpoint, dark_support, slope, intercept))
+
+    clustered: list[tuple[float, float, float, float]] = []
+    for candidate in sorted(candidates, key=lambda item: (-item[1], item[0])):
+        if any(abs(candidate[0] - item[0]) < 0.012 for item in clustered):
+            continue
+        clustered.append(candidate)
+    clustered.sort(key=lambda item: item[0])
+
+    LineCandidate = tuple[float, float, float, float]
+    best: tuple[float, LineCandidate, LineCandidate, float] | None = None
+    for upper in clustered:
+        for lower in clustered:
+            span = lower[0] - upper[0]
+            if not 0.35 <= span <= 0.95:
+                continue
+            upper_angle = degrees(atan2(upper[2], 1.0))
+            lower_angle = degrees(atan2(lower[2], 1.0))
+            divergence = abs(upper_angle - lower_angle)
+            if divergence < MIN_TABLE_PERSPECTIVE_ANGLE_DIVERGENCE:
+                continue
+            score = span + 0.25 * (upper[1] + lower[1])
+            if best is None or score > best[0]:
+                best = (score, upper, lower, divergence)
+    if best is None:
+        return None, 0.0, 0.0
+
+    _, upper, lower, divergence = best
+    left = 0.0
+    right = float(width - 1)
+    points = (
+        (left / scale, (upper[2] * left + upper[3]) / scale),
+        (right / scale, (upper[2] * right + upper[3]) / scale),
+        (right / scale, (lower[2] * right + lower[3]) / scale),
+        (left / scale, (lower[2] * left + lower[3]) / scale),
+    )
+    confidence = min(1.0, 0.5 * (upper[1] + lower[1]))
+    return points, confidence, divergence
 
 
 def _enhance_camera_page(source: Path, output: Path) -> str:

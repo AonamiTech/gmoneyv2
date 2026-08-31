@@ -14,13 +14,17 @@ DAY_QUANTITY = re.compile(
 )
 MAX_ABSOLUTE = Decimal("999999999999.9999")
 DATE_FRAGMENT = re.compile(
+    r"(?:\d{4}[/.-]\d{1,2}[/.-]\d{1,2}|"
     r"\d{1,2}(?:[/.-]\d{1,2}[/.-]\d{2,4}|[-\s](?:Jan(?:uary)?|Feb(?:ruary)?|"
     r"Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|"
-    r"Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)[-\s]\d{2,4})",
+    r"Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)[-\s]\d{2,4}))",
     re.IGNORECASE,
 )
 
 SERVICE_DATE_FORMATS = (
+    "%Y/%m/%d",
+    "%Y-%m-%d",
+    "%Y.%m.%d",
     "%d/%m/%Y",
     "%d-%m-%Y",
     "%d.%m.%Y",

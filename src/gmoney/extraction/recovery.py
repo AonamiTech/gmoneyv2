@@ -22,6 +22,7 @@ from gmoney.extraction.ocr_rows import ReconstructionResult
 from gmoney.extraction.rows import CandidateLedgerRow
 from gmoney.extraction.spatial import AlignedLedgerRow
 from gmoney.extraction.typed_values import parse_decimal
+from gmoney.geometry.transform import Matrix, apply_matrix
 
 FIELD_QUALITY_FLAGS = frozenset(
     {
@@ -86,11 +87,7 @@ def needs_field_quality_recovery(reconstruction: ReconstructionResult) -> bool:
 
 
 def _field_quality_defects(reconstruction: ReconstructionResult) -> tuple[int, int]:
-    flags = tuple(
-        flag
-        for row in reconstruction.rows
-        for flag in row.candidate.validation_flags
-    )
+    flags = tuple(flag for row in reconstruction.rows for flag in row.candidate.validation_flags)
     return (
         sum(
             flags.count(flag)
@@ -100,8 +97,7 @@ def _field_quality_defects(reconstruction: ReconstructionResult) -> tuple[int, i
             )
         ),
         sum(
-            flags.count(flag)
-            for flag in ("missing_labeled_quantity", "missing_labeled_unit_price")
+            flags.count(flag) for flag in ("missing_labeled_quantity", "missing_labeled_unit_price")
         ),
     )
 
@@ -134,9 +130,7 @@ def _populated_source_cells(reconstruction: ReconstructionResult) -> int:
 
 def reconstruction_quality(reconstruction: ReconstructionResult) -> tuple[int, ...]:
     arithmetic_mismatches, missing_labeled_fields = _field_quality_defects(reconstruction)
-    publishable_rows = tuple(
-        row for row in reconstruction.rows if is_publishable_aligned_row(row)
-    )
+    publishable_rows = tuple(row for row in reconstruction.rows if is_publishable_aligned_row(row))
     grounded_rows = sum(
         bool(row.evidence_token_ids and row.evidence_box) for row in publishable_rows
     )
@@ -202,10 +196,14 @@ def _geometry_is_compatible(
         return True
     baseline_center = (baseline_top + baseline_bottom) / 2
     candidate_center = (candidate_top + candidate_bottom) / 2
-    return abs(baseline_center - candidate_center) <= max(
-        baseline_height,
-        candidate_height,
-    ) / 2
+    return (
+        abs(baseline_center - candidate_center)
+        <= max(
+            baseline_height,
+            candidate_height,
+        )
+        / 2
+    )
 
 
 def _row_match_score(
@@ -218,16 +216,12 @@ def _row_match_score(
     description_similarity = _description_similarity(baseline, candidate)
     if description_similarity < 0.75:
         return None
-    source_row_matches = (
-        baseline.candidate.source_row == candidate.candidate.source_row
-    )
+    source_row_matches = baseline.candidate.source_row == candidate.candidate.source_row
     geometry_matches = _geometry_is_compatible(baseline, candidate)
     order_distance = abs(baseline_order - candidate_order)
     if not source_row_matches and not (geometry_matches and order_distance <= 1):
         return None
-    source_row_distance = abs(
-        baseline.candidate.source_row - candidate.candidate.source_row
-    )
+    source_row_distance = abs(baseline.candidate.source_row - candidate.candidate.source_row)
     return (
         int(source_row_matches),
         int(geometry_matches),
@@ -242,12 +236,8 @@ def _match_publishable_rows(
     baseline: ReconstructionResult,
     candidate: ReconstructionResult,
 ) -> tuple[tuple[AlignedLedgerRow, AlignedLedgerRow], ...] | None:
-    baseline_rows = tuple(
-        row for row in baseline.rows if is_publishable_aligned_row(row)
-    )
-    candidate_rows = tuple(
-        row for row in candidate.rows if is_publishable_aligned_row(row)
-    )
+    baseline_rows = tuple(row for row in baseline.rows if is_publishable_aligned_row(row))
+    candidate_rows = tuple(row for row in candidate.rows if is_publishable_aligned_row(row))
     if len(candidate_rows) < len(baseline_rows):
         return None
     zero_score = (0, 0, 0, 0, 0, 0)
@@ -310,11 +300,16 @@ def _preserves_grounded_fields(
 ) -> bool:
     def equivalent(left: object, right: object) -> bool:
         if isinstance(left, str) and isinstance(right, str):
-            return re.sub(r"\s+", " ", left).strip().casefold() == re.sub(
-                r"\s+",
-                " ",
-                right,
-            ).strip().casefold()
+            return (
+                re.sub(r"\s+", " ", left).strip().casefold()
+                == re.sub(
+                    r"\s+",
+                    " ",
+                    right,
+                )
+                .strip()
+                .casefold()
+            )
         return left == right
 
     def is_grounded_refund_sign_correction(
@@ -326,8 +321,7 @@ def _preserves_grounded_fields(
     ) -> bool:
         return (
             field == "amount"
-            and "positive_amount_in_return_section"
-            in baseline.candidate.validation_flags
+            and "positive_amount_in_return_section" in baseline.candidate.validation_flags
             and baseline.candidate.role is RowRole.DETAIL
             and candidate.candidate.role is RowRole.REFUND
             and bool(candidate.field_token_ids.get(field))
@@ -335,8 +329,7 @@ def _preserves_grounded_fields(
             and isinstance(candidate_value, Decimal)
             and baseline_value > 0
             and candidate_value == -baseline_value
-            and "positive_amount_in_return_section"
-            not in candidate.candidate.validation_flags
+            and "positive_amount_in_return_section" not in candidate.candidate.validation_flags
         )
 
     for baseline, candidate in matches:
@@ -415,17 +408,14 @@ def safely_improves_reconstruction(
             )
         ):
             return False
-    matched_candidate_ids = {
-        id(candidate_row) for _, candidate_row in matched_rows
-    }
+    matched_candidate_ids = {id(candidate_row) for _, candidate_row in matched_rows}
     if any(
         {
             "line_arithmetic_mismatch",
             "positive_amount_in_return_section",
         }.intersection(row.candidate.validation_flags)
         for row in candidate.rows
-        if is_publishable_aligned_row(row)
-        and id(row) not in matched_candidate_ids
+        if is_publishable_aligned_row(row) and id(row) not in matched_candidate_ids
     ):
         return False
     if _mapped_field_coverage(candidate) < _mapped_field_coverage(baseline):
@@ -470,9 +460,7 @@ def decide_recovery(
             stages.append(RecoveryStage.GEMINI)
         stages.append(RecoveryStage.REVIEW)
     route = "profile_fast" if profile_match and profile_match.selected else "local_ocr"
-    if reasons and (
-        route != "profile_fast" or RecoveryReason.VALIDATION_FAILURE in reasons
-    ):
+    if reasons and (route != "profile_fast" or RecoveryReason.VALIDATION_FAILURE in reasons):
         route = "local_recovery"
     return RouteDecision(
         route=route,
@@ -512,6 +500,32 @@ def map_crop_tokens_to_page(
     )
 
 
+def map_transformed_tokens_to_page(
+    tokens: tuple[OcrToken, ...],
+    source_to_page_matrix: Matrix,
+    page_artifact_sha256: str,
+) -> tuple[OcrToken, ...]:
+    """Ground tokens from any reversible recovery image on the source page."""
+    return tuple(
+        token.model_copy(
+            update={
+                "polygon": Polygon(
+                    points=tuple(
+                        Point(x=x, y=y)
+                        for x, y in apply_matrix(
+                            source_to_page_matrix,
+                            tuple((point.x, point.y) for point in token.polygon.points),
+                        )
+                    )
+                ),
+                "artifact_sha256": page_artifact_sha256,
+                "token_id": f"recovery:{token.token_id}",
+            }
+        )
+        for token in tokens
+    )
+
+
 def _evidence_bounds(
     evidence: tuple[object, ...],
 ) -> tuple[float, float, float, float] | None:
@@ -535,8 +549,7 @@ def _row_evidence_bounds(row: object) -> tuple[float, float, float, float] | Non
     bounds = tuple(
         bound
         for cell in getattr(row, "cells", ())
-        if "all_text_rotated"
-        not in getattr(cell, "validation_flags", ())
+        if "all_text_rotated" not in getattr(cell, "validation_flags", ())
         if (bound := _evidence_bounds(getattr(cell, "evidence", ()))) is not None
     )
     if not bounds:
@@ -559,8 +572,7 @@ def return_sign_recovery_targets(
     targets: list[ReturnSignRecoveryTarget] = []
     for aligned_row in reconstruction.rows:
         if (
-            "positive_amount_in_return_section"
-            not in aligned_row.candidate.validation_flags
+            "positive_amount_in_return_section" not in aligned_row.candidate.validation_flags
             or aligned_row.candidate.amount is None
             or aligned_row.candidate.amount <= 0
         ):
@@ -578,8 +590,7 @@ def return_sign_recovery_targets(
                 for table in reconstruction.source_tables
                 for row in table.rows
                 for cell in row.cells
-                if parse_decimal(getattr(cell, "raw_value", None))
-                == aligned_row.candidate.amount
+                if parse_decimal(getattr(cell, "raw_value", None)) == aligned_row.candidate.amount
                 and any(
                     amount_token_ids.intersection(
                         token_id.strip()
@@ -710,10 +721,7 @@ def description_lane_recovery_regions(
         )
         target_groups: list[list[int]] = []
         for target_index in target_indexes:
-            if (
-                not target_groups
-                or target_index - target_groups[-1][-1] > 2
-            ):
+            if not target_groups or target_index - target_groups[-1][-1] > 2:
                 target_groups.append([target_index])
             else:
                 target_groups[-1].append(target_index)
@@ -791,8 +799,7 @@ def replace_tokens_in_regions(
         center_x = (left + right) / 2
         center_y = (top + bottom) / 2
         return any(
-            region_left <= center_x <= region_right
-            and region_top <= center_y <= region_bottom
+            region_left <= center_x <= region_right and region_top <= center_y <= region_bottom
             for region_left, region_top, region_right, region_bottom in regions
         )
 
@@ -816,8 +823,7 @@ def merge_recovery_tokens(
         center_x = (left + right) / 2
         center_y = (top + bottom) / 2
         return any(
-            region_left <= center_x <= region_right
-            and region_top <= center_y <= region_bottom
+            region_left <= center_x <= region_right and region_top <= center_y <= region_bottom
             for region_left, region_top, region_right, region_bottom in regions
         )
 
@@ -846,8 +852,7 @@ def merge_recovery_tokens(
     supplements = tuple(
         token
         for token in recovered
-        if not inside_region(token)
-        and not substantially_overlaps_preserved(token)
+        if not inside_region(token) and not substantially_overlaps_preserved(token)
     )
     return (*preserved, *supplements, *targeted)
 
@@ -867,9 +872,9 @@ def _polygon_bounds(polygon: Polygon) -> tuple[float, float, float, float]:
 def _overlaps(
     left: tuple[float, float, float, float], right: tuple[float, float, float, float]
 ) -> bool:
-    return min(left[2], right[2]) > max(left[0], right[0]) and min(
-        left[3], right[3]
-    ) > max(left[1], right[1])
+    return min(left[2], right[2]) > max(left[0], right[0]) and min(left[3], right[3]) > max(
+        left[1], right[1]
+    )
 
 
 def _normalize(value: object) -> str:
@@ -943,12 +948,7 @@ def ground_adjudication(
                 valid = False
                 continue
             bounds = _polygon_bounds(field.polygon)
-            if (
-                bounds[0] < 0
-                or bounds[1] < 0
-                or bounds[2] > crop_width
-                or bounds[3] > crop_height
-            ):
+            if bounds[0] < 0 or bounds[1] < 0 or bounds[2] > crop_width or bounds[3] > crop_height:
                 rejected.append(f"row_{row.row_order}:out_of_crop:{field.name}")
                 valid = False
                 continue
@@ -982,9 +982,7 @@ def ground_adjudication(
             continue
         evidence_ids = tuple(
             dict.fromkeys(
-                token_id
-                for token_ids in field_token_ids.values()
-                for token_id in token_ids
+                token_id for token_ids in field_token_ids.values() for token_id in token_ids
             )
         )
         page_boxes = [_bounds(evidence_by_id[token_id]) for token_id in evidence_ids]
