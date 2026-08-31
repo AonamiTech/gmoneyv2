@@ -50,12 +50,23 @@ docker compose \
   -f compose.demo.yaml -f compose.gpu.yaml -f compose.canary.yaml \
   up -d --build --no-deps api frontend worker nginx
 curl --fail http://127.0.0.1:3110/api/v2/health/ready
+
+COMPOSE_PROJECT_NAME=gmoney-v2-canary \
+python3 scripts/verify_release_attestation.py \
+  --expected-revision "$GMONEY_BUILD_REVISION" \
+  --compose-file compose.demo.yaml \
+  --compose-file compose.gpu.yaml \
+  --compose-file compose.canary.yaml \
+  --base-url http://127.0.0.1:3110 \
+  --output "/home/ubuntu/gmoneyv2-releases/$GMONEY_IMAGE_TAG/canary-release-attestation.json"
 ```
 
 The live stack must be idle before candidate inference starts. Process one
 candidate document at a time and pause the candidate worker if a live job
 arrives. Stop the canary with the same three Compose files; never use `down -v`
 because runtime data is bind-mounted and retained for the evaluation report.
+The explicit canary base URL is mandatory: the verifier defaults to the live
+port and must never attest the production stack as though it were the candidate.
 
 ### Mandatory rollback capture
 
