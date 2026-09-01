@@ -61,6 +61,45 @@ def crop_region(
     )
 
 
+def resize_region(
+    source: Path,
+    output: Path,
+    page_number: int,
+    scale: float,
+) -> CropResult:
+    """Resize a canonical crop while retaining a reversible child-to-parent map."""
+    if scale < 1:
+        raise ValueError("canonical recovery resize cannot downsample")
+    image = cv2.imread(str(source), cv2.IMREAD_COLOR)
+    if image is None:
+        raise ValueError(f"cannot read crop: {source}")
+    height, width = image.shape[:2]
+    derived_width = max(1, round(width * scale))
+    derived_height = max(1, round(height * scale))
+    resized = cv2.resize(
+        image,
+        (derived_width, derived_height),
+        interpolation=cv2.INTER_CUBIC if scale > 1 else cv2.INTER_LINEAR,
+    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_name(f".{output.stem}.tmp{output.suffix}")
+    if not cv2.imwrite(str(temporary), resized):
+        raise RuntimeError(f"failed to write resized crop: {temporary}")
+    temporary.replace(output)
+    forward = ((scale, 0.0, 0.0), (0.0, scale, 0.0), (0.0, 0.0, 1.0))
+    transform = TransformChain(
+        page_number=page_number,
+        source_width=width,
+        source_height=height,
+        derived_width=derived_width,
+        derived_height=derived_height,
+        forward_matrix=forward,
+        inverse_matrix=invert(forward),
+        operations=(f"resize:{scale:.8f}",),
+    )
+    return CropResult(output, sha256_file(output), transform)
+
+
 def render_pdf_region(
     source: Path,
     output: Path,

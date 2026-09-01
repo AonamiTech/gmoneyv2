@@ -40,6 +40,8 @@ class _FakeAdapter:
         self.calls += 1
         return InferenceResponse(
             request_id=request.request_id,
+            input_artifact_sha256=request.artifact_sha256,
+            canonical_artifact_sha256=request.canonical_artifact_sha256,
             spec=self.spec,
             output={"content": "fixture"},
             latency_ms=1,
@@ -194,6 +196,7 @@ def test_inference_cache_is_bound_to_artifact_options_and_model(tmp_path: Path) 
     request = InferenceRequest(
         request_id="first",
         artifact_sha256="a" * 64,
+        canonical_artifact_sha256="a" * 64,
         image_path="fixture.png",
         page_number=1,
         options={"prompt": "Table Recognition:"},
@@ -210,10 +213,24 @@ def test_inference_cache_is_bound_to_artifact_options_and_model(tmp_path: Path) 
         changed_options,
         adapter,
     )
+    changed_canonical = request.model_copy(
+        update={"request_id": "changed-canonical", "canonical_artifact_sha256": "c" * 64}
+    )
+    fifth, fifth_hit = _cached_prediction(
+        tmp_path / "stage.json",
+        changed_canonical,
+        adapter,
+    )
 
-    assert first.output == second.output == third.output == fourth.output
-    assert (first_hit, second_hit, third_hit, fourth_hit) == (False, True, False, False)
-    assert adapter.calls == 3
+    assert first.output == second.output == third.output == fourth.output == fifth.output
+    assert (first_hit, second_hit, third_hit, fourth_hit, fifth_hit) == (
+        False,
+        True,
+        False,
+        False,
+        False,
+    )
+    assert adapter.calls == 4
 
 
 def test_table_box_has_extra_vertical_tolerance_for_trailing_rows() -> None:

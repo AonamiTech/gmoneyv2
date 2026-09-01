@@ -268,6 +268,62 @@ class ExtractionDiagnostic(ContractModel):
         return self
 
 
+class TableAdapterInput(ContractModel):
+    """One table-level inference response bound to its canonical crop."""
+
+    adapter_name: str = Field(min_length=1)
+    stage: str = Field(min_length=1)
+    recognition_variant: str = Field(min_length=1)
+    input_artifact_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    canonical_crop_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    cache_hit: bool = False
+    accepted: bool = False
+
+
+class CanonicalTableCrop(ContractModel):
+    """M1 table crop record; the general artifact graph is introduced by V6."""
+
+    record_version: Literal["canonical_table_crop_v1"] = "canonical_table_crop_v1"
+    page_number: int = Field(ge=1)
+    table_id: str = Field(min_length=1)
+    source_page_artifact_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    selected_page_artifact_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    selected_variant: str = Field(min_length=1)
+    artifact_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    artifact_relative_path: str = Field(min_length=1)
+    width: int = Field(gt=0)
+    height: int = Field(gt=0)
+    candidate_box: tuple[int, int, int, int]
+    source_box: tuple[int, int, int, int]
+    source_polygon: Polygon
+    crop_to_source_matrix: tuple[tuple[float, float, float], ...]
+    adapter_inputs: tuple[TableAdapterInput, ...] = ()
+
+    @model_validator(mode="after")
+    def require_consistent_crop(self) -> "CanonicalTableCrop":
+        left, top, right, bottom = self.candidate_box
+        if left < 0 or top < 0 or right <= left or bottom <= top:
+            raise ValueError("canonical crop candidate box is invalid")
+        source_left, source_top, source_right, source_bottom = self.source_box
+        if (
+            source_left < 0
+            or source_top < 0
+            or source_right <= source_left
+            or source_bottom <= source_top
+        ):
+            raise ValueError("canonical crop source box is invalid")
+        if len(self.crop_to_source_matrix) != 3 or any(
+            len(row) != 3 for row in self.crop_to_source_matrix
+        ):
+            raise ValueError("canonical crop transform must be 3x3")
+        if any(
+            item.canonical_crop_sha256 != self.artifact_sha256
+            for item in self.adapter_inputs
+        ):
+            raise ValueError("table adapter canonical crop hash differs from crop record")
+        return self
+
+
 class SourceColumn(ContractModel):
     id: str
     label: str
@@ -456,7 +512,7 @@ class ExtractionResultV5(ContractModel):
     """Complete extractor/publication envelope accepted by the safety gate."""
 
     output_version: Literal["offline_accuracy_spine_v5"]
-    contract_revision: Literal[2, 3, 4]
+    contract_revision: Literal[2, 3, 4, 5]
     document_total_version: str
     document_totals_version: str
     document_total: DocumentTotal | None
@@ -473,6 +529,7 @@ class ExtractionResultV5(ContractModel):
     pages: int = Field(ge=1)
     page_assets: tuple[PageAsset, ...]
     page_preprocessing: tuple[PagePreprocessingRecord, ...] = ()
+    table_crops: tuple[CanonicalTableCrop, ...] = ()
     source_tables: tuple[SourceTable, ...]
     token_manifest: tuple[TokenManifestEntry, ...]
     suppressed_repeated_source_tables: tuple[SuppressedSourceTable, ...] = ()
@@ -487,7 +544,7 @@ class ExtractionResultV5(ContractModel):
 
     @model_validator(mode="after")
     def require_revision_four_preprocessing(self) -> "ExtractionResultV5":
-        if self.contract_revision == 4:
+        if self.contract_revision in {4, 5}:
             expected = tuple(asset.page_number for asset in self.page_assets)
             observed = tuple(record.page_number for record in self.page_preprocessing)
             if observed != expected:
@@ -512,4 +569,32 @@ class ExtractionResultV5(ContractModel):
                     raise ValueError("preprocessing raw artifact does not match page asset")
         elif self.page_preprocessing:
             raise ValueError("preprocessing records require contract revision 4")
+        if self.contract_revision == 5:
+            identities = [(item.page_number, item.table_id) for item in self.table_crops]
+            if len(identities) != len(set(identities)):
+                raise ValueError("canonical table crop identities must be unique")
+            published_tables = {
+                (item.page_number, item.table_id) for item in self.source_tables
+            }
+            if not published_tables.issubset(set(identities)):
+                raise ValueError("every published source table requires a canonical crop")
+            assets = {item.page_number: item for item in self.page_assets}
+            preprocessing = {item.page_number: item for item in self.page_preprocessing}
+            for crop in self.table_crops:
+                page = assets.get(crop.page_number)
+                record = preprocessing.get(crop.page_number)
+                if page is None or crop.source_page_artifact_sha256 != page.artifact_sha256:
+                    raise ValueError("canonical crop source page artifact is invalid")
+                selected = next(
+                    (candidate for candidate in record.candidates if candidate.selected),
+                    None,
+                ) if record is not None else None
+                if (
+                    selected is None
+                    or crop.selected_page_artifact_sha256 != selected.artifact_sha256
+                    or crop.selected_variant != selected.variant.value
+                ):
+                    raise ValueError("canonical crop selected page artifact is invalid")
+        elif self.table_crops:
+            raise ValueError("canonical table crops require contract revision 5")
         return self

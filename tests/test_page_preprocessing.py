@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import cv2
+import numpy as np
 import pytest
 
 from gmoney.contracts.evidence import (
@@ -13,7 +15,10 @@ from gmoney.contracts.evidence import (
     PreprocessingVariant,
     TransformChain,
 )
+from gmoney.evaluation.corpus import sha256_file
+from gmoney.extraction import offline as offline_module
 from gmoney.extraction.offline import (
+    OfflineExtractor,
     PageInferenceBundle,
     _orientation_correction,
     _select_page_inference,
@@ -95,6 +100,7 @@ def _bundle(
     )
     response = InferenceResponse(
         request_id=f"request-{variant.value}",
+        input_artifact_sha256=artifact_sha256,
         spec=ModelSpec(
             kind=ModelKind.OCR,
             provider="test",
@@ -118,6 +124,8 @@ def _bundle(
         layout_cache_hit=False,
         tokens=tokens,
         source_tokens=tokens,
+        candidate_layout_boxes=boxes,
+        candidate_geometry_boxes=(),
         layout_boxes=boxes,
         geometry_boxes=(),
         reconstruction_score=reconstruction_score,
@@ -296,3 +304,82 @@ def test_preprocessing_record_rejects_a_derivative_without_raw_candidate() -> No
             candidates=(derivative,),
             selected_variant=PreprocessingVariant.GEOMETRY_300,
         )
+
+
+def test_final_table_ocr_uses_selected_candidate_crop_and_maps_tokens_to_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected_path = tmp_path / "selected.png"
+    image = np.zeros((200, 100, 3), dtype=np.uint8)
+    image[20:120, 10:90] = 127
+    assert cv2.imwrite(str(selected_path), image)
+    selected_sha256 = sha256_file(selected_path)
+    contract = PreprocessingCandidate(
+        variant=PreprocessingVariant.GEOMETRY_300,
+        artifact_sha256=selected_sha256,
+        artifact_relative_path="preprocessing/selected.png",
+        width=100,
+        height=200,
+        dpi=300,
+        transform=_transform(),
+        quality=_quality(selected_sha256),
+    )
+    page = PageAsset(
+        document_sha256="f" * 64,
+        page_number=1,
+        artifact_sha256="a" * 64,
+        relative_path="pages/page-1.png",
+        width=100,
+        height=200,
+        dpi=300,
+        renderer="test",
+        renderer_version="1",
+    )
+
+    class Adapter:
+        spec = ModelSpec(
+            kind=ModelKind.OCR,
+            provider="test",
+            model_name="canonical-ocr",
+            model_version="1",
+            backend="test",
+            device="cpu",
+        )
+
+        def predict(self, request):
+            return InferenceResponse(
+                request_id=request.request_id,
+                input_artifact_sha256=request.artifact_sha256,
+                canonical_artifact_sha256=request.canonical_artifact_sha256,
+                spec=self.spec,
+                output={},
+                latency_ms=1,
+                memory_scope="process",
+            )
+
+    monkeypatch.setattr(
+        offline_module,
+        "paddle_ocr_tokens",
+        lambda output, page_number, artifact_sha256: (
+            _token(0, "100.00", 0.99, artifact_sha256),
+        ),
+    )
+    extractor = object.__new__(OfflineExtractor)
+    extractor.ocr = Adapter()
+    work = extractor._canonical_table_work(
+        artifact_root=tmp_path,
+        page_asset=page,
+        selected=PreparedPageCandidate(selected_path, contract),
+        table_id="p1-t1",
+        candidate_box=(10, 20, 90, 120),
+    )
+
+    crop = cv2.imread(str(work.crop_path), cv2.IMREAD_COLOR)
+    assert crop is not None and crop.shape[:2] == (100, 80)
+    assert np.all(crop == 127)
+    assert work.adapter_inputs[0].canonical_crop_sha256 == work.crop_sha256
+    assert work.tokens[0].artifact_sha256 == page.artifact_sha256
+    local_point = work.canonical_tokens[0].polygon.points[0]
+    mapped_point = work.tokens[0].polygon.points[0]
+    assert (mapped_point.x, mapped_point.y) == (local_point.x + 10, local_point.y + 20)

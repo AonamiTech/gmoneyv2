@@ -27,7 +27,7 @@ from gmoney.extraction.date_context import service_date_from_context
 from gmoney.extraction.typed_values import parse_decimal, parse_quantity, parse_service_date
 from gmoney.geometry.transform import apply_matrix
 
-VALIDATION_VERSION = "extraction_validation_v5_r3"
+VALIDATION_VERSION = "extraction_validation_v5_r4"
 SUPPORTED_OUTPUT_VERSION = "offline_accuracy_spine_v5"
 
 
@@ -1872,6 +1872,65 @@ def _validate_extraction_result(
                         field="page_preprocessing",
                     )
                 )
+
+    for crop in result.get("table_crops") or []:
+        page_number = int(crop.get("page_number") or 0)
+        table_id = str(crop.get("table_id") or "") or None
+        relative = Path(str(crop.get("artifact_relative_path") or ""))
+        unresolved = artifact_root / relative
+        path = unresolved.resolve()
+        width = int(crop.get("width") or 0)
+        height = int(crop.get("height") or 0)
+        source_polygon = (crop.get("source_polygon") or {}).get("points") or []
+        projected: tuple[tuple[float, float], ...] = ()
+        try:
+            projected = apply_matrix(
+                crop["crop_to_source_matrix"],
+                (
+                    (0.0, 0.0),
+                    (float(width), 0.0),
+                    (float(width), float(height)),
+                    (0.0, float(height)),
+                ),
+            )
+        except (KeyError, TypeError, ValueError):
+            projected = ()
+        polygon_matches = bool(
+            len(projected) == len(source_polygon) == 4
+            and all(
+                abs(actual_x - float(expected["x"])) <= 2.0
+                and abs(actual_y - float(expected["y"])) <= 2.0
+                for (actual_x, actual_y), expected in zip(
+                    projected,
+                    source_polygon,
+                    strict=True,
+                )
+            )
+        )
+        adapters_match = all(
+            item.get("canonical_crop_sha256") == crop.get("artifact_sha256")
+            for item in crop.get("adapter_inputs") or []
+        )
+        valid_crop = bool(
+            not relative.is_absolute()
+            and artifact_root.resolve() in path.parents
+            and unresolved.is_file()
+            and not _path_uses_symlink(unresolved, artifact_root)
+            and cached_sha256_file(path) == crop.get("artifact_sha256")
+            and polygon_matches
+            and adapters_match
+        )
+        if not valid_crop:
+            issues.append(
+                _issue(
+                    "canonical_table_crop_invalid",
+                    ValidationSeverity.FATAL,
+                    "Canonical table crop, mapping, or adapter binding is invalid",
+                    page_number=page_number or None,
+                    table_id=table_id,
+                    field="table_crops",
+                )
+            )
 
     token_manifest: dict[str, TokenManifestEntry] = {}
     token_payloads = result.get("token_manifest")

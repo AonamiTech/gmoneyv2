@@ -11,6 +11,7 @@ from gmoney.geometry.crop import (
     color_overlay_suppressed_variant,
     crop_region,
     render_pdf_region,
+    resize_region,
 )
 from gmoney.geometry.normalize import normalize_page, normalize_quadrilateral_region
 from gmoney.geometry.preprocess import (
@@ -101,6 +102,17 @@ def test_crop_retains_inverse_page_mapping(tmp_path: Path) -> None:
     assert crop_points[0] == (0.0, 0.0)
     restored = apply_matrix(result.transform.inverse_matrix, crop_points)
     assert restored == page_points
+
+
+def test_canonical_recovery_resize_retains_inverse_crop_mapping(tmp_path: Path) -> None:
+    source = tmp_path / "crop.png"
+    image = np.full((80, 120, 3), 255, dtype=np.uint8)
+    assert cv2.imwrite(str(source), image)
+    result = resize_region(source, tmp_path / "resized.png", 1, 2.0)
+    original = ((0.0, 0.0), (120.0, 80.0), (30.0, 20.0))
+    resized = apply_matrix(result.transform.forward_matrix, original)
+    assert resized == ((0.0, 0.0), (240.0, 160.0), (60.0, 40.0))
+    assert apply_matrix(result.transform.inverse_matrix, resized) == original
 
 
 def test_color_overlay_suppression_fades_colored_marks_and_preserves_dark_text(

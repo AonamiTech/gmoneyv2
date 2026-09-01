@@ -54,6 +54,7 @@ class RouteDecision(ContractModel):
 class RecoveryAttempt(ContractModel):
     stage: RecoveryStage
     artifact_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    canonical_crop_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
     cache_hit: bool = False
     latency_ms: int = Field(default=0, ge=0)
     produced_rows: int = Field(default=0, ge=0)
@@ -100,6 +101,7 @@ class AdjudicationRequest(ContractModel):
     table_id: str
     masked_crop_path: str
     masked_crop_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    canonical_crop_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     page_type: PageType | None = None
     table_type: TableType = TableType.UNKNOWN
     tokens: tuple[OcrToken, ...]
@@ -113,6 +115,7 @@ class AdjudicationRequest(ContractModel):
 class AdjudicationResponse(ContractModel):
     response_version: str = "adjudication_response_v1"
     request_id: str
+    canonical_crop_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     provider: str
     model: str
     rows: tuple[AdjudicationRow, ...] = ()

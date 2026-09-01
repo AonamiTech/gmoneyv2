@@ -160,6 +160,7 @@ class GeminiAdjudicationAdapter:
             finish_reason = str(getattr(candidates[0], "finish_reason", "") or "") or None
         return AdjudicationResponse(
             request_id=request.request_id,
+            canonical_crop_sha256=request.canonical_crop_sha256,
             provider=self.provider,
             model=self.model,
             rows=rows,
@@ -201,6 +202,7 @@ def adjudication_cache_identity(
 ) -> str:
     payload = {
         "masked_crop_sha256": request.masked_crop_sha256,
+        "canonical_crop_sha256": request.canonical_crop_sha256,
         "model": model,
         "prompt_version": request.prompt_version,
         "schema_version": request.schema_version,
@@ -223,8 +225,16 @@ def cached_adjudication(
     if cache_path.exists():
         envelope = json.loads(cache_path.read_text())
         if envelope.get("cache_identity") == identity:
-            return AdjudicationResponse.model_validate(envelope["response"]), True
+            try:
+                response = AdjudicationResponse.model_validate(envelope["response"])
+            except (KeyError, TypeError, ValueError):
+                pass
+            else:
+                if response.canonical_crop_sha256 == request.canonical_crop_sha256:
+                    return response, True
     response = adapter.adjudicate(request)
+    if response.canonical_crop_sha256 != request.canonical_crop_sha256:
+        raise ValueError("adjudication response canonical crop hash differs from request")
     envelope = {
         "cache_identity": identity,
         "request_id": request.request_id,

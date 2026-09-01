@@ -12,6 +12,7 @@ from gmoney.contracts.evidence import (
 )
 from gmoney.contracts.extraction import (
     CanonicalRow,
+    CanonicalTableCrop,
     DocumentTotal,
     EvidenceRef,
     ExtractionResultV5,
@@ -19,6 +20,7 @@ from gmoney.contracts.extraction import (
     ProviderCandidate,
     ReviewDisposition,
     RowRole,
+    TableAdapterInput,
     TableType,
     TokenManifestEntry,
 )
@@ -55,6 +57,7 @@ from gmoney.contracts.phase3 import (
 )
 
 __all__ = [
+    "CanonicalTableCrop",
     "CanonicalRow",
     "AdjudicationField",
     "AdjudicationRequest",
@@ -100,6 +103,7 @@ __all__ = [
     "RouteDecision",
     "TableRegion",
     "TableType",
+    "TableAdapterInput",
     "TokenManifestEntry",
     "TransformChain",
 ]

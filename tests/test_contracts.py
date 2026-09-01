@@ -5,9 +5,11 @@ from pydantic import ValidationError
 
 from gmoney.contracts.evidence import Point, Polygon, TransformChain
 from gmoney.contracts.extraction import (
+    CanonicalTableCrop,
     SourceCell,
     SourceColumn,
     SourceTable,
+    TableAdapterInput,
     TokenManifestEntry,
 )
 from gmoney.contracts.gold import GoldAnnotation, GoldSourceTable
@@ -37,6 +39,42 @@ def test_transform_requires_three_by_three_matrices() -> None:
             derived_height=100,
             forward_matrix=((1, 0), (0, 1)),
             inverse_matrix=((1, 0, 0), (0, 1, 0), (0, 0, 1)),
+        )
+
+
+def test_canonical_table_crop_rejects_adapter_bound_to_another_crop() -> None:
+    with pytest.raises(ValidationError, match="adapter canonical crop hash differs"):
+        CanonicalTableCrop(
+            page_number=1,
+            table_id="p1-t1",
+            source_page_artifact_sha256="a" * 64,
+            selected_page_artifact_sha256="b" * 64,
+            selected_variant="geometry_300",
+            artifact_sha256="c" * 64,
+            artifact_relative_path="crops/p1-t1.png",
+            width=100,
+            height=200,
+            candidate_box=(10, 20, 110, 220),
+            source_box=(10, 20, 110, 220),
+            source_polygon=Polygon(
+                points=(
+                    Point(x=10, y=20),
+                    Point(x=110, y=20),
+                    Point(x=110, y=220),
+                    Point(x=10, y=220),
+                )
+            ),
+            crop_to_source_matrix=((1, 0, 10), (0, 1, 20), (0, 0, 1)),
+            adapter_inputs=(
+                TableAdapterInput(
+                    adapter_name="test",
+                    stage="final_table_ocr",
+                    recognition_variant="canonical",
+                    input_artifact_sha256="c" * 64,
+                    canonical_crop_sha256="d" * 64,
+                    accepted=True,
+                ),
+            ),
         )
 
 

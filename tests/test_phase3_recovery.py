@@ -5,7 +5,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from gmoney.contracts.evidence import OcrToken, Point, Polygon
+from gmoney.contracts.evidence import (
+    OcrToken,
+    Point,
+    Polygon,
+    PreprocessingVariant,
+    TransformChain,
+)
 from gmoney.contracts.extraction import (
     EvidenceRef,
     RowRole,
@@ -45,6 +51,88 @@ from gmoney.extraction.recovery import (
 from gmoney.extraction.rows import CandidateLedgerRow
 from gmoney.extraction.spatial import AlignedLedgerRow
 from gmoney.extraction.typed_values import parse_decimal
+from gmoney.geometry.transform import translation
+
+
+def _recovery_work(
+    tmp_path: Path,
+    *,
+    page_artifact_sha256: str,
+    crop_sha256: str,
+    box: tuple[int, int, int, int],
+) -> TableWork:
+    left, top, right, bottom = box
+    width = right - left
+    height = bottom - top
+    return TableWork(
+        table_id="table-1",
+        page_number=1,
+        page_artifact_sha256=page_artifact_sha256,
+        crop_path=tmp_path / "primary.png",
+        crop_sha256=crop_sha256,
+        crop_width=width,
+        crop_height=height,
+        candidate_box=(0, 0, width, height),
+        box=box,
+        source_polygon=Polygon(
+            points=(
+                Point(x=left, y=top),
+                Point(x=right, y=top),
+                Point(x=right, y=bottom),
+                Point(x=left, y=bottom),
+            )
+        ),
+        crop_to_source_matrix=translation(left, top),
+        selected_page_artifact_sha256=page_artifact_sha256,
+        selected_variant=PreprocessingVariant.RAW,
+        selected_dpi=300,
+        tokens=(),
+        canonical_tokens=(),
+        adapter_inputs=[],
+    )
+
+
+def _resize_result(
+    path: Path,
+    artifact_sha256: str,
+    *,
+    width: int,
+    height: int,
+    scale: float,
+):
+    forward = ((scale, 0.0, 0.0), (0.0, scale, 0.0), (0.0, 0.0, 1.0))
+    inverse = ((1 / scale, 0.0, 0.0), (0.0, 1 / scale, 0.0), (0.0, 0.0, 1.0))
+    return SimpleNamespace(
+        output_path=path,
+        artifact_sha256=artifact_sha256,
+        transform=TransformChain(
+            page_number=1,
+            source_width=width,
+            source_height=height,
+            derived_width=round(width * scale),
+            derived_height=round(height * scale),
+            forward_matrix=forward,
+            inverse_matrix=inverse,
+        ),
+    )
+
+
+def _crop_result(path: Path, artifact_sha256: str, box: tuple[int, int, int, int]):
+    left, top, right, bottom = box
+    forward = translation(-left, -top)
+    return SimpleNamespace(
+        output_path=path,
+        artifact_sha256=artifact_sha256,
+        transform=TransformChain(
+            page_number=1,
+            source_width=max(right, 1),
+            source_height=max(bottom, 1),
+            derived_width=right - left,
+            derived_height=bottom - top,
+            forward_matrix=forward,
+            inverse_matrix=translation(left, top),
+        ),
+    )
 
 
 def _schema(table_type: TableType = TableType.ITEM_LEDGER) -> TableSchemaState:
@@ -1270,10 +1358,13 @@ def test_crop_recovery_isolates_and_ranks_grounded_variants(
 
     monkeypatch.setattr(
         offline_module,
-        "render_pdf_region",
-        lambda *args, **kwargs: SimpleNamespace(
-            output_path=tmp_path / "high.png",
-            artifact_sha256=high_artifact_sha256,
+        "resize_region",
+        lambda source, output, page_number, scale: _resize_result(
+            tmp_path / "high.png",
+            high_artifact_sha256,
+            width=200,
+            height=100,
+            scale=scale,
         ),
     )
     monkeypatch.setattr(
@@ -1369,17 +1460,14 @@ def test_crop_recovery_isolates_and_ranks_grounded_variants(
     monkeypatch.setattr(offline_module, "reconstruct_ocr_rows", fake_reconstruct)
     extractor = object.__new__(OfflineExtractor)
     extractor.ocr = object()
-    work = TableWork(
-        table_id="table-1",
-        page_number=1,
+    work = _recovery_work(
+        tmp_path,
         page_artifact_sha256=page_artifact_sha256,
-        crop_path=tmp_path / "primary.png",
         crop_sha256="d" * 64,
         box=(200, 300, 400, 400),
     )
 
     recovered, attempts, recovered_manifest = extractor._recover_crop_ocr(
-        source=tmp_path / "bill.pdf",
         artifact_root=tmp_path,
         work=work,
         prior_schemas=(),
@@ -1425,10 +1513,13 @@ def test_crop_recovery_uses_targeted_description_lane_for_grounded_financial_row
 
     monkeypatch.setattr(
         offline_module,
-        "render_pdf_region",
-        lambda *args, **kwargs: SimpleNamespace(
-            output_path=tmp_path / "high.png",
-            artifact_sha256=high_artifact_sha256,
+        "resize_region",
+        lambda source, output, page_number, scale: _resize_result(
+            tmp_path / "high.png",
+            high_artifact_sha256,
+            width=750,
+            height=220,
+            scale=scale,
         ),
     )
     monkeypatch.setattr(
@@ -1447,9 +1538,10 @@ def test_crop_recovery_uses_targeted_description_lane_for_grounded_financial_row
     monkeypatch.setattr(
         offline_module,
         "crop_region",
-        lambda *args, **kwargs: SimpleNamespace(
-            output_path=tmp_path / "description-lane.png",
-            artifact_sha256=target_artifact_sha256,
+        lambda source, output, page_number, box: _crop_result(
+            tmp_path / "description-lane.png",
+            target_artifact_sha256,
+            box,
         ),
     )
 
@@ -1510,17 +1602,14 @@ def test_crop_recovery_uses_targeted_description_lane_for_grounded_financial_row
     monkeypatch.setattr(offline_module, "reconstruct_ocr_rows", fake_reconstruct)
     extractor = object.__new__(OfflineExtractor)
     extractor.ocr = object()
-    work = TableWork(
-        table_id="table-1",
-        page_number=1,
+    work = _recovery_work(
+        tmp_path,
         page_artifact_sha256=page_artifact_sha256,
-        crop_path=tmp_path / "primary.png",
         crop_sha256="e" * 64,
         box=(50, 80, 800, 300),
     )
 
     recovered, attempts, recovered_manifest = extractor._recover_crop_ocr(
-        source=tmp_path / "bill.pdf",
         artifact_root=tmp_path,
         work=work,
         prior_schemas=(),
@@ -1574,19 +1663,31 @@ def test_crop_recovery_uses_800dpi_clahe_only_for_a_grounded_refund_sign(
 ) -> None:
     page_artifact_sha256 = "a" * 64
     baseline = _return_sign_recovery_baseline()
-    render_calls: list[tuple[tuple[int, int, int, int], int]] = []
+    resize_calls: list[float] = []
     observed_variants: list[str] = []
     reconstructed_batches: list[tuple[OcrToken, ...]] = []
 
-    def fake_render(source, output, page_number, box, **kwargs):
-        output_dpi = int(kwargs.get("output_dpi", 400))
-        render_calls.append((box, output_dpi))
-        return SimpleNamespace(
-            output_path=tmp_path / f"render-{output_dpi}.png",
-            artifact_sha256=("b" if output_dpi == 400 else "c") * 64,
+    def fake_resize(source, output, page_number, scale):
+        resize_calls.append(scale)
+        is_sign = "800dpi-return-sign" in str(output)
+        return _resize_result(
+            tmp_path / ("render-800.png" if is_sign else "render-400.png"),
+            (("c" if is_sign else "b") * 64),
+            width=(75 if is_sign else 750),
+            height=(40 if is_sign else 220),
+            scale=scale,
         )
 
-    monkeypatch.setattr(offline_module, "render_pdf_region", fake_render)
+    monkeypatch.setattr(offline_module, "resize_region", fake_resize)
+    monkeypatch.setattr(
+        offline_module,
+        "crop_region",
+        lambda source, output, page_number, box: _crop_result(
+            tmp_path / "sign-crop.png",
+            "9" * 64,
+            box,
+        ),
+    )
     monkeypatch.setattr(
         offline_module,
         "clahe_variant",
@@ -1640,11 +1741,9 @@ def test_crop_recovery_uses_800dpi_clahe_only_for_a_grounded_refund_sign(
     monkeypatch.setattr(offline_module, "reconstruct_ocr_rows", fake_reconstruct)
     extractor = object.__new__(OfflineExtractor)
     extractor.ocr = object()
-    work = TableWork(
-        table_id="table-1",
-        page_number=1,
+    work = _recovery_work(
+        tmp_path,
         page_artifact_sha256=page_artifact_sha256,
-        crop_path=tmp_path / "primary.png",
         crop_sha256="f" * 64,
         box=(50, 80, 800, 300),
     )
@@ -1666,7 +1765,6 @@ def test_crop_recovery_uses_800dpi_clahe_only_for_a_grounded_refund_sign(
     )
 
     recovered, attempts, recovered_manifest = extractor._recover_crop_ocr(
-        source=tmp_path / "bill.pdf",
         artifact_root=tmp_path,
         work=work,
         prior_schemas=(),
@@ -1680,7 +1778,7 @@ def test_crop_recovery_uses_800dpi_clahe_only_for_a_grounded_refund_sign(
     assert recovered is not None
     assert recovered.rows[0].candidate.amount == Decimal("-23.93")
     assert recovered.rows[0].candidate.role is RowRole.REFUND
-    assert ((670, 130, 745, 170), 800) in render_calls
+    assert 2.0 in resize_calls
     assert "return_sign_800dpi_clahe" in observed_variants
     sign_batch = next(
         tokens

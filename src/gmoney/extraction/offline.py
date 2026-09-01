@@ -31,6 +31,7 @@ from gmoney.contracts.evidence import (
 )
 from gmoney.contracts.extraction import (
     CanonicalRow,
+    CanonicalTableCrop,
     DerivedFieldProvenance,
     EvidenceRef,
     PageType,
@@ -41,6 +42,7 @@ from gmoney.contracts.extraction import (
     SourceColumn,
     SourceRow,
     SourceTable,
+    TableAdapterInput,
     TableType,
     TokenManifestEntry,
 )
@@ -92,8 +94,6 @@ from gmoney.extraction.recovery import (
     ground_adjudication,
     is_implausibly_low_yield,
     is_terminal_non_ledger,
-    map_crop_tokens_to_page,
-    map_page_box_to_crop_pixels,
     map_transformed_tokens_to_page,
     merge_recovery_tokens,
     needs_field_quality_recovery,
@@ -114,7 +114,7 @@ from gmoney.geometry.crop import (
     clahe_variant,
     color_overlay_suppressed_variant,
     crop_region,
-    render_pdf_region,
+    resize_region,
 )
 from gmoney.geometry.normalize import normalize_quadrilateral_region
 from gmoney.geometry.preprocess import (
@@ -127,6 +127,7 @@ from gmoney.geometry.transform import (
     Matrix,
     apply_matrix,
     compose,
+    invert,
 )
 from gmoney.geometry.transform import (
     identity as transform_identity,
@@ -166,7 +167,18 @@ class TableWork:
     page_artifact_sha256: str
     crop_path: Path
     crop_sha256: str
+    crop_width: int
+    crop_height: int
+    candidate_box: tuple[int, int, int, int]
     box: tuple[int, int, int, int]
+    source_polygon: Polygon
+    crop_to_source_matrix: Matrix
+    selected_page_artifact_sha256: str
+    selected_variant: PreprocessingVariant
+    selected_dpi: int
+    tokens: tuple[OcrToken, ...]
+    canonical_tokens: tuple[OcrToken, ...]
+    adapter_inputs: list[TableAdapterInput]
 
 
 @dataclass(frozen=True)
@@ -178,6 +190,8 @@ class PageInferenceBundle:
     layout_cache_hit: bool
     tokens: tuple[OcrToken, ...]
     source_tokens: tuple[OcrToken, ...]
+    candidate_layout_boxes: tuple[tuple[int, int, int, int], ...]
+    candidate_geometry_boxes: tuple[tuple[int, int, int, int], ...]
     layout_boxes: tuple[tuple[int, int, int, int], ...]
     geometry_boxes: tuple[tuple[int, int, int, int], ...]
     reconstruction_score: tuple[int, ...]
@@ -248,9 +262,23 @@ def _cached_prediction(
             and envelope.get("options") == request.options
             and envelope.get("model_spec") == adapter.spec.model_dump(mode="json")
         ):
-            return InferenceResponse.model_validate(envelope["response"]), True
+            try:
+                response = InferenceResponse.model_validate(envelope["response"])
+            except (KeyError, TypeError, ValueError):
+                pass
+            else:
+                if (
+                    response.input_artifact_sha256 == request.artifact_sha256
+                    and response.canonical_artifact_sha256
+                    == request.canonical_artifact_sha256
+                ):
+                    return response, True
 
     response = adapter.predict(request)
+    if response.input_artifact_sha256 != request.artifact_sha256:
+        raise ValueError("inference response input artifact hash differs from request")
+    if response.canonical_artifact_sha256 != request.canonical_artifact_sha256:
+        raise ValueError("inference response canonical artifact hash differs from request")
     envelope = {
         "artifact_sha256": request.artifact_sha256,
         "options": request.options,
@@ -279,6 +307,65 @@ def _mapped_box(
         round(max(point[0] for point in points)),
         round(max(point[1] for point in points)),
     )
+
+
+def _bounded_mapped_box(
+    box: Collection[float],
+    transform: Matrix,
+    *,
+    width: int,
+    height: int,
+) -> tuple[int, int, int, int]:
+    left, top, right, bottom = _mapped_box(box, transform)
+    bounded = (
+        max(0, min(width - 1, left)),
+        max(0, min(height - 1, top)),
+        max(1, min(width, right)),
+        max(1, min(height, bottom)),
+    )
+    if bounded[2] <= bounded[0] or bounded[3] <= bounded[1]:
+        raise ValueError("mapped table box is outside the target artifact")
+    return bounded
+
+
+def _source_polygon(
+    candidate_box: tuple[int, int, int, int],
+    candidate_to_source: Matrix,
+    *,
+    source_width: int,
+    source_height: int,
+) -> Polygon:
+    left, top, right, bottom = candidate_box
+    mapped = apply_matrix(
+        candidate_to_source,
+        ((left, top), (right, top), (right, bottom), (left, bottom)),
+    )
+    return Polygon(
+        points=tuple(
+            Point(
+                x=max(0.0, min(float(source_width), x)),
+                y=max(0.0, min(float(source_height), y)),
+            )
+            for x, y in mapped
+        )
+    )
+
+
+def _polygon_box(
+    polygon: Polygon,
+    *,
+    width: int,
+    height: int,
+) -> tuple[int, int, int, int]:
+    xs = tuple(point.x for point in polygon.points)
+    ys = tuple(point.y for point in polygon.points)
+    left = max(0, min(width - 1, round(min(xs))))
+    top = max(0, min(height - 1, round(min(ys))))
+    right = max(1, min(width, round(max(xs))))
+    bottom = max(1, min(height, round(max(ys))))
+    if right <= left or bottom <= top:
+        raise ValueError("canonical table crop has an empty source projection")
+    return left, top, right, bottom
 
 
 def _layout_boxes(
@@ -3950,6 +4037,7 @@ class TableExtractionUnit:
     recovery_tokens: tuple[TokenManifestEntry, ...]
     raw_total_candidates: tuple[DocumentTotalCandidate, ...]
     provider_usage: dict[str, Any]
+    canonical_crop: CanonicalTableCrop | None = None
 
     def raw_digest(self) -> str:
         return _stable_payload_digest(
@@ -3975,6 +4063,11 @@ class TableExtractionUnit:
                     for item in self.raw_total_candidates
                 ],
                 "provider_usage": self.provider_usage,
+                "canonical_crop": (
+                    self.canonical_crop.model_dump(mode="json")
+                    if self.canonical_crop is not None
+                    else None
+                ),
             }
         )
 
@@ -4120,6 +4213,17 @@ def _prefix_recovery_page_units(
             replace(
                 table,
                 crop_relative_path=relative(table.crop_relative_path),
+                canonical_crop=(
+                    table.canonical_crop.model_copy(
+                        update={
+                            "artifact_relative_path": relative(
+                                table.canonical_crop.artifact_relative_path
+                            )
+                        }
+                    )
+                    if table.canonical_crop is not None
+                    else None
+                ),
                 diagnostics=tuple(diagnostic(item) for item in table.diagnostics),
                 normalized_fragments=tuple(
                     tokens_by_id.get(fragment.token_id, fragment)
@@ -4362,9 +4466,21 @@ def _project_extraction_draft(draft: ExtractionDraft) -> dict[str, Any]:
         unit.preprocessing for unit in draft.page_units if unit.preprocessing is not None
     )
     has_complete_preprocessing = len(projected_preprocessing) == len(draft.page_units)
+    projected_table_crops = tuple(
+        table.canonical_crop
+        for unit in draft.page_units
+        for table in unit.table_units
+        if table.canonical_crop is not None
+    )
+    table_unit_count = sum(len(unit.table_units) for unit in draft.page_units)
+    has_complete_table_crops = len(projected_table_crops) == table_unit_count
     result: dict[str, Any] = {
         "output_version": "offline_accuracy_spine_v5",
-        "contract_revision": 4 if has_complete_preprocessing else 3,
+        "contract_revision": (
+            5
+            if has_complete_preprocessing and has_complete_table_crops
+            else (4 if has_complete_preprocessing else 3)
+        ),
         "document_total_version": DOCUMENT_TOTAL_VERSION,
         "document_totals_version": DOCUMENT_TOTALS_VERSION,
         "document_total": (document_total.model_dump(mode="json") if document_total else None),
@@ -4382,6 +4498,10 @@ def _project_extraction_draft(draft: ExtractionDraft) -> dict[str, Any]:
         "page_assets": [unit.page_asset.model_dump(mode="json") for unit in draft.page_units],
         "page_preprocessing": [
             record.model_dump(mode="json") for record in projected_preprocessing
+        ],
+        "table_crops": [
+            record.model_dump(mode="json")
+            for record in (projected_table_crops if has_complete_table_crops else ())
         ],
         "source_tables": [table.model_dump(mode="json") for table in source_tables],
         "token_manifest": [token.model_dump(mode="json") for token in token_manifest],
@@ -5097,10 +5217,101 @@ class OfflineExtractor:
         )
         return match_profile(candidates, observation, include_shadow=include_shadow)
 
+    def _canonical_table_work(
+        self,
+        *,
+        artifact_root: Path,
+        page_asset: PageAsset,
+        selected: PreparedPageCandidate,
+        table_id: str,
+        candidate_box: tuple[int, int, int, int],
+    ) -> TableWork:
+        crop = crop_region(
+            selected.path,
+            artifact_root / "crops" / f"{table_id}.png",
+            page_asset.page_number,
+            candidate_box,
+        )
+        crop_to_source = compose(
+            crop.transform.inverse_matrix,
+            selected.contract.transform.inverse_matrix,
+        )
+        source_polygon = _source_polygon(
+            candidate_box,
+            selected.contract.transform.inverse_matrix,
+            source_width=page_asset.width,
+            source_height=page_asset.height,
+        )
+        source_box = _polygon_box(
+            source_polygon,
+            width=page_asset.width,
+            height=page_asset.height,
+        )
+        request = InferenceRequest(
+            request_id=str(uuid4()),
+            artifact_sha256=crop.artifact_sha256,
+            canonical_artifact_sha256=crop.artifact_sha256,
+            image_path=str(crop.output_path.resolve()),
+            page_number=page_asset.page_number,
+            options={
+                "preprocessing_policy": "camera_preprocessing_v1",
+                "table_stage": "canonical_table_ocr_v1",
+                "recognition_variant": "canonical",
+            },
+        )
+        response, cache_hit = _cached_prediction(
+            artifact_root / "inference" / f"{table_id}.canonical.ocr.json",
+            request,
+            self.ocr,
+        )
+        local_tokens = tuple(
+            token.model_copy(
+                update={"token_id": f"{table_id}:canonical:{token.token_id}"}
+            )
+            for token in paddle_ocr_tokens(
+                response.output,
+                page_asset.page_number,
+                crop.artifact_sha256,
+            )
+        )
+        mapped_tokens = map_transformed_tokens_to_page(
+            local_tokens,
+            crop_to_source,
+            page_asset.artifact_sha256,
+        )
+        return TableWork(
+            table_id=table_id,
+            page_number=page_asset.page_number,
+            page_artifact_sha256=page_asset.artifact_sha256,
+            crop_path=crop.output_path,
+            crop_sha256=crop.artifact_sha256,
+            crop_width=crop.transform.derived_width,
+            crop_height=crop.transform.derived_height,
+            candidate_box=candidate_box,
+            box=source_box,
+            source_polygon=source_polygon,
+            crop_to_source_matrix=crop_to_source,
+            selected_page_artifact_sha256=selected.contract.artifact_sha256,
+            selected_variant=selected.contract.variant,
+            selected_dpi=selected.contract.dpi,
+            tokens=mapped_tokens,
+            canonical_tokens=local_tokens,
+            adapter_inputs=[
+                TableAdapterInput(
+                    adapter_name=self.ocr.spec.model_name,
+                    stage="final_table_ocr",
+                    recognition_variant="canonical",
+                    input_artifact_sha256=response.input_artifact_sha256,
+                    canonical_crop_sha256=crop.artifact_sha256,
+                    cache_hit=cache_hit,
+                    accepted=True,
+                )
+            ],
+        )
+
     def _recover_crop_ocr(
         self,
         *,
-        source: Path,
         artifact_root: Path,
         work: TableWork,
         prior_schemas: tuple[TableSchemaState, ...],
@@ -5115,11 +5326,11 @@ class OfflineExtractor:
     ]:
         attempts: list[RecoveryAttempt] = []
         try:
-            high_resolution = render_pdf_region(
-                source,
+            high_resolution = resize_region(
+                work.crop_path,
                 artifact_root / "crops" / f"{work.table_id}-400dpi.png",
                 work.page_number,
-                work.box,
+                max(1.0, 400 / work.selected_dpi),
             )
         except Exception as error:
             attempts.append(
@@ -5131,10 +5342,11 @@ class OfflineExtractor:
             )
             return None, tuple(attempts), ()
         attempts.append(
-            RecoveryAttempt(
-                stage=RecoveryStage.HIGH_RESOLUTION,
-                artifact_sha256=high_resolution.artifact_sha256,
-                status="rendered",
+                RecoveryAttempt(
+                    stage=RecoveryStage.HIGH_RESOLUTION,
+                    artifact_sha256=high_resolution.artifact_sha256,
+                    canonical_crop_sha256=work.crop_sha256,
+                    status="rendered",
             )
         )
         assets = [
@@ -5143,7 +5355,10 @@ class OfflineExtractor:
                 high_resolution.output_path,
                 high_resolution.artifact_sha256,
                 f"{work.table_id}.400dpi.ocr.json",
-                getattr(getattr(high_resolution, "transform", None), "inverse_matrix", None),
+                compose(
+                    high_resolution.transform.inverse_matrix,
+                    work.crop_to_source_matrix,
+                ),
             )
         ]
         try:
@@ -5161,9 +5376,10 @@ class OfflineExtractor:
             )
         else:
             attempts.append(
-                RecoveryAttempt(
-                    stage=RecoveryStage.PHOTOMETRIC,
-                    artifact_sha256=photometric.artifact_sha256,
+                    RecoveryAttempt(
+                        stage=RecoveryStage.PHOTOMETRIC,
+                        artifact_sha256=photometric.artifact_sha256,
+                        canonical_crop_sha256=work.crop_sha256,
                     status="prepared",
                 )
             )
@@ -5173,7 +5389,10 @@ class OfflineExtractor:
                     photometric.output_path,
                     photometric.artifact_sha256,
                     f"{work.table_id}.400dpi-clahe.ocr.json",
-                    getattr(getattr(high_resolution, "transform", None), "inverse_matrix", None),
+                    compose(
+                        high_resolution.transform.inverse_matrix,
+                        work.crop_to_source_matrix,
+                    ),
                 )
             )
         try:
@@ -5190,6 +5409,7 @@ class OfflineExtractor:
                 perspective_to_page = compose(
                     perspective.transform.inverse_matrix,
                     high_resolution.transform.inverse_matrix,
+                    work.crop_to_source_matrix,
                 )
                 assets.append(
                     (
@@ -5204,6 +5424,7 @@ class OfflineExtractor:
                     RecoveryAttempt(
                         stage=RecoveryStage.HIGH_RESOLUTION,
                         artifact_sha256=perspective.artifact_sha256,
+                        canonical_crop_sha256=work.crop_sha256,
                         status="prepared",
                         reason=(
                             "table_perspective:"
@@ -5284,6 +5505,7 @@ class OfflineExtractor:
             request = InferenceRequest(
                 request_id=str(uuid4()),
                 artifact_sha256=artifact_sha256,
+                canonical_artifact_sha256=work.crop_sha256,
                 image_path=str(image_path.resolve()),
                 page_number=work.page_number,
                 options={
@@ -5438,12 +5660,16 @@ class OfflineExtractor:
                     recovered_manifest: list[TokenManifestEntry] = []
                     target_cache_hits: list[bool] = []
                     target_latency_ms = 0
+                    source_to_overlay = compose(
+                        invert(work.crop_to_source_matrix),
+                        high_resolution.transform.forward_matrix,
+                    )
                     for region_index, region in enumerate(regions, start=1):
-                        pixel_box = map_page_box_to_crop_pixels(
+                        pixel_box = _bounded_mapped_box(
                             region,
-                            parent_page_box=work.box,
-                            crop_width=overlay_image.shape[1],
-                            crop_height=overlay_image.shape[0],
+                            source_to_overlay,
+                            width=overlay_image.shape[1],
+                            height=overlay_image.shape[0],
                         )
                         if pixel_box[2] <= pixel_box[0] or pixel_box[3] <= pixel_box[1]:
                             continue
@@ -5460,6 +5686,7 @@ class OfflineExtractor:
                             target_request = InferenceRequest(
                                 request_id=str(uuid4()),
                                 artifact_sha256=targeted_crop.artifact_sha256,
+                                canonical_artifact_sha256=work.crop_sha256,
                                 image_path=str(targeted_crop.output_path.resolve()),
                                 page_number=work.page_number,
                                 options={
@@ -5495,11 +5722,14 @@ class OfflineExtractor:
                                 raise ValueError(
                                     f"cannot read description crop: {targeted_crop.output_path}"
                                 )
-                            mapped_target_tokens = map_crop_tokens_to_page(
+                            target_to_source = compose(
+                                targeted_crop.transform.inverse_matrix,
+                                high_resolution.transform.inverse_matrix,
+                                work.crop_to_source_matrix,
+                            )
+                            mapped_target_tokens = map_transformed_tokens_to_page(
                                 local_target_tokens,
-                                region,
-                                target_image.shape[1],
-                                target_image.shape[0],
+                                target_to_source,
                                 page_artifact_sha256,
                             )
                             recovered_tokens.extend(mapped_target_tokens)
@@ -5511,7 +5741,7 @@ class OfflineExtractor:
                                     artifact_sha256=targeted_crop.artifact_sha256,
                                     width=target_image.shape[1],
                                     height=target_image.shape[0],
-                                    page_box=region,
+                                    source_to_page_matrix=target_to_source,
                                 )
                             )
                             target_cache_hits.append(target_cache_hit)
@@ -5574,18 +5804,35 @@ class OfflineExtractor:
             sign_cache_hits: list[bool] = []
             sign_latency_ms = 0
             sign_artifact_sha256 = page_artifact_sha256
+            source_to_high_resolution = compose(
+                invert(work.crop_to_source_matrix),
+                high_resolution.transform.forward_matrix,
+            )
             for target_index, target in enumerate(sign_targets, start=1):
                 region = target.region
                 region_slug = "-".join(str(value) for value in region)
                 try:
-                    high_resolution_sign = render_pdf_region(
-                        source,
+                    sign_pixel_box = _bounded_mapped_box(
+                        region,
+                        source_to_high_resolution,
+                        width=high_resolution.transform.derived_width,
+                        height=high_resolution.transform.derived_height,
+                    )
+                    sign_crop = crop_region(
+                        high_resolution.output_path,
+                        artifact_root
+                        / "crops"
+                        / f"{work.table_id}-400dpi-return-sign-{region_slug}.png",
+                        work.page_number,
+                        sign_pixel_box,
+                    )
+                    high_resolution_sign = resize_region(
+                        sign_crop.output_path,
                         artifact_root
                         / "crops"
                         / f"{work.table_id}-800dpi-return-sign-{region_slug}.png",
                         work.page_number,
-                        region,
-                        output_dpi=800,
+                        2.0,
                     )
                     enhanced_sign = clahe_variant(
                         high_resolution_sign.output_path,
@@ -5596,6 +5843,7 @@ class OfflineExtractor:
                     sign_request = InferenceRequest(
                         request_id=str(uuid4()),
                         artifact_sha256=enhanced_sign.artifact_sha256,
+                        canonical_artifact_sha256=work.crop_sha256,
                         image_path=str(enhanced_sign.output_path.resolve()),
                         page_number=work.page_number,
                         options={
@@ -5637,11 +5885,15 @@ class OfflineExtractor:
                         )
                         for token in matching_sign_tokens
                     )
-                    mapped_sign_tokens = map_crop_tokens_to_page(
+                    sign_to_source = compose(
+                        high_resolution_sign.transform.inverse_matrix,
+                        sign_crop.transform.inverse_matrix,
+                        high_resolution.transform.inverse_matrix,
+                        work.crop_to_source_matrix,
+                    )
+                    mapped_sign_tokens = map_transformed_tokens_to_page(
                         prefixed_sign_tokens,
-                        region,
-                        sign_image.shape[1],
-                        sign_image.shape[0],
+                        sign_to_source,
                         page_artifact_sha256,
                     )
                     recovered_sign_tokens.extend(mapped_sign_tokens)
@@ -5653,7 +5905,7 @@ class OfflineExtractor:
                             artifact_sha256=enhanced_sign.artifact_sha256,
                             width=sign_image.shape[1],
                             height=sign_image.shape[0],
-                            page_box=region,
+                            source_to_page_matrix=sign_to_source,
                         )
                     )
                     recovered_sign_regions.append(region)
@@ -5757,6 +6009,7 @@ class OfflineExtractor:
                 RecoveryAttempt(
                     stage=RecoveryStage.CROP_OCR,
                     artifact_sha256=artifact_sha256,
+                    canonical_crop_sha256=work.crop_sha256,
                     cache_hit=cache_hit,
                     latency_ms=latency_ms,
                     produced_rows=len(reconstruction.rows),
@@ -5817,6 +6070,8 @@ class OfflineExtractor:
             tuple[int, str],
             tuple[int, int, int, int],
         ] = {}
+        canonical_table_work: list[TableWork] = []
+        canonical_token_manifest: dict[str, TokenManifestEntry] = {}
         document_total_candidates: list[DocumentTotalCandidate] = []
         diagnostics: list[dict[str, Any]] = []
         schema_states: list[TableSchemaState] = []
@@ -6021,21 +6276,43 @@ class OfflineExtractor:
                 )
                 abort_checkpoint()
                 to_page = prepared.contract.transform.inverse_matrix
-                mapped_layout_boxes = tuple(
+                candidate_layout_boxes = tuple(
                     box
-                    for box in _layout_boxes(layout_response.output, to_page=to_page)
+                    for box in _layout_boxes(layout_response.output)
                     if box[2] > 0
                     and box[3] > 0
-                    and box[0] < page_asset.width
-                    and box[1] < page_asset.height
+                    and box[0] < prepared.contract.width
+                    and box[1] < prepared.contract.height
+                )
+                mapped_layout_boxes = tuple(
+                    _bounded_mapped_box(
+                        box,
+                        to_page,
+                        width=page_asset.width,
+                        height=page_asset.height,
+                    )
+                    for box in candidate_layout_boxes
+                    if box[2] > 0
+                    and box[3] > 0
+                )
+                candidate_geometry_boxes = tuple(
+                    box
+                    for box in _ocr_geometry_boxes(ocr_response.output, transform_identity())
+                    if box[2] > 0
+                    and box[3] > 0
+                    and box[0] < prepared.contract.width
+                    and box[1] < prepared.contract.height
                 )
                 mapped_geometry_boxes = tuple(
-                    box
-                    for box in _ocr_geometry_boxes(ocr_response.output, to_page)
+                    _bounded_mapped_box(
+                        box,
+                        to_page,
+                        width=page_asset.width,
+                        height=page_asset.height,
+                    )
+                    for box in candidate_geometry_boxes
                     if box[2] > 0
                     and box[3] > 0
-                    and box[0] < page_asset.width
-                    and box[1] < page_asset.height
                 )
                 bundles.append(
                     PageInferenceBundle(
@@ -6046,6 +6323,8 @@ class OfflineExtractor:
                         layout_cache_hit=layout_cache_hit,
                         tokens=tokens,
                         source_tokens=source_tokens,
+                        candidate_layout_boxes=candidate_layout_boxes,
+                        candidate_geometry_boxes=candidate_geometry_boxes,
                         layout_boxes=mapped_layout_boxes,
                         geometry_boxes=mapped_geometry_boxes,
                         reconstruction_score=reconstruction_quality(
@@ -6138,7 +6417,12 @@ class OfflineExtractor:
             layout_cache_hit = selected_bundle.layout_cache_hit
             layout_boxes = list(selected_bundle.layout_boxes)
             geometry_boxes = list(selected_bundle.geometry_boxes)
-            boxes = _merge_table_boxes(layout_boxes, geometry_boxes)
+            candidate_layout_boxes = list(selected_bundle.candidate_layout_boxes)
+            candidate_geometry_boxes = list(selected_bundle.candidate_geometry_boxes)
+            candidate_boxes = _merge_table_boxes(
+                candidate_layout_boxes,
+                candidate_geometry_boxes,
+            )
             route = (
                 "layout+ocr_geometry"
                 if layout_boxes and geometry_boxes
@@ -6162,34 +6446,73 @@ class OfflineExtractor:
                         None,
                     )
                     if diagnostic is not None:
-                        work_boxes.append(
-                            (table_id, tuple(int(value) for value in diagnostic["box"]))
+                        stored_candidate_box = diagnostic.get("candidate_box")
+                        candidate_box = (
+                            tuple(int(value) for value in stored_candidate_box)
+                            if isinstance(stored_candidate_box, (list, tuple))
+                            and len(stored_candidate_box) == 4
+                            else _bounded_mapped_box(
+                                tuple(int(value) for value in diagnostic["box"]),
+                                selected_candidate.transform.forward_matrix,
+                                width=selected_candidate.width,
+                                height=selected_candidate.height,
+                            )
                         )
+                        work_boxes.append((table_id, candidate_box))
             else:
+                scale = selected_candidate.dpi / page_asset.dpi
                 work_boxes.extend(
-                    (f"p{page_asset.page_number}-t{table_index + 1}", box)
-                    for table_index, box in enumerate(boxes)
-                )
-            for table_id, box in work_boxes:
-                safe_box = _safe_box(box, page_asset.width, page_asset.height)
-                crop = crop_region(
-                    page_path,
-                    artifact_root / "crops" / f"{table_id}.png",
-                    page_asset.page_number,
-                    safe_box,
-                )
-                source_table_crop_paths[(page_asset.page_number, table_id)] = crop.output_path
-                source_table_crop_boxes[(page_asset.page_number, table_id)] = safe_box
-                table_work.append(
-                    TableWork(
-                        table_id=table_id,
-                        page_number=page_asset.page_number,
-                        page_artifact_sha256=page_asset.artifact_sha256,
-                        crop_path=crop.output_path,
-                        crop_sha256=crop.artifact_sha256,
-                        box=safe_box,
+                    (
+                        f"p{page_asset.page_number}-t{table_index + 1}",
+                        _safe_box(
+                            box,
+                            selected_candidate.width,
+                            selected_candidate.height,
+                            horizontal_padding=max(1, round(20 * scale)),
+                            vertical_padding=max(1, round(100 * scale)),
+                        ),
                     )
+                    for table_index, box in enumerate(candidate_boxes)
                 )
+            for table_id, candidate_box in work_boxes:
+                work = self._canonical_table_work(
+                    artifact_root=artifact_root,
+                    page_asset=page_asset,
+                    selected=selected_bundle.candidate,
+                    table_id=table_id,
+                    candidate_box=candidate_box,
+                )
+                source_table_crop_paths[(page_asset.page_number, table_id)] = work.crop_path
+                source_table_crop_boxes[(page_asset.page_number, table_id)] = work.box
+                crop_relative_path = str(
+                    work.crop_path.resolve().relative_to(artifact_root.resolve())
+                )
+                canonical_token_manifest.update(
+                    {
+                        mapped.token_id: TokenManifestEntry(
+                            token_id=mapped.token_id,
+                            page_number=mapped.page_number,
+                            text=mapped.text,
+                            polygon=mapped.polygon,
+                            artifact_sha256=page_asset.artifact_sha256,
+                            artifact_relative_path=raw_relative_path,
+                            confidence=mapped.confidence,
+                            source_artifact_sha256=work.crop_sha256,
+                            source_artifact_relative_path=crop_relative_path,
+                            source_polygon=local.polygon,
+                            source_width=work.crop_width,
+                            source_height=work.crop_height,
+                            source_to_page_matrix=work.crop_to_source_matrix,
+                        )
+                        for local, mapped in zip(
+                            work.canonical_tokens,
+                            work.tokens,
+                            strict=True,
+                        )
+                    }
+                )
+                table_work.append(work)
+                canonical_table_work.append(work)
 
             specific_table_recovery = bool(baseline_draft is not None and None not in page_targets)
             if not table_work and not specific_table_recovery:
@@ -6204,25 +6527,50 @@ class OfflineExtractor:
                 )
             ):
                 table_id = f"p{page_asset.page_number}-t1"
-                safe_box = (0, 0, page_asset.width, page_asset.height)
-                crop = crop_region(
-                    page_path,
-                    artifact_root / "crops" / f"{table_id}.png",
-                    page_asset.page_number,
-                    safe_box,
+                candidate_box = (
+                    0,
+                    0,
+                    selected_candidate.width,
+                    selected_candidate.height,
                 )
-                source_table_crop_paths[(page_asset.page_number, table_id)] = crop.output_path
-                source_table_crop_boxes[(page_asset.page_number, table_id)] = safe_box
-                table_work.append(
-                    TableWork(
-                        table_id=table_id,
-                        page_number=page_asset.page_number,
-                        page_artifact_sha256=page_asset.artifact_sha256,
-                        crop_path=crop.output_path,
-                        crop_sha256=crop.artifact_sha256,
-                        box=safe_box,
-                    )
+                work = self._canonical_table_work(
+                    artifact_root=artifact_root,
+                    page_asset=page_asset,
+                    selected=selected_bundle.candidate,
+                    table_id=table_id,
+                    candidate_box=candidate_box,
                 )
+                source_table_crop_paths[(page_asset.page_number, table_id)] = work.crop_path
+                source_table_crop_boxes[(page_asset.page_number, table_id)] = work.box
+                crop_relative_path = str(
+                    work.crop_path.resolve().relative_to(artifact_root.resolve())
+                )
+                canonical_token_manifest.update(
+                    {
+                        mapped.token_id: TokenManifestEntry(
+                            token_id=mapped.token_id,
+                            page_number=mapped.page_number,
+                            text=mapped.text,
+                            polygon=mapped.polygon,
+                            artifact_sha256=page_asset.artifact_sha256,
+                            artifact_relative_path=raw_relative_path,
+                            confidence=mapped.confidence,
+                            source_artifact_sha256=work.crop_sha256,
+                            source_artifact_relative_path=crop_relative_path,
+                            source_polygon=local.polygon,
+                            source_width=work.crop_width,
+                            source_height=work.crop_height,
+                            source_to_page_matrix=work.crop_to_source_matrix,
+                        )
+                        for local, mapped in zip(
+                            work.canonical_tokens,
+                            work.tokens,
+                            strict=True,
+                        )
+                    }
+                )
+                table_work.append(work)
+                canonical_table_work.append(work)
                 route = "full_page_form_assessment"
 
             if not table_work:
@@ -6272,7 +6620,7 @@ class OfflineExtractor:
                     or (work.page_number, None) in recovery_target_set
                 )
                 reconstruction = reconstruct_ocr_rows(
-                    tokens,
+                    work.tokens,
                     page_number=work.page_number,
                     table_id=work.table_id,
                     box=work.box,
@@ -6285,7 +6633,7 @@ class OfflineExtractor:
                     page_height=page_asset.height,
                     box=work.box,
                     reconstruction=reconstruction,
-                    tokens=tokens,
+                    tokens=work.tokens,
                     profiles=job_profiles,
                 )
                 shadow_profile_match = self._profile_match(
@@ -6295,7 +6643,7 @@ class OfflineExtractor:
                     page_height=page_asset.height,
                     box=work.box,
                     reconstruction=reconstruction,
-                    tokens=tokens,
+                    tokens=work.tokens,
                     profiles=tuple(
                         profile
                         for profile in job_profiles
@@ -6312,7 +6660,7 @@ class OfflineExtractor:
                         and profile.profile_version == profile_match.profile_version
                     )
                     guided = reconstruct_ocr_rows(
-                        tokens,
+                        work.tokens,
                         page_number=work.page_number,
                         table_id=work.table_id,
                         box=work.box,
@@ -6363,7 +6711,6 @@ class OfflineExtractor:
                     table_box=work.box,
                 ):
                     recovered, attempts, recovered_manifest = self._recover_crop_ocr(
-                        source=source,
                         artifact_root=artifact_root,
                         work=work,
                         prior_schemas=_recovery_prior_schemas(
@@ -6374,9 +6721,30 @@ class OfflineExtractor:
                         page_artifact_sha256=work.page_artifact_sha256,
                         page_artifact_relative_path=str(Path("pages") / page_asset.relative_path),
                         baseline=reconstruction,
-                        baseline_tokens=tokens_in_box(tokens, work.box),
+                        baseline_tokens=work.tokens,
                     )
                     recovery_attempts.extend(attempts)
+                    work.adapter_inputs.extend(
+                        TableAdapterInput(
+                            adapter_name=self.ocr.spec.model_name,
+                            stage="crop_recovery",
+                            recognition_variant=(
+                                attempt.reason.removeprefix("input_variant:")
+                                if attempt.reason
+                                and attempt.reason.startswith("input_variant:")
+                                else "recovery"
+                            ),
+                            input_artifact_sha256=attempt.artifact_sha256,
+                            canonical_crop_sha256=work.crop_sha256,
+                            cache_hit=attempt.cache_hit,
+                            accepted=attempt.status == "recovered",
+                        )
+                        for attempt in attempts
+                        if attempt.stage is RecoveryStage.CROP_OCR
+                        and attempt.artifact_sha256 is not None
+                        and attempt.reason is not None
+                        and attempt.reason.startswith("input_variant:")
+                    )
                     if recovered is not None:
                         recovery_token_manifest.update(
                             {item.token_id: item for item in recovered_manifest}
@@ -6407,8 +6775,15 @@ class OfflineExtractor:
                         artifact_relative_path=str(Path("pages") / page_asset.relative_path),
                         confidence=token.confidence,
                     )
-                    for token in tokens
+                    for token in work.tokens
                 }
+                reconstruction_token_lookup.update(
+                    {
+                        token.token_id: canonical_token_manifest[token.token_id]
+                        for token in work.tokens
+                        if token.token_id in canonical_token_manifest
+                    }
+                )
                 reconstruction_token_lookup.update(recovery_token_manifest)
                 materialized_tables, fragments, fragment_assignments = (
                     _materialize_printed_cell_fragments(
@@ -6492,7 +6867,7 @@ class OfflineExtractor:
                 )
                 rows_before_vl = len(parsed_rows)
                 if use_vl:
-                    scoped_tokens = tokens_in_box(tokens, work.box)
+                    scoped_tokens = work.tokens
                     vl_cache_hits: list[bool] = []
                     vl_contents: list[str] = []
                     orientation = str(reconstruction.diagnostics.get("orientation") or "upright")
@@ -6507,6 +6882,7 @@ class OfflineExtractor:
                         vl_request = InferenceRequest(
                             request_id=str(uuid4()),
                             artifact_sha256=asset.artifact_sha256,
+                            canonical_artifact_sha256=work.crop_sha256,
                             image_path=str(asset.path.resolve()),
                             page_number=work.page_number,
                             options={
@@ -6577,6 +6953,19 @@ class OfflineExtractor:
                                     )
                                 )
                         candidate_count += response_candidate_count
+                        work.adapter_inputs.append(
+                            TableAdapterInput(
+                                adapter_name=self.vl.spec.model_name,
+                                stage="local_vlm",
+                                recognition_variant=asset.identity,
+                                input_artifact_sha256=vl_response.input_artifact_sha256,
+                                canonical_crop_sha256=work.crop_sha256,
+                                cache_hit=cache_hit,
+                                accepted=bool(
+                                    response_candidate_count and not profile_heavy_sample
+                                ),
+                            )
+                        )
                         response_truncated = bool(vl_response.output.get("truncated"))
                         vl_truncated = vl_truncated or response_truncated
                         if job_index == 0:
@@ -6690,8 +7079,8 @@ class OfflineExtractor:
                         redaction = redact_crop(
                             work.crop_path,
                             artifact_root / "crops" / f"{work.table_id}-redacted.png",
-                            tokens,
-                            work.box,
+                            work.canonical_tokens,
+                            (0, 0, work.crop_width, work.crop_height),
                         )
                     except Exception as error:
                         gemini_block_reason = f"redaction_error:{type(error).__name__}"
@@ -6713,6 +7102,7 @@ class OfflineExtractor:
                                 table_id=work.table_id,
                                 masked_crop_path=str(redaction.path.resolve()),
                                 masked_crop_sha256=redaction.artifact_sha256,
+                                canonical_crop_sha256=work.crop_sha256,
                                 page_type=_page_type(table_type),
                                 table_type=table_type,
                                 tokens=redaction.tokens,
@@ -6745,6 +7135,20 @@ class OfflineExtractor:
                             else:
                                 gemini_invoked = True
                                 gemini_calls += 0 if gemini_cache_hit else 1
+                                work.adapter_inputs.append(
+                                    TableAdapterInput(
+                                        adapter_name=self.gemini.model,
+                                        stage="gemini",
+                                        recognition_variant="redacted",
+                                        input_artifact_sha256=redaction.artifact_sha256,
+                                        canonical_crop_sha256=(
+                                            response.canonical_crop_sha256
+                                        ),
+                                        cache_hit=gemini_cache_hit,
+                                        accepted=False,
+                                    )
+                                )
+                                gemini_trace_index = len(work.adapter_inputs) - 1
                                 if not gemini_cache_hit:
                                     gemini_cost += response.measured_cost_usd
                                 try:
@@ -6754,7 +7158,7 @@ class OfflineExtractor:
                                     grounded = ground_adjudication(
                                         response,
                                         validation_tokens=redaction.tokens,
-                                        evidence_tokens=tokens_in_box(tokens, work.box),
+                                        evidence_tokens=work.tokens,
                                         crop_width=image.shape[1],
                                         crop_height=image.shape[0],
                                         table_type=table_type,
@@ -6781,6 +7185,11 @@ class OfflineExtractor:
                                     gemini_grounded_rows = len(grounded.rows)
                                     gemini_rejected_reasons = grounded.rejected_reasons
                                     if self.gemini_mode is GeminiMode.ENABLED and grounded.rows:
+                                        work.adapter_inputs[gemini_trace_index] = (
+                                            work.adapter_inputs[gemini_trace_index].model_copy(
+                                                update={"accepted": True}
+                                            )
+                                        )
                                         parsed_rows.extend(
                                             canonicalize_rows(
                                                 document_id,
@@ -6899,6 +7308,15 @@ class OfflineExtractor:
                             work.crop_path.resolve().relative_to(artifact_root.resolve())
                         ),
                         "box": work.box,
+                        "candidate_box": work.candidate_box,
+                        "source_polygon": work.source_polygon.model_dump(mode="json"),
+                        "crop_to_source_matrix": work.crop_to_source_matrix,
+                        "selected_page_artifact_sha256": (
+                            work.selected_page_artifact_sha256
+                        ),
+                        "adapter_inputs": [
+                            item.model_dump(mode="json") for item in work.adapter_inputs
+                        ],
                         "vl_invoked": use_vl,
                         "vl_latency_ms": vl_latency_ms,
                         "vl_cache_hit": vl_cache_hit,
@@ -6969,6 +7387,7 @@ class OfflineExtractor:
                 for token in tokens
             }
         )
+        token_lookup.update(canonical_token_manifest)
         token_lookup.update(recovery_token_manifest)
         token_lookup.update(precanonical_fragment_manifest)
         (
@@ -7061,6 +7480,16 @@ class OfflineExtractor:
                 for token in page_tokens[page_number]
             }
         )
+        token_manifest_by_id.update(
+            {
+                token_id: token.model_copy(
+                    update={
+                        "table_ids": tuple(sorted(table_ids_by_token.get(token_id, ())))
+                    }
+                )
+                for token_id, token in canonical_token_manifest.items()
+            }
+        )
         token_manifest_by_id.update(recovery_token_manifest)
         token_manifest_by_id.update(precanonical_fragment_manifest)
         token_manifest_by_id.update({item.token_id: item for item in printed_fragments})
@@ -7138,9 +7567,43 @@ class OfflineExtractor:
         )
         if any(record is None for record in published_preprocessing):
             raise RuntimeError("page_preprocessing_record_missing")
+        new_table_crops = tuple(
+            CanonicalTableCrop(
+                page_number=work.page_number,
+                table_id=work.table_id,
+                source_page_artifact_sha256=work.page_artifact_sha256,
+                selected_page_artifact_sha256=work.selected_page_artifact_sha256,
+                selected_variant=work.selected_variant.value,
+                artifact_sha256=work.crop_sha256,
+                artifact_relative_path=str(
+                    work.crop_path.resolve().relative_to(artifact_root.resolve())
+                ),
+                width=work.crop_width,
+                height=work.crop_height,
+                candidate_box=work.candidate_box,
+                source_box=work.box,
+                source_polygon=work.source_polygon,
+                crop_to_source_matrix=work.crop_to_source_matrix,
+                adapter_inputs=tuple(work.adapter_inputs),
+            )
+            for work in canonical_table_work
+        )
+        published_table_crops_by_id = {
+            (crop.page_number, crop.table_id): crop
+            for unit in (baseline_draft.page_units if baseline_draft else ())
+            for table in unit.table_units
+            if (crop := table.canonical_crop) is not None
+        }
+        published_table_crops_by_id.update(
+            {(crop.page_number, crop.table_id): crop for crop in new_table_crops}
+        )
+        published_table_crops = tuple(
+            published_table_crops_by_id[key]
+            for key in sorted(published_table_crops_by_id)
+        )
         result = {
             "output_version": "offline_accuracy_spine_v5",
-            "contract_revision": 4,
+            "contract_revision": 5,
             "document_total_version": DOCUMENT_TOTAL_VERSION,
             "document_totals_version": DOCUMENT_TOTALS_VERSION,
             "document_total": (
@@ -7184,6 +7647,9 @@ class OfflineExtractor:
                 for record in published_preprocessing
                 if record is not None
             ],
+            "table_crops": [
+                record.model_dump(mode="json") for record in published_table_crops
+            ],
             "source_tables": [table.model_dump(mode="json") for table in source_tables],
             "token_manifest": [item.model_dump(mode="json") for item in token_manifest],
             "suppressed_repeated_source_tables": [
@@ -7201,6 +7667,9 @@ class OfflineExtractor:
         }
         if _draft_sink is not None:
             baseline_units = baseline_units_by_page
+            canonical_crops_by_table = {
+                (item.page_number, item.table_id): item for item in published_table_crops
+            }
             page_units: list[PageExtractionUnit] = []
             for page in manifest.pages:
                 published_asset = page.model_copy(
@@ -7265,6 +7734,9 @@ class OfflineExtractor:
                             if item.total.evidence.table_id == table.table_id
                         ),
                         provider_usage=provider_usage,
+                        canonical_crop=canonical_crops_by_table.get(
+                            (page.page_number, table.table_id)
+                        ),
                     )
                     for table in raw_page_tables
                 )

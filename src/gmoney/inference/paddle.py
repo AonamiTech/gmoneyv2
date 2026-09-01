@@ -66,6 +66,8 @@ class PaddleDocOrientationAdapter:
         elapsed = round((time.perf_counter() - started) * 1000)
         return InferenceResponse(
             request_id=request.request_id,
+            input_artifact_sha256=request.artifact_sha256,
+            canonical_artifact_sha256=request.canonical_artifact_sha256,
             spec=self.spec,
             output={"pages": _jsonable(output)},
             latency_ms=elapsed,
@@ -106,6 +108,8 @@ class PaddleOcrV6Adapter:
         elapsed = round((time.perf_counter() - started) * 1000)
         return InferenceResponse(
             request_id=request.request_id,
+            input_artifact_sha256=request.artifact_sha256,
+            canonical_artifact_sha256=request.canonical_artifact_sha256,
             spec=self.spec,
             output={"pages": _jsonable(output)},
             latency_ms=elapsed,
@@ -139,6 +143,8 @@ class PaddleDocLayoutV3Adapter:
         elapsed = round((time.perf_counter() - started) * 1000)
         return InferenceResponse(
             request_id=request.request_id,
+            input_artifact_sha256=request.artifact_sha256,
+            canonical_artifact_sha256=request.canonical_artifact_sha256,
             spec=self.spec,
             output={"pages": _jsonable(output)},
             latency_ms=elapsed,
@@ -175,6 +181,8 @@ class PaddleWirelessTableAdapter:
         elapsed = round((time.perf_counter() - started) * 1000)
         return InferenceResponse(
             request_id=request.request_id,
+            input_artifact_sha256=request.artifact_sha256,
+            canonical_artifact_sha256=request.canonical_artifact_sha256,
             spec=self.spec,
             output={"pages": _jsonable(output)},
             latency_ms=elapsed,
@@ -258,6 +266,8 @@ class PaddleOcrVlAdapter:
         elapsed = round((time.perf_counter() - started) * 1000)
         return InferenceResponse(
             request_id=request.request_id,
+            input_artifact_sha256=request.artifact_sha256,
+            canonical_artifact_sha256=request.canonical_artifact_sha256,
             spec=self.spec,
             output={
                 "content": content,

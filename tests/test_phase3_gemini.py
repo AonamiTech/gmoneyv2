@@ -55,6 +55,7 @@ def request(tmp_path: Path, prompt: str = "p1") -> AdjudicationRequest:
         table_id="p1-t1",
         masked_crop_path=str(crop),
         masked_crop_sha256="b" * 64,
+        canonical_crop_sha256="c" * 64,
         table_type=TableType.ITEM_LEDGER,
         tokens=(
             token("description", "Blood Test", (10, 10, 80, 25)),
@@ -69,6 +70,7 @@ def request(tmp_path: Path, prompt: str = "p1") -> AdjudicationRequest:
 def response() -> AdjudicationResponse:
     return AdjudicationResponse(
         request_id="request-1",
+        canonical_crop_sha256="c" * 64,
         provider="fake",
         model="fake-model",
         rows=(

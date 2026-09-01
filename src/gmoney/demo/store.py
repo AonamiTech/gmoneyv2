@@ -417,6 +417,9 @@ class JobStore:
                         candidate.get("artifact_relative_path"),
                         candidate.get("artifact_sha256"),
                     )
+        for crop in result.get("table_crops") or ():
+            if isinstance(crop, dict):
+                add(crop.get("artifact_relative_path"), crop.get("artifact_sha256"))
         for token in result.get("token_manifest") or ():
             if not isinstance(token, dict):
                 continue
