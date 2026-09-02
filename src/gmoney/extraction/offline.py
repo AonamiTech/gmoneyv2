@@ -33,15 +33,21 @@ from gmoney.contracts.extraction import (
     CanonicalRow,
     CanonicalTableCrop,
     DerivedFieldProvenance,
+    DocumentTotal,
     EvidenceRef,
+    ExtractionDiagnostic,
     PageType,
+    ProviderUsage,
     RawTotalCandidate,
+    ReceiptDuplicatePair,
     ReceiptSourceMetadata,
+    RecoveryMetadata,
     RowRole,
     SourceCell,
     SourceColumn,
     SourceRow,
     SourceTable,
+    SuppressedSourceTable,
     TableAdapterInput,
     TableType,
     TokenManifestEntry,
@@ -56,6 +62,30 @@ from gmoney.contracts.phase3 import (
     RecoveryAttempt,
     RecoveryReason,
     RecoveryStage,
+)
+from gmoney.contracts.v6 import (
+    ArtifactKind,
+    ArtifactManifest,
+    ArtifactRef,
+    CanonicalRowV2,
+    CanonicalTableArtifact,
+    DocumentTotalV2,
+    EvidenceRefV2,
+    ExtractionResultV6,
+    HomographyMapping,
+    IdentityMapping,
+    RawTotalCandidateV2,
+    SourceCellV2,
+    SourceColumnV2,
+    SourceRowV2,
+    SourceTableV2,
+    TableAdapterInputV2,
+    TokenManifestEntryV2,
+    canonical_json,
+    canonical_sha256,
+)
+from gmoney.contracts.v6 import (
+    PageArtifact as V6PageArtifact,
 )
 from gmoney.evaluation.corpus import sha256_file
 from gmoney.extraction.canonicalize import canonicalize_rows
@@ -128,6 +158,8 @@ from gmoney.geometry.transform import (
     apply_matrix,
     compose,
     invert,
+    right_angle_rotation,
+    translation,
 )
 from gmoney.geometry.transform import (
     identity as transform_identity,
@@ -259,6 +291,8 @@ def _cached_prediction(
         envelope = json.loads(cache_path.read_text())
         if (
             envelope.get("artifact_sha256") == request.artifact_sha256
+            and envelope.get("canonical_artifact_id") == request.canonical_artifact_id
+            and envelope.get("canonical_artifact_sha256") == request.canonical_artifact_sha256
             and envelope.get("options") == request.options
             and envelope.get("model_spec") == adapter.spec.model_dump(mode="json")
         ):
@@ -271,6 +305,7 @@ def _cached_prediction(
                     response.input_artifact_sha256 == request.artifact_sha256
                     and response.canonical_artifact_sha256
                     == request.canonical_artifact_sha256
+                    and response.canonical_artifact_id == request.canonical_artifact_id
                 ):
                     return response, True
 
@@ -279,8 +314,12 @@ def _cached_prediction(
         raise ValueError("inference response input artifact hash differs from request")
     if response.canonical_artifact_sha256 != request.canonical_artifact_sha256:
         raise ValueError("inference response canonical artifact hash differs from request")
+    if response.canonical_artifact_id != request.canonical_artifact_id:
+        raise ValueError("inference response canonical artifact ID differs from request")
     envelope = {
         "artifact_sha256": request.artifact_sha256,
+        "canonical_artifact_id": request.canonical_artifact_id,
+        "canonical_artifact_sha256": request.canonical_artifact_sha256,
         "options": request.options,
         "model_spec": adapter.spec.model_dump(mode="json"),
         "response": response.model_dump(mode="json"),
@@ -4390,6 +4429,7 @@ class ExtractionDraft:
     applied_alias_ids: tuple[str, ...]
     suppressed_repeated_source_tables: tuple[tuple[int, str], ...]
     recovery_metadata: dict[str, Any]
+    artifact_root: Path | None = None
     worker_release_revision: str | None = None
     validation_recovery_attempted: bool | None = None
 
@@ -4412,7 +4452,7 @@ class ExtractionDraft:
         return inventory
 
 
-def _project_extraction_draft(draft: ExtractionDraft) -> dict[str, Any]:
+def _project_extraction_draft_v5(draft: ExtractionDraft) -> dict[str, Any]:
     source_tables = tuple(table for unit in draft.page_units for table in unit.source_tables)
     token_lookup = {
         token.token_id: token for unit in draft.page_units for token in unit.token_manifest
@@ -4520,6 +4560,628 @@ def _project_extraction_draft(draft: ExtractionDraft) -> dict[str, Any]:
     if draft.validation_recovery_attempted is not None:
         result["validation_recovery_attempted"] = draft.validation_recovery_attempted
     return result
+
+
+def _relative_artifact_path(root: Path, path: str | Path) -> str:
+    """Return a stable path rooted at the extraction artifact directory."""
+
+    candidate = Path(path)
+    if candidate.is_absolute():
+        try:
+            candidate = candidate.resolve().relative_to(root.resolve())
+        except ValueError:
+            candidate = Path(candidate.name)
+    return candidate.as_posix()
+
+
+def _project_extraction_draft(draft: ExtractionDraft) -> dict[str, Any]:
+    """Project a draft to V6 when its immutable artifact substrate is present.
+
+    Fixture-created drafts from the V5 era intentionally keep their old output;
+    drafts produced by ``extract_draft`` always carry ``artifact_root`` and use
+    the strict V6 writer below.
+    """
+
+    result = _project_extraction_draft_v5(draft)
+    if draft.artifact_root is None:
+        return result
+    if len(result.get("page_preprocessing", ())) != int(result.get("pages") or 0):
+        return result
+    if len(result.get("table_crops", ())) != sum(
+        len(unit.table_units) for unit in draft.page_units
+    ):
+        return result
+    return _project_result_v6(result, draft.artifact_root)
+
+
+def _project_result_v6(result: dict[str, Any], artifact_root: Path) -> dict[str, Any]:
+    """Build the deterministic V6 graph and convert the complete V5 payload.
+
+    The extraction algorithms still operate on V5 internal models.  This
+    boundary is deliberately the only place that changes their public shape,
+    which keeps recovery selection and OCR/layout decisions unchanged.
+    """
+
+    pages = tuple(PageAsset.model_validate(item) for item in result.get("page_assets", ()))
+    preprocessing = tuple(
+        PagePreprocessingRecord.model_validate(item)
+        for item in result.get("page_preprocessing", ())
+    )
+    crops = tuple(
+        CanonicalTableCrop.model_validate(item) for item in result.get("table_crops", ())
+    )
+    if not pages or len(preprocessing) != len(pages):
+        return result
+
+    artifacts: list[ArtifactRef] = []
+    page_artifacts: list[V6PageArtifact] = []
+    page_raw_ids: dict[int, str] = {}
+    page_selected_ids: dict[int, str] = {}
+    artifact_by_sha: dict[str, list[ArtifactRef]] = defaultdict(list)
+    table_artifacts: list[CanonicalTableArtifact] = []
+    table_artifact_by_key: dict[tuple[int, str], ArtifactRef] = {}
+
+    def add_artifact(ref: ArtifactRef) -> ArtifactRef:
+        artifacts.append(ref)
+        artifact_by_sha[ref.image_sha256].append(ref)
+        return ref
+
+    for page, record in zip(pages, preprocessing, strict=True):
+        root_config = canonical_sha256(
+            {
+                "document_sha256": result["source_sha256"],
+                "page_number": page.page_number,
+                "renderer": page.renderer,
+                "renderer_version": page.renderer_version,
+                "dpi": page.dpi,
+            }
+        )
+        raw = add_artifact(
+            ArtifactRef(
+                artifact_kind=ArtifactKind.SOURCE_RAW,
+                image_sha256=page.artifact_sha256,
+                artifact_relative_path=_relative_artifact_path(
+                    artifact_root, page.relative_path
+                ),
+                width=page.width,
+                height=page.height,
+                producer=page.renderer,
+                producer_version=page.renderer_version,
+                configuration_sha256=root_config,
+                child_to_parent_mapping=IdentityMapping(),
+            )
+        )
+        page_raw_ids[page.page_number] = raw.artifact_id
+        orientation_matrix, oriented_width, oriented_height = right_angle_rotation(
+            record.orientation_degrees, page.width, page.height
+        )
+        oriented_path = Path(page.relative_path)
+        oriented_sha = page.artifact_sha256
+        if record.orientation_degrees:
+            source_path = artifact_root / page.relative_path
+            image = cv2.imread(str(source_path))
+            if image is None:
+                raise RuntimeError("oriented_raw_source_image_unreadable")
+            if record.orientation_degrees == 90:
+                image = cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
+            elif record.orientation_degrees == 180:
+                image = cv2.rotate(image, cv2.ROTATE_180)
+            else:
+                image = cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
+            oriented_path = Path("lineage") / "oriented" / f"page-{page.page_number:04d}.png"
+            destination = artifact_root / oriented_path
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if not cv2.imwrite(str(destination), image):
+                raise RuntimeError("oriented_raw_image_write_failed")
+            oriented_sha = sha256_file(destination)
+        oriented_config = canonical_sha256(
+            {
+                "parent_configuration_sha256": root_config,
+                "orientation_degrees": record.orientation_degrees,
+            }
+        )
+        oriented = add_artifact(
+            ArtifactRef(
+                artifact_kind=ArtifactKind.ORIENTED_RAW,
+                image_sha256=oriented_sha,
+                artifact_relative_path=_relative_artifact_path(artifact_root, oriented_path),
+                width=oriented_width,
+                height=oriented_height,
+                parent_artifact_id=raw.artifact_id,
+                producer="gmoney.orientation",
+                producer_version="orientation_v1",
+                configuration_sha256=oriented_config,
+                child_to_parent_mapping=(
+                    IdentityMapping()
+                    if record.orientation_degrees == 0
+                    else HomographyMapping(
+                        child_to_parent_matrix=invert(orientation_matrix)
+                    )
+                ),
+            )
+        )
+        candidates_by_variant: dict[PreprocessingVariant, ArtifactRef] = {}
+        for candidate in record.candidates:
+            if candidate.variant is PreprocessingVariant.RAW:
+                candidates_by_variant[candidate.variant] = oriented
+                continue
+            candidate_kind = (
+                ArtifactKind.PROJECTIVE_ENHANCED
+                if candidate.variant is PreprocessingVariant.CAMERA_400
+                else ArtifactKind.PROJECTIVE
+            )
+            candidate_config = canonical_sha256(
+                {
+                    "page_configuration_sha256": root_config,
+                    "policy_version": record.policy_version,
+                    "variant": candidate.variant.value,
+                    "dpi": candidate.dpi,
+                    "operations": candidate.transform.operations,
+                }
+            )
+            candidates_by_variant[candidate.variant] = add_artifact(
+                ArtifactRef(
+                    artifact_kind=candidate_kind,
+                    image_sha256=candidate.artifact_sha256,
+                    artifact_relative_path=_relative_artifact_path(
+                        artifact_root, candidate.artifact_relative_path
+                    ),
+                    width=candidate.width,
+                    height=candidate.height,
+                    parent_artifact_id=oriented.artifact_id,
+                    producer="gmoney.preprocessing",
+                    producer_version=record.policy_version,
+                    configuration_sha256=candidate_config,
+                    child_to_parent_mapping=HomographyMapping(
+                        child_to_parent_matrix=compose(
+                            candidate.transform.inverse_matrix,
+                            orientation_matrix,
+                        )
+                    ),
+                )
+            )
+        selected = candidates_by_variant[record.selected_variant]
+        page_selected_ids[page.page_number] = selected.artifact_id
+        page_artifacts.append(
+            V6PageArtifact(
+                artifact=raw,
+                page_number=page.page_number,
+                dpi=page.dpi,
+                role="SOURCE_RAW",
+                quality_metrics=record.raw_quality.model_dump(mode="json"),
+            )
+        )
+        page_artifacts.append(
+            V6PageArtifact(
+                artifact=oriented,
+                page_number=page.page_number,
+                dpi=page.dpi,
+                role="ORIENTED_RAW",
+                selected=record.selected_variant is PreprocessingVariant.RAW,
+                quality_metrics=record.raw_quality.model_dump(mode="json"),
+                transform_metrics={"orientation_degrees": record.orientation_degrees},
+            )
+        )
+        for candidate_variant, artifact in candidates_by_variant.items():
+            if candidate_variant is PreprocessingVariant.RAW:
+                continue
+            candidate = next(
+                item for item in record.candidates if item.variant is candidate_variant
+            )
+            page_artifacts.append(
+                V6PageArtifact(
+                    artifact=artifact,
+                    page_number=page.page_number,
+                    dpi=candidate.dpi,
+                    role="CANDIDATE",
+                    selected=candidate_variant is record.selected_variant,
+                    quality_metrics=candidate.quality.model_dump(mode="json"),
+                    route_reasons=candidate.route_reasons,
+                    transform_metrics={"operations": candidate.transform.operations},
+                )
+            )
+    role_order = {"SOURCE_RAW": 0, "ORIENTED_RAW": 1, "CANDIDATE": 2}
+    page_artifacts.sort(
+        key=lambda item: (
+            item.page_number,
+            role_order.get(item.role or "CANDIDATE", 3),
+            item.artifact.artifact_id,
+        )
+    )
+
+    for crop in sorted(crops, key=lambda item: (item.page_number, item.table_id)):
+        parent_id = page_selected_ids[crop.page_number]
+        crop_ref = add_artifact(
+            ArtifactRef(
+                artifact_kind=ArtifactKind.TABLE_CROP,
+                image_sha256=crop.artifact_sha256,
+                artifact_relative_path=_relative_artifact_path(
+                    artifact_root, crop.artifact_relative_path
+                ),
+                width=crop.width,
+                height=crop.height,
+                parent_artifact_id=parent_id,
+                producer="gmoney.table_crop",
+                producer_version="canonical_table_crop_v1",
+                configuration_sha256=canonical_sha256(
+                    {
+                        "document_sha256": result["source_sha256"],
+                        "page_number": crop.page_number,
+                        "table_id": crop.table_id,
+                        "candidate_box": crop.candidate_box,
+                    }
+                ),
+                child_to_parent_mapping=HomographyMapping(
+                    child_to_parent_matrix=translation(
+                        crop.candidate_box[0], crop.candidate_box[1]
+                    )
+                ),
+            )
+        )
+        table_artifact_by_key[(crop.page_number, crop.table_id)] = crop_ref
+        table_artifacts.append(
+            CanonicalTableArtifact(
+                artifact=crop_ref,
+                page_number=crop.page_number,
+                logical_table_id=crop.table_id,
+                page_artifact_id=parent_id,
+                crop_polygon_in_page_artifact=Polygon(
+                    points=tuple(
+                        Point(x=float(x), y=float(y))
+                        for x, y in (
+                            (crop.candidate_box[0], crop.candidate_box[1]),
+                            (crop.candidate_box[2], crop.candidate_box[1]),
+                            (crop.candidate_box[2], crop.candidate_box[3]),
+                            (crop.candidate_box[0], crop.candidate_box[3]),
+                        )
+                    )
+                ),
+                crop_polygon_in_source_raw=crop.source_polygon,
+                table_type_hint=None,
+            )
+        )
+
+    by_sha = {sha: tuple(items) for sha, items in artifact_by_sha.items()}
+
+    def ensure_recovery_artifact(token: TokenManifestEntry) -> None:
+        if not token.source_artifact_sha256 or token.source_artifact_sha256 in by_sha:
+            return
+        owned_key = next(
+            (
+                (token.page_number, table_id)
+                for table_id in token.table_ids
+                if (token.page_number, table_id) in table_artifact_by_key
+            ),
+            None,
+        )
+        owned_table = table_artifact_by_key[owned_key] if owned_key is not None else None
+        parent_id = (
+            owned_table.artifact_id if owned_table is not None else page_raw_ids[token.page_number]
+        )
+        parent = next(item for item in artifacts if item.artifact_id == parent_id)
+        source_path = token.source_artifact_relative_path or next(
+            item.relative_path for item in pages if item.page_number == token.page_number
+        )
+        source_width = token.source_width or parent.width
+        source_height = token.source_height or parent.height
+        if token.source_to_page_matrix is None:
+            mapping = IdentityMapping()
+        elif owned_table is None:
+            mapping = HomographyMapping(child_to_parent_matrix=token.source_to_page_matrix)
+        else:
+            assert owned_key is not None
+            canonical_crop = next(
+                item
+                for item in crops
+                if (item.page_number, item.table_id) == owned_key
+            )
+            mapping = HomographyMapping(
+                child_to_parent_matrix=compose(
+                    token.source_to_page_matrix,
+                    invert(canonical_crop.crop_to_source_matrix),
+                )
+            )
+        recovered = add_artifact(
+            ArtifactRef(
+                artifact_kind=ArtifactKind.CELL_CROP,
+                image_sha256=token.source_artifact_sha256,
+                artifact_relative_path=_relative_artifact_path(artifact_root, source_path),
+                width=source_width,
+                height=source_height,
+                parent_artifact_id=parent_id,
+                producer="gmoney.recovery",
+                producer_version="recovery_v1",
+                configuration_sha256=canonical_sha256(
+                    {
+                        "page_number": token.page_number,
+                        "source_artifact_sha256": token.source_artifact_sha256,
+                        "source_artifact_relative_path": source_path,
+                    }
+                ),
+                child_to_parent_mapping=mapping,
+            )
+        )
+        by_sha[token.source_artifact_sha256] = (recovered,)
+
+    def artifact_for_token(token: TokenManifestEntry) -> ArtifactRef:
+        if token.source_artifact_sha256:
+            choices = by_sha.get(token.source_artifact_sha256, ())
+            for choice in choices:
+                if any(
+                    (token.page_number, table_id) in table_artifact_by_key
+                    and table_artifact_by_key[(token.page_number, table_id)].artifact_id
+                    == choice.artifact_id
+                    for table_id in token.table_ids
+                ):
+                    return choice
+        choices = by_sha.get(token.artifact_sha256, ())
+        if choices:
+            return choices[0]
+        return next(
+            item for item in artifacts if item.artifact_id == page_raw_ids[token.page_number]
+        )
+
+    v2_tokens: list[TokenManifestEntryV2] = []
+    for raw_token in result.get("token_manifest", ()):
+        token = TokenManifestEntry.model_validate(raw_token)
+        ensure_recovery_artifact(token)
+        artifact = artifact_for_token(token)
+        canonical_polygon = token.source_polygon or token.polygon
+        source_polygon = token.polygon
+        source_artifact_id = page_raw_ids[token.page_number]
+        v2 = TokenManifestEntryV2(
+            token_id=token.token_id,
+            page_number=token.page_number,
+            table_ids=token.table_ids,
+            text=token.text,
+            canonical_polygon=canonical_polygon,
+            source_page_polygon=source_polygon,
+            source_page_artifact_id=source_artifact_id,
+            artifact_id=artifact.artifact_id,
+            artifact_sha256=(token.source_artifact_sha256 or artifact.image_sha256),
+            artifact_relative_path=artifact.artifact_relative_path,
+            confidence=token.confidence,
+            parent_token_id=token.parent_token_id,
+            parent_token_ids=token.parent_token_ids,
+            parent_character_spans=token.parent_character_spans,
+            character_start=token.character_start,
+            character_end=token.character_end,
+            fragment_role=token.fragment_role,
+        )
+        v2_tokens.append(v2)
+    v2_tokens.sort(key=lambda item: item.token_id)
+    token_by_id = {item.token_id: item for item in v2_tokens}
+
+    def artifact_to_source_matrix(artifact_id: str) -> Matrix:
+        by_id = {item.artifact_id: item for item in artifacts}
+        current = by_id[artifact_id]
+        matrix = transform_identity()
+        while current.parent_artifact_id is not None:
+            mapping = current.child_to_parent_mapping
+            if isinstance(mapping, HomographyMapping):
+                matrix = compose(matrix, mapping.child_to_parent_matrix)
+            current = by_id[current.parent_artifact_id]
+        return matrix
+
+    def evidence_v2(raw: EvidenceRef) -> EvidenceRefV2:
+        cited = tuple(token_by_id.get(token_id) for token_id in raw.token_ids)
+        if any(token is None for token in cited):
+            raise ValueError("V1 evidence cites a token missing from the V2 manifest")
+        cited_artifact_ids = {token.artifact_id for token in cited if token is not None}
+        if len(cited_artifact_ids) > 1:
+            raise ValueError("V1 evidence crosses canonical artifact boundaries")
+        artifact_id = next(iter(cited_artifact_ids), None)
+        if artifact_id is None:
+            choices = by_sha.get(raw.artifact_sha256, ())
+            artifact_id = (
+                min(choices, key=lambda item: item.artifact_id).artifact_id
+                if choices
+                else page_raw_ids[raw.page_number]
+            )
+        artifact = next(item for item in artifacts if item.artifact_id == artifact_id)
+        source_to_artifact = invert(artifact_to_source_matrix(artifact_id))
+        canonical_points = apply_matrix(
+            source_to_artifact,
+            tuple((point.x, point.y) for point in raw.polygon.points),
+        )
+        canonical_polygon = Polygon(
+            points=tuple(Point(x=max(0.0, x), y=max(0.0, y)) for x, y in canonical_points)
+        )
+        return EvidenceRefV2(
+            artifact_id=artifact_id,
+            artifact_sha256=artifact.image_sha256,
+            canonical_polygon=canonical_polygon,
+            source_page_polygon=raw.polygon,
+            source_page_number=raw.page_number,
+            source_page_artifact_id=page_raw_ids[raw.page_number],
+            ocr_token_ids=raw.token_ids,
+            extractor="gmoney.offline",
+            model_name="paddleocr",
+            model_version="v6",
+            recognition_variant=(
+                "canonical"
+                if artifact.artifact_kind is ArtifactKind.TABLE_CROP
+                else "page"
+            ),
+        )
+
+    def source_table_v2(raw: SourceTable) -> SourceTableV2:
+        return SourceTableV2(
+            **raw.model_dump(exclude={"columns", "rows"}),
+            columns=tuple(
+                SourceColumnV2(
+                    **column.model_dump(exclude={"evidence"}),
+                    evidence=tuple(evidence_v2(item) for item in column.evidence),
+                )
+                for column in raw.columns
+            ),
+            rows=tuple(
+                SourceRowV2(
+                    **row.model_dump(exclude={"cells"}),
+                    cells=tuple(
+                        SourceCellV2(
+                            **cell.model_dump(exclude={"evidence"}),
+                            evidence=tuple(evidence_v2(item) for item in cell.evidence),
+                        )
+                        for cell in row.cells
+                    ),
+                )
+                for row in raw.rows
+            ),
+        )
+
+    source_tables = tuple(
+        source_table_v2(SourceTable.model_validate(item))
+        for item in result.get("source_tables", ())
+    )
+    rows: list[CanonicalRowV2] = []
+    for item in result.get("rows", ()):
+        raw_row = CanonicalRow.model_validate(item)
+        rows.append(
+            CanonicalRowV2(
+                **raw_row.model_dump(exclude={"evidence", "field_evidence"}),
+                evidence=tuple(evidence_v2(ref) for ref in raw_row.evidence),
+                field_evidence={
+                    name: tuple(evidence_v2(ref) for ref in refs)
+                    for name, refs in raw_row.field_evidence.items()
+                },
+            )
+        )
+
+    totals: list[Any] = []
+    for item in result.get("document_totals", ()):
+        raw_total = DocumentTotal.model_validate(item)
+        totals.append(
+            DocumentTotalV2(
+                **raw_total.model_dump(exclude={"evidence"}),
+                evidence=evidence_v2(raw_total.evidence),
+            )
+        )
+    document_total = result.get("document_total")
+    typed_document_total = None
+    if document_total is not None:
+        raw_total = DocumentTotal.model_validate(document_total)
+        typed_document_total = DocumentTotalV2(
+            **raw_total.model_dump(exclude={"evidence"}),
+            evidence=evidence_v2(raw_total.evidence),
+        )
+    raw_candidates: list[RawTotalCandidateV2] = []
+    for item in result.get("raw_total_candidates", ()):
+        candidate = RawTotalCandidate.model_validate(item)
+        total = DocumentTotal.model_validate(candidate.total.model_dump(mode="json"))
+        raw_candidates.append(
+            RawTotalCandidateV2(
+                **candidate.model_dump(exclude={"total", "context_evidence"}),
+                total=DocumentTotalV2(
+                    **total.model_dump(exclude={"evidence"}),
+                    evidence=evidence_v2(total.evidence),
+                ),
+                context_evidence=tuple(evidence_v2(ref) for ref in candidate.context_evidence),
+            )
+        )
+    all_evidence: dict[str, EvidenceRefV2] = {}
+    for table in source_tables:
+        for column in table.columns:
+            for ref in column.evidence:
+                all_evidence[canonical_json(ref).decode()] = ref
+        for row in table.rows:
+            for cell in row.cells:
+                for ref in cell.evidence:
+                    all_evidence[canonical_json(ref).decode()] = ref
+    for row in rows:
+        for ref in row.evidence:
+            all_evidence[canonical_json(ref).decode()] = ref
+    if typed_document_total:
+        all_evidence[canonical_json(typed_document_total.evidence).decode()] = (
+            typed_document_total.evidence
+        )
+    for candidate in raw_candidates:
+        all_evidence[canonical_json(candidate.total.evidence).decode()] = candidate.total.evidence
+        for ref in candidate.context_evidence:
+            all_evidence[canonical_json(ref).decode()] = ref
+
+    adapter_inputs: list[TableAdapterInputV2] = []
+    for crop in crops:
+        crop_ref = table_artifact_by_key[(crop.page_number, crop.table_id)]
+        for trace in crop.adapter_inputs:
+            adapter_inputs.append(
+                TableAdapterInputV2(
+                    input_artifact_id=trace.input_artifact_id or crop_ref.artifact_id,
+                    input_artifact_sha256=trace.input_artifact_sha256,
+                    adapter_name=trace.adapter_name,
+                    adapter_version=trace.adapter_version or "legacy-v5",
+                    configuration_sha256=trace.configuration_sha256
+                    or canonical_sha256(
+                        {
+                            "adapter": trace.adapter_name,
+                            "stage": trace.stage,
+                            "recognition_variant": trace.recognition_variant,
+                        }
+                    ),
+                    latency_ms=trace.latency_ms,
+                    cache_hit=trace.cache_hit,
+                    accepted=trace.accepted,
+                    stage=trace.stage,
+                    recognition_variant=trace.recognition_variant,
+                )
+            )
+    artifacts.sort(key=lambda item: (item.artifact_kind.value, item.artifact_id))
+    table_artifacts.sort(key=lambda item: (item.page_number, item.logical_table_id))
+    adapter_inputs.sort(
+        key=lambda item: (
+            item.input_artifact_id,
+            item.adapter_name,
+            item.stage,
+            item.recognition_variant,
+        )
+    )
+    artifact_manifest = ArtifactManifest(artifacts=tuple(artifacts))
+    diagnostics = tuple(
+        ExtractionDiagnostic.model_validate(item) for item in result.get("diagnostics", ())
+    )
+    provider_usage = ProviderUsage.model_validate(result["provider_usage"])
+    recovery = RecoveryMetadata.model_validate(result["recovery"])
+    envelope = ExtractionResultV6(
+        document_id=result["document_id"],
+        source_sha256=result["source_sha256"],
+        source_name=result["source_name"],
+        pages=result["pages"],
+        artifact_manifest=artifact_manifest,
+        page_artifacts=tuple(page_artifacts),
+        canonical_table_artifacts=tuple(table_artifacts),
+        token_manifest=tuple(v2_tokens),
+        evidence=tuple(all_evidence.values()),
+        adapter_inputs=tuple(adapter_inputs),
+        document_total_version=result["document_total_version"],
+        document_totals_version=result["document_totals_version"],
+        document_total=typed_document_total,
+        document_totals=tuple(totals),
+        raw_total_candidates=tuple(raw_candidates),
+        hospital_id=result.get("hospital_id"),
+        hospital=result.get("hospital"),
+        alias_registry_revision=result.get("alias_registry_revision"),
+        profile_registry_revision=result.get("profile_registry_revision"),
+        applied_alias_ids=tuple(result.get("applied_alias_ids") or ()),
+        page_assets=pages,
+        page_preprocessing=preprocessing,
+        source_tables=source_tables,
+        suppressed_repeated_source_tables=tuple(
+            SuppressedSourceTable.model_validate(item)
+            for item in result.get("suppressed_repeated_source_tables", ())
+        ),
+        rows=tuple(rows),
+        receipt_duplicate_pairs=tuple(
+            ReceiptDuplicatePair.model_validate(item)
+            for item in result.get("receipt_duplicate_pairs", ())
+        ),
+        diagnostics=diagnostics,
+        provider_usage=provider_usage,
+        recovery=recovery,
+        worker_release_revision=result.get("worker_release_revision"),
+        semantic_validation=result.get("semantic_validation"),
+        validation_recovery_attempted=result.get("validation_recovery_attempted"),
+    )
+    return envelope.model_dump(mode="json")
 
 
 def _issue_semantic_key(issue: object) -> tuple[object, ...]:
@@ -5305,6 +5967,15 @@ class OfflineExtractor:
                     canonical_crop_sha256=crop.artifact_sha256,
                     cache_hit=cache_hit,
                     accepted=True,
+                    adapter_version=response.spec.model_version,
+                    configuration_sha256=canonical_sha256(
+                        {
+                            "adapter": response.spec.model_name,
+                            "stage": "final_table_ocr",
+                            "recognition_variant": "canonical",
+                        }
+                    ),
+                    latency_ms=response.latency_ms,
                 )
             ],
         )
@@ -7786,6 +8457,9 @@ class OfflineExtractor:
             _draft_sink["applied_alias_ids"] = tuple(matched_header_alias_ids())
             _draft_sink["suppressed_repeated_source_tables"] = tuple(suppressed_source_tables)
             _draft_sink["recovery_metadata"] = recovery_metadata
+            _draft_sink["artifact_root"] = artifact_root
+        if _draft_sink is None:
+            return _project_result_v6(result, artifact_root)
         return result
 
     def extract_draft(
@@ -7816,6 +8490,7 @@ class OfflineExtractor:
             applied_alias_ids=sink["applied_alias_ids"],
             suppressed_repeated_source_tables=sink["suppressed_repeated_source_tables"],
             recovery_metadata=sink["recovery_metadata"],
+            artifact_root=Path(artifact_root),
         )
 
     def recover_draft(
@@ -7859,6 +8534,7 @@ class OfflineExtractor:
             applied_alias_ids=sink["applied_alias_ids"],
             suppressed_repeated_source_tables=sink["suppressed_repeated_source_tables"],
             recovery_metadata=sink["recovery_metadata"],
+            artifact_root=Path(artifact_root),
         )
         from gmoney.extraction.validation import validate_extraction_result
 
@@ -8042,6 +8718,7 @@ class OfflineExtractor:
             applied_alias_ids=selected.applied_alias_ids,
             suppressed_repeated_source_tables=(selected.suppressed_repeated_source_tables),
             recovery_metadata=recovery_metadata,
+            artifact_root=selected.artifact_root,
         )
 
 

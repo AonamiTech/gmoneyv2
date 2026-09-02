@@ -33,6 +33,10 @@ class InferenceRequest(ContractModel):
         default=None,
         pattern=r"^[a-f0-9]{64}$",
     )
+    canonical_artifact_id: str | None = Field(
+        default=None,
+        pattern=r"^[a-f0-9]{64}$",
+    )
     image_path: str
     page_number: int = Field(ge=1)
     options: dict[str, Any] = Field(default_factory=dict)
@@ -42,6 +46,10 @@ class InferenceResponse(ContractModel):
     request_id: str
     input_artifact_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     canonical_artifact_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[a-f0-9]{64}$",
+    )
+    canonical_artifact_id: str | None = Field(
         default=None,
         pattern=r"^[a-f0-9]{64}$",
     )

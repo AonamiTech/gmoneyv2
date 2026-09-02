@@ -25,6 +25,7 @@ from gmoney.geometry.artifacts import (
     max_round_trip_error,
     round_trip_within_tolerance,
 )
+from gmoney.geometry.transform import apply_matrix, invert, right_angle_rotation
 
 
 def _artifact(
@@ -87,10 +88,8 @@ def test_source_and_oriented_lineage_rules_are_strict() -> None:
         width=source.height,
         height=source.width,
         mapping=HomographyMapping(
-            child_to_parent_matrix=(
-                (0, 1, 0),
-                (-1, 0, source.width - 1),
-                (0, 0, 1),
+            child_to_parent_matrix=invert(
+                right_angle_rotation(90, source.width, source.height)[0]
             )
         ),
     )
@@ -103,10 +102,8 @@ def test_source_and_oriented_lineage_rules_are_strict() -> None:
         width=79,
         height=120,
         mapping=HomographyMapping(
-            child_to_parent_matrix=(
-                (0, 1, 0),
-                (-1, 0, source.width - 1),
-                (0, 0, 1),
+            child_to_parent_matrix=invert(
+                right_angle_rotation(90, source.width, source.height)[0]
             )
         ),
     )
@@ -115,6 +112,26 @@ def test_source_and_oriented_lineage_rules_are_strict() -> None:
 
     with pytest.raises(ValidationError, match="SOURCE_RAW artifacts must be graph roots"):
         _artifact(ArtifactKind.SOURCE_RAW, "d", parent=source.artifact_id)
+
+
+@pytest.mark.parametrize("degrees", (90, 270))
+def test_rectangular_oriented_inverse_maps_pixel_corners_exactly(degrees: int) -> None:
+    width, height = 120, 80
+    forward, child_width, child_height = right_angle_rotation(degrees, width, height)
+    source_corners = ((0, 0), (width - 1, 0), (width - 1, height - 1), (0, height - 1))
+    oriented_corners = apply_matrix(forward, source_corners)
+    restored = apply_matrix(invert(forward), oriented_corners)
+    assert restored == source_corners
+    source = _artifact(ArtifactKind.SOURCE_RAW, "a", width=width, height=height)
+    oriented = _artifact(
+        ArtifactKind.ORIENTED_RAW,
+        "b",
+        parent=source.artifact_id,
+        width=child_width,
+        height=child_height,
+        mapping=HomographyMapping(child_to_parent_matrix=invert(forward)),
+    )
+    ArtifactManifest(artifacts=(source, oriented))
 
 
 def test_graph_traversal_maps_child_coordinates_to_source() -> None:

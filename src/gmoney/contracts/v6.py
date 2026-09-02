@@ -15,7 +15,21 @@ from typing import Annotated, Any, Literal, TypeAlias
 from pydantic import Field, TypeAdapter, field_validator, model_validator
 
 from gmoney.contracts.common import ContractModel
-from gmoney.contracts.evidence import Polygon
+from gmoney.contracts.evidence import PageAsset, PagePreprocessingRecord, Polygon
+from gmoney.contracts.extraction import (
+    CanonicalRow,
+    DocumentTotal,
+    ExtractionDiagnostic,
+    ProviderUsage,
+    RawTotalCandidate,
+    ReceiptDuplicatePair,
+    RecoveryMetadata,
+    SourceCell,
+    SourceColumn,
+    SourceRow,
+    SourceTable,
+    SuppressedSourceTable,
+)
 
 SHA256_PATTERN = r"^[a-f0-9]{64}$"
 Matrix = tuple[tuple[float, float, float], ...]
@@ -223,9 +237,9 @@ def _is_right_angle_homography(
 
     w, h = float(parent_width), float(parent_height)
     expected = (
-        ((0.0, 1.0, 0.0), (-1.0, 0.0, w - 1.0), (0.0, 0.0, 1.0)),
+        ((0.0, 1.0, 0.0), (-1.0, 0.0, h - 1.0), (0.0, 0.0, 1.0)),
         ((-1.0, 0.0, w - 1.0), (0.0, -1.0, h - 1.0), (0.0, 0.0, 1.0)),
-        ((0.0, -1.0, h - 1.0), (1.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
+        ((0.0, -1.0, w - 1.0), (1.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
     )
     dimensions = ((h, w), (w, h), (h, w))
     return any(
@@ -382,6 +396,8 @@ class PageArtifact(ContractModel):
     artifact: ArtifactRef
     page_number: int = Field(ge=1)
     dpi: int = Field(gt=0)
+    role: Literal["SOURCE_RAW", "ORIENTED_RAW", "CANDIDATE"] | None = None
+    selected: bool = False
     quality_metrics: dict[str, Any] = Field(default_factory=dict)
     route_reasons: tuple[str, ...] = ()
     transform_metrics: dict[str, Any] = Field(default_factory=dict)
@@ -389,6 +405,7 @@ class PageArtifact(ContractModel):
 
 class CanonicalTableArtifact(ContractModel):
     artifact: ArtifactRef
+    page_number: int = Field(default=1, ge=1)
     logical_table_id: str = Field(min_length=1)
     page_artifact_id: str = Field(pattern=SHA256_PATTERN)
     crop_polygon_in_page_artifact: Polygon
@@ -424,6 +441,59 @@ class EvidenceRefV2(ContractModel):
         if any(not token_id.strip() for token_id in token_ids):
             raise ValueError("evidence token IDs must be non-blank strings")
         return token_ids
+
+
+class SourceColumnV2(SourceColumn):
+    """Printed column with V2 artifact evidence."""
+
+    evidence: tuple[EvidenceRefV2, ...] = ()
+
+    @model_validator(mode="after")
+    def require_grounded_or_synthetic_header(self) -> SourceColumnV2:
+        grounded = any(item.ocr_token_ids for item in self.evidence)
+        synthetic = "synthetic_header" in self.validation_flags
+        if not grounded and not synthetic:
+            raise ValueError("source header requires grounded OCR evidence")
+        if grounded and synthetic:
+            raise ValueError("grounded source header cannot be marked synthetic")
+        return self
+
+
+class SourceCellV2(SourceCell):
+    """Printed cell with V2 artifact evidence."""
+
+    evidence: tuple[EvidenceRefV2, ...] = ()
+
+    @model_validator(mode="after")
+    def require_grounded_value(self) -> SourceCellV2:
+        if self.raw_value and self.raw_value.strip() and not any(
+            item.ocr_token_ids for item in self.evidence
+        ):
+            raise ValueError("non-empty source cell requires grounded OCR evidence")
+        return self
+
+
+class SourceRowV2(SourceRow):
+    cells: tuple[SourceCellV2, ...]
+
+
+class SourceTableV2(SourceTable):
+    columns: tuple[SourceColumnV2, ...]
+    rows: tuple[SourceRowV2, ...]
+
+
+class DocumentTotalV2(DocumentTotal):
+    evidence: EvidenceRefV2
+
+
+class RawTotalCandidateV2(RawTotalCandidate):
+    total: DocumentTotalV2
+    context_evidence: tuple[EvidenceRefV2, ...]
+
+
+class CanonicalRowV2(CanonicalRow):
+    evidence: tuple[EvidenceRefV2, ...]
+    field_evidence: dict[str, tuple[EvidenceRefV2, ...]]
 
 
 class TokenManifestEntryV2(ContractModel):
@@ -478,7 +548,7 @@ class TableAdapterInputV2(ContractModel):
 
 
 class ExtractionResultV6(ContractModel):
-    """V6 envelope skeleton; extraction and publication wiring lands separately."""
+    """Complete V6 extraction envelope with strict business payload types."""
 
     output_version: Literal["offline_accuracy_spine_v6"] = "offline_accuracy_spine_v6"
     contract_revision: Literal[6] = 6
@@ -492,9 +562,28 @@ class ExtractionResultV6(ContractModel):
     token_manifest: tuple[TokenManifestEntryV2, ...] = ()
     evidence: tuple[EvidenceRefV2, ...] = ()
     adapter_inputs: tuple[TableAdapterInputV2, ...] = ()
-    source_tables: tuple[dict[str, Any], ...] = ()
-    rows: tuple[dict[str, Any], ...] = ()
-    metadata: dict[str, Any] = Field(default_factory=dict)
+    document_total_version: str = "document_total_v2"
+    document_totals_version: str = "document_totals_v2"
+    document_total: DocumentTotalV2 | None = None
+    document_totals: tuple[DocumentTotalV2, ...] = ()
+    raw_total_candidates: tuple[RawTotalCandidateV2, ...] = ()
+    hospital_id: str | None = None
+    hospital: dict[str, Any] | None = None
+    alias_registry_revision: int | None = None
+    profile_registry_revision: int | None = None
+    applied_alias_ids: tuple[str, ...] = ()
+    page_assets: tuple[PageAsset, ...] = ()
+    page_preprocessing: tuple[PagePreprocessingRecord, ...] = ()
+    source_tables: tuple[SourceTableV2, ...] = ()
+    suppressed_repeated_source_tables: tuple[SuppressedSourceTable, ...] = ()
+    rows: tuple[CanonicalRowV2, ...] = ()
+    receipt_duplicate_pairs: tuple[ReceiptDuplicatePair, ...] = ()
+    diagnostics: tuple[ExtractionDiagnostic, ...] = ()
+    provider_usage: ProviderUsage | None = None
+    recovery: RecoveryMetadata | None = None
+    worker_release_revision: str | None = None
+    semantic_validation: dict[str, Any] | None = None
+    validation_recovery_attempted: bool | None = None
 
     @model_validator(mode="after")
     def validate_v6_references(self) -> ExtractionResultV6:
@@ -510,6 +599,17 @@ class ExtractionResultV6(ContractModel):
                 raise ValueError("page artifact is missing from artifact manifest")
             if page.artifact != expected:
                 raise ValueError("embedded page artifact differs from artifact manifest")
+        if self.page_artifacts and any(item.role is not None for item in self.page_artifacts):
+            for page_number in sorted({item.page_number for item in self.page_artifacts}):
+                page_items = tuple(
+                    item for item in self.page_artifacts if item.page_number == page_number
+                )
+                if sum(item.role == "SOURCE_RAW" for item in page_items) != 1:
+                    raise ValueError("each page requires exactly one SOURCE_RAW inventory item")
+                if sum(item.role == "ORIENTED_RAW" for item in page_items) != 1:
+                    raise ValueError("each page requires exactly one ORIENTED_RAW inventory item")
+                if sum(item.selected for item in page_items) != 1:
+                    raise ValueError("each page requires exactly one selected candidate")
         for table in self.canonical_table_artifacts:
             expected = manifest.get(table.artifact.artifact_id)
             if expected is None:
@@ -527,6 +627,13 @@ class ExtractionResultV6(ContractModel):
             raise ValueError("V6 token IDs must be unique")
         if any(item.input_artifact_id not in manifest for item in self.adapter_inputs):
             raise ValueError("adapter input artifact is missing from artifact manifest")
+        table_ids = {(item.page_number, item.table_id) for item in self.source_tables}
+        crop_ids = {
+            (item.page_number, item.logical_table_id)
+            for item in self.canonical_table_artifacts
+        }
+        if not table_ids.issubset(crop_ids):
+            raise ValueError("every V6 source table requires a canonical table artifact")
         return self
 
 
@@ -544,6 +651,13 @@ __all__ = [
     "EvidenceRefV2",
     "TokenManifestEntryV2",
     "TableAdapterInputV2",
+    "SourceColumnV2",
+    "SourceCellV2",
+    "SourceRowV2",
+    "SourceTableV2",
+    "DocumentTotalV2",
+    "RawTotalCandidateV2",
+    "CanonicalRowV2",
     "ExtractionResultV6",
     "canonical_json",
     "canonical_sha256",

@@ -278,6 +278,10 @@ class TableAdapterInput(ContractModel):
     canonical_crop_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     cache_hit: bool = False
     accepted: bool = False
+    adapter_version: str | None = None
+    configuration_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    latency_ms: int = Field(default=0, ge=0)
+    input_artifact_id: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
 
 
 class CanonicalTableCrop(ContractModel):
