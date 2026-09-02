@@ -10,7 +10,9 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+import cv2
 import fitz
+import numpy as np
 from pydantic import Field, ValidationError
 
 from gmoney.contracts.common import ContractModel
@@ -22,13 +24,26 @@ from gmoney.contracts.extraction import (
     SourceTable,
     TokenManifestEntry,
 )
+from gmoney.contracts.v6 import (
+    ArtifactKind,
+    ArtifactRef,
+    DenseBackwardGridMapping,
+    EvidenceRefV2,
+    ExtractionResultV6,
+    HomographyMapping,
+    IdentityMapping,
+    artifact_id_for,
+    canonical_sha256,
+)
 from gmoney.evaluation.corpus import sha256_file
 from gmoney.extraction.date_context import service_date_from_context
 from gmoney.extraction.typed_values import parse_decimal, parse_quantity, parse_service_date
+from gmoney.geometry.artifacts import map_points_to_source, max_round_trip_error
 from gmoney.geometry.transform import apply_matrix
 
 VALIDATION_VERSION = "extraction_validation_v5_r4"
 SUPPORTED_OUTPUT_VERSION = "offline_accuracy_spine_v5"
+V6_VALIDATION_VERSION = "extraction_validation_v6_r1"
 
 
 class ValidationSeverity(StrEnum):
@@ -512,7 +527,11 @@ def _issue(
     )
 
 
-def _report(issues: list[ValidationIssue]) -> ValidationReport:
+def _report(
+    issues: list[ValidationIssue],
+    *,
+    validation_version: str = VALIDATION_VERSION,
+) -> ValidationReport:
     unique = {issue.id: issue for issue in issues}
     ordered = tuple(
         sorted(
@@ -536,7 +555,519 @@ def _report(issues: list[ValidationIssue]) -> ValidationReport:
             else ValidationStatus.PASSED
         )
     )
-    return ValidationReport(status=status, issues=ordered)
+    return ValidationReport(validation_version=validation_version, status=status, issues=ordered)
+
+
+def _v6_fatal(
+    issues: list[ValidationIssue],
+    code: str,
+    message: str,
+    *,
+    field: str | None = None,
+    page_number: int | None = None,
+    table_id: str | None = None,
+) -> None:
+    """Append a stable, fatal V6 integrity issue.
+
+    V6 is a publication contract: malformed graph/evidence metadata must never
+    be downgraded to a semantic review issue.
+    """
+    issues.append(
+        _issue(
+            code,
+            ValidationSeverity.FATAL,
+            message,
+            field=field,
+            page_number=page_number,
+            table_id=table_id,
+        )
+    )
+
+
+def _v6_polygon_points(polygon: object) -> tuple[tuple[float, float], ...]:
+    return tuple((float(point.x), float(point.y)) for point in polygon.points)
+
+
+def _v6_in_bounds(points: tuple[tuple[float, float], ...], width: int, height: int) -> bool:
+    return all(0.0 <= x <= width - 1 and 0.0 <= y <= height - 1 for x, y in points)
+
+
+def _v6_path_has_symlink(root: Path, relative: Path) -> bool:
+    current = root
+    for part in relative.parts:
+        current /= part
+        try:
+            if current.is_symlink():
+                return True
+        except OSError:
+            return True
+    return False
+
+
+def _validate_extraction_result_v6(
+    source: Path,
+    result: object,
+    artifact_root: Path,
+) -> ValidationReport:
+    """Strict V6 graph, bytes, adapter, and evidence validation."""
+    issues: list[ValidationIssue] = []
+    try:
+        parsed = ExtractionResultV6.model_validate(result)
+    except (ValidationError, TypeError, ValueError) as error:
+        _v6_fatal(
+            issues,
+            "v6_contract_invalid",
+            f"V6 extraction envelope is invalid: {type(error).__name__}",
+            field="result",
+        )
+        return _report(issues, validation_version=V6_VALIDATION_VERSION)
+
+    try:
+        source_digest = sha256_file(source)
+        if parsed.source_sha256 != source_digest:
+            _v6_fatal(
+                issues,
+                "v6_source_digest_mismatch",
+                "Source PDF digest does not match result",
+                field="source_sha256",
+            )
+    except (OSError, ValueError):
+        _v6_fatal(
+            issues, "v6_source_unreadable", "Source PDF cannot be read", field="source_sha256"
+        )
+
+    manifest = parsed.artifact_manifest
+    by_id = manifest.by_id()
+    expected_manifest_hash = canonical_sha256(
+        {
+            "manifest_version": manifest.manifest_version,
+            "artifacts": [item.model_dump(mode="json") for item in manifest.artifacts],
+        }
+    )
+    if manifest.manifest_sha256 != expected_manifest_hash:
+        _v6_fatal(
+            issues,
+            "v6_manifest_hash_mismatch",
+            "Artifact manifest hash is not canonical",
+            field="artifact_manifest.manifest_sha256",
+        )
+
+    # The model performs the same checks for ordinary JSON, but repeat them here
+    # against the publication filesystem and graph so tampering after parsing is
+    # still fatal.
+    for artifact in manifest.artifacts:
+        expected_id = artifact_id_for(
+            artifact_kind=artifact.artifact_kind,
+            image_sha256=artifact.image_sha256,
+            parent_artifact_id=artifact.parent_artifact_id,
+            producer=artifact.producer,
+            producer_version=artifact.producer_version,
+            configuration_sha256=artifact.configuration_sha256,
+            mapping_sha256=artifact.child_to_parent_mapping.mapping_sha256,
+        )
+        if artifact.artifact_id != expected_id:
+            _v6_fatal(
+                issues,
+                "v6_artifact_id_mismatch",
+                "Artifact ID does not match its identity",
+                field="artifact_manifest.artifacts",
+            )
+        relative = Path(artifact.artifact_relative_path)
+        if (
+            relative.is_absolute()
+            or ".." in relative.parts
+            or artifact_root.is_symlink()
+            or _v6_path_has_symlink(artifact_root, relative)
+        ):
+            _v6_fatal(
+                issues,
+                "v6_artifact_path_invalid",
+                "Artifact path escapes the artifact root or uses a symlink",
+                field="artifact_relative_path",
+            )
+            continue
+        path = artifact_root / relative
+        try:
+            content = path.read_bytes()
+            actual = hashlib.sha256(content).hexdigest()
+            if actual != artifact.image_sha256:
+                _v6_fatal(
+                    issues,
+                    "v6_artifact_hash_mismatch",
+                    "Artifact bytes do not match the manifest",
+                    field="artifact_manifest.artifacts",
+                )
+            image = cv2.imdecode(np.frombuffer(content, dtype="uint8"), cv2.IMREAD_UNCHANGED)
+            if (
+                image is None
+                or image.shape[1] != artifact.width
+                or image.shape[0] != artifact.height
+            ):
+                _v6_fatal(
+                    issues,
+                    "v6_artifact_dimensions_mismatch",
+                    "Artifact dimensions do not match the manifest",
+                    field="artifact_manifest.artifacts",
+                )
+        except (OSError, ValueError, TypeError):
+            _v6_fatal(
+                issues,
+                "v6_artifact_missing",
+                "Manifest artifact bytes are missing or unreadable",
+                field="artifact_manifest.artifacts",
+            )
+
+        mapping = artifact.child_to_parent_mapping
+        if isinstance(mapping, DenseBackwardGridMapping):
+            _v6_fatal(
+                issues,
+                "v6_dense_mapping_unsupported",
+                "Dense backward-grid mappings are reserved for M3",
+                field="child_to_parent_mapping",
+            )
+            continue
+        if artifact.parent_artifact_id is None:
+            continue
+        parent = by_id.get(artifact.parent_artifact_id)
+        if parent is None:
+            _v6_fatal(
+                issues,
+                "v6_parent_missing",
+                "Artifact parent is missing from the manifest",
+                field="parent_artifact_id",
+            )
+            continue
+        if isinstance(mapping, HomographyMapping):
+            corners = (
+                (0.0, 0.0),
+                (artifact.width - 1.0, 0.0),
+                (artifact.width - 1.0, artifact.height - 1.0),
+                (0.0, artifact.height - 1.0),
+            )
+            try:
+                mapped = apply_matrix(mapping.child_to_parent_matrix, corners)
+                if not _v6_in_bounds(mapped, parent.width, parent.height):
+                    _v6_fatal(
+                        issues,
+                        "v6_mapping_out_of_bounds",
+                        "Homography maps child bounds outside its parent",
+                        field="child_to_parent_mapping",
+                    )
+                if max_round_trip_error(mapping.child_to_parent_matrix, corners) > 2.0:
+                    _v6_fatal(
+                        issues,
+                        "v6_mapping_round_trip_error",
+                        "Homography round trip exceeds 2px",
+                        field="child_to_parent_mapping",
+                    )
+            except (ValueError, ZeroDivisionError, OverflowError):
+                _v6_fatal(
+                    issues,
+                    "v6_mapping_invalid",
+                    "Homography cannot be evaluated",
+                    field="child_to_parent_mapping",
+                )
+        elif isinstance(mapping, IdentityMapping) and (artifact.width, artifact.height) != (
+            parent.width,
+            parent.height,
+        ):
+            _v6_fatal(
+                issues,
+                "v6_identity_dimensions_mismatch",
+                "Identity mapping changes dimensions",
+                field="child_to_parent_mapping",
+            )
+
+    # Verify all graph links and detect orphan/cycle references explicitly.
+    for artifact in manifest.artifacts:
+        seen: set[str] = set()
+        current = artifact
+        while current.parent_artifact_id is not None:
+            if current.artifact_id in seen:
+                _v6_fatal(
+                    issues,
+                    "v6_graph_cycle",
+                    "Artifact graph contains a cycle",
+                    field="artifact_manifest.artifacts",
+                )
+                break
+            seen.add(current.artifact_id)
+            parent = by_id.get(current.parent_artifact_id)
+            if parent is None:
+                _v6_fatal(
+                    issues,
+                    "v6_graph_orphan",
+                    "Artifact graph contains an orphan reference",
+                    field="parent_artifact_id",
+                )
+                break
+            current = parent
+        if current.artifact_kind is not ArtifactKind.SOURCE_RAW:
+            _v6_fatal(
+                issues,
+                "v6_graph_root_invalid",
+                "Artifact graph must terminate at SOURCE_RAW",
+                field="artifact_manifest.artifacts",
+            )
+
+    source_page_by_number: dict[int, ArtifactRef] = {}
+    for item in parsed.page_artifacts:
+        if item.role == "SOURCE_RAW":
+            source_page_by_number[item.page_number] = item.artifact
+    if parsed.pages != len(source_page_by_number):
+        _v6_fatal(
+            issues,
+            "v6_page_inventory_incomplete",
+            "Each result page requires one source artifact",
+            field="page_artifacts",
+        )
+
+    for table in parsed.canonical_table_artifacts:
+        parent = by_id.get(table.page_artifact_id)
+        if parent is None:
+            _v6_fatal(
+                issues,
+                "v6_table_parent_missing",
+                "Canonical table parent is missing",
+                field="canonical_table_artifacts",
+            )
+            continue
+        page_points = _v6_polygon_points(table.crop_polygon_in_page_artifact)
+        source_points = _v6_polygon_points(table.crop_polygon_in_source_raw)
+        if not _v6_in_bounds(page_points, parent.width, parent.height):
+            _v6_fatal(
+                issues,
+                "v6_table_page_bounds_invalid",
+                "Canonical table polygon exceeds its page artifact",
+                field="canonical_table_artifacts",
+            )
+        source_parent = source_page_by_number.get(table.page_number)
+        if source_parent is not None and not _v6_in_bounds(
+            source_points, source_parent.width, source_parent.height
+        ):
+            _v6_fatal(
+                issues,
+                "v6_table_source_bounds_invalid",
+                "Canonical table source polygon exceeds its source page",
+                field="canonical_table_artifacts",
+            )
+    def check_evidence(evidence: EvidenceRefV2, field: str) -> None:
+        artifact = by_id.get(evidence.artifact_id)
+        source_artifact = by_id.get(evidence.source_page_artifact_id)
+        if artifact is None:
+            _v6_fatal(
+                issues,
+                "v6_evidence_artifact_missing",
+                "Evidence references an unknown artifact",
+                field=field,
+            )
+            return
+        if source_artifact is None or source_artifact.artifact_kind is not ArtifactKind.SOURCE_RAW:
+            _v6_fatal(
+                issues,
+                "v6_evidence_source_artifact_invalid",
+                "Evidence source page artifact is invalid",
+                field=field,
+            )
+            return
+        if source_page_by_number.get(evidence.source_page_number) != source_artifact:
+            _v6_fatal(
+                issues,
+                "v6_evidence_page_reference_invalid",
+                "Evidence source page number does not match its source artifact",
+                field=field,
+            )
+        if evidence.artifact_sha256 != artifact.image_sha256:
+            _v6_fatal(
+                issues,
+                "v6_evidence_hash_ownership_mismatch",
+                "Evidence hash does not belong to its artifact",
+                field=field,
+            )
+        canonical = _v6_polygon_points(evidence.canonical_polygon)
+        source_points = _v6_polygon_points(evidence.source_page_polygon)
+        if not _v6_in_bounds(canonical, artifact.width, artifact.height) or not _v6_in_bounds(
+            source_points, source_artifact.width, source_artifact.height
+        ):
+            _v6_fatal(
+                issues,
+                "v6_evidence_bounds_invalid",
+                "Evidence polygon is outside its artifact",
+                field=field,
+            )
+        try:
+            projected = map_points_to_source(manifest, evidence.artifact_id, canonical)
+            if any(
+                ((x - sx) ** 2 + (y - sy) ** 2) ** 0.5 > 2.0
+                for (x, y), (sx, sy) in zip(projected, source_points, strict=True)
+            ):
+                _v6_fatal(
+                    issues,
+                    "v6_evidence_projection_mismatch",
+                    "Canonical evidence does not project to source evidence within 2px",
+                    field=field,
+                )
+        except (ValueError, KeyError, ZeroDivisionError):
+            _v6_fatal(
+                issues,
+                "v6_evidence_projection_invalid",
+                "Evidence projection cannot be evaluated",
+                field=field,
+            )
+        token_ids = set(parsed_token_ids)
+        for token_id in evidence.ocr_token_ids:
+            if token_id not in token_ids:
+                _v6_fatal(
+                    issues,
+                    "v6_evidence_token_missing",
+                    "Evidence references an unknown OCR token",
+                    field=field,
+                )
+            elif parsed_token_by_id[token_id].artifact_id != evidence.artifact_id:
+                _v6_fatal(
+                    issues,
+                    "v6_evidence_token_artifact_mismatch",
+                    "Evidence token belongs to another artifact",
+                    field=field,
+                )
+
+    parsed_token_ids = {item.token_id for item in parsed.token_manifest}
+    parsed_token_by_id = {item.token_id: item for item in parsed.token_manifest}
+    for token in parsed.token_manifest:
+        artifact = by_id.get(token.artifact_id)
+        source_artifact = by_id.get(token.source_page_artifact_id)
+        if artifact is None or source_artifact is None:
+            _v6_fatal(
+                issues,
+                "v6_token_artifact_missing",
+                "Token references an unknown artifact",
+                field="token_manifest",
+            )
+            continue
+        if source_page_by_number.get(token.page_number) != source_artifact:
+            _v6_fatal(
+                issues,
+                "v6_token_page_reference_invalid",
+                "Token page number does not match its source artifact",
+                field="token_manifest",
+            )
+        if token.artifact_sha256 != artifact.image_sha256:
+            _v6_fatal(
+                issues,
+                "v6_token_hash_ownership_mismatch",
+                "Token hash does not belong to its artifact",
+                field="token_manifest",
+            )
+        if token.artifact_relative_path != artifact.artifact_relative_path:
+            _v6_fatal(
+                issues,
+                "v6_token_path_ownership_mismatch",
+                "Token path does not belong to its artifact",
+                field="token_manifest",
+            )
+        canonical = _v6_polygon_points(token.canonical_polygon)
+        source_points = _v6_polygon_points(token.source_page_polygon)
+        if not _v6_in_bounds(canonical, artifact.width, artifact.height) or not _v6_in_bounds(
+            source_points, source_artifact.width, source_artifact.height
+        ):
+            _v6_fatal(
+                issues,
+                "v6_token_bounds_invalid",
+                "Token polygon is outside its artifact",
+                field="token_manifest",
+            )
+        try:
+            projected = map_points_to_source(manifest, token.artifact_id, canonical)
+            if any(
+                ((x - sx) ** 2 + (y - sy) ** 2) ** 0.5 > 2.0
+                for (x, y), (sx, sy) in zip(projected, source_points, strict=True)
+            ):
+                _v6_fatal(
+                    issues,
+                    "v6_token_projection_mismatch",
+                    "Token projection exceeds 2px",
+                    field="token_manifest",
+                )
+        except (ValueError, KeyError, ZeroDivisionError):
+            _v6_fatal(
+                issues,
+                "v6_token_projection_invalid",
+                "Token projection cannot be evaluated",
+                field="token_manifest",
+            )
+
+    evidence_items: list[EvidenceRefV2] = list(parsed.evidence)
+    for row in parsed.rows:
+        evidence_items.extend(row.evidence)
+        evidence_items.extend(item for values in row.field_evidence.values() for item in values)
+    for table in parsed.source_tables:
+        for column in table.columns:
+            evidence_items.extend(column.evidence)
+        for row in table.rows:
+            for cell in row.cells:
+                evidence_items.extend(cell.evidence)
+    if parsed.document_total is not None:
+        evidence_items.append(parsed.document_total.evidence)
+    for candidate in parsed.raw_total_candidates:
+        evidence_items.extend(candidate.context_evidence)
+        evidence_items.append(candidate.total.evidence)
+    for evidence in evidence_items:
+        check_evidence(evidence, "evidence")
+
+    for adapter in parsed.adapter_inputs:
+        artifact = by_id.get(adapter.input_artifact_id)
+        if artifact is None:
+            _v6_fatal(
+                issues,
+                "v6_adapter_artifact_missing",
+                "Adapter input references an unknown artifact",
+                field="adapter_inputs",
+            )
+        elif adapter.input_artifact_sha256 != artifact.image_sha256:
+            _v6_fatal(
+                issues,
+                "v6_adapter_hash_ownership_mismatch",
+                "Adapter input hash does not belong to its artifact",
+                field="adapter_inputs",
+            )
+        elif (
+            adapter.stage == "canonical_table"
+            and artifact.artifact_kind is not ArtifactKind.TABLE_CROP
+        ):
+            _v6_fatal(
+                issues,
+                "v6_adapter_canonical_artifact_invalid",
+                "Canonical adapter input must reference a table crop",
+                field="adapter_inputs",
+            )
+
+    referenced = {item.artifact.artifact_id for item in parsed.page_artifacts}
+    referenced.update(item.artifact.artifact_id for item in parsed.canonical_table_artifacts)
+    referenced.update(item.page_artifact_id for item in parsed.canonical_table_artifacts)
+    referenced.update(item.artifact_id for item in parsed.token_manifest)
+    referenced.update(item.source_page_artifact_id for item in parsed.token_manifest)
+    referenced.update(item.input_artifact_id for item in parsed.adapter_inputs)
+    referenced.update(item.artifact_id for item in evidence_items)
+    referenced.update(item.source_page_artifact_id for item in evidence_items)
+    closure = set(referenced)
+    pending = list(referenced)
+    while pending:
+        artifact_id = pending.pop()
+        artifact = by_id.get(artifact_id)
+        if artifact is None:
+            continue
+        if artifact.parent_artifact_id is not None and artifact.parent_artifact_id not in closure:
+            closure.add(artifact.parent_artifact_id)
+            pending.append(artifact.parent_artifact_id)
+    if closure != set(by_id):
+        _v6_fatal(
+            issues,
+            "v6_graph_orphan",
+            "Artifact manifest contains unreferenced orphan nodes",
+            field="artifact_manifest.artifacts",
+        )
+
+    return _report(issues, validation_version=V6_VALIDATION_VERSION)
 
 
 def _attach_stable_issue_anchors(
@@ -3183,6 +3714,8 @@ def validate_extraction_result(
     """Fail closed for every JSON-compatible payload and validator defect."""
 
     try:
+        if isinstance(result, dict) and result.get("output_version") == "offline_accuracy_spine_v6":
+            return _validate_extraction_result_v6(source, result, artifact_root)
         return _validate_extraction_result(source, result, artifact_root)
     except (KeyboardInterrupt, SystemExit):
         raise

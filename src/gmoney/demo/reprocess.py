@@ -1358,6 +1358,7 @@ def _prepare_source_group(
     snapshots: list[JobSnapshot],
     stage_root: Path,
     extractor: Any,
+    target_output_version: str | None = None,
 ) -> list[PreparedJob]:
     ordered = sorted(snapshots, key=lambda item: item.job_id)
     representative = ordered[0]
@@ -1390,6 +1391,11 @@ def _prepare_source_group(
             representative.source,
             representative_stage / "artifacts",
         )
+    if (
+        target_output_version is not None
+        and extracted_result.get("output_version") != target_output_version
+    ):
+        raise ValueError("staged extraction output version does not match target")
     report = _staged_validation_report(
         representative.source,
         extracted_result,
@@ -1418,6 +1424,11 @@ def _prepare_source_group(
             representative_stage / "artifacts",
             require_attached=False,
         )
+    if (
+        target_output_version is not None
+        and extracted_result.get("output_version") != target_output_version
+    ):
+        raise ValueError("staged recovery output version does not match target")
     extracted_result["semantic_validation"] = report.model_dump(mode="json")
     extracted_result["validation_recovery_attempted"] = recovery_attempted
 
@@ -1666,6 +1677,7 @@ def stage_reprocess_jobs(
     paddle_device: str = "cpu",
     vl_device: str = "cpu",
     extractor: Any | None = None,
+    target_output_version: str | None = None,
 ) -> dict[str, Any]:
     """Build and validate replacement results without mutating live jobs."""
     store = JobStore(root)
@@ -1686,6 +1698,7 @@ def stage_reprocess_jobs(
                 paddle_device=paddle_device,
                 vl_device=vl_device,
             ),
+            target_output_version=target_output_version,
         )
     return _stage_reprocess_jobs(
         store=store,
@@ -1700,6 +1713,7 @@ def stage_reprocess_jobs(
                 vl_device=vl_device,
             )
         ),
+        target_output_version=target_output_version,
     )
 
 
@@ -1709,6 +1723,7 @@ def _stage_reprocess_jobs(
     job_ids: list[str] | None,
     stage_root: Path | None,
     extractor: Any,
+    target_output_version: str | None = None,
 ) -> dict[str, Any]:
     selected = sorted(
         set(
@@ -1740,6 +1755,7 @@ def _stage_reprocess_jobs(
             snapshots=snapshots_by_source[source_sha256],
             stage_root=staging,
             extractor=extractor,
+            target_output_version=target_output_version,
         ):
             prepared_by_id[item.job_id] = item
     prepared = [prepared_by_id[job_id] for job_id in selected]

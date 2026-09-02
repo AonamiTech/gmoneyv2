@@ -261,6 +261,75 @@ def test_v6_envelope_binds_page_and_canonical_table_artifacts() -> None:
     assert envelope.output_version == "offline_accuracy_spine_v6"
 
 
+def test_v6_rejects_unreferenced_manifest_source() -> None:
+    source = _artifact(ArtifactKind.SOURCE_RAW, "a")
+    orphan = _artifact(ArtifactKind.SOURCE_RAW, "c")
+    with pytest.raises(ValidationError, match="unreferenced orphan"):
+        ExtractionResultV6(
+            document_id="doc",
+            source_sha256="e" * 64,
+            source_name="bill.pdf",
+            pages=1,
+            artifact_manifest=ArtifactManifest(artifacts=(source, orphan)),
+            page_artifacts=(PageArtifact(artifact=source, page_number=1, dpi=300),),
+        )
+
+
+def test_v6_rejects_evidence_token_from_another_artifact() -> None:
+    source = _artifact(ArtifactKind.SOURCE_RAW, "a")
+    first = _artifact(
+        ArtifactKind.PROJECTIVE,
+        "b",
+        parent=source.artifact_id,
+        mapping=HomographyMapping(child_to_parent_matrix=((1, 0, 0), (0, 1, 0), (0, 0, 1))),
+    )
+    second = _artifact(
+        ArtifactKind.PROJECTIVE,
+        "c",
+        parent=source.artifact_id,
+        mapping=HomographyMapping(child_to_parent_matrix=((1, 0, 0), (0, 1, 0), (0, 0, 1))),
+    )
+    polygon = Polygon(
+        points=(Point(x=1, y=1), Point(x=10, y=1), Point(x=10, y=10), Point(x=1, y=10))
+    )
+    token = TokenManifestEntryV2(
+        token_id="token-1",
+        page_number=1,
+        text="x",
+        canonical_polygon=polygon,
+        source_page_polygon=polygon,
+        source_page_artifact_id=source.artifact_id,
+        artifact_id=first.artifact_id,
+        artifact_sha256=first.image_sha256,
+        artifact_relative_path=first.artifact_relative_path,
+        confidence=1,
+    )
+    evidence = EvidenceRefV2(
+        artifact_id=second.artifact_id,
+        artifact_sha256=second.image_sha256,
+        canonical_polygon=polygon,
+        source_page_polygon=polygon,
+        source_page_number=1,
+        source_page_artifact_id=source.artifact_id,
+        ocr_token_ids=(token.token_id,),
+        extractor="test",
+        model_name="test-model",
+        model_version="1",
+        recognition_variant="canonical",
+    )
+    with pytest.raises(ValidationError, match="another artifact"):
+        ExtractionResultV6(
+            document_id="doc",
+            source_sha256="e" * 64,
+            source_name="bill.pdf",
+            pages=1,
+            artifact_manifest=ArtifactManifest(artifacts=(source, first, second)),
+            page_artifacts=(PageArtifact(artifact=source, page_number=1, dpi=300),),
+            token_manifest=(token,),
+            evidence=(evidence,),
+        )
+
+
 def test_v6_rejects_embedded_artifact_drift_and_table_parent_mismatch() -> None:
     source = _artifact(ArtifactKind.SOURCE_RAW, "a")
     other_source = _artifact(ArtifactKind.SOURCE_RAW, "c")

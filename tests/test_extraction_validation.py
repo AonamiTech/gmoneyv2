@@ -8,7 +8,9 @@ from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
 
+import cv2
 import fitz
+import numpy as np
 import pytest
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
@@ -23,6 +25,14 @@ from gmoney.contracts.extraction import (
     SourceRow,
     SourceTable,
     TableType,
+)
+from gmoney.contracts.v6 import (
+    ArtifactKind,
+    ArtifactManifest,
+    ArtifactRef,
+    IdentityMapping,
+    PageArtifact,
+    canonical_sha256,
 )
 from gmoney.demo.store import JobStore
 from gmoney.extraction.document_total import DocumentTotalCandidate
@@ -320,6 +330,90 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, dict[str, object]]:
         },
     }
     return source, artifact_root, result
+
+
+def test_publication_validation_rejects_unreferenced_v6_manifest_node(tmp_path: Path) -> None:
+    source_pdf = tmp_path / "source.pdf"
+    document = fitz.open()
+    document.new_page(width=72, height=72)
+    document.save(source_pdf)
+    document.close()
+    artifact_root = tmp_path / "artifacts"
+    artifact_root.mkdir()
+    ok, encoded = cv2.imencode(".png", np.zeros((10, 10, 3), dtype=np.uint8))
+    assert ok
+    image = encoded.tobytes()
+    (artifact_root / "page.png").write_bytes(image)
+    (artifact_root / "orphan.png").write_bytes(image)
+    digest = _sha(image)
+    source_artifact = ArtifactRef(
+        artifact_kind=ArtifactKind.SOURCE_RAW,
+        image_sha256=digest,
+        artifact_relative_path="page.png",
+        width=10,
+        height=10,
+        producer="test",
+        producer_version="1",
+        configuration_sha256="a" * 64,
+        child_to_parent_mapping=IdentityMapping(),
+    )
+    orphan = ArtifactRef(
+        artifact_kind=ArtifactKind.SOURCE_RAW,
+        image_sha256=digest,
+        artifact_relative_path="orphan.png",
+        width=10,
+        height=10,
+        producer="test",
+        producer_version="1",
+        configuration_sha256="b" * 64,
+        child_to_parent_mapping=IdentityMapping(),
+    )
+    oriented = ArtifactRef(
+        artifact_kind=ArtifactKind.ORIENTED_RAW,
+        image_sha256=digest,
+        artifact_relative_path="page.png",
+        width=10,
+        height=10,
+        parent_artifact_id=source_artifact.artifact_id,
+        producer="test",
+        producer_version="1",
+        configuration_sha256="c" * 64,
+        child_to_parent_mapping=IdentityMapping(),
+    )
+    manifest = ArtifactManifest(artifacts=(source_artifact, oriented, orphan))
+    result = {
+        "output_version": "offline_accuracy_spine_v6",
+        "contract_revision": 6,
+        "document_id": "doc",
+        "source_sha256": _sha(source_pdf.read_bytes()),
+        "source_name": "bill.pdf",
+        "pages": 1,
+        "artifact_manifest": manifest.model_dump(mode="json"),
+        "page_artifacts": [
+            PageArtifact(
+                artifact=source_artifact,
+                page_number=1,
+                dpi=72,
+                role="SOURCE_RAW",
+            ).model_dump(mode="json"),
+            PageArtifact(
+                artifact=oriented,
+                page_number=1,
+                dpi=72,
+                role="ORIENTED_RAW",
+                selected=True,
+            ).model_dump(mode="json"),
+        ],
+    }
+    result["artifact_manifest"]["manifest_sha256"] = canonical_sha256(
+        {
+            "manifest_version": "artifact_manifest_v1",
+            "artifacts": result["artifact_manifest"]["artifacts"],
+        }
+    )
+    report = validate_extraction_result(source_pdf, result, artifact_root)
+    assert report.fatal
+    assert "v6_contract_invalid" in {issue.code for issue in report.issues}
 
 
 def test_validation_returns_a_complete_structured_report(tmp_path: Path) -> None:

@@ -233,10 +233,10 @@ class JobStore:
         certification = state.get("certification")
         valid = False
         certification_status = "legacy_uncertified"
-        if (
-            isinstance(certification, dict)
-            and certification.get("certification_version") == "job_certification_v2"
-        ):
+        if isinstance(certification, dict) and certification.get("certification_version") in {
+            "job_certification_v2",
+            "job_certification_v3",
+        }:
             certification_status = "invalid"
             result_path = self.job_dir(job_id) / "result.json"
             validation_path = self.job_dir(job_id) / "validation.json"
@@ -252,16 +252,19 @@ class JobStore:
                     sort_keys=True,
                     separators=(",", ":"),
                 ).encode()
-                expected = self._certification_v2_unlocked(
-                    job_id,
-                    result,
-                    result_bytes,
-                    report,
-                    report_payload,
+                expected = (
+                    self._certification_v3_unlocked(
+                        job_id, result, result_bytes, report, report_payload
+                    )
+                    if certification.get("certification_version") == "job_certification_v3"
+                    else self._certification_v2_unlocked(
+                        job_id, result, result_bytes, report, report_payload
+                    )
                 )
                 valid = bool(
                     certification == expected
-                    and certification.get("output_version") == "offline_accuracy_spine_v5"
+                    and certification.get("output_version")
+                    in {"offline_accuracy_spine_v5", "offline_accuracy_spine_v6"}
                     and isinstance(report, dict)
                     and persisted_report == report
                     and report.get("status") == state.get("validation_status")
@@ -390,6 +393,40 @@ class JobStore:
         artifact_root: Path | None = None,
     ) -> tuple[list[dict[str, Any]], str]:
         root = artifact_root or self.job_dir(job_id) / "artifacts"
+        if result.get("output_version") == "offline_accuracy_spine_v6":
+            manifest = result.get("artifact_manifest")
+            artifacts = manifest.get("artifacts") if isinstance(manifest, dict) else None
+            if not isinstance(artifacts, list):
+                raise JobTransactionError("invalid_artifact_inventory")
+            inventory: list[dict[str, Any]] = []
+            seen: dict[str, str] = {}
+            for artifact in artifacts:
+                if not isinstance(artifact, dict):
+                    raise JobTransactionError("invalid_artifact_inventory")
+                relative_value = artifact.get("artifact_relative_path")
+                digest_value = artifact.get("image_sha256")
+                if not isinstance(relative_value, str) or not isinstance(digest_value, str):
+                    raise JobTransactionError("invalid_artifact_inventory")
+                relative = Path(relative_value)
+                if relative.is_absolute() or ".." in relative.parts:
+                    raise JobTransactionError("invalid_artifact_inventory")
+                previous = seen.get(relative.as_posix())
+                if previous is not None and previous != digest_value:
+                    raise JobTransactionError("artifact_digest_conflict")
+                seen[relative.as_posix()] = digest_value
+                if previous is not None:
+                    continue
+                content = self._contained_file_bytes(
+                    root, relative, "invalid_certification_artifact"
+                )
+                actual = hashlib.sha256(content).hexdigest()
+                if actual != digest_value:
+                    raise JobTransactionError("certification_artifact_digest_mismatch")
+                inventory.append(
+                    {"relative_path": relative.as_posix(), "sha256": actual, "size": len(content)}
+                )
+            inventory.sort(key=lambda item: item["relative_path"])
+            return inventory, self._canonical_sha256(inventory)
         expected: dict[str, str] = {}
 
         def add(relative: object, digest: object) -> None:
@@ -485,6 +522,43 @@ class JobStore:
             "report_sha256": hashlib.sha256(report_payload).hexdigest(),
             "source_sha256": source_sha256,
             "artifact_inventory_sha256": inventory_sha256,
+        }
+        certification["certification_sha256"] = self._canonical_sha256(certification)
+        return certification
+
+    def _certification_v3_unlocked(
+        self,
+        job_id: str,
+        result: dict[str, Any],
+        result_bytes: bytes,
+        report: dict[str, Any],
+        report_payload: bytes,
+        *,
+        artifact_root: Path | None = None,
+    ) -> dict[str, Any]:
+        source = self._contained_file_bytes(
+            self.job_dir(job_id), Path("source.pdf"), "invalid_certification_source"
+        )
+        source_sha256 = hashlib.sha256(source).hexdigest()
+        if result.get("source_sha256") != source_sha256:
+            raise JobTransactionError("certification_source_digest_mismatch")
+        _inventory, inventory_sha256 = self._artifact_inventory_unlocked(
+            job_id, result, artifact_root
+        )
+        manifest = result.get("artifact_manifest")
+        if not isinstance(manifest, dict) or not isinstance(manifest.get("manifest_sha256"), str):
+            raise JobTransactionError("invalid_artifact_graph")
+        certification = {
+            "certification_version": "job_certification_v3",
+            "output_version": result.get("output_version"),
+            "contract_revision": result.get("contract_revision"),
+            "validation_version": report.get("validation_version"),
+            "worker_release_revision": result.get("worker_release_revision"),
+            "result_sha256": hashlib.sha256(result_bytes).hexdigest(),
+            "report_sha256": hashlib.sha256(report_payload).hexdigest(),
+            "source_sha256": source_sha256,
+            "artifact_inventory_sha256": inventory_sha256,
+            "artifact_graph_sha256": manifest["manifest_sha256"],
         }
         certification["certification_sha256"] = self._canonical_sha256(certification)
         return certification
@@ -662,13 +736,24 @@ class JobStore:
         row_count = len(rows) if isinstance(rows, list) else 0
         certification = None
         if not report.fatal:
-            certification = self._certification_v2_unlocked(
-                job_id,
-                result,
-                serialized,
-                report_json,
-                report_payload,
-                artifact_root=artifact_root,
+            certification = (
+                self._certification_v3_unlocked(
+                    job_id,
+                    result,
+                    serialized,
+                    report_json,
+                    report_payload,
+                    artifact_root=artifact_root,
+                )
+                if result.get("output_version") == "offline_accuracy_spine_v6"
+                else self._certification_v2_unlocked(
+                    job_id,
+                    result,
+                    serialized,
+                    report_json,
+                    report_payload,
+                    artifact_root=artifact_root,
+                )
             )
         state_fields = {
             "status": (
@@ -687,6 +772,14 @@ class JobStore:
             "validation_issue_codes": list(dict.fromkeys(issue.code for issue in report.issues)),
             "validation_report_sha256": hashlib.sha256(report_payload).hexdigest(),
             "certification": (certification),
+            "output_version": result.get("output_version"),
+            "contract_revision": result.get("contract_revision"),
+            "evidence_contract_status": (
+                "current_v6"
+                if result.get("output_version") == "offline_accuracy_spine_v6"
+                else "legacy_v5"
+            ),
+            "reprocess_recommended": result.get("output_version") != "offline_accuracy_spine_v6",
         }
         return result, report_json, state_fields
 
@@ -896,9 +989,7 @@ class JobStore:
             )
             if (
                 expected_certification_sha256 is not None
-                and (certified_state.get("certification") or {}).get(
-                    "certification_sha256"
-                )
+                and (certified_state.get("certification") or {}).get("certification_sha256")
                 != expected_certification_sha256
             ):
                 raise JobTransactionError("maintenance_certification_changed")

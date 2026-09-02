@@ -17,6 +17,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, ValidationError
 
 from gmoney.contracts.extraction import SourceTable
+from gmoney.contracts.v6 import SourceTableV2
 from gmoney.demo.alias_transactions import AliasTransactionCoordinator
 from gmoney.demo.review import (
     ReviewValidationError,
@@ -27,6 +28,7 @@ from gmoney.demo.review import (
     export_payload,
     normalize_changes,
     project_hospital,
+    project_legacy_evidence_tree,
     project_rows,
     public_page_assets,
     review_summary,
@@ -251,9 +253,19 @@ def _public_state(state: dict[str, Any]) -> dict[str, Any]:
             "validation_issue_count",
             "validation_issue_codes",
             "error",
+            "output_version",
+            "contract_revision",
+            "evidence_contract_status",
+            "reprocess_recommended",
         )
     }
     public["hospital_name_source"] = "machine" if state.get("hospital_name") else None
+    if public.get("evidence_contract_status") is None and state.get("status") in {
+        "complete",
+        "needs_review",
+    }:
+        public["evidence_contract_status"] = "legacy_v5"
+        public["reprocess_recommended"] = True
     certified = state.get("_certification_valid") is True
     if state.get("status") in {"complete", "needs_review"} and not certified:
         public["validation_status"] = None
@@ -1035,6 +1047,8 @@ def get_rows(
     result, review = _complete_result(job_id)
     rows = project_rows(result, review)
     totals = totals_summary(result, review, rows)
+    if result.get("output_version") == "offline_accuracy_spine_v6":
+        totals = project_legacy_evidence_tree(result, totals)
     if query:
         needle = query.casefold().strip()
         rows = [
@@ -1104,7 +1118,12 @@ def get_source_tables(
         None if available else ("no_source_tables" if source_present else "legacy_result")
     )
     try:
-        tables = [SourceTable.model_validate(table) for table in source_payload or []]
+        table_model = (
+            SourceTableV2
+            if result.get("output_version") == "offline_accuracy_spine_v6"
+            else SourceTable
+        )
+        tables = [table_model.model_validate(table) for table in source_payload or []]
     except ValidationError as error:
         raise HTTPException(
             status_code=409,
@@ -1162,9 +1181,13 @@ def get_source_tables(
         if index not in rows_by_table:
             continue
         payload = table.model_dump(mode="json")
+        if result.get("output_version") == "offline_accuracy_spine_v6":
+            payload = project_legacy_evidence_tree(result, payload)
         payload["rows"] = []
         for row, ordinal in rows_by_table[index]:
             row_payload = row.model_dump(mode="json")
+            if result.get("output_version") == "offline_accuracy_spine_v6":
+                row_payload = project_legacy_evidence_tree(result, row_payload)
             row_payload["ordinal"] = ordinal
             payload["rows"].append(row_payload)
         public_tables.append(payload)
@@ -2154,6 +2177,8 @@ def approve_document(
                 )
             },
         }
+        if certification.get("artifact_graph_sha256") is not None:
+            approval["artifact_graph_sha256"] = certification["artifact_graph_sha256"]
         review["approval"] = approval
         review["events"].append(
             _event(expected + 1, "document_approved", job_id, "Review complete")

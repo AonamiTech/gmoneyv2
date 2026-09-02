@@ -81,6 +81,44 @@ def public_page_assets(result: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
+def _v6_source_hashes(result: dict[str, Any]) -> dict[str, str]:
+    manifest = result.get("artifact_manifest") or {}
+    return {
+        str(item.get("artifact_id")): str(item.get("image_sha256"))
+        for item in manifest.get("artifacts", [])
+        if isinstance(item, dict) and item.get("artifact_id")
+    }
+
+
+def project_legacy_evidence(result: dict[str, Any], evidence: Any) -> Any:
+    """Project V6 source-page evidence to the unchanged V5 API shape."""
+    if not isinstance(evidence, dict) or "source_page_polygon" not in evidence:
+        return evidence
+    source_id = str(evidence.get("source_page_artifact_id") or "")
+    return {
+        "page_number": evidence.get("source_page_number"),
+        "polygon": evidence.get("source_page_polygon"),
+        "artifact_sha256": _v6_source_hashes(result).get(
+            source_id, evidence.get("artifact_sha256")
+        ),
+        "token_ids": list(evidence.get("ocr_token_ids") or []),
+        "extractor": evidence.get("extractor"),
+        "model_name": evidence.get("model_name"),
+        "model_version": evidence.get("model_version"),
+        "recognition_variant": evidence.get("recognition_variant"),
+    }
+
+
+def project_legacy_evidence_tree(result: dict[str, Any], payload: Any) -> Any:
+    if isinstance(payload, list):
+        return [project_legacy_evidence_tree(result, item) for item in payload]
+    if isinstance(payload, dict):
+        if "source_page_polygon" in payload:
+            return project_legacy_evidence(result, payload)
+        return {key: project_legacy_evidence_tree(result, value) for key, value in payload.items()}
+    return payload
+
+
 def normalize_changes(changes: dict[str, Any]) -> dict[str, Any]:
     unsupported = set(changes) - EDITABLE_FIELDS
     if unsupported:
@@ -237,6 +275,8 @@ def project_rows(result: dict[str, Any], review: dict[str, Any]) -> list[dict[st
             row["rejection_provenance"] = None
         projected.append(row)
     projected.sort(key=lambda row: (int(row["page_number"]), int(row["row_order"]), row["id"]))
+    if result.get("output_version") == "offline_accuracy_spine_v6":
+        projected = [project_legacy_evidence_tree(result, row) for row in projected]
     return projected
 
 
@@ -617,13 +657,16 @@ def approval_blockers(
     certification = certified_state.get("certification")
     approval = review.get("approval")
     if isinstance(approval, dict) and isinstance(certification, dict):
-        for field in (
+        certification_fields = [
             "certification_sha256",
             "result_sha256",
             "report_sha256",
             "source_sha256",
             "artifact_inventory_sha256",
-        ):
+        ]
+        if certification.get("artifact_graph_sha256") is not None:
+            certification_fields.append("artifact_graph_sha256")
+        for field in certification_fields:
             if approval.get(field) != certification.get(field):
                 blockers.append("approval_certification_mismatch")
                 break
@@ -742,6 +785,16 @@ def create_evidence_bundle(
                 "page_assets": public_page_assets(result),
                 "rows": result.get("rows", []),
                 "provider_usage": result.get("provider_usage", {}),
+                "artifact_manifest": result.get("artifact_manifest")
+                if result.get("output_version") == "offline_accuracy_spine_v6"
+                else None,
+                "artifact_graph_sha256": certification.get("artifact_graph_sha256"),
+                "evidence": result.get("evidence", [])
+                if result.get("output_version") == "offline_accuracy_spine_v6"
+                else None,
+                "adapter_inputs": result.get("adapter_inputs", [])
+                if result.get("output_version") == "offline_accuracy_spine_v6"
+                else None,
             },
             indent=2,
             sort_keys=True,

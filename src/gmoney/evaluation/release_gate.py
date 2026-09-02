@@ -36,6 +36,12 @@ class GoldSnapshot(StrictModel):
     issues_sha256: str = Field(pattern=SHA256_PATTERN)
     recovery_sha256: str = Field(pattern=SHA256_PATTERN)
     provider_usage_sha256: str = Field(pattern=SHA256_PATTERN)
+    # Optional V6 certification metadata keeps sealed V5 manifests readable.
+    semantic_v5_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
+    artifact_inventory_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
+    artifact_graph_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
+    mapping_error_summary_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
+    evidence_contract_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
 
 
 class CorpusDocument(StrictModel):
@@ -101,6 +107,20 @@ def _payload_sha256(payload: object) -> str:
     ).hexdigest()
 
 
+def _strip_v6_evidence(value: object) -> object:
+    if isinstance(value, list):
+        return [_strip_v6_evidence(item) for item in value]
+    if isinstance(value, dict):
+        if "source_page_polygon" in value:
+            return {
+                "page_number": value.get("source_page_number"),
+                "polygon": _strip_v6_evidence(value.get("source_page_polygon")),
+                "token_ids": sorted(value.get("ocr_token_ids") or []),
+            }
+        return {key: _strip_v6_evidence(item) for key, item in value.items()}
+    return value
+
+
 def _pdf_inventory(root: Path) -> dict[str, Path]:
     inventory: dict[str, Path] = {}
     for path in sorted(root.rglob("*.pdf")):
@@ -157,6 +177,28 @@ def _gold_snapshot(
         "selected": result.get("document_totals") or [],
         "raw": result.get("raw_total_candidates") or [],
     }
+    manifest = result.get("artifact_manifest") or {}
+    certification = state.get("certification") or {}
+    v6 = result.get("output_version") == "offline_accuracy_spine_v6"
+    semantic_v5 = _payload_sha256(
+        {
+            "rows": _strip_v6_evidence(rows),
+            "source_tables": _strip_v6_evidence(result.get("source_tables") or []),
+        }
+    )
+    mapping_summary = [
+        {
+            "artifact_id": item.get("artifact_id"),
+            "mapping_sha256": (item.get("child_to_parent_mapping") or {}).get("mapping_sha256"),
+        }
+        for item in manifest.get("artifacts", [])
+        if isinstance(item, dict)
+    ]
+    evidence_contract = {
+        "evidence": result.get("evidence") or [],
+        "tokens": result.get("token_manifest") or [],
+        "adapters": result.get("adapter_inputs") or [],
+    }
     return GoldSnapshot(
         status=state.get("status"),
         validation_status=report.get("status"),
@@ -168,6 +210,11 @@ def _gold_snapshot(
         issues_sha256=_payload_sha256(report.get("issues") or []),
         recovery_sha256=_payload_sha256(result.get("recovery") or {}),
         provider_usage_sha256=_payload_sha256(result.get("provider_usage") or {}),
+        semantic_v5_sha256=semantic_v5 if v6 else None,
+        artifact_inventory_sha256=certification.get("artifact_inventory_sha256") if v6 else None,
+        artifact_graph_sha256=manifest.get("manifest_sha256") if v6 else None,
+        mapping_error_summary_sha256=_payload_sha256(mapping_summary) if v6 else None,
+        evidence_contract_sha256=_payload_sha256(evidence_contract) if v6 else None,
     )
 
 

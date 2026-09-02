@@ -593,6 +593,14 @@ class ExtractionResultV6(ContractModel):
             for item in self.artifact_manifest.artifacts
         ):
             raise ValueError("dense backward-grid mappings are reserved for M3")
+        page_artifact_ids = [page.artifact.artifact_id for page in self.page_artifacts]
+        if len(page_artifact_ids) != len(set(page_artifact_ids)):
+            raise ValueError("page artifact wrappers must reference unique artifacts")
+        page_numbers = {item.page_number for item in self.page_artifacts}
+        if any(item.role is not None for item in self.page_artifacts) and page_numbers != set(
+            range(1, self.pages + 1)
+        ):
+            raise ValueError("page artifact numbers must cover the declared page range")
         for page in self.page_artifacts:
             expected = manifest.get(page.artifact.artifact_id)
             if expected is None:
@@ -610,6 +618,10 @@ class ExtractionResultV6(ContractModel):
                     raise ValueError("each page requires exactly one ORIENTED_RAW inventory item")
                 if sum(item.selected for item in page_items) != 1:
                     raise ValueError("each page requires exactly one selected candidate")
+                source = next(item for item in page_items if item.role == "SOURCE_RAW")
+                oriented = next(item for item in page_items if item.role == "ORIENTED_RAW")
+                if oriented.artifact.parent_artifact_id != source.artifact.artifact_id:
+                    raise ValueError("ORIENTED_RAW must directly reference its page SOURCE_RAW")
         for table in self.canonical_table_artifacts:
             expected = manifest.get(table.artifact.artifact_id)
             if expected is None:
@@ -621,6 +633,7 @@ class ExtractionResultV6(ContractModel):
                 raise ValueError("canonical table page artifact is missing from artifact manifest")
             if table.artifact.parent_artifact_id != table.page_artifact_id:
                 raise ValueError("canonical table artifact parent differs from page artifact")
+        token_by_id = {item.token_id: item for item in self.token_manifest}
         if any(item.artifact_id not in manifest for item in self.token_manifest):
             raise ValueError("token artifact is missing from artifact manifest")
         if len({item.token_id for item in self.token_manifest}) != len(self.token_manifest):
@@ -634,6 +647,60 @@ class ExtractionResultV6(ContractModel):
         }
         if not table_ids.issubset(crop_ids):
             raise ValueError("every V6 source table requires a canonical table artifact")
+
+        referenced: set[str] = set(page_artifact_ids)
+        referenced.update(item.artifact.artifact_id for item in self.canonical_table_artifacts)
+        referenced.update(item.page_artifact_id for item in self.canonical_table_artifacts)
+        referenced.update(item.artifact_id for item in self.token_manifest)
+        referenced.update(item.source_page_artifact_id for item in self.token_manifest)
+        referenced.update(item.input_artifact_id for item in self.adapter_inputs)
+
+        evidence_items: list[EvidenceRefV2] = list(self.evidence)
+        for row in self.rows:
+            evidence_items.extend(row.evidence)
+            evidence_items.extend(item for values in row.field_evidence.values() for item in values)
+        for table in self.source_tables:
+            evidence_items.extend(item for column in table.columns for item in column.evidence)
+            evidence_items.extend(
+                item for row in table.rows for cell in row.cells for item in cell.evidence
+            )
+        if self.document_total is not None:
+            evidence_items.append(self.document_total.evidence)
+        for candidate in self.raw_total_candidates:
+            evidence_items.append(candidate.total.evidence)
+            evidence_items.extend(candidate.context_evidence)
+        for evidence in evidence_items:
+            referenced.add(evidence.artifact_id)
+            referenced.add(evidence.source_page_artifact_id)
+            artifact = manifest.get(evidence.artifact_id)
+            if artifact is None or evidence.artifact_sha256 != artifact.image_sha256:
+                raise ValueError("evidence artifact hash does not match manifest")
+            for token_id in evidence.ocr_token_ids:
+                token = token_by_id.get(token_id)
+                if token is None:
+                    raise ValueError("evidence references an unknown OCR token")
+                if token.artifact_id != evidence.artifact_id:
+                    raise ValueError("evidence token belongs to another artifact")
+        for token in self.token_manifest:
+            artifact = manifest.get(token.artifact_id)
+            if artifact is None or token.artifact_sha256 != artifact.image_sha256:
+                raise ValueError("token artifact hash does not match manifest")
+            if token.artifact_relative_path != artifact.artifact_relative_path:
+                raise ValueError("token artifact path does not match manifest")
+
+        closure = set(referenced)
+        pending = list(referenced)
+        while pending:
+            artifact_id = pending.pop()
+            artifact = manifest.get(artifact_id)
+            if artifact is None:
+                continue
+            parent_id = artifact.parent_artifact_id
+            if parent_id is not None and parent_id not in closure:
+                closure.add(parent_id)
+                pending.append(parent_id)
+        if closure != set(manifest):
+            raise ValueError("artifact manifest contains unreferenced orphan nodes")
         return self
 
 

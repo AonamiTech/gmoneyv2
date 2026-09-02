@@ -32,7 +32,7 @@ def plan_recertification(
     data_root: Path,
     job_ids: set[str] | None = None,
 ) -> dict[str, Any]:
-    """Inspect v5 workspaces without recovery, migration, or publication writes."""
+    """Inspect V5/V6 workspaces without recovery, migration, or publication writes."""
 
     store = JobStore(data_root)
     entries: list[dict[str, Any]] = []
@@ -65,14 +65,24 @@ def plan_recertification(
                         store._read_review_unlocked(job_id).get("approval")
                     ),
                 )
-                if result.get("output_version") != "offline_accuracy_spine_v5":
-                    entry["reason"] = "not_v5"
+                output_version = result.get("output_version")
+                if output_version not in {
+                    "offline_accuracy_spine_v5",
+                    "offline_accuracy_spine_v6",
+                }:
+                    entry["reason"] = "unsupported_output_version"
                 elif result.get("contract_revision") == 2 and bool(
                     (result.get("recovery") or {}).get("attempted")
                 ):
                     entry["eligibility"] = "reprocess_required"
                     entry["reason"] = "revision_2_recovery_audit_incomplete"
-                elif result.get("contract_revision") not in {2, 3, 4}:
+                elif (
+                    output_version == "offline_accuracy_spine_v5"
+                    and result.get("contract_revision") not in {2, 3, 4, 5}
+                ) or (
+                    output_version == "offline_accuracy_spine_v6"
+                    and result.get("contract_revision") != 6
+                ):
                     entry["reason"] = "unsupported_contract_revision"
                 else:
                     candidate = json.loads(json.dumps(result))
@@ -97,12 +107,22 @@ def plan_recertification(
                         report_payload = json.dumps(
                             report_json, sort_keys=True, separators=(",", ":")
                         ).encode()
-                        certification = store._certification_v2_unlocked(
-                            job_id,
-                            candidate,
-                            serialized,
-                            report_json,
-                            report_payload,
+                        certification = (
+                            store._certification_v3_unlocked(
+                                job_id,
+                                candidate,
+                                serialized,
+                                report_json,
+                                report_payload,
+                            )
+                            if output_version == "offline_accuracy_spine_v6"
+                            else store._certification_v2_unlocked(
+                                job_id,
+                                candidate,
+                                serialized,
+                                report_json,
+                                report_payload,
+                            )
                         )
                         entry.update(
                             eligibility="eligible",
@@ -173,9 +193,7 @@ def apply_recertification(data_root: Path, plan: dict[str, Any]) -> dict[str, An
             job_id,
             candidate,
             expected_result_sha256=live_digest,
-            expected_certification_sha256=str(
-                entry["target_certification_sha256"]
-            ),
+            expected_certification_sha256=str(entry["target_certification_sha256"]),
         )
         state = store.read(job_id)
         outcomes.append(
