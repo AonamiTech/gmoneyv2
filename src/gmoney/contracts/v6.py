@@ -1,0 +1,551 @@
+"""Strict V6 artifact, evidence, and envelope contracts.
+
+The V5 contracts deliberately remain unchanged.  V6 makes the image used by an
+adapter a first-class, content-addressed node in an immutable coordinate graph.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+from enum import StrEnum
+from typing import Annotated, Any, Literal, TypeAlias
+
+from pydantic import Field, TypeAdapter, field_validator, model_validator
+
+from gmoney.contracts.common import ContractModel
+from gmoney.contracts.evidence import Polygon
+
+SHA256_PATTERN = r"^[a-f0-9]{64}$"
+Matrix = tuple[tuple[float, float, float], ...]
+
+
+def canonical_json(value: Any) -> bytes:
+    """Serialize JSON-compatible data deterministically for content hashes."""
+
+    if hasattr(value, "model_dump"):
+        value = value.model_dump(mode="json")
+    return json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def canonical_sha256(value: Any) -> str:
+    return hashlib.sha256(canonical_json(value)).hexdigest()
+
+
+def _finite_matrix(matrix: Matrix) -> None:
+    if len(matrix) != 3 or any(len(row) != 3 for row in matrix):
+        raise ValueError("homography must be a 3x3 matrix")
+    if any(not math.isfinite(value) for row in matrix for value in row):
+        raise ValueError("homography must contain only finite values")
+
+
+def _determinant(matrix: Matrix) -> float:
+    a, b, c = matrix[0]
+    d, e, f = matrix[1]
+    g, h, i = matrix[2]
+    return a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
+
+
+def _validate_homography(matrix: Matrix) -> None:
+    _finite_matrix(matrix)
+    determinant = _determinant(matrix)
+    if abs(determinant) <= 1e-12:
+        raise ValueError("homography must be invertible")
+    if determinant < 0:
+        raise ValueError("homography must preserve orientation")
+
+
+class ArtifactKind(StrEnum):
+    SOURCE_RAW = "SOURCE_RAW"
+    ORIENTED_RAW = "ORIENTED_RAW"
+    PROJECTIVE = "PROJECTIVE"
+    PROJECTIVE_ENHANCED = "PROJECTIVE_ENHANCED"
+    UVDOC = "UVDOC"
+    UVDOC_ENHANCED = "UVDOC_ENHANCED"
+    TABLE_CROP = "TABLE_CROP"
+    CELL_CROP = "CELL_CROP"
+
+
+class MappingType(StrEnum):
+    IDENTITY = "IDENTITY"
+    HOMOGRAPHY = "HOMOGRAPHY"
+    DENSE_BACKWARD_GRID = "DENSE_BACKWARD_GRID"
+
+
+class IdentityMapping(ContractModel):
+    mapping_type: Literal[MappingType.IDENTITY] = MappingType.IDENTITY
+    mapping_sha256: str = Field(default="", pattern=SHA256_PATTERN)
+
+    @model_validator(mode="before")
+    @classmethod
+    def fill_mapping_hash(cls, value: Any) -> Any:
+        data = dict(value)
+        if not data.get("mapping_sha256"):
+            data["mapping_sha256"] = canonical_sha256({"mapping_type": MappingType.IDENTITY.value})
+        return data
+
+    @model_validator(mode="after")
+    def verify_mapping_hash(self) -> IdentityMapping:
+        expected = canonical_sha256({"mapping_type": self.mapping_type.value})
+        if self.mapping_sha256 != expected:
+            raise ValueError("identity mapping hash does not match canonical mapping")
+        return self
+
+
+class HomographyMapping(ContractModel):
+    mapping_type: Literal[MappingType.HOMOGRAPHY] = MappingType.HOMOGRAPHY
+    child_to_parent_matrix: Matrix
+    mapping_sha256: str = Field(default="", pattern=SHA256_PATTERN)
+
+    @model_validator(mode="before")
+    @classmethod
+    def fill_mapping_hash(cls, value: Any) -> Any:
+        data = dict(value)
+        matrix = data.get("child_to_parent_matrix")
+        if not data.get("mapping_sha256") and matrix is not None:
+            matrix = tuple(tuple(float(cell) for cell in row) for row in matrix)
+            data["child_to_parent_matrix"] = matrix
+            data["mapping_sha256"] = canonical_sha256(
+                {
+                    "mapping_type": MappingType.HOMOGRAPHY.value,
+                    "child_to_parent_matrix": matrix,
+                }
+            )
+        return data
+
+    @model_validator(mode="after")
+    def validate_matrix_and_hash(self) -> HomographyMapping:
+        _validate_homography(self.child_to_parent_matrix)
+        expected = canonical_sha256(
+            {
+                "mapping_type": self.mapping_type.value,
+                "child_to_parent_matrix": self.child_to_parent_matrix,
+            }
+        )
+        if self.mapping_sha256 != expected:
+            raise ValueError("homography mapping hash does not match canonical mapping")
+        return self
+
+
+class DenseBackwardGridMapping(ContractModel):
+    """Reserved M3 mapping schema; V6 envelopes reject this mapping type."""
+
+    mapping_type: Literal[MappingType.DENSE_BACKWARD_GRID] = MappingType.DENSE_BACKWARD_GRID
+    grid_relative_path: str = Field(min_length=1)
+    grid_sha256: str = Field(pattern=SHA256_PATTERN)
+    grid_dtype: Literal["float32"] = "float32"
+    grid_shape: tuple[int, int, int] = Field(min_length=3, max_length=3)
+    child_width: int = Field(gt=0)
+    child_height: int = Field(gt=0)
+    parent_width: int = Field(gt=0)
+    parent_height: int = Field(gt=0)
+    coordinate_domain: Literal["normalized_minus_one_to_one"] = "normalized_minus_one_to_one"
+    interpolation: Literal["bilinear"] = "bilinear"
+    align_corners: Literal[True] = True
+    padding_mode: Literal["zeros", "border", "reflection"]
+    mapping_sha256: str = Field(default="", pattern=SHA256_PATTERN)
+
+    @field_validator("grid_shape")
+    @classmethod
+    def require_positive_shape(cls, shape: tuple[int, int, int]) -> tuple[int, int, int]:
+        if any(value <= 0 for value in shape):
+            raise ValueError("dense grid dimensions must be positive")
+        return shape
+
+    @model_validator(mode="before")
+    @classmethod
+    def fill_mapping_hash(cls, value: Any) -> Any:
+        data = dict(value)
+        if not data.get("mapping_sha256"):
+            data.setdefault("mapping_type", MappingType.DENSE_BACKWARD_GRID)
+            data.setdefault("grid_dtype", "float32")
+            data.setdefault("coordinate_domain", "normalized_minus_one_to_one")
+            data.setdefault("interpolation", "bilinear")
+            data.setdefault("align_corners", True)
+            payload = dict(data)
+            payload.pop("mapping_sha256", None)
+            data["mapping_sha256"] = canonical_sha256(payload)
+        return data
+
+    @model_validator(mode="after")
+    def verify_mapping_hash(self) -> DenseBackwardGridMapping:
+        payload = self.model_dump(mode="json", exclude={"mapping_sha256"})
+        if self.mapping_sha256 != canonical_sha256(payload):
+            raise ValueError("dense mapping hash does not match canonical mapping")
+        return self
+
+
+ArtifactMapping: TypeAlias = Annotated[
+    IdentityMapping | HomographyMapping | DenseBackwardGridMapping,
+    Field(discriminator="mapping_type"),
+]
+_mapping_adapter = TypeAdapter(ArtifactMapping)
+
+
+def artifact_id_for(
+    *,
+    artifact_kind: ArtifactKind,
+    image_sha256: str,
+    parent_artifact_id: str | None,
+    producer: str,
+    producer_version: str,
+    configuration_sha256: str,
+    mapping_sha256: str,
+) -> str:
+    return canonical_sha256(
+        {
+            "artifact_kind": artifact_kind.value,
+            "image_sha256": image_sha256,
+            "parent_artifact_id": parent_artifact_id,
+            "producer": producer,
+            "producer_version": producer_version,
+            "configuration_sha256": configuration_sha256,
+            "mapping_sha256": mapping_sha256,
+        }
+    )
+
+
+def _is_right_angle_homography(
+    matrix: Matrix,
+    parent_width: int,
+    parent_height: int,
+    child_width: int,
+    child_height: int,
+) -> bool:
+    """Check a child-to-parent matrix against the three pixel-grid rotations."""
+
+    w, h = float(parent_width), float(parent_height)
+    expected = (
+        ((0.0, 1.0, 0.0), (-1.0, 0.0, w - 1.0), (0.0, 0.0, 1.0)),
+        ((-1.0, 0.0, w - 1.0), (0.0, -1.0, h - 1.0), (0.0, 0.0, 1.0)),
+        ((0.0, -1.0, h - 1.0), (1.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
+    )
+    dimensions = ((h, w), (w, h), (h, w))
+    return any(
+        (child_width, child_height) == size
+        and all(
+            abs(actual - wanted) <= 1e-6
+            for actual, wanted in zip(
+                (cell for row in matrix for cell in row),
+                (cell for row in candidate for cell in row),
+                strict=True,
+            )
+        )
+        for candidate, size in zip(expected, dimensions, strict=True)
+    )
+
+
+class ArtifactRef(ContractModel):
+    artifact_id: str = Field(default="", pattern=SHA256_PATTERN)
+    artifact_kind: ArtifactKind
+    image_sha256: str = Field(pattern=SHA256_PATTERN)
+    artifact_relative_path: str = Field(min_length=1)
+    width: int = Field(gt=0)
+    height: int = Field(gt=0)
+    parent_artifact_id: str | None = Field(default=None, pattern=SHA256_PATTERN)
+    producer: str = Field(min_length=1)
+    producer_version: str = Field(min_length=1)
+    configuration_sha256: str = Field(pattern=SHA256_PATTERN)
+    child_to_parent_mapping: ArtifactMapping
+
+    @model_validator(mode="before")
+    @classmethod
+    def fill_artifact_id(cls, value: Any) -> Any:
+        data = dict(value)
+        if not data.get("artifact_id") and data.get("child_to_parent_mapping") is not None:
+            mapping = _mapping_adapter.validate_python(data["child_to_parent_mapping"])
+            data["artifact_id"] = artifact_id_for(
+                artifact_kind=ArtifactKind(data["artifact_kind"]),
+                image_sha256=data["image_sha256"],
+                parent_artifact_id=data.get("parent_artifact_id"),
+                producer=data["producer"],
+                producer_version=data["producer_version"],
+                configuration_sha256=data["configuration_sha256"],
+                mapping_sha256=mapping.mapping_sha256,
+            )
+        return data
+
+    @model_validator(mode="after")
+    def validate_identity_and_id(self) -> ArtifactRef:
+        if self.artifact_kind is ArtifactKind.SOURCE_RAW:
+            if self.parent_artifact_id is not None:
+                raise ValueError("SOURCE_RAW artifacts must be graph roots")
+            if not isinstance(self.child_to_parent_mapping, IdentityMapping):
+                raise ValueError("SOURCE_RAW artifacts require an identity mapping")
+        elif self.parent_artifact_id is None:
+            raise ValueError("non-SOURCE_RAW artifacts require a parent artifact")
+        expected = artifact_id_for(
+            artifact_kind=self.artifact_kind,
+            image_sha256=self.image_sha256,
+            parent_artifact_id=self.parent_artifact_id,
+            producer=self.producer,
+            producer_version=self.producer_version,
+            configuration_sha256=self.configuration_sha256,
+            mapping_sha256=self.child_to_parent_mapping.mapping_sha256,
+        )
+        if self.artifact_id != expected:
+            raise ValueError("artifact ID does not match canonical artifact identity")
+        return self
+
+
+class ArtifactManifest(ContractModel):
+    manifest_version: Literal["artifact_manifest_v1"] = "artifact_manifest_v1"
+    artifacts: tuple[ArtifactRef, ...]
+    manifest_sha256: str = Field(default="", pattern=SHA256_PATTERN)
+
+    @model_validator(mode="before")
+    @classmethod
+    def fill_manifest_hash(cls, value: Any) -> Any:
+        data = dict(value)
+        if not data.get("manifest_sha256") and data.get("artifacts") is not None:
+            artifacts = tuple(
+                item if isinstance(item, ArtifactRef) else ArtifactRef.model_validate(item)
+                for item in data["artifacts"]
+            )
+            data["manifest_sha256"] = canonical_sha256(
+                {
+                    "manifest_version": data.get("manifest_version", "artifact_manifest_v1"),
+                    "artifacts": [item.model_dump(mode="json") for item in artifacts],
+                }
+            )
+        return data
+
+    @model_validator(mode="after")
+    def validate_graph(self) -> ArtifactManifest:
+        by_id = {item.artifact_id: item for item in self.artifacts}
+        if len(by_id) != len(self.artifacts):
+            raise ValueError("artifact IDs must be unique")
+        roots = tuple(item for item in self.artifacts if item.parent_artifact_id is None)
+        if not roots or any(item.artifact_kind is not ArtifactKind.SOURCE_RAW for item in roots):
+            raise ValueError("only SOURCE_RAW artifacts may be graph roots")
+        for artifact in self.artifacts:
+            parent_id = artifact.parent_artifact_id
+            if parent_id is not None and parent_id not in by_id:
+                raise ValueError("artifact parent is missing from manifest")
+            if artifact.artifact_kind is ArtifactKind.ORIENTED_RAW and (
+                parent_id is None or by_id[parent_id].artifact_kind is not ArtifactKind.SOURCE_RAW
+            ):
+                raise ValueError("ORIENTED_RAW must be a direct child of SOURCE_RAW")
+            if artifact.artifact_kind is ArtifactKind.ORIENTED_RAW:
+                parent = by_id[parent_id]
+                mapping = artifact.child_to_parent_mapping
+                if isinstance(mapping, IdentityMapping):
+                    if (artifact.width, artifact.height) != (parent.width, parent.height):
+                        raise ValueError("identity ORIENTED_RAW must preserve source dimensions")
+                elif not isinstance(mapping, HomographyMapping) or not _is_right_angle_homography(
+                    mapping.child_to_parent_matrix,
+                    parent.width,
+                    parent.height,
+                    artifact.width,
+                    artifact.height,
+                ):
+                    raise ValueError(
+                        "ORIENTED_RAW homography must represent a 90/180/270-degree rotation"
+                    )
+            if (
+                isinstance(artifact.child_to_parent_mapping, IdentityMapping)
+                and parent_id is not None
+            ):
+                parent = by_id[parent_id]
+                if (artifact.width, artifact.height) != (parent.width, parent.height):
+                    raise ValueError("identity child dimensions must equal parent dimensions")
+        for artifact in self.artifacts:
+            seen: set[str] = set()
+            current = artifact
+            while current.parent_artifact_id is not None:
+                if current.artifact_id in seen:
+                    raise ValueError("artifact graph contains a cycle")
+                seen.add(current.artifact_id)
+                current = by_id[current.parent_artifact_id]
+        expected = canonical_sha256(
+            {
+                "manifest_version": self.manifest_version,
+                "artifacts": [item.model_dump(mode="json") for item in self.artifacts],
+            }
+        )
+        if self.manifest_sha256 != expected:
+            raise ValueError("artifact manifest hash does not match canonical manifest")
+        return self
+
+    def by_id(self) -> dict[str, ArtifactRef]:
+        return {item.artifact_id: item for item in self.artifacts}
+
+
+class PageArtifact(ContractModel):
+    artifact: ArtifactRef
+    page_number: int = Field(ge=1)
+    dpi: int = Field(gt=0)
+    quality_metrics: dict[str, Any] = Field(default_factory=dict)
+    route_reasons: tuple[str, ...] = ()
+    transform_metrics: dict[str, Any] = Field(default_factory=dict)
+
+
+class CanonicalTableArtifact(ContractModel):
+    artifact: ArtifactRef
+    logical_table_id: str = Field(min_length=1)
+    page_artifact_id: str = Field(pattern=SHA256_PATTERN)
+    crop_polygon_in_page_artifact: Polygon
+    crop_polygon_in_source_raw: Polygon
+    context_margin: tuple[int, int, int, int] = (0, 0, 0, 0)
+    table_type_hint: str | None = None
+
+    @model_validator(mode="after")
+    def require_table_crop(self) -> CanonicalTableArtifact:
+        if self.artifact.artifact_kind is not ArtifactKind.TABLE_CROP:
+            raise ValueError("canonical table artifact must reference a TABLE_CROP")
+        if any(value < 0 for value in self.context_margin):
+            raise ValueError("context margin must be non-negative")
+        return self
+
+
+class EvidenceRefV2(ContractModel):
+    artifact_id: str = Field(pattern=SHA256_PATTERN)
+    artifact_sha256: str = Field(pattern=SHA256_PATTERN)
+    canonical_polygon: Polygon
+    source_page_polygon: Polygon
+    source_page_number: int = Field(ge=1)
+    source_page_artifact_id: str = Field(pattern=SHA256_PATTERN)
+    ocr_token_ids: tuple[str, ...] = ()
+    extractor: str = Field(min_length=1)
+    model_name: str = Field(min_length=1)
+    model_version: str = Field(min_length=1)
+    recognition_variant: str = Field(min_length=1)
+
+    @field_validator("ocr_token_ids")
+    @classmethod
+    def require_non_blank_token_ids(cls, token_ids: tuple[str, ...]) -> tuple[str, ...]:
+        if any(not token_id.strip() for token_id in token_ids):
+            raise ValueError("evidence token IDs must be non-blank strings")
+        return token_ids
+
+
+class TokenManifestEntryV2(ContractModel):
+    token_id: str = Field(min_length=1)
+    page_number: int = Field(ge=1)
+    table_ids: tuple[str, ...] = ()
+    text: str
+    canonical_polygon: Polygon
+    source_page_polygon: Polygon
+    source_page_artifact_id: str = Field(pattern=SHA256_PATTERN)
+    artifact_id: str = Field(pattern=SHA256_PATTERN)
+    artifact_sha256: str = Field(pattern=SHA256_PATTERN)
+    artifact_relative_path: str = Field(min_length=1)
+    confidence: float = Field(ge=0, le=1)
+    parent_token_id: str | None = None
+    parent_token_ids: tuple[str, ...] = ()
+    parent_character_spans: tuple[tuple[int, int], ...] = ()
+    character_start: int | None = Field(default=None, ge=0)
+    character_end: int | None = Field(default=None, ge=0)
+    fragment_role: str | None = None
+
+    @model_validator(mode="after")
+    def require_consistent_fragment(self) -> TokenManifestEntryV2:
+        if self.parent_token_id and self.parent_token_ids:
+            raise ValueError("token provenance must use one parent representation")
+        if self.parent_token_id is not None:
+            if self.character_start is None or self.character_end is None or not self.fragment_role:
+                raise ValueError("fragment token metadata must be complete")
+            if self.character_end <= self.character_start:
+                raise ValueError("fragment token range must be non-empty")
+        if self.parent_token_ids:
+            if len(self.parent_token_ids) != len(self.parent_character_spans):
+                raise ValueError("composite token parents and spans must align")
+            if not self.fragment_role or any(
+                end <= start for start, end in self.parent_character_spans
+            ):
+                raise ValueError("composite fragments require role and non-empty spans")
+        return self
+
+
+class TableAdapterInputV2(ContractModel):
+    input_artifact_id: str = Field(pattern=SHA256_PATTERN)
+    input_artifact_sha256: str = Field(pattern=SHA256_PATTERN)
+    adapter_name: str = Field(min_length=1)
+    adapter_version: str = Field(min_length=1)
+    configuration_sha256: str = Field(pattern=SHA256_PATTERN)
+    latency_ms: int = Field(ge=0)
+    cache_hit: bool = False
+    accepted: bool = False
+    stage: str = Field(min_length=1)
+    recognition_variant: str = Field(min_length=1)
+
+
+class ExtractionResultV6(ContractModel):
+    """V6 envelope skeleton; extraction and publication wiring lands separately."""
+
+    output_version: Literal["offline_accuracy_spine_v6"] = "offline_accuracy_spine_v6"
+    contract_revision: Literal[6] = 6
+    document_id: str = Field(min_length=1)
+    source_sha256: str = Field(pattern=SHA256_PATTERN)
+    source_name: str = Field(min_length=1)
+    pages: int = Field(ge=1)
+    artifact_manifest: ArtifactManifest
+    page_artifacts: tuple[PageArtifact, ...]
+    canonical_table_artifacts: tuple[CanonicalTableArtifact, ...] = ()
+    token_manifest: tuple[TokenManifestEntryV2, ...] = ()
+    evidence: tuple[EvidenceRefV2, ...] = ()
+    adapter_inputs: tuple[TableAdapterInputV2, ...] = ()
+    source_tables: tuple[dict[str, Any], ...] = ()
+    rows: tuple[dict[str, Any], ...] = ()
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_v6_references(self) -> ExtractionResultV6:
+        manifest = self.artifact_manifest.by_id()
+        if any(
+            isinstance(item.child_to_parent_mapping, DenseBackwardGridMapping)
+            for item in self.artifact_manifest.artifacts
+        ):
+            raise ValueError("dense backward-grid mappings are reserved for M3")
+        for page in self.page_artifacts:
+            expected = manifest.get(page.artifact.artifact_id)
+            if expected is None:
+                raise ValueError("page artifact is missing from artifact manifest")
+            if page.artifact != expected:
+                raise ValueError("embedded page artifact differs from artifact manifest")
+        for table in self.canonical_table_artifacts:
+            expected = manifest.get(table.artifact.artifact_id)
+            if expected is None:
+                raise ValueError("canonical table artifact is missing from artifact manifest")
+            if table.artifact != expected:
+                raise ValueError("embedded table artifact differs from artifact manifest")
+            page = manifest.get(table.page_artifact_id)
+            if page is None:
+                raise ValueError("canonical table page artifact is missing from artifact manifest")
+            if table.artifact.parent_artifact_id != table.page_artifact_id:
+                raise ValueError("canonical table artifact parent differs from page artifact")
+        if any(item.artifact_id not in manifest for item in self.token_manifest):
+            raise ValueError("token artifact is missing from artifact manifest")
+        if len({item.token_id for item in self.token_manifest}) != len(self.token_manifest):
+            raise ValueError("V6 token IDs must be unique")
+        if any(item.input_artifact_id not in manifest for item in self.adapter_inputs):
+            raise ValueError("adapter input artifact is missing from artifact manifest")
+        return self
+
+
+__all__ = [
+    "ArtifactKind",
+    "MappingType",
+    "ArtifactMapping",
+    "IdentityMapping",
+    "HomographyMapping",
+    "DenseBackwardGridMapping",
+    "ArtifactRef",
+    "ArtifactManifest",
+    "PageArtifact",
+    "CanonicalTableArtifact",
+    "EvidenceRefV2",
+    "TokenManifestEntryV2",
+    "TableAdapterInputV2",
+    "ExtractionResultV6",
+    "canonical_json",
+    "canonical_sha256",
+    "artifact_id_for",
+]
