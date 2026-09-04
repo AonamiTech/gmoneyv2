@@ -400,11 +400,8 @@ class JobStore:
                 raise JobTransactionError("invalid_artifact_inventory")
             inventory: list[dict[str, Any]] = []
             seen: dict[str, str] = {}
-            for artifact in artifacts:
-                if not isinstance(artifact, dict):
-                    raise JobTransactionError("invalid_artifact_inventory")
-                relative_value = artifact.get("artifact_relative_path")
-                digest_value = artifact.get("image_sha256")
+
+            def add(relative_value: object, digest_value: object) -> None:
                 if not isinstance(relative_value, str) or not isinstance(digest_value, str):
                     raise JobTransactionError("invalid_artifact_inventory")
                 relative = Path(relative_value)
@@ -414,8 +411,19 @@ class JobStore:
                 if previous is not None and previous != digest_value:
                     raise JobTransactionError("artifact_digest_conflict")
                 seen[relative.as_posix()] = digest_value
-                if previous is not None:
-                    continue
+
+            for artifact in artifacts:
+                if not isinstance(artifact, dict):
+                    raise JobTransactionError("invalid_artifact_inventory")
+                add(artifact.get("artifact_relative_path"), artifact.get("image_sha256"))
+                mapping = artifact.get("child_to_parent_mapping")
+                if isinstance(mapping, dict) and mapping.get("mapping_type") == (
+                    "DENSE_BACKWARD_GRID"
+                ):
+                    add(mapping.get("grid_relative_path"), mapping.get("grid_sha256"))
+
+            for relative_value, digest_value in sorted(seen.items()):
+                relative = Path(relative_value)
                 content = self._contained_file_bytes(
                     root, relative, "invalid_certification_artifact"
                 )
@@ -425,7 +433,6 @@ class JobStore:
                 inventory.append(
                     {"relative_path": relative.as_posix(), "sha256": actual, "size": len(content)}
                 )
-            inventory.sort(key=lambda item: item["relative_path"])
             return inventory, self._canonical_sha256(inventory)
         expected: dict[str, str] = {}
 

@@ -5,6 +5,16 @@ from gmoney.geometry.artifacts import (
     max_round_trip_error,
     round_trip_within_tolerance,
 )
+from gmoney.geometry.dense import (
+    DenseGridDiagnostics,
+    DenseGridError,
+    DenseGridResolver,
+    StoredDenseGrid,
+    analyze_dense_grid,
+    load_dense_grid,
+    render_dense_overlay,
+    write_dense_grid,
+)
 from gmoney.geometry.normalize import NormalizationResult, normalize_page
 from gmoney.geometry.preprocess import (
     CAMERA_PREPROCESSING_VERSION,
@@ -37,5 +47,13 @@ __all__ = [
     "map_polygon_to_source",
     "max_round_trip_error",
     "round_trip_within_tolerance",
+    "DenseGridDiagnostics",
+    "DenseGridError",
+    "DenseGridResolver",
+    "StoredDenseGrid",
+    "analyze_dense_grid",
+    "load_dense_grid",
+    "render_dense_overlay",
+    "write_dense_grid",
 ]
 from gmoney.geometry.crop import CropResult, crop_region

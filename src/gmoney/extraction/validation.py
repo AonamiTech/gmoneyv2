@@ -38,12 +38,13 @@ from gmoney.contracts.v6 import (
 from gmoney.evaluation.corpus import sha256_file
 from gmoney.extraction.date_context import service_date_from_context
 from gmoney.extraction.typed_values import parse_decimal, parse_quantity, parse_service_date
-from gmoney.geometry.artifacts import map_points_to_source, max_round_trip_error
+from gmoney.geometry.artifacts import map_polygon_to_source, max_round_trip_error
+from gmoney.geometry.dense import DenseGridError, DenseGridResolver, analyze_dense_grid
 from gmoney.geometry.transform import apply_matrix
 
 VALIDATION_VERSION = "extraction_validation_v5_r4"
 SUPPORTED_OUTPUT_VERSION = "offline_accuracy_spine_v5"
-V6_VALIDATION_VERSION = "extraction_validation_v6_r1"
+V6_VALIDATION_VERSION = "extraction_validation_v6_r2"
 
 
 class ValidationSeverity(StrEnum):
@@ -638,6 +639,7 @@ def _validate_extraction_result_v6(
 
     manifest = parsed.artifact_manifest
     by_id = manifest.by_id()
+    dense_grid_resolver = DenseGridResolver(artifact_root)
     expected_manifest_hash = canonical_sha256(
         {
             "manifest_version": manifest.manifest_version,
@@ -718,14 +720,6 @@ def _validate_extraction_result_v6(
             )
 
         mapping = artifact.child_to_parent_mapping
-        if isinstance(mapping, DenseBackwardGridMapping):
-            _v6_fatal(
-                issues,
-                "v6_dense_mapping_unsupported",
-                "Dense backward-grid mappings are reserved for M3",
-                field="child_to_parent_mapping",
-            )
-            continue
         if artifact.parent_artifact_id is None:
             continue
         parent = by_id.get(artifact.parent_artifact_id)
@@ -736,6 +730,31 @@ def _validate_extraction_result_v6(
                 "Artifact parent is missing from the manifest",
                 field="parent_artifact_id",
             )
+            continue
+        if isinstance(mapping, DenseBackwardGridMapping):
+            try:
+                diagnostics = analyze_dense_grid(mapping, dense_grid_resolver(mapping))
+                if diagnostics.out_of_bounds_rate > 0:
+                    _v6_fatal(
+                        issues,
+                        "v6_dense_mapping_out_of_bounds",
+                        "Dense mapping contains parent coordinates outside artifact bounds",
+                        field="child_to_parent_mapping",
+                    )
+                if diagnostics.foldover_count > 0:
+                    _v6_fatal(
+                        issues,
+                        "v6_dense_grid_jacobian_invalid",
+                        "Dense mapping contains a non-positive Jacobian or fold-over",
+                        field="child_to_parent_mapping",
+                    )
+            except DenseGridError as error:
+                _v6_fatal(
+                    issues,
+                    error.code,
+                    str(error),
+                    field="child_to_parent_mapping",
+                )
             continue
         if isinstance(mapping, HomographyMapping):
             corners = (
@@ -909,6 +928,46 @@ def _validate_extraction_result_v6(
                 "Canonical table source polygon exceeds its source page",
                 field="canonical_table_artifacts",
             )
+        try:
+            projected = _v6_polygon_points(
+                map_polygon_to_source(
+                    manifest,
+                    table.page_artifact_id,
+                    table.crop_polygon_in_page_artifact,
+                    dense_grid_resolver=dense_grid_resolver,
+                )
+            )
+            if len(projected) != len(source_points) or any(
+                ((x - sx) ** 2 + (y - sy) ** 2) ** 0.5 > 2.0
+                for (x, y), (sx, sy) in zip(projected, source_points, strict=True)
+            ):
+                _v6_fatal(
+                    issues,
+                    "v6_table_projection_mismatch",
+                    "Canonical table polygon does not project to source within 2px",
+                    field="canonical_table_artifacts",
+                    page_number=table.page_number,
+                    table_id=table.logical_table_id,
+                )
+        except DenseGridError as error:
+            _v6_fatal(
+                issues,
+                error.code,
+                str(error),
+                field="canonical_table_artifacts",
+                page_number=table.page_number,
+                table_id=table.logical_table_id,
+            )
+        except (ValueError, KeyError, ZeroDivisionError):
+            _v6_fatal(
+                issues,
+                "v6_table_projection_invalid",
+                "Canonical table projection cannot be evaluated",
+                field="canonical_table_artifacts",
+                page_number=table.page_number,
+                table_id=table.logical_table_id,
+            )
+
     def check_evidence(evidence: EvidenceRefV2, field: str) -> None:
         artifact = by_id.get(evidence.artifact_id)
         source_artifact = by_id.get(evidence.source_page_artifact_id)
@@ -954,8 +1013,15 @@ def _validate_extraction_result_v6(
                 field=field,
             )
         try:
-            projected = map_points_to_source(manifest, evidence.artifact_id, canonical)
-            if any(
+            projected = _v6_polygon_points(
+                map_polygon_to_source(
+                    manifest,
+                    evidence.artifact_id,
+                    evidence.canonical_polygon,
+                    dense_grid_resolver=dense_grid_resolver,
+                )
+            )
+            if len(projected) != len(source_points) or any(
                 ((x - sx) ** 2 + (y - sy) ** 2) ** 0.5 > 2.0
                 for (x, y), (sx, sy) in zip(projected, source_points, strict=True)
             ):
@@ -965,6 +1031,8 @@ def _validate_extraction_result_v6(
                     "Canonical evidence does not project to source evidence within 2px",
                     field=field,
                 )
+        except DenseGridError as error:
+            _v6_fatal(issues, error.code, str(error), field=field)
         except (ValueError, KeyError, ZeroDivisionError):
             _v6_fatal(
                 issues,
@@ -1035,8 +1103,15 @@ def _validate_extraction_result_v6(
                 field="token_manifest",
             )
         try:
-            projected = map_points_to_source(manifest, token.artifact_id, canonical)
-            if any(
+            projected = _v6_polygon_points(
+                map_polygon_to_source(
+                    manifest,
+                    token.artifact_id,
+                    token.canonical_polygon,
+                    dense_grid_resolver=dense_grid_resolver,
+                )
+            )
+            if len(projected) != len(source_points) or any(
                 ((x - sx) ** 2 + (y - sy) ** 2) ** 0.5 > 2.0
                 for (x, y), (sx, sy) in zip(projected, source_points, strict=True)
             ):
@@ -1046,6 +1121,8 @@ def _validate_extraction_result_v6(
                     "Token projection exceeds 2px",
                     field="token_manifest",
                 )
+        except DenseGridError as error:
+            _v6_fatal(issues, error.code, str(error), field="token_manifest")
         except (ValueError, KeyError, ZeroDivisionError):
             _v6_fatal(
                 issues,

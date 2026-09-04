@@ -174,11 +174,11 @@ def test_translation_round_trip_property(x: float, y: float) -> None:
     assert round_trip_within_tolerance(matrix, ((x, y),), tolerance_px=1e-8)
 
 
-def test_v6_rejects_dense_mapping_but_schema_can_parse_reserved_tag() -> None:
+def test_v6_accepts_well_formed_dense_mapping_metadata() -> None:
     source = _artifact(ArtifactKind.SOURCE_RAW, "a")
     dense_payload = {
         "mapping_type": "DENSE_BACKWARD_GRID",
-        "grid_relative_path": "grids/a.npy",
+        "grid_relative_path": "grids/a.npz",
         "grid_sha256": "d" * 64,
         "grid_dtype": "float32",
         "grid_shape": (10, 10, 2),
@@ -202,15 +202,18 @@ def test_v6_rejects_dense_mapping_but_schema_can_parse_reserved_tag() -> None:
         mapping=dense,
     )
     manifest = ArtifactManifest(artifacts=(source, child))
-    with pytest.raises(ValidationError, match="reserved for M3"):
-        ExtractionResultV6(
-            document_id="doc",
-            source_sha256="e" * 64,
-            source_name="bill.pdf",
-            pages=1,
-            artifact_manifest=manifest,
-            page_artifacts=(PageArtifact(artifact=source, page_number=1, dpi=300),),
-        )
+    envelope = ExtractionResultV6(
+        document_id="doc",
+        source_sha256="e" * 64,
+        source_name="bill.pdf",
+        pages=1,
+        artifact_manifest=manifest,
+        page_artifacts=(
+            PageArtifact(artifact=source, page_number=1, dpi=300),
+            PageArtifact(artifact=child, page_number=1, dpi=300, selected=True),
+        ),
+    )
+    assert envelope.artifact_manifest.artifacts[1].child_to_parent_mapping == dense
 
 
 def test_v6_envelope_binds_page_and_canonical_table_artifacts() -> None:

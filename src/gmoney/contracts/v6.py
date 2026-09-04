@@ -10,6 +10,7 @@ import hashlib
 import json
 import math
 from enum import StrEnum
+from pathlib import PurePosixPath
 from typing import Annotated, Any, Literal, TypeAlias
 
 from pydantic import Field, TypeAdapter, field_validator, model_validator
@@ -149,28 +150,36 @@ class HomographyMapping(ContractModel):
 
 
 class DenseBackwardGridMapping(ContractModel):
-    """Reserved M3 mapping schema; V6 envelopes reject this mapping type."""
+    """A content-addressed child-to-parent normalized coordinate grid."""
 
     mapping_type: Literal[MappingType.DENSE_BACKWARD_GRID] = MappingType.DENSE_BACKWARD_GRID
     grid_relative_path: str = Field(min_length=1)
     grid_sha256: str = Field(pattern=SHA256_PATTERN)
     grid_dtype: Literal["float32"] = "float32"
     grid_shape: tuple[int, int, int] = Field(min_length=3, max_length=3)
-    child_width: int = Field(gt=0)
-    child_height: int = Field(gt=0)
-    parent_width: int = Field(gt=0)
-    parent_height: int = Field(gt=0)
+    child_width: int = Field(ge=2)
+    child_height: int = Field(ge=2)
+    parent_width: int = Field(ge=2)
+    parent_height: int = Field(ge=2)
     coordinate_domain: Literal["normalized_minus_one_to_one"] = "normalized_minus_one_to_one"
     interpolation: Literal["bilinear"] = "bilinear"
     align_corners: Literal[True] = True
     padding_mode: Literal["zeros", "border", "reflection"]
     mapping_sha256: str = Field(default="", pattern=SHA256_PATTERN)
 
+    @field_validator("grid_relative_path")
+    @classmethod
+    def require_contained_npz_path(cls, value: str) -> str:
+        path = PurePosixPath(value)
+        if path.is_absolute() or ".." in path.parts or "\\" in value or path.suffix != ".npz":
+            raise ValueError("dense grid path must be a contained relative .npz path")
+        return value
+
     @field_validator("grid_shape")
     @classmethod
     def require_positive_shape(cls, shape: tuple[int, int, int]) -> tuple[int, int, int]:
-        if any(value <= 0 for value in shape):
-            raise ValueError("dense grid dimensions must be positive")
+        if shape[0] < 2 or shape[1] < 2 or shape[2] != 2:
+            raise ValueError("dense grid shape must be (height>=2, width>=2, 2)")
         return shape
 
     @model_validator(mode="before")
@@ -370,6 +379,19 @@ class ArtifactManifest(ContractModel):
                 parent = by_id[parent_id]
                 if (artifact.width, artifact.height) != (parent.width, parent.height):
                     raise ValueError("identity child dimensions must equal parent dimensions")
+            if isinstance(artifact.child_to_parent_mapping, DenseBackwardGridMapping):
+                mapping = artifact.child_to_parent_mapping
+                parent = by_id[parent_id]
+                if (mapping.child_width, mapping.child_height) != (
+                    artifact.width,
+                    artifact.height,
+                ):
+                    raise ValueError("dense mapping child dimensions differ from artifact")
+                if (mapping.parent_width, mapping.parent_height) != (
+                    parent.width,
+                    parent.height,
+                ):
+                    raise ValueError("dense mapping parent dimensions differ from parent artifact")
         for artifact in self.artifacts:
             seen: set[str] = set()
             current = artifact
@@ -590,11 +612,6 @@ class ExtractionResultV6(ContractModel):
     @model_validator(mode="after")
     def validate_v6_references(self) -> ExtractionResultV6:
         manifest = self.artifact_manifest.by_id()
-        if any(
-            isinstance(item.child_to_parent_mapping, DenseBackwardGridMapping)
-            for item in self.artifact_manifest.artifacts
-        ):
-            raise ValueError("dense backward-grid mappings are reserved for M3")
         page_artifact_ids = [page.artifact.artifact_id for page in self.page_artifacts]
         if len(page_artifact_ids) != len(set(page_artifact_ids)):
             raise ValueError("page artifact wrappers must reference unique artifacts")
