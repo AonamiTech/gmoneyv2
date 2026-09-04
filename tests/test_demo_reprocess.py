@@ -798,6 +798,51 @@ def row(
     }
 
 
+def test_reprocessing_preserves_timestamps_for_stable_machine_rows() -> None:
+    stable_id = fixture_row_id("stable-row")
+    old = {
+        "rows": [
+            {
+                "id": stable_id,
+                "row_anchor": "row-stable",
+                "created_at": "2026-07-20T00:00:00Z",
+            },
+            {
+                "id": fixture_row_id("anchor-before"),
+                "row_anchor": "row-anchor-only",
+                "created_at": "2026-07-21T00:00:00Z",
+            },
+        ]
+    }
+    new = {
+        "rows": [
+            {
+                "id": stable_id,
+                "row_anchor": "row-stable",
+                "created_at": "2026-09-04T00:00:00Z",
+            },
+            {
+                "id": fixture_row_id("anchor-after"),
+                "row_anchor": "row-anchor-only",
+                "created_at": "2026-09-04T00:00:01Z",
+            },
+            {
+                "id": fixture_row_id("new-row"),
+                "row_anchor": "row-new",
+                "created_at": "2026-09-04T00:00:02Z",
+            },
+        ]
+    }
+
+    reprocess_module._preserve_machine_row_timestamps(old, new)
+
+    assert [item["created_at"] for item in new["rows"]] == [
+        "2026-07-20T00:00:00Z",
+        "2026-07-21T00:00:00Z",
+        "2026-09-04T00:00:02Z",
+    ]
+
+
 def source_tables(
     rows: list[dict[str, Any]],
     artifact_sha256: str,

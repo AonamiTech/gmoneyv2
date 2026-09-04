@@ -1352,6 +1352,37 @@ def _hardlink_or_copy2(source: str, target: str) -> str:
     return target
 
 
+def _preserve_machine_row_timestamps(
+    old_result: dict[str, Any],
+    new_result: dict[str, Any],
+) -> None:
+    """Keep stable machine rows byte-identical across cached reprocessing."""
+
+    old_rows = tuple(
+        row for row in old_result.get("rows", ()) if isinstance(row, dict)
+    )
+    old_by_id = {
+        str(row["id"]): row
+        for row in old_rows
+        if row.get("id") is not None
+    }
+    rows_by_anchor: dict[str, list[dict[str, Any]]] = {}
+    for row in old_rows:
+        if row.get("row_anchor"):
+            rows_by_anchor.setdefault(str(row["row_anchor"]), []).append(row)
+
+    for row in new_result.get("rows", ()):
+        if not isinstance(row, dict):
+            continue
+        previous = old_by_id.get(str(row.get("id")))
+        if previous is None and row.get("row_anchor"):
+            anchored = rows_by_anchor.get(str(row["row_anchor"]), ())
+            if len(anchored) == 1:
+                previous = anchored[0]
+        if previous is not None and previous.get("created_at") is not None:
+            row["created_at"] = previous["created_at"]
+
+
 def _prepare_source_group(
     *,
     store: JobStore,
@@ -1446,6 +1477,7 @@ def _prepare_source_group(
             )
         new_result = json.loads(json.dumps(extracted_result))
         new_result["source_name"] = snapshot.source_name
+        _preserve_machine_row_timestamps(snapshot.old_result, new_result)
         report = _staged_validation_report(
             snapshot.source,
             new_result,
