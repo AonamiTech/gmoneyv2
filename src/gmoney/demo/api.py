@@ -792,6 +792,8 @@ def ready(response: Response) -> dict[str, Any]:
     storage = shutil.disk_usage(store.jobs_root)
     worker_release_revision: str | None = None
     worker_status_updated_at: str | None = None
+    worker_uvdoc_mode: str | None = None
+    worker_uvdoc_configuration_status: str | None = None
     release_consistent = True
     worker_ready = True
     if WORKER_STATUS_PATH is not None:
@@ -799,6 +801,10 @@ def ready(response: Response) -> dict[str, Any]:
             worker_status = json.loads(WORKER_STATUS_PATH.read_text())
             worker_release_revision = str(worker_status["release_revision"])
             worker_status_updated_at = str(worker_status["updated_at"])
+            worker_uvdoc_mode = str(worker_status.get("uvdoc_mode") or "off")
+            worker_uvdoc_configuration_status = str(
+                worker_status.get("uvdoc_configuration_status") or "off"
+            )
             updated_at = datetime.fromisoformat(worker_status_updated_at.replace("Z", "+00:00"))
             age = (datetime.now(UTC) - updated_at).total_seconds()
             worker_ready = (
@@ -820,6 +826,8 @@ def ready(response: Response) -> dict[str, Any]:
         "worker_status_updated_at": worker_status_updated_at,
         "worker_status_max_age_seconds": WORKER_STATUS_MAX_AGE_SECONDS,
         "worker_status_future_skew_seconds": WORKER_STATUS_FUTURE_SKEW_SECONDS,
+        "worker_uvdoc_mode": worker_uvdoc_mode,
+        "worker_uvdoc_configuration_status": worker_uvdoc_configuration_status,
         "release_consistent": release_consistent,
         "profile_revision": profiles.revision,
         "alias_registry_revision": aliases["revision"],

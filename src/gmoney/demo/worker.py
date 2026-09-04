@@ -373,6 +373,7 @@ def run_worker_loop(
     fatal_error: Exception | None = None
     pending_identity_snapshot: RuntimeIdentitySnapshot | None = None
     release_revision = build_revision()
+    uvdoc_mode = os.environ.get("GMONEY_UVDOC_MODE", "off")
     worker_started_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
     last_worker_status = float("-inf")
     logger.info(
@@ -382,6 +383,7 @@ def run_worker_loop(
                 "release_revision": release_revision,
                 "paddle_device": paddle_device,
                 "concurrency": concurrency,
+                "uvdoc_mode": uvdoc_mode,
             },
             sort_keys=True,
         )
@@ -402,6 +404,15 @@ def run_worker_loop(
                 "pid": os.getpid(),
                 "paddle_device": paddle_device,
                 "concurrency": concurrency,
+                "uvdoc_mode": uvdoc_mode,
+                "uvdoc_configuration_status": (
+                    "off"
+                    if uvdoc_mode == "off"
+                    else "configured"
+                    if os.environ.get("GMONEY_UVDOC_MODEL_DIR")
+                    and os.environ.get("GMONEY_UVDOC_PREREGISTRATION_PATH")
+                    else "incomplete"
+                ),
             },
             suffix="worker-status.tmp",
         )

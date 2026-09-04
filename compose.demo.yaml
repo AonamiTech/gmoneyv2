@@ -114,6 +114,9 @@ services:
       FLAGS_paddle_num_threads: "4"
       GMONEY_DEMO_ROOT: /runtime
       GMONEY_VL_URL: http://paddleocr-vl:8111
+      GMONEY_UVDOC_MODE: "${GMONEY_UVDOC_MODE:-off}"
+      GMONEY_UVDOC_MODEL_DIR: /home/modelworker/.paddlex/uvdoc
+      GMONEY_UVDOC_PREREGISTRATION_PATH: /runtime-config/uvdoc-preregistration.json
       GMONEY_WORKER_CONCURRENCY: "2"
       GMONEY_RETENTION_HOURS: "720"
       GMONEY_PROFILE_REGISTRY: /profiles/registry.json

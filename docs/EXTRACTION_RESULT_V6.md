@@ -36,6 +36,20 @@ cross-table artifact substitution fails validation. Publication additionally
 requires exactly one `SOURCE_RAW`, one `ORIENTED_RAW`, and one selected page
 artifact for every declared page.
 
+## UVDoc shadow artifacts
+
+M4 adds optional `uvdoc_shadow_runs` audit records without changing the V6 revision or the V5
+reader. A valid run binds the pinned Paddle/model/config identities, exact grid-reproduction
+error, deterministic transform diagnostics, and the `ORIENTED_RAW -> UVDOC -> UVDOC_ENHANCED`
+artifact IDs. `UVDOC` uses the M3 dense backward-grid mapping; the enhanced derivative is
+photometric-only and uses an identity mapping.
+
+Both artifacts must remain unselected `CANDIDATE` page artifacts. The V6 validator rejects a
+shadow artifact used as a canonical-table parent, adapter input, token owner, or evidence owner.
+Failed and ineligible runs record a stable reason but may not publish candidate artifact IDs.
+`GMONEY_UVDOC_MODE` defaults to `off`; M4 supports only `off` and `shadow`, and rejects `enabled`
+until a later frozen promotion decision exists.
+
 ## Certification and compatibility
 
 V6 workspaces use `job_certification_v3`, binding the result, validation report,

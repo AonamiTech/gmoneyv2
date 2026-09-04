@@ -69,6 +69,7 @@ from gmoney.contracts.v6 import (
     ArtifactRef,
     CanonicalRowV2,
     CanonicalTableArtifact,
+    DenseBackwardGridMapping,
     DocumentTotalV2,
     EvidenceRefV2,
     ExtractionResultV6,
@@ -81,6 +82,7 @@ from gmoney.contracts.v6 import (
     SourceTableV2,
     TableAdapterInputV2,
     TokenManifestEntryV2,
+    UvdocShadowRun,
     canonical_json,
     canonical_sha256,
 )
@@ -148,6 +150,7 @@ from gmoney.geometry.crop import (
 )
 from gmoney.geometry.normalize import normalize_quadrilateral_region
 from gmoney.geometry.preprocess import (
+    ORIENTATION_CONFIDENCE_THRESHOLD,
     PreparedPageCandidate,
     detect_table_quadrilateral,
     prepare_page_candidates,
@@ -179,6 +182,13 @@ from gmoney.inference.paddle import (
     PaddleOcrVlAdapter,
 )
 from gmoney.inference.redaction import redact_crop
+from gmoney.inference.uvdoc import (
+    UVDOC_ADAPTER_VERSION,
+    PaddleUvdocAdapter,
+    UvdocPreparedRun,
+    UvdocPreregistration,
+    load_preregistration,
+)
 from gmoney.profiles.aliases import (
     CANONICAL_TO_HEADER_ROLE,
     AliasRegistryUnavailable,
@@ -303,8 +313,7 @@ def _cached_prediction(
             else:
                 if (
                     response.input_artifact_sha256 == request.artifact_sha256
-                    and response.canonical_artifact_sha256
-                    == request.canonical_artifact_sha256
+                    and response.canonical_artifact_sha256 == request.canonical_artifact_sha256
                     and response.canonical_artifact_id == request.canonical_artifact_id
                 ):
                     return response, True
@@ -4432,6 +4441,7 @@ class ExtractionDraft:
     artifact_root: Path | None = None
     worker_release_revision: str | None = None
     validation_recovery_attempted: bool | None = None
+    uvdoc_shadow_runs: tuple[UvdocPreparedRun, ...] = ()
 
     @property
     def result(self) -> dict[str, Any]:
@@ -4591,10 +4601,14 @@ def _project_extraction_draft(draft: ExtractionDraft) -> dict[str, Any]:
         len(unit.table_units) for unit in draft.page_units
     ):
         return result
-    return _project_result_v6(result, draft.artifact_root)
+    return _project_result_v6(result, draft.artifact_root, draft.uvdoc_shadow_runs)
 
 
-def _project_result_v6(result: dict[str, Any], artifact_root: Path) -> dict[str, Any]:
+def _project_result_v6(
+    result: dict[str, Any],
+    artifact_root: Path,
+    uvdoc_runs: tuple[UvdocPreparedRun, ...] = (),
+) -> dict[str, Any]:
     """Build the deterministic V6 graph and convert the complete V5 payload.
 
     The extraction algorithms still operate on V5 internal models.  This
@@ -4607,9 +4621,7 @@ def _project_result_v6(result: dict[str, Any], artifact_root: Path) -> dict[str,
         PagePreprocessingRecord.model_validate(item)
         for item in result.get("page_preprocessing", ())
     )
-    crops = tuple(
-        CanonicalTableCrop.model_validate(item) for item in result.get("table_crops", ())
-    )
+    crops = tuple(CanonicalTableCrop.model_validate(item) for item in result.get("table_crops", ()))
     if not pages or len(preprocessing) != len(pages):
         return result
 
@@ -4620,6 +4632,8 @@ def _project_result_v6(result: dict[str, Any], artifact_root: Path) -> dict[str,
     artifact_by_sha: dict[str, list[ArtifactRef]] = defaultdict(list)
     table_artifacts: list[CanonicalTableArtifact] = []
     table_artifact_by_key: dict[tuple[int, str], ArtifactRef] = {}
+    uvdoc_records: list[UvdocShadowRun] = []
+    uvdoc_by_page = {run.page_number: run for run in uvdoc_runs}
 
     def add_artifact(ref: ArtifactRef) -> ArtifactRef:
         artifacts.append(ref)
@@ -4640,9 +4654,7 @@ def _project_result_v6(result: dict[str, Any], artifact_root: Path) -> dict[str,
             ArtifactRef(
                 artifact_kind=ArtifactKind.SOURCE_RAW,
                 image_sha256=page.artifact_sha256,
-                artifact_relative_path=_relative_artifact_path(
-                    artifact_root, page.relative_path
-                ),
+                artifact_relative_path=_relative_artifact_path(artifact_root, page.relative_path),
                 width=page.width,
                 height=page.height,
                 producer=page.renderer,
@@ -4694,9 +4706,7 @@ def _project_result_v6(result: dict[str, Any], artifact_root: Path) -> dict[str,
                 child_to_parent_mapping=(
                     IdentityMapping()
                     if record.orientation_degrees == 0
-                    else HomographyMapping(
-                        child_to_parent_matrix=invert(orientation_matrix)
-                    )
+                    else HomographyMapping(child_to_parent_matrix=invert(orientation_matrix))
                 ),
             )
         )
@@ -4780,6 +4790,111 @@ def _project_result_v6(result: dict[str, Any], artifact_root: Path) -> dict[str,
                     transform_metrics={"operations": candidate.transform.operations},
                 )
             )
+        shadow = uvdoc_by_page.get(page.page_number)
+        if shadow is not None and shadow.status == "valid":
+            compatibility = shadow.compatibility
+            if (
+                compatibility is None
+                or shadow.parent_image_sha256 != oriented.image_sha256
+                or shadow.image_relative_path is None
+                or shadow.image_sha256 is None
+                or shadow.enhanced_relative_path is None
+                or shadow.enhanced_sha256 is None
+                or shadow.grid_relative_path is None
+                or shadow.grid_sha256 is None
+                or shadow.grid_shape is None
+                or shadow.width is None
+                or shadow.height is None
+            ):
+                raise RuntimeError("uvdoc_shadow_artifact_metadata_incomplete")
+            dense_mapping = DenseBackwardGridMapping(
+                grid_relative_path=shadow.grid_relative_path,
+                grid_sha256=shadow.grid_sha256,
+                grid_shape=shadow.grid_shape,
+                child_width=shadow.width,
+                child_height=shadow.height,
+                parent_width=oriented.width,
+                parent_height=oriented.height,
+                padding_mode="zeros",
+            )
+            uvdoc = add_artifact(
+                ArtifactRef(
+                    artifact_kind=ArtifactKind.UVDOC,
+                    image_sha256=shadow.image_sha256,
+                    artifact_relative_path=shadow.image_relative_path,
+                    width=shadow.width,
+                    height=shadow.height,
+                    parent_artifact_id=oriented.artifact_id,
+                    producer="gmoney.uvdoc",
+                    producer_version=UVDOC_ADAPTER_VERSION,
+                    configuration_sha256=compatibility.adapter_config_sha256,
+                    child_to_parent_mapping=dense_mapping,
+                )
+            )
+            enhanced_config = canonical_sha256(
+                {
+                    "parent_configuration_sha256": compatibility.adapter_config_sha256,
+                    "operations": ("clahe:2.0,8x8", "unsharp:1.0,0.5"),
+                }
+            )
+            enhanced = add_artifact(
+                ArtifactRef(
+                    artifact_kind=ArtifactKind.UVDOC_ENHANCED,
+                    image_sha256=shadow.enhanced_sha256,
+                    artifact_relative_path=shadow.enhanced_relative_path,
+                    width=shadow.width,
+                    height=shadow.height,
+                    parent_artifact_id=uvdoc.artifact_id,
+                    producer="gmoney.uvdoc_enhancement",
+                    producer_version="uvdoc_enhancement_v1",
+                    configuration_sha256=enhanced_config,
+                    child_to_parent_mapping=IdentityMapping(),
+                )
+            )
+            for candidate, reasons in (
+                (uvdoc, ("uvdoc_shadow",)),
+                (enhanced, ("uvdoc_shadow", "clahe", "unsharp")),
+            ):
+                page_artifacts.append(
+                    V6PageArtifact(
+                        artifact=candidate,
+                        page_number=page.page_number,
+                        dpi=page.dpi,
+                        role="CANDIDATE",
+                        selected=False,
+                        route_reasons=reasons,
+                        transform_metrics=shadow.transform_metrics or {},
+                    )
+                )
+            uvdoc_records.append(
+                UvdocShadowRun(
+                    page_number=page.page_number,
+                    status="valid",
+                    reason_code=shadow.reason_code,
+                    input_artifact_id=oriented.artifact_id,
+                    uvdoc_artifact_id=uvdoc.artifact_id,
+                    enhanced_artifact_id=enhanced.artifact_id,
+                    model_sha256=compatibility.model_sha256,
+                    model_config_sha256=compatibility.model_config_sha256,
+                    adapter_config_sha256=compatibility.adapter_config_sha256,
+                    paddle_version=compatibility.paddle_version,
+                    paddleocr_version=compatibility.paddleocr_version,
+                    paddlex_version=compatibility.paddlex_version,
+                    reproduction_max_error_by_channel=(shadow.reproduction_max_error_by_channel),
+                    transform_metrics=shadow.transform_metrics or {},
+                    probe_metrics=shadow.probe_metrics or {},
+                )
+            )
+        elif shadow is not None:
+            uvdoc_records.append(
+                UvdocShadowRun(
+                    page_number=page.page_number,
+                    status=shadow.status,
+                    reason_code=shadow.reason_code,
+                    transform_metrics=shadow.transform_metrics or {},
+                    probe_metrics=shadow.probe_metrics or {},
+                )
+            )
     role_order = {"SOURCE_RAW": 0, "ORIENTED_RAW": 1, "CANDIDATE": 2}
     page_artifacts.sort(
         key=lambda item: (
@@ -4812,9 +4927,7 @@ def _project_result_v6(result: dict[str, Any], artifact_root: Path) -> dict[str,
                     }
                 ),
                 child_to_parent_mapping=HomographyMapping(
-                    child_to_parent_matrix=translation(
-                        crop.candidate_box[0], crop.candidate_box[1]
-                    )
+                    child_to_parent_matrix=translation(crop.candidate_box[0], crop.candidate_box[1])
                 ),
             )
         )
@@ -4871,9 +4984,7 @@ def _project_result_v6(result: dict[str, Any], artifact_root: Path) -> dict[str,
         else:
             assert owned_key is not None
             canonical_crop = next(
-                item
-                for item in crops
-                if (item.page_number, item.table_id) == owned_key
+                item for item in crops if (item.page_number, item.table_id) == owned_key
             )
             mapping = HomographyMapping(
                 child_to_parent_matrix=compose(
@@ -4908,17 +5019,14 @@ def _project_result_v6(result: dict[str, Any], artifact_root: Path) -> dict[str,
             choices = by_sha.get(token.source_artifact_sha256, ())
             if choices:
                 source_path = (
-                    _relative_artifact_path(
-                        artifact_root, token.source_artifact_relative_path
-                    )
+                    _relative_artifact_path(artifact_root, token.source_artifact_relative_path)
                     if token.source_artifact_relative_path
                     else None
                 )
                 matching_paths = tuple(
                     choice
                     for choice in choices
-                    if source_path is not None
-                    and choice.artifact_relative_path == source_path
+                    if source_path is not None and choice.artifact_relative_path == source_path
                 )
                 if matching_paths:
                     return min(matching_paths, key=lambda item: item.artifact_id)
@@ -5023,9 +5131,7 @@ def _project_result_v6(result: dict[str, Any], artifact_root: Path) -> dict[str,
             model_name="paddleocr",
             model_version="v6",
             recognition_variant=(
-                "canonical"
-                if artifact.artifact_kind is ArtifactKind.TABLE_CROP
-                else "page"
+                "canonical" if artifact.artifact_kind is ArtifactKind.TABLE_CROP else "page"
             ),
         )
 
@@ -5176,6 +5282,7 @@ def _project_result_v6(result: dict[str, Any], artifact_root: Path) -> dict[str,
         pages=result["pages"],
         artifact_manifest=artifact_manifest,
         page_artifacts=tuple(page_artifacts),
+        uvdoc_shadow_runs=tuple(sorted(uvdoc_records, key=lambda item: item.page_number)),
         canonical_table_artifacts=tuple(table_artifacts),
         token_manifest=tuple(v2_tokens),
         evidence=tuple(all_evidence.values()),
@@ -5809,8 +5916,36 @@ class OfflineExtractor:
         gemini_mode: GeminiMode = GeminiMode.OFF,
         gemini_adapter: AdjudicationAdapter | None = None,
         settings: Settings | None = None,
+        uvdoc_mode: str | None = None,
+        uvdoc_adapter: PaddleUvdocAdapter | None = None,
+        uvdoc_preregistration: UvdocPreregistration | None = None,
     ) -> None:
         self.settings = settings or get_settings()
+        self.uvdoc_mode = uvdoc_mode or self.settings.uvdoc_mode
+        if self.uvdoc_mode == "enabled":
+            raise ValueError("uvdoc_enabled_not_promoted")
+        self.uvdoc_adapter = uvdoc_adapter
+        self.uvdoc_preregistration = uvdoc_preregistration
+        self.uvdoc_preregistration_sha256: str | None = None
+        self.uvdoc_initialization_error: str | None = None
+        if self.uvdoc_mode == "shadow":
+            try:
+                if self.uvdoc_preregistration is None:
+                    preregistration_path = self.settings.uvdoc_preregistration_path
+                    if preregistration_path is None:
+                        raise ValueError("uvdoc_preregistration_missing")
+                    (
+                        self.uvdoc_preregistration,
+                        self.uvdoc_preregistration_sha256,
+                    ) = load_preregistration(preregistration_path)
+                if self.uvdoc_adapter is None:
+                    model_dir = self.settings.uvdoc_model_dir
+                    if model_dir is None:
+                        raise ValueError("uvdoc_model_dir_missing")
+                    self.uvdoc_adapter = PaddleUvdocAdapter(model_dir, device=paddle_device)
+            except Exception as error:  # shadow initialization cannot stop baseline extraction
+                self.uvdoc_initialization_error = f"uvdoc_initialization_{type(error).__name__}"
+                self.uvdoc_adapter = None
         self.hospital_id = hospital_id
         self.alias_registry = alias_registry
         self.gemini_mode = gemini_mode
@@ -5955,9 +6090,7 @@ class OfflineExtractor:
             self.ocr,
         )
         local_tokens = tuple(
-            token.model_copy(
-                update={"token_id": f"{table_id}:canonical:{token.token_id}"}
-            )
+            token.model_copy(update={"token_id": f"{table_id}:canonical:{token.token_id}"})
             for token in paddle_ocr_tokens(
                 response.output,
                 page_asset.page_number,
@@ -6041,11 +6174,11 @@ class OfflineExtractor:
             )
             return None, tuple(attempts), ()
         attempts.append(
-                RecoveryAttempt(
-                    stage=RecoveryStage.HIGH_RESOLUTION,
-                    artifact_sha256=high_resolution.artifact_sha256,
-                    canonical_crop_sha256=work.crop_sha256,
-                    status="rendered",
+            RecoveryAttempt(
+                stage=RecoveryStage.HIGH_RESOLUTION,
+                artifact_sha256=high_resolution.artifact_sha256,
+                canonical_crop_sha256=work.crop_sha256,
+                status="rendered",
             )
         )
         assets = [
@@ -6075,10 +6208,10 @@ class OfflineExtractor:
             )
         else:
             attempts.append(
-                    RecoveryAttempt(
-                        stage=RecoveryStage.PHOTOMETRIC,
-                        artifact_sha256=photometric.artifact_sha256,
-                        canonical_crop_sha256=work.crop_sha256,
+                RecoveryAttempt(
+                    stage=RecoveryStage.PHOTOMETRIC,
+                    artifact_sha256=photometric.artifact_sha256,
+                    canonical_crop_sha256=work.crop_sha256,
                     status="prepared",
                 )
             )
@@ -6772,6 +6905,7 @@ class OfflineExtractor:
         canonical_table_work: list[TableWork] = []
         canonical_token_manifest: dict[str, TokenManifestEntry] = {}
         document_total_candidates: list[DocumentTotalCandidate] = []
+        uvdoc_shadow_runs: list[UvdocPreparedRun] = []
         diagnostics: list[dict[str, Any]] = []
         schema_states: list[TableSchemaState] = []
         baseline_rows = tuple(
@@ -6905,6 +7039,67 @@ class OfflineExtractor:
             orientation_degrees, orientation_confidence = _orientation_correction(
                 orientation_response.output
             )
+            applied_orientation = (
+                orientation_degrees
+                if orientation_confidence >= ORIENTATION_CONFIDENCE_THRESHOLD
+                else 0
+            )
+            if self.uvdoc_mode == "shadow":
+                if self.uvdoc_initialization_error is not None:
+                    uvdoc_shadow_runs.append(
+                        UvdocPreparedRun(
+                            page_number=page_asset.page_number,
+                            status="failed",
+                            reason_code=self.uvdoc_initialization_error,
+                        )
+                    )
+                elif self.uvdoc_preregistration is None or not self.uvdoc_preregistration.eligible(
+                    document_id, page_asset.page_number
+                ):
+                    uvdoc_shadow_runs.append(
+                        UvdocPreparedRun(
+                            page_number=page_asset.page_number,
+                            status="ineligible",
+                            reason_code="uvdoc_not_preregistered",
+                        )
+                    )
+                else:
+                    oriented_path = page_path
+                    if applied_orientation:
+                        image = cv2.imread(str(page_path), cv2.IMREAD_COLOR)
+                        if image is None:
+                            raise RuntimeError("oriented_raw_source_image_unreadable")
+                        if applied_orientation == 90:
+                            image = cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
+                        elif applied_orientation == 180:
+                            image = cv2.rotate(image, cv2.ROTATE_180)
+                        else:
+                            image = cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                        oriented_path = (
+                            artifact_root
+                            / "lineage/oriented"
+                            / f"page-{page_asset.page_number:04d}.png"
+                        )
+                        oriented_path.parent.mkdir(parents=True, exist_ok=True)
+                        if not cv2.imwrite(str(oriented_path), image):
+                            raise RuntimeError("oriented_raw_image_write_failed")
+                    try:
+                        assert self.uvdoc_adapter is not None
+                        uvdoc_shadow_runs.append(
+                            self.uvdoc_adapter.predict(
+                                oriented_path,
+                                artifact_root,
+                                page_number=page_asset.page_number,
+                            )
+                        )
+                    except Exception as error:  # shadow inference cannot change publication
+                        uvdoc_shadow_runs.append(
+                            UvdocPreparedRun(
+                                page_number=page_asset.page_number,
+                                status="failed",
+                                reason_code=f"uvdoc_inference_{type(error).__name__}",
+                            )
+                        )
             prepared_candidates = prepare_page_candidates(
                 source_pdf=source,
                 raw_path=page_path,
@@ -6912,7 +7107,7 @@ class OfflineExtractor:
                 page=page_asset,
                 quality=quality_by_page[page_asset.page_number],
                 artifact_root=artifact_root,
-                orientation_degrees=orientation_degrees,
+                orientation_degrees=applied_orientation,
                 orientation_confidence=orientation_confidence,
             )
             bundles: list[PageInferenceBundle] = []
@@ -6991,8 +7186,7 @@ class OfflineExtractor:
                         height=page_asset.height,
                     )
                     for box in candidate_layout_boxes
-                    if box[2] > 0
-                    and box[3] > 0
+                    if box[2] > 0 and box[3] > 0
                 )
                 candidate_geometry_boxes = tuple(
                     box
@@ -7010,8 +7204,7 @@ class OfflineExtractor:
                         height=page_asset.height,
                     )
                     for box in candidate_geometry_boxes
-                    if box[2] > 0
-                    and box[3] > 0
+                    if box[2] > 0 and box[3] > 0
                 )
                 bundles.append(
                     PageInferenceBundle(
@@ -7046,7 +7239,7 @@ class OfflineExtractor:
                 raw_artifact_sha256=page_asset.artifact_sha256,
                 raw_artifact_relative_path=raw_relative_path,
                 raw_quality=quality_by_page[page_asset.page_number],
-                orientation_degrees=orientation_degrees,
+                orientation_degrees=applied_orientation,
                 orientation_confidence=orientation_confidence,
                 candidates=annotated_candidates,
                 selected_variant=selected_candidate.variant,
@@ -7429,8 +7622,7 @@ class OfflineExtractor:
                             stage="crop_recovery",
                             recognition_variant=(
                                 attempt.reason.removeprefix("input_variant:")
-                                if attempt.reason
-                                and attempt.reason.startswith("input_variant:")
+                                if attempt.reason and attempt.reason.startswith("input_variant:")
                                 else "recovery"
                             ),
                             input_artifact_sha256=attempt.artifact_sha256,
@@ -7840,9 +8032,7 @@ class OfflineExtractor:
                                         stage="gemini",
                                         recognition_variant="redacted",
                                         input_artifact_sha256=redaction.artifact_sha256,
-                                        canonical_crop_sha256=(
-                                            response.canonical_crop_sha256
-                                        ),
+                                        canonical_crop_sha256=(response.canonical_crop_sha256),
                                         cache_hit=gemini_cache_hit,
                                         accepted=False,
                                     )
@@ -8010,9 +8200,7 @@ class OfflineExtractor:
                         "candidate_box": work.candidate_box,
                         "source_polygon": work.source_polygon.model_dump(mode="json"),
                         "crop_to_source_matrix": work.crop_to_source_matrix,
-                        "selected_page_artifact_sha256": (
-                            work.selected_page_artifact_sha256
-                        ),
+                        "selected_page_artifact_sha256": (work.selected_page_artifact_sha256),
                         "adapter_inputs": [
                             item.model_dump(mode="json") for item in work.adapter_inputs
                         ],
@@ -8182,9 +8370,7 @@ class OfflineExtractor:
         token_manifest_by_id.update(
             {
                 token_id: token.model_copy(
-                    update={
-                        "table_ids": tuple(sorted(table_ids_by_token.get(token_id, ())))
-                    }
+                    update={"table_ids": tuple(sorted(table_ids_by_token.get(token_id, ())))}
                 )
                 for token_id, token in canonical_token_manifest.items()
             }
@@ -8297,8 +8483,7 @@ class OfflineExtractor:
             {(crop.page_number, crop.table_id): crop for crop in new_table_crops}
         )
         published_table_crops = tuple(
-            published_table_crops_by_id[key]
-            for key in sorted(published_table_crops_by_id)
+            published_table_crops_by_id[key] for key in sorted(published_table_crops_by_id)
         )
         result = {
             "output_version": "offline_accuracy_spine_v5",
@@ -8346,9 +8531,7 @@ class OfflineExtractor:
                 for record in published_preprocessing
                 if record is not None
             ],
-            "table_crops": [
-                record.model_dump(mode="json") for record in published_table_crops
-            ],
+            "table_crops": [record.model_dump(mode="json") for record in published_table_crops],
             "source_tables": [table.model_dump(mode="json") for table in source_tables],
             "token_manifest": [item.model_dump(mode="json") for item in token_manifest],
             "suppressed_repeated_source_tables": [
@@ -8486,8 +8669,9 @@ class OfflineExtractor:
             _draft_sink["suppressed_repeated_source_tables"] = tuple(suppressed_source_tables)
             _draft_sink["recovery_metadata"] = recovery_metadata
             _draft_sink["artifact_root"] = artifact_root
+            _draft_sink["uvdoc_shadow_runs"] = tuple(uvdoc_shadow_runs)
         if _draft_sink is None:
-            return _project_result_v6(result, artifact_root)
+            return _project_result_v6(result, artifact_root, tuple(uvdoc_shadow_runs))
         return result
 
     def extract_draft(
@@ -8519,6 +8703,7 @@ class OfflineExtractor:
             suppressed_repeated_source_tables=sink["suppressed_repeated_source_tables"],
             recovery_metadata=sink["recovery_metadata"],
             artifact_root=Path(artifact_root),
+            uvdoc_shadow_runs=sink["uvdoc_shadow_runs"],
         )
 
     def recover_draft(
@@ -8563,6 +8748,7 @@ class OfflineExtractor:
             suppressed_repeated_source_tables=sink["suppressed_repeated_source_tables"],
             recovery_metadata=sink["recovery_metadata"],
             artifact_root=Path(artifact_root),
+            uvdoc_shadow_runs=draft.uvdoc_shadow_runs,
         )
         from gmoney.extraction.validation import validate_extraction_result
 

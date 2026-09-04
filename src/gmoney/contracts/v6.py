@@ -425,6 +425,48 @@ class PageArtifact(ContractModel):
     transform_metrics: dict[str, Any] = Field(default_factory=dict)
 
 
+class UvdocShadowStatus(StrEnum):
+    VALID = "valid"
+    INVALID = "invalid"
+    FAILED = "failed"
+    INELIGIBLE = "ineligible"
+
+
+class UvdocShadowRun(ContractModel):
+    """Deterministic audit record for one page-level UVDoc shadow attempt."""
+
+    page_number: int = Field(ge=1)
+    status: UvdocShadowStatus
+    reason_code: str = Field(min_length=1)
+    input_artifact_id: str | None = Field(default=None, pattern=SHA256_PATTERN)
+    uvdoc_artifact_id: str | None = Field(default=None, pattern=SHA256_PATTERN)
+    enhanced_artifact_id: str | None = Field(default=None, pattern=SHA256_PATTERN)
+    model_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
+    model_config_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
+    adapter_config_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
+    paddle_version: str | None = None
+    paddleocr_version: str | None = None
+    paddlex_version: str | None = None
+    reproduction_max_error_by_channel: tuple[int, int, int] | None = None
+    transform_metrics: dict[str, Any] = Field(default_factory=dict)
+    probe_metrics: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def require_valid_artifacts(self) -> UvdocShadowRun:
+        artifact_ids = (self.input_artifact_id, self.uvdoc_artifact_id, self.enhanced_artifact_id)
+        identities = (self.model_sha256, self.model_config_sha256, self.adapter_config_sha256)
+        if self.status is UvdocShadowStatus.VALID:
+            if any(value is None for value in (*artifact_ids, *identities)):
+                raise ValueError("valid UVDoc shadow runs require artifacts and model identities")
+            if self.reproduction_max_error_by_channel is None:
+                raise ValueError("valid UVDoc shadow runs require reproduction errors")
+            if any(value > 1 for value in self.reproduction_max_error_by_channel):
+                raise ValueError("UVDoc reproduction error exceeds one value per channel")
+        elif self.uvdoc_artifact_id is not None or self.enhanced_artifact_id is not None:
+            raise ValueError("invalid UVDoc shadow runs may not publish candidate artifacts")
+        return self
+
+
 class CanonicalTableArtifact(ContractModel):
     artifact: ArtifactRef
     page_number: int = Field(default=1, ge=1)
@@ -488,8 +530,10 @@ class SourceCellV2(SourceCell):
 
     @model_validator(mode="after")
     def require_grounded_value(self) -> SourceCellV2:
-        if self.raw_value and self.raw_value.strip() and not any(
-            item.ocr_token_ids for item in self.evidence
+        if (
+            self.raw_value
+            and self.raw_value.strip()
+            and not any(item.ocr_token_ids for item in self.evidence)
         ):
             raise ValueError("non-empty source cell requires grounded OCR evidence")
         return self
@@ -582,6 +626,7 @@ class ExtractionResultV6(ContractModel):
     pages: int = Field(ge=1)
     artifact_manifest: ArtifactManifest
     page_artifacts: tuple[PageArtifact, ...]
+    uvdoc_shadow_runs: tuple[UvdocShadowRun, ...] = ()
     canonical_table_artifacts: tuple[CanonicalTableArtifact, ...] = ()
     token_manifest: tuple[TokenManifestEntryV2, ...] = ()
     evidence: tuple[EvidenceRefV2, ...] = ()
@@ -621,6 +666,44 @@ class ExtractionResultV6(ContractModel):
                 raise ValueError("page artifact is missing from artifact manifest")
             if page.artifact != expected:
                 raise ValueError("embedded page artifact differs from artifact manifest")
+        page_wrapper_by_id = {page.artifact.artifact_id: page for page in self.page_artifacts}
+        if len({run.page_number for run in self.uvdoc_shadow_runs}) != len(self.uvdoc_shadow_runs):
+            raise ValueError("UVDoc shadow runs must be unique by page")
+        for run in self.uvdoc_shadow_runs:
+            if run.status is not UvdocShadowStatus.VALID:
+                continue
+            input_artifact = manifest.get(run.input_artifact_id or "")
+            uvdoc_artifact = manifest.get(run.uvdoc_artifact_id or "")
+            enhanced_artifact = manifest.get(run.enhanced_artifact_id or "")
+            if (
+                input_artifact is None
+                or input_artifact.artifact_kind is not ArtifactKind.ORIENTED_RAW
+            ):
+                raise ValueError("UVDoc shadow input must be an ORIENTED_RAW artifact")
+            if (
+                uvdoc_artifact is None
+                or uvdoc_artifact.artifact_kind is not ArtifactKind.UVDOC
+                or uvdoc_artifact.parent_artifact_id != input_artifact.artifact_id
+                or not isinstance(uvdoc_artifact.child_to_parent_mapping, DenseBackwardGridMapping)
+            ):
+                raise ValueError("UVDoc shadow artifact has invalid dense lineage")
+            if (
+                enhanced_artifact is None
+                or enhanced_artifact.artifact_kind is not ArtifactKind.UVDOC_ENHANCED
+                or enhanced_artifact.parent_artifact_id != uvdoc_artifact.artifact_id
+                or not isinstance(enhanced_artifact.child_to_parent_mapping, IdentityMapping)
+            ):
+                raise ValueError("enhanced UVDoc artifact has invalid identity lineage")
+            for artifact in (uvdoc_artifact, enhanced_artifact):
+                wrapper = page_wrapper_by_id.get(artifact.artifact_id)
+                if wrapper is None or wrapper.selected or wrapper.role != "CANDIDATE":
+                    raise ValueError("UVDoc shadow artifacts must be unselected page candidates")
+        shadow_artifact_ids = {
+            artifact_id
+            for run in self.uvdoc_shadow_runs
+            for artifact_id in (run.uvdoc_artifact_id, run.enhanced_artifact_id)
+            if artifact_id is not None
+        }
         for table in self.canonical_table_artifacts:
             expected = manifest.get(table.artifact.artifact_id)
             if expected is None:
@@ -632,13 +715,19 @@ class ExtractionResultV6(ContractModel):
                 raise ValueError("canonical table page artifact is missing from artifact manifest")
             if table.artifact.parent_artifact_id != table.page_artifact_id:
                 raise ValueError("canonical table artifact parent differs from page artifact")
+            if table.page_artifact_id in shadow_artifact_ids:
+                raise ValueError("UVDoc shadow artifacts cannot own canonical tables")
         token_by_id = {item.token_id: item for item in self.token_manifest}
         if any(item.artifact_id not in manifest for item in self.token_manifest):
             raise ValueError("token artifact is missing from artifact manifest")
+        if any(item.artifact_id in shadow_artifact_ids for item in self.token_manifest):
+            raise ValueError("UVDoc shadow artifacts cannot own authoritative tokens")
         if len({item.token_id for item in self.token_manifest}) != len(self.token_manifest):
             raise ValueError("V6 token IDs must be unique")
         if any(item.input_artifact_id not in manifest for item in self.adapter_inputs):
             raise ValueError("adapter input artifact is missing from artifact manifest")
+        if any(item.input_artifact_id in shadow_artifact_ids for item in self.adapter_inputs):
+            raise ValueError("UVDoc shadow artifacts cannot be authoritative adapter inputs")
         table_ids = {(item.page_number, item.table_id) for item in self.source_tables}
         crop_by_key = {
             (item.page_number, item.logical_table_id): item
@@ -683,6 +772,8 @@ class ExtractionResultV6(ContractModel):
             evidence_items.append(candidate.total.evidence)
             evidence_items.extend(candidate.context_evidence)
         for evidence in evidence_items:
+            if evidence.artifact_id in shadow_artifact_ids:
+                raise ValueError("UVDoc shadow artifacts cannot own authoritative evidence")
             referenced.add(evidence.artifact_id)
             referenced.add(evidence.source_page_artifact_id)
             artifact = manifest.get(evidence.artifact_id)
@@ -727,6 +818,8 @@ __all__ = [
     "ArtifactRef",
     "ArtifactManifest",
     "PageArtifact",
+    "UvdocShadowRun",
+    "UvdocShadowStatus",
     "CanonicalTableArtifact",
     "EvidenceRefV2",
     "TokenManifestEntryV2",
