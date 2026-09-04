@@ -416,6 +416,88 @@ def test_publication_validation_rejects_unreferenced_v6_manifest_node(tmp_path: 
     assert "v6_contract_invalid" in {issue.code for issue in report.issues}
 
 
+def _v6_page_inventory_fixture(tmp_path: Path) -> tuple[Path, Path, dict[str, object]]:
+    source_pdf = tmp_path / "source.pdf"
+    document = fitz.open()
+    document.new_page(width=72, height=72)
+    document.save(source_pdf)
+    document.close()
+    artifact_root = tmp_path / "artifacts"
+    artifact_root.mkdir()
+    ok, encoded = cv2.imencode(".png", np.zeros((10, 10, 3), dtype=np.uint8))
+    assert ok
+    image = encoded.tobytes()
+    (artifact_root / "page.png").write_bytes(image)
+    digest = _sha(image)
+    source = ArtifactRef(
+        artifact_kind=ArtifactKind.SOURCE_RAW,
+        image_sha256=digest,
+        artifact_relative_path="page.png",
+        width=10,
+        height=10,
+        producer="test",
+        producer_version="1",
+        configuration_sha256="a" * 64,
+        child_to_parent_mapping=IdentityMapping(),
+    )
+    oriented = ArtifactRef(
+        artifact_kind=ArtifactKind.ORIENTED_RAW,
+        image_sha256=digest,
+        artifact_relative_path="page.png",
+        width=10,
+        height=10,
+        parent_artifact_id=source.artifact_id,
+        producer="test",
+        producer_version="1",
+        configuration_sha256="b" * 64,
+        child_to_parent_mapping=IdentityMapping(),
+    )
+    result: dict[str, object] = {
+        "output_version": "offline_accuracy_spine_v6",
+        "contract_revision": 6,
+        "document_id": "doc",
+        "source_sha256": _sha(source_pdf.read_bytes()),
+        "source_name": "source.pdf",
+        "pages": 1,
+        "artifact_manifest": ArtifactManifest(
+            artifacts=(source, oriented)
+        ).model_dump(mode="json"),
+        "page_artifacts": [
+            PageArtifact(
+                artifact=source,
+                page_number=1,
+                dpi=72,
+                role="SOURCE_RAW",
+            ).model_dump(mode="json"),
+            PageArtifact(
+                artifact=oriented,
+                page_number=1,
+                dpi=72,
+                role="ORIENTED_RAW",
+                selected=True,
+            ).model_dump(mode="json"),
+        ],
+    }
+    return source_pdf, artifact_root, result
+
+
+def test_v6_publication_requires_explicit_page_roles_and_one_selection(tmp_path: Path) -> None:
+    source, artifact_root, result = _v6_page_inventory_fixture(tmp_path)
+    assert validate_extraction_result(source, result, artifact_root).status == "passed"
+
+    page_artifacts = result["page_artifacts"]
+    assert isinstance(page_artifacts, list)
+    page_artifacts[1]["role"] = "CANDIDATE"
+    page_artifacts[0]["selected"] = True
+
+    report = validate_extraction_result(source, result, artifact_root)
+
+    assert report.fatal
+    codes = {issue.code for issue in report.issues}
+    assert "v6_oriented_page_inventory_invalid" in codes
+    assert "v6_selected_page_inventory_invalid" in codes
+
+
 def test_validation_returns_a_complete_structured_report(tmp_path: Path) -> None:
     source, artifact_root, result = _fixture(tmp_path)
 

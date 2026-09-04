@@ -16,6 +16,11 @@ reserved for M3).
 Evidence carries both `canonical_polygon` and `source_page_polygon`, the source
 page artifact ID, artifact hash, and OCR token IDs. Publication validation checks
 ownership, bounds, graph projection, and a two-pixel round-trip tolerance.
+Every table adapter record also declares its page and logical table. Its input
+artifact must be the selected canonical table crop or a descendant of that crop;
+cross-table artifact substitution fails validation. Publication additionally
+requires exactly one `SOURCE_RAW`, one `ORIENTED_RAW`, and one selected page
+artifact for every declared page.
 
 ## Certification and compatibility
 
@@ -29,4 +34,3 @@ Recertification revalidates the current output version only. A V5 revision 5
 result remains V5 and is never silently upgraded. V5-to-V6 conversion requires
 the digest-bound staged reprocess flow; source and review data are retained and
 approval is cleared only after successful V6 publication.
-

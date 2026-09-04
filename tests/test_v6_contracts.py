@@ -15,6 +15,7 @@ from gmoney.contracts.v6 import (
     HomographyMapping,
     IdentityMapping,
     PageArtifact,
+    TableAdapterInputV2,
     TokenManifestEntryV2,
     canonical_json,
     canonical_sha256,
@@ -259,6 +260,91 @@ def test_v6_envelope_binds_page_and_canonical_table_artifacts() -> None:
         ),
     )
     assert envelope.output_version == "offline_accuracy_spine_v6"
+
+
+def test_v6_adapter_input_is_bound_to_its_logical_table_lineage() -> None:
+    source = _artifact(ArtifactKind.SOURCE_RAW, "a")
+    first = _artifact(
+        ArtifactKind.TABLE_CROP,
+        "b",
+        parent=source.artifact_id,
+        mapping=HomographyMapping(
+            child_to_parent_matrix=((1, 0, 5), (0, 1, 5), (0, 0, 1))
+        ),
+        width=40,
+        height=40,
+    )
+    second = _artifact(
+        ArtifactKind.TABLE_CROP,
+        "c",
+        parent=source.artifact_id,
+        mapping=HomographyMapping(
+            child_to_parent_matrix=((1, 0, 50), (0, 1, 50), (0, 0, 1))
+        ),
+        width=40,
+        height=40,
+    )
+    recovery = _artifact(
+        ArtifactKind.CELL_CROP,
+        "d",
+        parent=first.artifact_id,
+        width=40,
+        height=40,
+    )
+    polygon = Polygon(
+        points=(Point(x=0, y=0), Point(x=39, y=0), Point(x=39, y=39), Point(x=0, y=39))
+    )
+    tables = (
+        CanonicalTableArtifact(
+            artifact=first,
+            logical_table_id="p1-t1",
+            page_artifact_id=source.artifact_id,
+            crop_polygon_in_page_artifact=polygon,
+            crop_polygon_in_source_raw=polygon,
+        ),
+        CanonicalTableArtifact(
+            artifact=second,
+            logical_table_id="p1-t2",
+            page_artifact_id=source.artifact_id,
+            crop_polygon_in_page_artifact=polygon,
+            crop_polygon_in_source_raw=polygon,
+        ),
+    )
+    adapter = TableAdapterInputV2(
+        page_number=1,
+        logical_table_id="p1-t1",
+        input_artifact_id=recovery.artifact_id,
+        input_artifact_sha256=recovery.image_sha256,
+        adapter_name="test-ocr",
+        adapter_version="1",
+        configuration_sha256="e" * 64,
+        latency_ms=1,
+        stage="crop_recovery",
+        recognition_variant="high_resolution",
+    )
+    manifest = ArtifactManifest(artifacts=(source, first, second, recovery))
+    ExtractionResultV6(
+        document_id="doc",
+        source_sha256="f" * 64,
+        source_name="bill.pdf",
+        pages=1,
+        artifact_manifest=manifest,
+        page_artifacts=(PageArtifact(artifact=source, page_number=1, dpi=300),),
+        canonical_table_artifacts=tables,
+        adapter_inputs=(adapter,),
+    )
+
+    with pytest.raises(ValidationError, match="outside its canonical table lineage"):
+        ExtractionResultV6(
+            document_id="doc",
+            source_sha256="f" * 64,
+            source_name="bill.pdf",
+            pages=1,
+            artifact_manifest=manifest,
+            page_artifacts=(PageArtifact(artifact=source, page_number=1, dpi=300),),
+            canonical_table_artifacts=tables,
+            adapter_inputs=(adapter.model_copy(update={"logical_table_id": "p1-t2"}),),
+        )
 
 
 def test_v6_rejects_unreferenced_manifest_source() -> None:

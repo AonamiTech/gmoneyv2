@@ -810,17 +810,75 @@ def _validate_extraction_result_v6(
                 field="artifact_manifest.artifacts",
             )
 
-    source_page_by_number: dict[int, ArtifactRef] = {}
-    for item in parsed.page_artifacts:
-        if item.role == "SOURCE_RAW":
-            source_page_by_number[item.page_number] = item.artifact
-    if parsed.pages != len(source_page_by_number):
+    expected_page_numbers = set(range(1, parsed.pages + 1))
+    actual_page_numbers = {item.page_number for item in parsed.page_artifacts}
+    if actual_page_numbers != expected_page_numbers:
         _v6_fatal(
             issues,
             "v6_page_inventory_incomplete",
-            "Each result page requires one source artifact",
+            "Page artifact numbers must cover the declared page range",
             field="page_artifacts",
         )
+    source_page_by_number: dict[int, ArtifactRef] = {}
+    for page_number in sorted(expected_page_numbers):
+        page_items = tuple(
+            item for item in parsed.page_artifacts if item.page_number == page_number
+        )
+        sources = tuple(item for item in page_items if item.role == "SOURCE_RAW")
+        oriented = tuple(item for item in page_items if item.role == "ORIENTED_RAW")
+        selected = tuple(item for item in page_items if item.selected)
+        if len(sources) != 1:
+            _v6_fatal(
+                issues,
+                "v6_source_page_inventory_invalid",
+                "Each page requires exactly one SOURCE_RAW artifact",
+                field="page_artifacts",
+                page_number=page_number,
+            )
+        else:
+            source_page_by_number[page_number] = sources[0].artifact
+            if sources[0].artifact.artifact_kind is not ArtifactKind.SOURCE_RAW:
+                _v6_fatal(
+                    issues,
+                    "v6_source_page_role_invalid",
+                    "SOURCE_RAW role must reference a SOURCE_RAW artifact",
+                    field="page_artifacts",
+                    page_number=page_number,
+                )
+        if len(oriented) != 1:
+            _v6_fatal(
+                issues,
+                "v6_oriented_page_inventory_invalid",
+                "Each page requires exactly one ORIENTED_RAW artifact",
+                field="page_artifacts",
+                page_number=page_number,
+            )
+        elif oriented[0].artifact.artifact_kind is not ArtifactKind.ORIENTED_RAW:
+            _v6_fatal(
+                issues,
+                "v6_oriented_page_role_invalid",
+                "ORIENTED_RAW role must reference an ORIENTED_RAW artifact",
+                field="page_artifacts",
+                page_number=page_number,
+            )
+        elif len(sources) == 1 and (
+            oriented[0].artifact.parent_artifact_id != sources[0].artifact.artifact_id
+        ):
+            _v6_fatal(
+                issues,
+                "v6_oriented_page_parent_invalid",
+                "ORIENTED_RAW must directly reference its page SOURCE_RAW",
+                field="page_artifacts",
+                page_number=page_number,
+            )
+        if len(selected) != 1:
+            _v6_fatal(
+                issues,
+                "v6_selected_page_inventory_invalid",
+                "Each page requires exactly one selected artifact",
+                field="page_artifacts",
+                page_number=page_number,
+            )
 
     for table in parsed.canonical_table_artifacts:
         parent = by_id.get(table.page_artifact_id)
@@ -1014,8 +1072,24 @@ def _validate_extraction_result_v6(
     for evidence in evidence_items:
         check_evidence(evidence, "evidence")
 
+    canonical_table_by_key = {
+        (item.page_number, item.logical_table_id): item
+        for item in parsed.canonical_table_artifacts
+    }
     for adapter in parsed.adapter_inputs:
         artifact = by_id.get(adapter.input_artifact_id)
+        table = canonical_table_by_key.get(
+            (adapter.page_number, adapter.logical_table_id)
+        )
+        if table is None:
+            _v6_fatal(
+                issues,
+                "v6_adapter_table_missing",
+                "Adapter input references an unknown logical table",
+                field="adapter_inputs",
+                page_number=adapter.page_number,
+                table_id=adapter.logical_table_id,
+            )
         if artifact is None:
             _v6_fatal(
                 issues,
@@ -1030,16 +1104,23 @@ def _validate_extraction_result_v6(
                 "Adapter input hash does not belong to its artifact",
                 field="adapter_inputs",
             )
-        elif (
-            adapter.stage == "canonical_table"
-            and artifact.artifact_kind is not ArtifactKind.TABLE_CROP
-        ):
-            _v6_fatal(
-                issues,
-                "v6_adapter_canonical_artifact_invalid",
-                "Canonical adapter input must reference a table crop",
-                field="adapter_inputs",
-            )
+        elif table is not None:
+            current = artifact
+            while current.artifact_id != table.artifact.artifact_id:
+                if current.parent_artifact_id is None:
+                    _v6_fatal(
+                        issues,
+                        "v6_adapter_table_lineage_mismatch",
+                        "Adapter input is outside its canonical table lineage",
+                        field="adapter_inputs",
+                        page_number=adapter.page_number,
+                        table_id=adapter.logical_table_id,
+                    )
+                    break
+                parent = by_id.get(current.parent_artifact_id)
+                if parent is None:
+                    break
+                current = parent
 
     referenced = {item.artifact.artifact_id for item in parsed.page_artifacts}
     referenced.update(item.artifact.artifact_id for item in parsed.canonical_table_artifacts)

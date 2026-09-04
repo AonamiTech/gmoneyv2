@@ -5106,6 +5106,8 @@ def _project_result_v6(result: dict[str, Any], artifact_root: Path) -> dict[str,
         for trace in crop.adapter_inputs:
             adapter_inputs.append(
                 TableAdapterInputV2(
+                    page_number=crop.page_number,
+                    logical_table_id=crop.table_id,
                     input_artifact_id=trace.input_artifact_id or crop_ref.artifact_id,
                     input_artifact_sha256=trace.input_artifact_sha256,
                     adapter_name=trace.adapter_name,
@@ -5129,6 +5131,8 @@ def _project_result_v6(result: dict[str, Any], artifact_root: Path) -> dict[str,
     table_artifacts.sort(key=lambda item: (item.page_number, item.logical_table_id))
     adapter_inputs.sort(
         key=lambda item: (
+            item.page_number,
+            item.logical_table_id,
             item.input_artifact_id,
             item.adapter_name,
             item.stage,

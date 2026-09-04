@@ -535,6 +535,8 @@ class TokenManifestEntryV2(ContractModel):
 
 
 class TableAdapterInputV2(ContractModel):
+    page_number: int = Field(ge=1)
+    logical_table_id: str = Field(min_length=1)
     input_artifact_id: str = Field(pattern=SHA256_PATTERN)
     input_artifact_sha256: str = Field(pattern=SHA256_PATTERN)
     adapter_name: str = Field(min_length=1)
@@ -596,32 +598,12 @@ class ExtractionResultV6(ContractModel):
         page_artifact_ids = [page.artifact.artifact_id for page in self.page_artifacts]
         if len(page_artifact_ids) != len(set(page_artifact_ids)):
             raise ValueError("page artifact wrappers must reference unique artifacts")
-        page_numbers = {item.page_number for item in self.page_artifacts}
-        if any(item.role is not None for item in self.page_artifacts) and page_numbers != set(
-            range(1, self.pages + 1)
-        ):
-            raise ValueError("page artifact numbers must cover the declared page range")
         for page in self.page_artifacts:
             expected = manifest.get(page.artifact.artifact_id)
             if expected is None:
                 raise ValueError("page artifact is missing from artifact manifest")
             if page.artifact != expected:
                 raise ValueError("embedded page artifact differs from artifact manifest")
-        if self.page_artifacts and any(item.role is not None for item in self.page_artifacts):
-            for page_number in sorted({item.page_number for item in self.page_artifacts}):
-                page_items = tuple(
-                    item for item in self.page_artifacts if item.page_number == page_number
-                )
-                if sum(item.role == "SOURCE_RAW" for item in page_items) != 1:
-                    raise ValueError("each page requires exactly one SOURCE_RAW inventory item")
-                if sum(item.role == "ORIENTED_RAW" for item in page_items) != 1:
-                    raise ValueError("each page requires exactly one ORIENTED_RAW inventory item")
-                if sum(item.selected for item in page_items) != 1:
-                    raise ValueError("each page requires exactly one selected candidate")
-                source = next(item for item in page_items if item.role == "SOURCE_RAW")
-                oriented = next(item for item in page_items if item.role == "ORIENTED_RAW")
-                if oriented.artifact.parent_artifact_id != source.artifact.artifact_id:
-                    raise ValueError("ORIENTED_RAW must directly reference its page SOURCE_RAW")
         for table in self.canonical_table_artifacts:
             expected = manifest.get(table.artifact.artifact_id)
             if expected is None:
@@ -641,12 +623,26 @@ class ExtractionResultV6(ContractModel):
         if any(item.input_artifact_id not in manifest for item in self.adapter_inputs):
             raise ValueError("adapter input artifact is missing from artifact manifest")
         table_ids = {(item.page_number, item.table_id) for item in self.source_tables}
-        crop_ids = {
-            (item.page_number, item.logical_table_id)
+        crop_by_key = {
+            (item.page_number, item.logical_table_id): item
             for item in self.canonical_table_artifacts
         }
+        if len(crop_by_key) != len(self.canonical_table_artifacts):
+            raise ValueError("canonical table artifact identities must be unique")
+        crop_ids = set(crop_by_key)
         if not table_ids.issubset(crop_ids):
             raise ValueError("every V6 source table requires a canonical table artifact")
+        for adapter in self.adapter_inputs:
+            table = crop_by_key.get((adapter.page_number, adapter.logical_table_id))
+            if table is None:
+                raise ValueError("adapter input references an unknown logical table")
+            artifact = manifest[adapter.input_artifact_id]
+            if artifact.image_sha256 != adapter.input_artifact_sha256:
+                raise ValueError("adapter input hash does not match its artifact")
+            while artifact.artifact_id != table.artifact.artifact_id:
+                if artifact.parent_artifact_id is None:
+                    raise ValueError("adapter input is outside its canonical table lineage")
+                artifact = manifest[artifact.parent_artifact_id]
 
         referenced: set[str] = set(page_artifact_ids)
         referenced.update(item.artifact.artifact_id for item in self.canonical_table_artifacts)
