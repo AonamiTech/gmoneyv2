@@ -641,7 +641,7 @@ Allowed states are `not_started`, `in_progress`, `blocked`, `shadow`, `promoted`
 | M1 | Canonical-image consistency | in_progress | All table adapters share one crop hash; no flat regression | `afe8caa`; frozen non-regression report pending |
 | M2 | Artifact and evidence V6 | in_progress | V5 read compatibility; tamper-safe lineage; <=2 px linear mapping error | `077d8e6`, `b947332`, `ec17b07`; integrity gates pass, frozen accuracy gate held in `docs/reviews/table-magic-m2.md` |
 | M3 | Dense transform foundation | promoted | Synthetic dense mappings pass and invalid grids fail closed | `057b6cf`, `5da09b6`, `76de77d`; local and isolated GPU-host certification in `docs/reviews/table-magic-m3.md` |
-| M4 | UVDoc feasibility/shadow | not_started | Reproducible grid, valid geometry, curved gain, no critical regression | TBD |
+| M4 | UVDoc feasibility/shadow | blocked | Reproducible grid, valid geometry, curved gain, no critical regression | Adapter/shadow substrate implemented; authoritative M2 corpus gate still held in `docs/reviews/table-magic-m4.md` |
 | M5 | Per-table matching/selection | not_started | Stable identity, no lost/duplicate tables, holdout improvement | TBD |
 | M6 | Table V2 shadow benchmark | not_started | Unique recoveries and acceptable GPU/latency cost | TBD |
 | M7 | PaddleOCR-VL client A/B | not_started | Frozen metric winner selected; direct adapter retained on tie | TBD |
