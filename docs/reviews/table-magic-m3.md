@@ -43,7 +43,7 @@ make compose-config
 git diff --check
 ```
 
-Results: 1,129 backend tests and 23 frontend tests passed. Ruff, frontend lint/type checking,
+Results: 1,130 backend tests and 23 frontend tests passed. Ruff, frontend lint/type checking,
 the production frontend build, diff checking, and all CPU/demo/GPU/admin Compose configurations
 passed.
 

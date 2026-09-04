@@ -195,6 +195,38 @@ def _validate_loaded_grid(
     return output
 
 
+def _validate_npy_header(
+    content: bytes,
+    mapping: DenseBackwardGridMapping,
+) -> None:
+    stream = io.BytesIO(content)
+    try:
+        version = np.lib.format.read_magic(stream)
+        if version == (1, 0):
+            shape, fortran_order, dtype = np.lib.format.read_array_header_1_0(stream)
+        elif version == (2, 0):
+            shape, fortran_order, dtype = np.lib.format.read_array_header_2_0(stream)
+        else:
+            raise ValueError("unsupported NPY version")
+    except (EOFError, ValueError) as error:
+        raise DenseGridError(
+            "v6_dense_grid_archive_invalid", "dense-grid NPY header is invalid"
+        ) from error
+    if fortran_order or dtype != np.dtype("<f4") or tuple(shape) != mapping.grid_shape:
+        raise DenseGridError(
+            "v6_dense_grid_metadata_mismatch",
+            "dense-grid NPY metadata differs from the mapping",
+        )
+    expected_bytes = math.prod(shape) * dtype.itemsize
+    if expected_bytes > MAX_DENSE_GRID_BYTES:
+        raise DenseGridError("v6_dense_grid_archive_invalid", "dense grid exceeds size limit")
+    if len(content) - stream.tell() != expected_bytes:
+        raise DenseGridError(
+            "v6_dense_grid_archive_invalid",
+            "dense-grid NPY payload length is invalid",
+        )
+
+
 def load_dense_grid(
     artifact_root: Path,
     mapping: DenseBackwardGridMapping,
@@ -229,16 +261,14 @@ def load_dense_grid(
                     "v6_dense_grid_archive_invalid",
                     "dense-grid member exceeds size limit",
                 )
-        with np.load(io.BytesIO(content), allow_pickle=False) as payload:
-            if payload.files != ["grid"]:
-                raise DenseGridError(
-                    "v6_dense_grid_archive_invalid",
-                    "dense-grid archive has an unexpected member",
-                )
-            array = payload["grid"]
+            member = archive.read(members[0])
+        _validate_npy_header(member, mapping)
+        array = np.lib.format.read_array(
+            io.BytesIO(member), allow_pickle=False, max_header_size=10_000
+        )
     except DenseGridError:
         raise
-    except (OSError, ValueError, zipfile.BadZipFile) as error:
+    except (EOFError, OSError, ValueError, zipfile.BadZipFile) as error:
         raise DenseGridError(
             "v6_dense_grid_archive_invalid",
             "dense-grid archive cannot be decoded",

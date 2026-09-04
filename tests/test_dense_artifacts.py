@@ -376,6 +376,36 @@ def test_dense_loader_rejects_corrupt_archive_with_matching_digest(tmp_path: Pat
     assert failure.value.code == "v6_dense_grid_archive_invalid"
 
 
+def test_dense_loader_rejects_oversized_npy_header_before_allocation(tmp_path: Path) -> None:
+    npy = io.BytesIO()
+    np.lib.format.write_array_header_1_0(
+        npy,
+        {
+            "descr": "<f4",
+            "fortran_order": False,
+            "shape": (100_000, 100_000, 2),
+        },
+    )
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as output:
+        output.writestr("grid.npy", npy.getvalue())
+    content = archive.getvalue()
+    (tmp_path / "grid.npz").write_bytes(content)
+    mapping = DenseBackwardGridMapping(
+        grid_relative_path="grid.npz",
+        grid_sha256=hashlib.sha256(content).hexdigest(),
+        grid_shape=(100_000, 100_000, 2),
+        child_width=3,
+        child_height=3,
+        parent_width=3,
+        parent_height=3,
+        padding_mode="border",
+    )
+    with pytest.raises(DenseGridError, match="size limit") as failure:
+        load_dense_grid(tmp_path, mapping)
+    assert failure.value.code == "v6_dense_grid_archive_invalid"
+
+
 def test_dense_diagnostics_detect_foldover_and_bounds(tmp_path: Path) -> None:
     folded = _identity_grid(3, 3)
     folded[:, :, 0] *= -1
