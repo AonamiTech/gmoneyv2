@@ -43,6 +43,7 @@ from gmoney.extraction.offline import (
     TableExtractionUnit,
     _financial_inventory_matches,
     _merge_targeted_page_units,
+    _project_result_v6,
     _recovery_preserves_grounded_charges,
 )
 from gmoney.extraction.validation import (
@@ -879,6 +880,118 @@ def test_recovery_token_retains_crop_identity_and_page_transform(
     token["source_artifact_sha256"] = "f" * 64
     failed = validate_extraction_result(source, result, artifact_root)
     assert "recovery_token_provenance_invalid" in {issue.code for issue in failed.issues}
+
+
+def test_v6_projection_binds_unassigned_crop_token_to_its_source_artifact(
+    tmp_path: Path,
+) -> None:
+    _source, artifact_root, result = _fixture(tmp_path)
+    page = result["page_assets"][0]
+    assert isinstance(page, dict)
+    page_sha = str(page["artifact_sha256"])
+    quality = {
+        "page_number": 1,
+        "artifact_sha256": page_sha,
+        "width": 100,
+        "height": 200,
+        "dpi": 300,
+        "mean_luminance": 200,
+        "contrast_stddev": 40,
+        "laplacian_variance": 100,
+        "edge_density": 0.05,
+        "estimated_skew_degrees": 0,
+    }
+    transform = {
+        "page_number": 1,
+        "source_width": 100,
+        "source_height": 200,
+        "derived_width": 100,
+        "derived_height": 200,
+        "forward_matrix": ((1, 0, 0), (0, 1, 0), (0, 0, 1)),
+        "inverse_matrix": ((1, 0, 0), (0, 1, 0), (0, 0, 1)),
+    }
+    result["page_preprocessing"] = [
+        {
+            "page_number": 1,
+            "raw_artifact_sha256": page_sha,
+            "raw_artifact_relative_path": page["relative_path"],
+            "raw_quality": quality,
+            "candidates": [
+                {
+                    "variant": "raw",
+                    "artifact_sha256": page_sha,
+                    "artifact_relative_path": page["relative_path"],
+                    "width": 100,
+                    "height": 200,
+                    "dpi": 300,
+                    "transform": transform,
+                    "quality": quality,
+                    "selected": True,
+                }
+            ],
+            "selected_variant": "raw",
+        }
+    ]
+    crop_path = artifact_root / "crops" / "p1-t1.png"
+    crop_path.parent.mkdir()
+    crop_path.write_bytes(b"canonical crop")
+    crop_sha = _sha(crop_path.read_bytes())
+    crop_polygon = Polygon(
+        points=(
+            Point(x=1, y=1),
+            Point(x=49, y=1),
+            Point(x=49, y=49),
+            Point(x=1, y=49),
+        )
+    )
+    result["table_crops"] = [
+        {
+            "page_number": 1,
+            "table_id": "p1-t1",
+            "source_page_artifact_sha256": page_sha,
+            "selected_page_artifact_sha256": page_sha,
+            "selected_variant": "raw",
+            "artifact_sha256": crop_sha,
+            "artifact_relative_path": "crops/p1-t1.png",
+            "width": 50,
+            "height": 50,
+            "candidate_box": (0, 0, 50, 50),
+            "source_box": (0, 0, 50, 50),
+            "source_polygon": crop_polygon.model_dump(mode="json"),
+            "crop_to_source_matrix": ((1, 0, 0), (0, 1, 0), (0, 0, 1)),
+        }
+    ]
+    tokens = result["token_manifest"]
+    assert isinstance(tokens, list)
+    tokens.append(
+        {
+            "token_id": "unassigned-crop-token",
+            "page_number": 1,
+            "table_ids": [],
+            "text": "uncited",
+            "polygon": crop_polygon.model_dump(mode="json"),
+            "artifact_sha256": page_sha,
+            "artifact_relative_path": page["relative_path"],
+            "confidence": 0.99,
+            "source_artifact_sha256": crop_sha,
+            "source_artifact_relative_path": "crops/p1-t1.png",
+            "source_polygon": crop_polygon.model_dump(mode="json"),
+            "source_width": 50,
+            "source_height": 50,
+            "source_to_page_matrix": ((1, 0, 0), (0, 1, 0), (0, 0, 1)),
+        }
+    )
+
+    projected = _project_result_v6(result, artifact_root)
+
+    token = next(
+        item
+        for item in projected["token_manifest"]
+        if item["token_id"] == "unassigned-crop-token"
+    )
+    table_artifact = projected["canonical_table_artifacts"][0]["artifact"]
+    assert token["artifact_id"] == table_artifact["artifact_id"]
+    assert token["artifact_sha256"] == crop_sha
 
 
 def test_revision_four_preprocessing_raw_page_must_match_page_asset(

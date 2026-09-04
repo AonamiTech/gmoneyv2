@@ -4906,14 +4906,38 @@ def _project_result_v6(result: dict[str, Any], artifact_root: Path) -> dict[str,
     def artifact_for_token(token: TokenManifestEntry) -> ArtifactRef:
         if token.source_artifact_sha256:
             choices = by_sha.get(token.source_artifact_sha256, ())
-            for choice in choices:
-                if any(
-                    (token.page_number, table_id) in table_artifact_by_key
-                    and table_artifact_by_key[(token.page_number, table_id)].artifact_id
-                    == choice.artifact_id
+            if choices:
+                source_path = (
+                    _relative_artifact_path(
+                        artifact_root, token.source_artifact_relative_path
+                    )
+                    if token.source_artifact_relative_path
+                    else None
+                )
+                matching_paths = tuple(
+                    choice
+                    for choice in choices
+                    if source_path is not None
+                    and choice.artifact_relative_path == source_path
+                )
+                if matching_paths:
+                    return min(matching_paths, key=lambda item: item.artifact_id)
+
+                manifest = {item.artifact_id: item for item in artifacts}
+                owned_table_ids = {
+                    table_artifact_by_key[(token.page_number, table_id)].artifact_id
                     for table_id in token.table_ids
-                ):
-                    return choice
+                    if (token.page_number, table_id) in table_artifact_by_key
+                }
+                for choice in sorted(choices, key=lambda item: item.artifact_id):
+                    ancestor = choice
+                    while True:
+                        if ancestor.artifact_id in owned_table_ids:
+                            return choice
+                        if ancestor.parent_artifact_id is None:
+                            break
+                        ancestor = manifest[ancestor.parent_artifact_id]
+                return min(choices, key=lambda item: item.artifact_id)
         choices = by_sha.get(token.artifact_sha256, ())
         if choices:
             return choices[0]
@@ -4938,7 +4962,7 @@ def _project_result_v6(result: dict[str, Any], artifact_root: Path) -> dict[str,
             source_page_polygon=source_polygon,
             source_page_artifact_id=source_artifact_id,
             artifact_id=artifact.artifact_id,
-            artifact_sha256=(token.source_artifact_sha256 or artifact.image_sha256),
+            artifact_sha256=artifact.image_sha256,
             artifact_relative_path=artifact.artifact_relative_path,
             confidence=token.confidence,
             parent_token_id=token.parent_token_id,
