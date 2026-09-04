@@ -4,12 +4,15 @@ Status: hold
 Date: 2026-09-04 UTC
 Owner: Codex
 Git SHAs: `1e3fced0a8e12a6a93e9f8a7c5682978f065c554`,
-`6ae7e4d20531a177895b3be4046aedda0f462057` (GPU candidate target)
-Image digests: unavailable — isolated GPU candidate did not start
+`6ae7e4d20531a177895b3be4046aedda0f462057`,
+`8dfdd4ae3b11aa03c41e0a3e4a41e2b60853f6b5`,
+`0c8650a40e24e1881b10ad839d8645d769c4a1b5` (GPU candidate target)
+Image digest: `sha256:d7f1b7c780746ef4c29a975da238591b1ca4caa1892aa441b4673d67c03847c9`
 Corpus manifest SHA-256: unavailable — inherited M2 external-data hold
 Gold/evaluator versions: unavailable
-Component/config versions: `gmoney_uvdoc_shadow_v1`, `gmoney_uvdoc_preregistration_v1`,
-`gmoney_uvdoc_accuracy_v1`, `gmoney_uvdoc_gate_v1`; model repository
+Component/config versions: `gmoney_uvdoc_shadow_v1`, `gmoney_uvdoc_hf_to_paddle_v1`,
+`gmoney_uvdoc_preregistration_v1`, `gmoney_uvdoc_accuracy_v1`, `gmoney_uvdoc_gate_v1`;
+model repository
 `PaddlePaddle/UVDoc_safetensors` at revision
 `7b8c629d7a15656889d0b21c73df206ac8a732b5`
 
@@ -17,9 +20,9 @@ Component/config versions: `gmoney_uvdoc_shadow_v1`, `gmoney_uvdoc_preregistrati
 
 Hold M4 at the accuracy boundary. The adapter, exact-grid capture, independent reproduction,
 shadow-only V6 lineage, preregistration contract, and fail-closed gate runner are implemented.
-M4 cannot move to `shadow` until the authoritative sealed 14/36/159 corpus, audited detailed
-gold, evaluator identity, baseline, and a successful isolated GPU run of the pinned UVDoc model
-snapshot are available.
+The isolated GPU substrate gate passes. M4 cannot move to `shadow` until the authoritative sealed
+14/36/159 corpus, audited detailed gold, evaluator identity, and baseline are available to prove
+curved gain and flat non-regression.
 
 ## Change evaluated
 
@@ -32,10 +35,12 @@ snapshot are available.
 - Prohibited shadow artifacts from production table, adapter, token, and evidence lineage.
 - Added a digest-bound gate runner that returns `hold` when authoritative accuracy evidence is
   missing and considers primary `UVDOC`, not the enhanced exploratory branch, for promotion.
+- Added a complete, shape-checked safetensors-to-Paddle checkpoint mapping after GPU testing found
+  that PaddleX's generic loader silently left the pinned checkpoint unused.
 
 ## Local verification
 
-- All 163 focused UVDoc and worker tests passed; 1,047 other backend tests passed with the three
+- All 168 focused UVDoc and worker tests passed; 1,047 other backend tests passed with the three
   local `TestClient` files excluded.
 - Ruff passed on all changed Python files.
 - The repository-wide backend run was interrupted after the pre-existing basic FastAPI
@@ -46,15 +51,30 @@ snapshot are available.
 
 ## GPU verification
 
-Two Luna agents were assigned separately to isolated candidate deployment and read-only
-monitoring for commit `6ae7e4d20531a177895b3be4046aedda0f462057`. At 2026-09-04 13:47:59 UTC,
-SSH to `34.180.11.221:22` timed out; the public readiness endpoint on port `3100` also timed
-out. An independent primary-agent SSH probe reproduced the port-22 timeout.
+Luna deployment and monitoring agents, followed by two Luna agents explicitly configured at
+maximum reasoning effort, tested commit `0c8650a40e24e1881b10ad839d8645d769c4a1b5` in disposable
+GPU containers with networking disabled and candidate source/model mounts read-only. Evidence is
+retained at `/home/ubuntu/gmoneyv2-releases/m4-0c8650a-20260904T1458Z/evidence/`.
 
-No remote mutation occurred. Candidate source transfer, model download/load, image build, and
-GPU adapter execution never started, so this review does not claim GPU validation. Live
-revision, readiness, GPU/VRAM, disk, restart/OOM, and port-isolation evidence could not be
-collected during the outage.
+- Paddle 3.2.2, PaddleOCR 3.7.0, PaddleX 3.7.2, CUDA, and the exact pinned model loaded on the
+  Tesla T4. All 251 Paddle tensors matched checkpoint values exactly; 44 foreign-framework batch
+  counters were explicitly skipped; missing, unexpected, collision, shape, and value mismatch
+  counts were zero.
+- A synthetic de-identified RGB input produced a valid `240 x 320 x 2` backward grid. Independent
+  reproduction error was `(1, 1, 1)`, foldover count was zero, and out-of-bounds rate was zero.
+  The output, enhanced image, and grid SHA-256 values are recorded in
+  `evidence/uvdoc-adapter-result.json`.
+- The worker container exited zero and was not OOM-killed. The production stack stayed ready and
+  release-consistent on `da20ceec63211559ea1707a16c831f600479c592`; restart counts stayed zero,
+  and no live configuration, container, port, or release changed.
+- The candidate archive SHA-256 is
+  `2dde12d6fa1ebbc4e35abce66afd52677569f8efc3bced72ad7eadb2cef7303e`. A fresh extraction's
+  196-file content manifest exactly matched the staged candidate manifest at
+  `46b46cc6aa8a3b7ed8959227645a421af84bcda63990f87ea3a8719a5aba7e34`.
+
+The runtime worker image intentionally lacks pytest, so repository tests were not claimed from
+that image; the real GPU/model probe above exercised the production dependency set, while the
+current 168-test worker/UVDoc suite passed locally.
 
 ## Gate decision and rollback condition
 
