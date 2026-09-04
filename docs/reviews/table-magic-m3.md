@@ -3,7 +3,8 @@
 Status: promote
 Date: 2026-09-04 UTC
 Owner: Codex
-Git SHA: `057b6cf870c2531f5a73baf436082a354585c5a0`
+Git SHAs: `057b6cf870c2531f5a73baf436082a354585c5a0`,
+`5da09b6228b40adb8a5e0b0a774bf39608ddb9da`
 Image digests: not applicable — repository-only dormant substrate; no deployment
 Corpus manifest SHA-256: unavailable — inherited M2 external-data hold
 Gold/evaluator versions: not applicable to the synthetic geometry gate
@@ -102,5 +103,6 @@ or live candidate was used for M3 because the feature is a dormant geometry subs
 
 M3 is promoted at the repository/contract level. Keep dense generation inactive. If any existing
 V5 or linear V6 payload changes, any malformed grid is accepted, a certified grid can change
-without invalidation, or a synthetic mapping exceeds two pixels, revert `057b6cf` and retain the
-matrix-only V6 path. Do not start M4 or deploy this revision until the M2 corpus hold is resolved.
+without invalidation, or a synthetic mapping exceeds two pixels, revert `5da09b6` and `057b6cf`
+and retain the matrix-only V6 path. Do not start M4 or deploy this revision until the M2 corpus
+hold is resolved.
