@@ -88,6 +88,32 @@ def test_replay_uvdoc_identity_preserves_rgb_conversion() -> None:
     assert np.array_equal(replayed, parent_bgr[..., ::-1])
 
 
+@pytest.mark.parametrize(
+    ("source", "target"),
+    (
+        (
+            "model.resnet_down.stages.0.layers.0.conv_start.conv.weight",
+            "backbone.resnet.resnet_down.0.layers.0.conv_start.convolution.weight",
+        ),
+        (
+            "model.bridge.5.blocks.2.norm.running_var",
+            "backbone.bridge.bridge.5.blocks.2.normalization._variance",
+        ),
+        (
+            "model.resnet_head.conv_down.norm.running_mean",
+            "backbone.resnet.resnet_head.0.normalization._mean",
+        ),
+        (
+            "model.out_point_positions2D.conv_down.act_fn.weight",
+            "head.out_point_positions2D.conv_down.activation._weight",
+        ),
+        ("model.bridge.0.blocks.0.norm.num_batches_tracked", None),
+    ),
+)
+def test_uvdoc_checkpoint_mapping_is_explicit(source: str, target: str | None) -> None:
+    assert PaddleUvdocAdapter._checkpoint_key(source) == target
+
+
 def test_adapter_captures_and_replays_exact_grid(tmp_path: Path, monkeypatch) -> None:
     model_dir = tmp_path / "model"
     model_dir.mkdir()

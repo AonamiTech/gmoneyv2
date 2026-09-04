@@ -624,12 +624,14 @@ inference-cpu = [
     { name = "paddlepaddle" },
     { name = "paddlex", extra = ["ocr"] },
     { name = "psutil" },
+    { name = "safetensors" },
 ]
 inference-gpu = [
     { name = "huggingface-hub" },
     { name = "paddleocr" },
     { name = "paddlex", extra = ["ocr"] },
     { name = "psutil" },
+    { name = "safetensors" },
 ]
 
 [package.metadata]
@@ -650,6 +652,8 @@ requires-dist = [
     { name = "pillow", specifier = ">=11,<13" },
     { name = "psutil", marker = "extra == 'inference-cpu'", specifier = ">=7,<8" },
     { name = "psutil", marker = "extra == 'inference-gpu'", specifier = ">=7,<8" },
+    { name = "safetensors", marker = "extra == 'inference-cpu'", specifier = ">=0.5,<1" },
+    { name = "safetensors", marker = "extra == 'inference-gpu'", specifier = ">=0.5,<1" },
     { name = "pydantic", specifier = ">=2.10,<3" },
     { name = "pydantic-settings", specifier = ">=2.7,<3" },
     { name = "pymupdf", specifier = ">=1.26,<2" },

@@ -24,6 +24,7 @@ from gmoney.geometry.dense import DenseGridDiagnostics, analyze_dense_grid, writ
 
 SHA256_PATTERN = r"^[a-f0-9]{64}$"
 UVDOC_ADAPTER_VERSION = "gmoney_uvdoc_shadow_v1"
+UVDOC_CHECKPOINT_ADAPTER_VERSION = "gmoney_uvdoc_hf_to_paddle_v1"
 UVDOC_MODEL_REPOSITORY = "PaddlePaddle/UVDoc_safetensors"
 UVDOC_MODEL_REVISION = "7b8c629d7a15656889d0b21c73df206ac8a732b5"
 EXPECTED_VERSIONS = {
@@ -155,6 +156,7 @@ class UvdocPreparedRun:
 
 class UvdocModel(Protocol):
     backbone: Any
+    config: Any
     head: Any
     upsample_size: Any
     upsample_mode: Any
@@ -276,9 +278,12 @@ class PaddleUvdocAdapter:
         if model is None:
             import paddle
             from paddlex.inference.models.image_unwarping.modeling import UVDocNet
+            from paddlex.inference.models.image_unwarping.modeling._config import UVDocConfig
 
             paddle.set_device(device)
-            model = UVDocNet.from_pretrained(str(self.model_dir))
+            config = UVDocConfig(**json.loads((self.model_dir / "config.json").read_text()))
+            model = UVDocNet(config)
+            self._load_exact_checkpoint(model)
         self.model = model
         self._validate_runtime_model()
         self.model.eval()
@@ -307,6 +312,7 @@ class PaddleUvdocAdapter:
                 "versions": versions,
                 "model_sha256": model_sha256,
                 "model_config_sha256": model_config_sha256,
+                "checkpoint_adapter_version": UVDOC_CHECKPOINT_ADAPTER_VERSION,
                 "coordinate_domain": "normalized_minus_one_to_one",
                 "interpolation": "bilinear",
                 "align_corners": True,
@@ -323,6 +329,59 @@ class PaddleUvdocAdapter:
             paddleocr_version=versions["paddleocr"],
             paddlex_version=versions["paddlex"],
         )
+
+    @staticmethod
+    def _checkpoint_key(source_key: str) -> str | None:
+        if source_key.endswith(".num_batches_tracked"):
+            return None
+        key = source_key.removeprefix("model.")
+        replacements = (
+            ("resnet_head.conv_down.", "backbone.resnet.resnet_head.0."),
+            ("resnet_head.conv_up.", "backbone.resnet.resnet_head.1."),
+            ("resnet_down.stages.", "backbone.resnet.resnet_down."),
+            ("bridge_concat.", "head.bridge_connector."),
+            ("bridge.", "backbone.bridge.bridge."),
+            ("out_point_positions2D.", "head.out_point_positions2D."),
+        )
+        for source_prefix, target_prefix in replacements:
+            if key.startswith(source_prefix):
+                key = target_prefix + key.removeprefix(source_prefix)
+                break
+        return (
+            key.replace(".conv.", ".convolution.")
+            .replace(".norm.", ".normalization.")
+            .replace(".running_mean", "._mean")
+            .replace(".running_var", "._variance")
+            .replace(".act_fn.weight", ".activation._weight")
+        )
+
+    def _load_exact_checkpoint(self, model: UvdocModel) -> None:
+        import paddle
+        from safetensors import safe_open
+
+        checkpoint_path = self.model_dir / "model.safetensors"
+        if checkpoint_path.is_symlink() or not checkpoint_path.is_file():
+            raise ValueError("UVDoc model requires a regular model.safetensors")
+        expected = model.state_dict()
+        converted: dict[str, Any] = {}
+        with safe_open(checkpoint_path, framework="np") as checkpoint:
+            source_keys = list(checkpoint.keys())
+            for source_key in source_keys:
+                target_key = self._checkpoint_key(source_key)
+                if target_key is None:
+                    continue
+                if target_key in converted:
+                    raise RuntimeError("uvdoc_checkpoint_key_collision")
+                if target_key not in expected:
+                    raise RuntimeError(f"uvdoc_checkpoint_unexpected_key:{source_key}")
+                value = checkpoint.get_tensor(source_key)
+                if tuple(value.shape) != tuple(expected[target_key].shape):
+                    raise RuntimeError(f"uvdoc_checkpoint_shape_mismatch:{source_key}")
+                converted[target_key] = paddle.to_tensor(value)
+        missing = sorted(set(expected) - set(converted))
+        if missing:
+            raise RuntimeError(f"uvdoc_checkpoint_missing_keys:{','.join(missing)}")
+        model.set_state_dict(converted)
 
     def _validate_runtime_model(self) -> None:
         if list(getattr(self.model, "upsample_size", ())) != EXPECTED_UPSAMPLE_SIZE:
@@ -437,6 +496,7 @@ __all__ = [
     "EXPECTED_VERSIONS",
     "PaddleUvdocAdapter",
     "UVDOC_ADAPTER_VERSION",
+    "UVDOC_CHECKPOINT_ADAPTER_VERSION",
     "UVDOC_MODEL_REPOSITORY",
     "UVDOC_MODEL_REVISION",
     "UvdocCompatibility",
