@@ -31,6 +31,27 @@ EXPECTED_VERSIONS = {
     "paddleocr": "3.7.0",
     "paddlex": "3.7.2",
 }
+EXPECTED_MODEL_CONFIG = {
+    "model_type": "uvdoc",
+    "num_filter": 32,
+    "in_channels": 3,
+    "kernel_size": 5,
+    "block_stride_values": [1, 2, 2],
+    "feature_map_multipliers": [1, 2, 4],
+    "block_counts_per_stage": [3, 4, 6],
+    "dilation_values": [
+        [1],
+        [2],
+        [5],
+        [8, 3, 2],
+        [12, 7, 4],
+        [18, 12, 6],
+    ],
+    "padding_mode": "reflect",
+}
+EXPECTED_UPSAMPLE_SIZE = [712, 488]
+EXPECTED_UPSAMPLE_MODE = "bilinear"
+EXPECTED_OUT_POINT_POSITIONS = [[128, 32], [32, 2]]
 
 
 class UvdocTarget(ContractModel):
@@ -259,6 +280,7 @@ class PaddleUvdocAdapter:
             paddle.set_device(device)
             model = UVDocNet.from_pretrained(str(self.model_dir))
         self.model = model
+        self._validate_runtime_model()
         self.model.eval()
 
     def _probe(self) -> UvdocCompatibility:
@@ -275,12 +297,7 @@ class PaddleUvdocAdapter:
         if config_path.is_symlink() or not config_path.is_file():
             raise ValueError("UVDoc model requires a regular config.json")
         config = json.loads(config_path.read_text())
-        expected = {
-            "upsample_size": [712, 488],
-            "upsample_mode": "bilinear",
-            "out_point_positions2D": [[128, 32], [32, 2]],
-        }
-        if any(config.get(key) != value for key, value in expected.items()):
+        if config != EXPECTED_MODEL_CONFIG:
             raise RuntimeError("uvdoc_incompatible_model_config")
         model_sha256 = _tree_sha256(self.model_dir)
         model_config_sha256 = sha256_file(config_path)
@@ -306,6 +323,19 @@ class PaddleUvdocAdapter:
             paddleocr_version=versions["paddleocr"],
             paddlex_version=versions["paddlex"],
         )
+
+    def _validate_runtime_model(self) -> None:
+        if list(getattr(self.model, "upsample_size", ())) != EXPECTED_UPSAMPLE_SIZE:
+            raise RuntimeError("uvdoc_incompatible_runtime_upsample_size")
+        if getattr(self.model, "upsample_mode", None) != EXPECTED_UPSAMPLE_MODE:
+            raise RuntimeError("uvdoc_incompatible_runtime_upsample_mode")
+        config = getattr(self.model, "config", None)
+        if (
+            config is None
+            or getattr(config, "out_point_positions2D", None)
+            != EXPECTED_OUT_POINT_POSITIONS
+        ):
+            raise RuntimeError("uvdoc_incompatible_runtime_output_points")
 
     def _forward(self, batch: NDArray[np.float32]) -> tuple[NDArray[np.uint8], NDArray[np.float32]]:
         import paddle
@@ -403,6 +433,7 @@ class PaddleUvdocAdapter:
 
 
 __all__ = [
+    "EXPECTED_MODEL_CONFIG",
     "EXPECTED_VERSIONS",
     "PaddleUvdocAdapter",
     "UVDOC_ADAPTER_VERSION",

@@ -9,7 +9,6 @@ from gmoney.inference.uvdoc import UVDOC_MODEL_REPOSITORY, UVDOC_MODEL_REVISION
 
 FILES = (
     "config.json",
-    "inference.yml",
     "model.safetensors",
     "preprocessor_config.json",
 )

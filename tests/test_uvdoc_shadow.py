@@ -22,6 +22,7 @@ from gmoney.evaluation.corpus import sha256_file
 from gmoney.evaluation.uvdoc import UvdocAccuracyReport, evaluate_uvdoc_gate
 from gmoney.geometry.dense import write_dense_grid
 from gmoney.inference.uvdoc import (
+    EXPECTED_MODEL_CONFIG,
     PaddleUvdocAdapter,
     UvdocPreregistration,
     load_preregistration,
@@ -90,17 +91,14 @@ def test_replay_uvdoc_identity_preserves_rgb_conversion() -> None:
 def test_adapter_captures_and_replays_exact_grid(tmp_path: Path, monkeypatch) -> None:
     model_dir = tmp_path / "model"
     model_dir.mkdir()
-    (model_dir / "config.json").write_text(
-        json.dumps(
-            {
-                "upsample_size": [712, 488],
-                "upsample_mode": "bilinear",
-                "out_point_positions2D": [[128, 32], [32, 2]],
-            }
-        )
-    )
+    (model_dir / "config.json").write_text(json.dumps(EXPECTED_MODEL_CONFIG))
     (model_dir / "model.safetensors").write_bytes(b"fixture")
-    model = SimpleNamespace(eval=lambda: None)
+    model = SimpleNamespace(
+        eval=lambda: None,
+        upsample_size=[712, 488],
+        upsample_mode="bilinear",
+        config=SimpleNamespace(out_point_positions2D=[[128, 32], [32, 2]]),
+    )
     adapter = PaddleUvdocAdapter(model_dir, model=model)
     parent_bgr = np.arange(4 * 5 * 3, dtype=np.uint8).reshape(4, 5, 3)
     input_path = tmp_path / "input.png"
