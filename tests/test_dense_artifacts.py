@@ -27,6 +27,7 @@ from gmoney.contracts.v6 import (
     IdentityMapping,
     PageArtifact,
 )
+from gmoney.demo.recertify import apply_recertification, plan_recertification
 from gmoney.demo.review import create_evidence_bundle
 from gmoney.demo.store import JobStore, JobTransactionError
 from gmoney.extraction.validation import validate_extraction_result
@@ -677,6 +678,12 @@ def test_dense_grid_is_bound_into_v3_certification_inventory(tmp_path: Path) -> 
         "page.png",
         "grids/grid.npz",
     }
+    plan = plan_recertification(store.root, {job_id})
+    assert plan["jobs"][0]["eligibility"] == "eligible"
+    recertification = apply_recertification(store.root, plan)
+    assert recertification["jobs"][0]["status"] == "recertified"
+    published = store.read(job_id)
+    assert published["_certification_valid"] is True
     bundle = create_evidence_bundle(
         store,
         job_id,

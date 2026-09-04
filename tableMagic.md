@@ -5,7 +5,7 @@
 | Field | Value |
 | --- | --- |
 | Status | Active technical roadmap |
-| Current milestone | M2 frozen-corpus hold; M3 implementation planned but gated |
+| Current milestone | M2 frozen-corpus hold; M3 dense-transform foundation promoted |
 | Last updated | 2026-09-04 |
 | Primary problem | Curved or wavy photographed bills that defeat one global projective transform |
 | Scope | Extraction accuracy, evidence geometry, recovery, evaluation, and promotion gates |
@@ -640,7 +640,7 @@ Allowed states are `not_started`, `in_progress`, `blocked`, `shadow`, `promoted`
 | M0 | Freeze baseline and labels | in_progress | Deterministic replay and per-column/cohort baseline | Existing frozen release corpus; Table Magic cohort report pending |
 | M1 | Canonical-image consistency | in_progress | All table adapters share one crop hash; no flat regression | `afe8caa`; frozen non-regression report pending |
 | M2 | Artifact and evidence V6 | in_progress | V5 read compatibility; tamper-safe lineage; <=2 px linear mapping error | `077d8e6`, `b947332`, `ec17b07`; integrity gates pass, frozen accuracy gate held in `docs/reviews/table-magic-m2.md` |
-| M3 | Dense transform foundation | not_started | Synthetic dense mappings pass and invalid grids fail closed | M3.1–M3.4 implementation plan below; gated on M2 promotion |
+| M3 | Dense transform foundation | promoted | Synthetic dense mappings pass and invalid grids fail closed | `057b6cf`; `docs/reviews/table-magic-m3.md` |
 | M4 | UVDoc feasibility/shadow | not_started | Reproducible grid, valid geometry, curved gain, no critical regression | TBD |
 | M5 | Per-table matching/selection | not_started | Stable identity, no lost/duplicate tables, holdout improvement | TBD |
 | M6 | Table V2 shadow benchmark | not_started | Unique recoveries and acceptable GPU/latency cost | TBD |
@@ -698,7 +698,7 @@ Deliverables:
 Gate: known synthetic warps map polygons within two source pixels; any non-finite grid,
 self-intersection, fold-over, corrupt digest, or incompatible metadata is rejected.
 
-#### M2 closure before M3 implementation
+#### M2 closure and M3 sequencing exception
 
 The V6 implementation is present, but M2 remains `in_progress` until its promotion evidence is
 recorded. The code closure consists of:
@@ -734,8 +734,12 @@ The 2026-09-04 isolated GPU review completed items 1, 2, 4, 5, and 6. It also fo
 artifact binding and replay timestamp defects before producing a passing final candidate. That
 candidate was stopped without a live cutover. Item 3 remains blocked because the authoritative
 sealed 14/36/159 inputs, audited gold, evaluator identity, and baseline are absent locally and on
-the GPU host. See `docs/reviews/table-magic-m2.md`; M2 therefore remains `in_progress`, and M3
-implementation remains gated.
+the GPU host. A source inventory found only 129 unique PDFs and no defensible audited replacement.
+See `docs/reviews/table-magic-m2.md`; M2 therefore remains `in_progress`.
+
+The user authorized M3 infrastructure work on 2026-09-04 despite this external-data hold. The
+exception permits the dormant dense-transform substrate and its synthetic certification only;
+it does not waive the M2 accuracy gate, authorize M4, or permit production deployment.
 
 #### M3 scope boundary
 
@@ -838,6 +842,8 @@ warps stay within two source pixels, and V5/V6 linear mapping tests remain uncha
 
 M4 may begin only after the M3 review is promoted. Its UVDoc adapter must consume the public M3
 serializer and mapping APIs; it must not introduce a second grid format or bypass M3 validation.
+Because M3 used the sequencing exception above, M4 additionally remains blocked until M2's
+frozen-corpus hold is resolved.
 
 ### M4 — Add UVDoc in shadow mode
 

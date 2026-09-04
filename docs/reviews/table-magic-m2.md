@@ -18,8 +18,14 @@ flat/known-layout accuracy gate could not be run because the exact sealed corpus
 and baseline are absent locally and on the GPU host. The synthetic canary is an integrity and
 operability check; it is not a substitute accuracy corpus.
 
-M3 is planned in `tableMagic.md` but remains `not_started`. Its implementation must not begin
-until this M2 hold is resolved and M2 is promoted.
+An inventory review found 129 unique PDFs across the available local and GPU stores, fewer than
+the 159 unique inputs required by the largest cohort. The 24 legacy gold drafts have no document
+hashes, two-pass image reviews, or source-table annotations and contain documented label errors.
+They cannot be relabelled as authoritative gold.
+
+On 2026-09-04 the user explicitly authorized M3 infrastructure work despite this external-data
+hold. This sequencing exception does not promote M2, waive its release gate, authorize M4, or
+permit a live deployment.
 
 ## Change evaluated
 
@@ -101,7 +107,8 @@ Four mutations were made only in isolated copies of the synthetic V6 workspace:
 The tamper matrix passed and records `published_jobs_modified: false`; its SHA-256 is
 `62f209499039741eee6ebadf1c158699b29e38e9597b60af7d00968a900bb1d9`.
 Linear mapping and lineage assertions, including the two-pixel contract, passed in the full
-local test suite. Dense mappings continue to fail closed as reserved for M3.
+local test suite. Dense mappings still failed closed at the M2 review boundary and were enabled
+later by the separately reviewed M3 substrate.
 
 ## Resources and deployment safety
 
@@ -129,8 +136,9 @@ local test suite. Dense mappings continue to fail closed as reserved for M3.
 
 ## Gate decision and rollback condition
 
-Decision: **hold**. Keep M2 `in_progress`, keep M3 `not_started`, and do not cut over the
-candidate. Resume the M2 promotion review only after running the exact sealed corpus against its
+Decision: **hold**. Keep M2 `in_progress` and do not cut over a candidate. M3 substrate work may
+proceed under the explicit sequencing exception, but M4 and any production promotion remain
+blocked. Resume the M2 promotion review only after running the exact sealed corpus against its
 audited gold and unchanged evaluator and confirming every Table Magic non-regression floor.
 
 If a later candidate changes any stable replay payload, accepts any tamper case, exceeds the
