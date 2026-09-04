@@ -47,6 +47,11 @@ class UvdocPreregistration(ContractModel):
     evaluator_name: str = Field(min_length=1)
     evaluator_version: str = Field(min_length=1)
     evaluator_sha256: str = Field(pattern=SHA256_PATTERN)
+    model_repository: Literal["PaddlePaddle/UVDoc_safetensors"] = UVDOC_MODEL_REPOSITORY
+    model_revision: Literal["7b8c629d7a15656889d0b21c73df206ac8a732b5"] = UVDOC_MODEL_REVISION
+    model_sha256: str = Field(pattern=SHA256_PATTERN)
+    model_config_sha256: str = Field(pattern=SHA256_PATTERN)
+    adapter_config_sha256: str = Field(pattern=SHA256_PATTERN)
     targets: tuple[UvdocTarget, ...]
 
     @model_validator(mode="after")

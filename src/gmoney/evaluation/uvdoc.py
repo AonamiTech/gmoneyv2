@@ -37,6 +37,9 @@ class UvdocAccuracyReport(ContractModel):
     evaluator_name: str = Field(min_length=1)
     evaluator_version: str = Field(min_length=1)
     evaluator_sha256: str = Field(pattern=SHA256_PATTERN)
+    model_sha256: str = Field(pattern=SHA256_PATTERN)
+    model_config_sha256: str = Field(pattern=SHA256_PATTERN)
+    adapter_config_sha256: str = Field(pattern=SHA256_PATTERN)
     observations: tuple[UvdocAccuracyObservation, ...]
 
     @model_validator(mode="after")
@@ -56,6 +59,9 @@ def _accuracy_identity_matches(
         and preregistration.evaluator_name == report.evaluator_name
         and preregistration.evaluator_version == report.evaluator_version
         and preregistration.evaluator_sha256 == report.evaluator_sha256
+        and preregistration.model_sha256 == report.model_sha256
+        and preregistration.model_config_sha256 == report.model_config_sha256
+        and preregistration.adapter_config_sha256 == report.adapter_config_sha256
     )
 
 

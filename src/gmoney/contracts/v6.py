@@ -458,10 +458,38 @@ class UvdocShadowRun(ContractModel):
         if self.status is UvdocShadowStatus.VALID:
             if any(value is None for value in (*artifact_ids, *identities)):
                 raise ValueError("valid UVDoc shadow runs require artifacts and model identities")
+            if any(
+                value is None
+                for value in (
+                    self.paddle_version,
+                    self.paddleocr_version,
+                    self.paddlex_version,
+                )
+            ):
+                raise ValueError("valid UVDoc shadow runs require package identities")
             if self.reproduction_max_error_by_channel is None:
                 raise ValueError("valid UVDoc shadow runs require reproduction errors")
-            if any(value > 1 for value in self.reproduction_max_error_by_channel):
+            if any(not 0 <= value <= 1 for value in self.reproduction_max_error_by_channel):
                 raise ValueError("UVDoc reproduction error exceeds one value per channel")
+            required_metrics = {
+                "mean_displacement_px",
+                "max_displacement_px",
+                "local_scale_p05",
+                "local_scale_p50",
+                "local_scale_p95",
+                "anisotropy_p95",
+                "jacobian_determinant_p05",
+                "jacobian_determinant_p50",
+                "jacobian_determinant_p95",
+                "foldover_count",
+                "out_of_bounds_rate",
+            }
+            if set(self.transform_metrics) != required_metrics:
+                raise ValueError("valid UVDoc shadow runs require complete transform metrics")
+            if self.transform_metrics["foldover_count"] != 0:
+                raise ValueError("valid UVDoc shadow runs cannot contain fold-over")
+            if self.transform_metrics["out_of_bounds_rate"] > 0.005:
+                raise ValueError("valid UVDoc shadow run exceeds out-of-bounds limit")
         elif self.uvdoc_artifact_id is not None or self.enhanced_artifact_id is not None:
             raise ValueError("invalid UVDoc shadow runs may not publish candidate artifacts")
         return self

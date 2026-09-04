@@ -43,6 +43,9 @@ def _preregistration() -> UvdocPreregistration:
         evaluator_name="gmoney-m4",
         evaluator_version="v1",
         evaluator_sha256="c" * 64,
+        model_sha256="1" * 64,
+        model_config_sha256="2" * 64,
+        adapter_config_sha256="3" * 64,
         targets=(
             {
                 "source_sha256": "d" * 64,
@@ -190,7 +193,23 @@ def test_v6_uvdoc_shadow_requires_unselected_dense_lineage(tmp_path: Path) -> No
         model_sha256="8" * 64,
         model_config_sha256="9" * 64,
         adapter_config_sha256="a" * 64,
+        paddle_version="3.2.2",
+        paddleocr_version="3.7.0",
+        paddlex_version="3.7.2",
         reproduction_max_error_by_channel=(0, 1, 0),
+        transform_metrics={
+            "mean_displacement_px": 0.0,
+            "max_displacement_px": 0.0,
+            "local_scale_p05": 1.0,
+            "local_scale_p50": 1.0,
+            "local_scale_p95": 1.0,
+            "anisotropy_p95": 1.0,
+            "jacobian_determinant_p05": 1.0,
+            "jacobian_determinant_p50": 1.0,
+            "jacobian_determinant_p95": 1.0,
+            "foldover_count": 0,
+            "out_of_bounds_rate": 0.0,
+        },
     )
     payload = dict(
         document_id="fixture",
@@ -238,6 +257,9 @@ def test_uvdoc_gate_uses_primary_branch_and_flat_non_regression(
         evaluator_name=preregistration.evaluator_name,
         evaluator_version=preregistration.evaluator_version,
         evaluator_sha256=preregistration.evaluator_sha256,
+        model_sha256=preregistration.model_sha256,
+        model_config_sha256=preregistration.model_config_sha256,
+        adapter_config_sha256=preregistration.adapter_config_sha256,
         observations=(
             {
                 "source_sha256": "d" * 64,

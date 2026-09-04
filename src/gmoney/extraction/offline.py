@@ -5943,6 +5943,19 @@ class OfflineExtractor:
                     if model_dir is None:
                         raise ValueError("uvdoc_model_dir_missing")
                     self.uvdoc_adapter = PaddleUvdocAdapter(model_dir, device=paddle_device)
+                compatibility = self.uvdoc_adapter.compatibility
+                registered_identity = (
+                    self.uvdoc_preregistration.model_sha256,
+                    self.uvdoc_preregistration.model_config_sha256,
+                    self.uvdoc_preregistration.adapter_config_sha256,
+                )
+                actual_identity = (
+                    compatibility.model_sha256,
+                    compatibility.model_config_sha256,
+                    compatibility.adapter_config_sha256,
+                )
+                if actual_identity != registered_identity:
+                    raise ValueError("uvdoc_preregistered_model_identity_mismatch")
             except Exception as error:  # shadow initialization cannot stop baseline extraction
                 self.uvdoc_initialization_error = f"uvdoc_initialization_{type(error).__name__}"
                 self.uvdoc_adapter = None
