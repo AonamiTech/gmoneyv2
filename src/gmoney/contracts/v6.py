@@ -13,7 +13,7 @@ from enum import StrEnum
 from pathlib import PurePosixPath
 from typing import Annotated, Any, Literal, TypeAlias
 
-from pydantic import Field, TypeAdapter, field_validator, model_validator
+from pydantic import AliasChoices, Field, TypeAdapter, field_validator, model_validator
 
 from gmoney.contracts.common import ContractModel
 from gmoney.contracts.evidence import PageAsset, PagePreprocessingRecord, Polygon
@@ -425,6 +425,449 @@ class PageArtifact(ContractModel):
     transform_metrics: dict[str, Any] = Field(default_factory=dict)
 
 
+class TableCandidateVariant(StrEnum):
+    """Page-artifact variants that may be compared for one logical table.
+
+    These values intentionally mirror :class:`ArtifactKind`.  Keeping a
+    table-selection variant separate from the generic artifact enum prevents a
+    selection record from silently referring to a table crop, cell crop, or
+    another non-page artifact.  ``_missing_`` accepts the lower-case spelling
+    used by older extraction telemetry while serializing to the canonical V6
+    spelling.
+    """
+
+    SOURCE_RAW = "source_raw"
+    ORIENTED_RAW = "oriented_raw"
+    PROJECTIVE = "projective"
+    PROJECTIVE_ENHANCED = "projective_enhanced"
+    UVDOC = "uvdoc"
+    UVDOC_ENHANCED = "uvdoc_enhanced"
+
+    @classmethod
+    def _missing_(cls, value: object) -> TableCandidateVariant | None:
+        if isinstance(value, str):
+            normalized = value.strip().lower().replace("-", "_")
+            for member in cls:
+                if member.value == normalized:
+                    return member
+        return None
+
+
+class TableMatchDecision(StrEnum):
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+    AMBIGUOUS = "ambiguous"
+
+
+class TableSelectionDecision(StrEnum):
+    SELECTED = "selected"
+    ABSTAINED = "abstained"
+    AMBIGUOUS = "ambiguous"
+    NO_CANDIDATE = "no_candidate"
+
+
+def _require_non_blank(value: str, label: str) -> str:
+    if not value.strip():
+        raise ValueError(f"{label} must be non-blank")
+    return value
+
+
+class TableMatchEdge(ContractModel):
+    """One deterministic source-space proposal matching observation.
+
+    Match edges are shadow telemetry.  They may mention a UVDoc candidate,
+    including a hypothetical winner, but they never carry an authority bit and
+    therefore cannot publish evidence or switch a canonical table on their own.
+    """
+
+    edge_id: str = Field(
+        default="",
+        validation_alias=AliasChoices("edge_id", "match_edge_id"),
+    )
+    logical_table_id: str = Field(min_length=1)
+    page_number: int = Field(default=1, ge=1)
+    anchor_proposal_id: str = Field(
+        min_length=1,
+        validation_alias=AliasChoices(
+            "anchor_proposal_id",
+            "source_proposal_id",
+            "left_proposal_id",
+        ),
+    )
+    candidate_proposal_id: str = Field(
+        min_length=1,
+        validation_alias=AliasChoices(
+            "candidate_proposal_id",
+            "derivative_proposal_id",
+            "right_proposal_id",
+        ),
+    )
+    anchor_artifact_id: str = Field(
+        pattern=SHA256_PATTERN,
+        validation_alias=AliasChoices("anchor_artifact_id", "source_artifact_id"),
+    )
+    candidate_artifact_id: str = Field(
+        pattern=SHA256_PATTERN,
+        validation_alias=AliasChoices("candidate_artifact_id", "artifact_id"),
+    )
+    candidate_variant: TableCandidateVariant = Field(
+        validation_alias=AliasChoices("candidate_variant", "variant")
+    )
+    match_score: float = Field(
+        ge=0,
+        le=1,
+        validation_alias=AliasChoices("match_score", "score"),
+    )
+    overlap_score: float | None = Field(default=None, ge=0, le=1)
+    center_distance_score: float | None = Field(default=None, ge=0, le=1)
+    reading_order_score: float | None = Field(default=None, ge=0, le=1)
+    header_similarity_score: float | None = Field(default=None, ge=0, le=1)
+    decision: TableMatchDecision = Field(
+        default=TableMatchDecision.REJECTED,
+        validation_alias=AliasChoices("decision", "disposition", "status"),
+    )
+    ambiguous: bool = False
+    ambiguity_reason: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def fill_edge_id(cls, value: Any) -> Any:
+        data = dict(value)
+        if not data.get("edge_id") and not data.get("match_edge_id"):
+            logical_table_id = data.get("logical_table_id", "")
+            anchor = (
+                data.get("anchor_proposal_id")
+                or data.get("source_proposal_id")
+                or data.get("left_proposal_id", "")
+            )
+            candidate = (
+                data.get("candidate_proposal_id")
+                or data.get("derivative_proposal_id")
+                or data.get("right_proposal_id", "")
+            )
+            data["edge_id"] = canonical_sha256(
+                {
+                    "contract": "table_match_edge_v1",
+                    "logical_table_id": logical_table_id,
+                    "anchor_proposal_id": anchor,
+                    "candidate_proposal_id": candidate,
+                }
+            )
+        return data
+
+    @model_validator(mode="after")
+    def validate_edge(self) -> TableMatchEdge:
+        _require_non_blank(self.logical_table_id, "logical table ID")
+        _require_non_blank(self.anchor_proposal_id, "anchor proposal ID")
+        _require_non_blank(self.candidate_proposal_id, "candidate proposal ID")
+        if self.anchor_proposal_id == self.candidate_proposal_id:
+            raise ValueError("table match edge cannot match a proposal to itself")
+        if self.decision is TableMatchDecision.AMBIGUOUS:
+            if not self.ambiguous:
+                raise ValueError("ambiguous match edges must set ambiguous=true")
+            if not self.ambiguity_reason or not self.ambiguity_reason.strip():
+                raise ValueError("ambiguous match edges require an ambiguity reason")
+        elif self.ambiguous:
+            raise ValueError("only ambiguous match edges may set ambiguous=true")
+        elif self.ambiguity_reason is not None:
+            raise ValueError("non-ambiguous match edges cannot carry an ambiguity reason")
+        return self
+
+
+class TableCandidateScore(ContractModel):
+    """Stage-1/2 score for one whole-table candidate artifact."""
+
+    evaluation_id: str = Field(
+        default="",
+        validation_alias=AliasChoices("evaluation_id", "candidate_score_id"),
+    )
+    logical_table_id: str = Field(min_length=1)
+    page_number: int = Field(default=1, ge=1)
+    candidate_id: str = Field(
+        min_length=1,
+        validation_alias=AliasChoices("candidate_id", "candidate_proposal_id"),
+    )
+    candidate_artifact_id: str = Field(
+        pattern=SHA256_PATTERN,
+        validation_alias=AliasChoices("candidate_artifact_id", "artifact_id"),
+    )
+    candidate_variant: TableCandidateVariant = Field(
+        validation_alias=AliasChoices("candidate_variant", "variant")
+    )
+    score: float = Field(
+        ge=0,
+        le=1,
+        validation_alias=AliasChoices("score", "candidate_score", "stage2_score"),
+    )
+    rank: int = Field(default=1, ge=1)
+    eligible: bool = True
+    selected: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("selected", "is_selected"),
+    )
+    evaluation_status: Literal["eligible", "rejected", "selected", "ambiguous"] = "eligible"
+    rejection_reason: str | None = None
+    score_components: dict[str, float] = Field(default_factory=dict)
+    whole_table: Literal[True] = True
+
+    @model_validator(mode="before")
+    @classmethod
+    def fill_evaluation_id(cls, value: Any) -> Any:
+        data = dict(value)
+        if not data.get("evaluation_id") and not data.get("candidate_score_id"):
+            data["evaluation_id"] = canonical_sha256(
+                {
+                    "contract": "table_candidate_score_v1",
+                    "logical_table_id": data.get("logical_table_id", ""),
+                    "candidate_id": data.get("candidate_id")
+                    or data.get("candidate_proposal_id", ""),
+                    "candidate_artifact_id": data.get("candidate_artifact_id")
+                    or data.get("artifact_id", ""),
+                }
+            )
+        return data
+
+    @model_validator(mode="after")
+    def validate_score(self) -> TableCandidateScore:
+        _require_non_blank(self.logical_table_id, "logical table ID")
+        _require_non_blank(self.candidate_id, "candidate ID")
+        if self.whole_table is not True:
+            raise ValueError("candidate evaluations must have whole_table=true")
+        if any(
+            not math.isfinite(value) or not 0 <= value <= 1
+            for value in self.score_components.values()
+        ):
+            raise ValueError("candidate score components must be finite values in [0, 1]")
+        if self.selected and (
+            not self.eligible or self.evaluation_status not in {"eligible", "selected"}
+        ):
+            raise ValueError("selected candidate must be eligible")
+        if self.evaluation_status == "selected" and not self.selected:
+            raise ValueError("selected candidate evaluation must set selected=true")
+        if self.evaluation_status == "rejected" and self.eligible:
+            raise ValueError("rejected candidate evaluation cannot remain eligible")
+        if self.rejection_reason is not None and not self.rejection_reason.strip():
+            raise ValueError("candidate rejection reason must be non-blank")
+        return self
+
+
+class LogicalTableSelection(ContractModel):
+    """A whole-table decision and its nested M5 shadow observations."""
+
+    logical_table_id: str = Field(min_length=1)
+    page_number: int = Field(ge=1)
+    match_edges: tuple[TableMatchEdge, ...] = ()
+    candidate_evaluations: tuple[TableCandidateScore, ...] = Field(
+        default=(),
+        validation_alias=AliasChoices(
+            "candidate_evaluations",
+            "candidate_scores",
+        ),
+    )
+    decision: TableSelectionDecision = Field(
+        default=TableSelectionDecision.NO_CANDIDATE,
+        validation_alias=AliasChoices("decision", "status"),
+    )
+    selected_candidate_id: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("selected_candidate_id", "winner_candidate_id"),
+    )
+    selected_candidate_variant: TableCandidateVariant | None = Field(
+        default=None,
+        validation_alias=AliasChoices("selected_candidate_variant", "winner_variant"),
+    )
+    selected_artifact_id: str | None = Field(
+        default=None,
+        pattern=SHA256_PATTERN,
+        validation_alias=AliasChoices(
+            "selected_artifact_id",
+            "selected_candidate_artifact_id",
+            "winner_artifact_id",
+        ),
+    )
+    ambiguous: bool = False
+    ambiguity_reason: str | None = None
+    whole_table: Literal[True] = True
+
+    @model_validator(mode="after")
+    def validate_selection(self) -> LogicalTableSelection:
+        _require_non_blank(self.logical_table_id, "logical table ID")
+        if self.whole_table is not True:
+            raise ValueError("table selection decisions must have whole_table=true")
+        if len({edge.edge_id for edge in self.match_edges}) != len(self.match_edges):
+            raise ValueError("match edge IDs must be unique within a logical table")
+        if len({item.evaluation_id for item in self.candidate_evaluations}) != len(
+            self.candidate_evaluations
+        ):
+            raise ValueError("candidate evaluation IDs must be unique within a logical table")
+        for edge in self.match_edges:
+            if (
+                edge.logical_table_id != self.logical_table_id
+                or edge.page_number != self.page_number
+            ):
+                raise ValueError("match edge references another logical table")
+        for evaluation in self.candidate_evaluations:
+            if (
+                evaluation.logical_table_id != self.logical_table_id
+                or evaluation.page_number != self.page_number
+            ):
+                raise ValueError("candidate evaluation references another logical table")
+        selected = tuple(item for item in self.candidate_evaluations if item.selected)
+        if self.decision is TableSelectionDecision.SELECTED:
+            if self.ambiguous or self.ambiguity_reason is not None:
+                raise ValueError("selected table cannot be ambiguous")
+            if len(selected) != 1:
+                raise ValueError("selected table requires exactly one selected candidate")
+            winner = selected[0]
+            if self.selected_candidate_id != winner.candidate_id:
+                raise ValueError("selected candidate ID does not match candidate evaluation")
+            if self.selected_candidate_variant is not winner.candidate_variant:
+                raise ValueError("selected candidate variant does not match candidate evaluation")
+            if self.selected_artifact_id != winner.candidate_artifact_id:
+                raise ValueError("selected artifact does not match candidate evaluation")
+        else:
+            if selected:
+                raise ValueError("abstained or ambiguous tables cannot select a candidate")
+            if any(
+                value is not None
+                for value in (
+                    self.selected_candidate_id,
+                    self.selected_candidate_variant,
+                    self.selected_artifact_id,
+                )
+            ):
+                raise ValueError("non-selected table decisions cannot name a winner")
+        if self.decision is TableSelectionDecision.AMBIGUOUS:
+            if not self.ambiguous:
+                raise ValueError("ambiguous table decisions must set ambiguous=true")
+            if not self.ambiguity_reason or not self.ambiguity_reason.strip():
+                raise ValueError("ambiguous table decisions require an ambiguity reason")
+        elif self.ambiguous:
+            raise ValueError("only ambiguous table decisions may set ambiguous=true")
+        elif self.ambiguity_reason is not None:
+            raise ValueError("non-ambiguous table decisions cannot carry an ambiguity reason")
+        return self
+
+    @property
+    def candidate_scores(self) -> tuple[TableCandidateScore, ...]:
+        """Compatibility view for callers that call evaluations ``scores``."""
+
+        return self.candidate_evaluations
+
+
+class TableSelectionRun(ContractModel):
+    """One deterministic M5 run, with observations grouped by logical table."""
+
+    run_id: str = Field(
+        default="",
+        validation_alias=AliasChoices("run_id", "selection_run_id"),
+    )
+    run_version: Literal["table_selection_v1"] = "table_selection_v1"
+    document_id: str | None = None
+    source_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
+    mode: Literal["off", "shadow", "enabled"] = "shadow"
+    logical_tables: tuple[LogicalTableSelection, ...] = Field(
+        default=(),
+        validation_alias=AliasChoices("logical_tables", "tables"),
+    )
+    # The single-table form is accepted for early M5 producers.  New writers
+    # should use ``logical_tables`` so edges and evaluations stay nested.
+    logical_table_id: str | None = None
+    page_number: int | None = Field(default=None, ge=1)
+    match_edges: tuple[TableMatchEdge, ...] = ()
+    candidate_evaluations: tuple[TableCandidateScore, ...] = Field(
+        default=(),
+        validation_alias=AliasChoices("candidate_evaluations", "candidate_scores"),
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def fill_run_id(cls, value: Any) -> Any:
+        data = dict(value)
+        if not data.get("run_id") and not data.get("selection_run_id"):
+            data["run_id"] = canonical_sha256(
+                {
+                    "contract": "table_selection_run_v1",
+                    "document_id": data.get("document_id"),
+                    "source_sha256": data.get("source_sha256"),
+                    "logical_table_id": data.get("logical_table_id"),
+                }
+            )
+        return data
+
+    @model_validator(mode="after")
+    def validate_run(self) -> TableSelectionRun:
+        if self.document_id is not None:
+            _require_non_blank(self.document_id, "document ID")
+        if self.logical_tables and (
+            self.logical_table_id is not None
+            or self.page_number is not None
+            or self.match_edges
+            or self.candidate_evaluations
+        ):
+            raise ValueError("nested and single-table selection run forms cannot be mixed")
+        if self.logical_tables:
+            logical_ids = tuple(item.logical_table_id for item in self.logical_tables)
+            if len(set(logical_ids)) != len(logical_ids):
+                raise ValueError("selection run logical table IDs must be unique")
+        else:
+            if self.logical_table_id is None or self.page_number is None:
+                raise ValueError("selection run requires logical table records")
+            LogicalTableSelection(
+                logical_table_id=self.logical_table_id,
+                page_number=self.page_number,
+                match_edges=self.match_edges,
+                candidate_evaluations=self.candidate_evaluations,
+            )
+        if self.mode == "off":
+            raise ValueError("table selection runs cannot be emitted when mode is off")
+        if self.mode == "enabled" and any(
+            table.decision is TableSelectionDecision.SELECTED
+            and table.selected_candidate_variant
+            in {TableCandidateVariant.UVDOC, TableCandidateVariant.UVDOC_ENHANCED}
+            for table in self.tables
+        ):
+            raise ValueError("UVDoc shadow candidates cannot become authoritative in enabled mode")
+        return self
+
+    @property
+    def tables(self) -> tuple[LogicalTableSelection, ...]:
+        """Compatibility view for callers that use ``tables`` as the field name."""
+
+        if self.logical_tables:
+            return self.logical_tables
+        assert self.logical_table_id is not None and self.page_number is not None
+        return (
+            LogicalTableSelection(
+                logical_table_id=self.logical_table_id,
+                page_number=self.page_number,
+                match_edges=self.match_edges,
+                candidate_evaluations=self.candidate_evaluations,
+            ),
+        )
+
+    @property
+    def candidate_scores(self) -> tuple[TableCandidateScore, ...]:
+        """Compatibility view for the legacy score terminology."""
+
+        if self.logical_tables:
+            return tuple(
+                item for table in self.logical_tables for item in table.candidate_evaluations
+            )
+        return self.candidate_evaluations
+
+
+# The V6 envelope is already versioned, while a few integrations imported
+# explicit ``V1`` names for the first M5 draft.  Keep those names as aliases so
+# old shadow readers do not need a migration just to read a result.
+TableMatchEdgeV1 = TableMatchEdge
+TableCandidateScoreV1 = TableCandidateScore
+TableCandidateEvaluation = TableCandidateScore
+TableCandidateEvaluationV1 = TableCandidateScore
+TableSelectionTable = LogicalTableSelection
+TableSelectionRunV1 = TableSelectionRun
+
+
 class UvdocShadowStatus(StrEnum):
     VALID = "valid"
     INVALID = "invalid"
@@ -655,6 +1098,26 @@ class ExtractionResultV6(ContractModel):
     artifact_manifest: ArtifactManifest
     page_artifacts: tuple[PageArtifact, ...]
     uvdoc_shadow_runs: tuple[UvdocShadowRun, ...] = ()
+    # M5 records are deliberately optional and default-empty so an old V6
+    # payload remains byte-for-byte readable when revalidated.  The nested
+    # records are observations; authoritative V6 fields below still own
+    # canonical crops, tokens, evidence, and rows.
+    table_match_edges: tuple[TableMatchEdge, ...] = Field(
+        default=(),
+        validation_alias=AliasChoices("table_match_edges", "m5_match_edges"),
+    )
+    table_candidate_scores: tuple[TableCandidateScore, ...] = Field(
+        default=(),
+        validation_alias=AliasChoices(
+            "table_candidate_scores",
+            "table_candidate_evaluations",
+            "m5_candidate_scores",
+        ),
+    )
+    table_selection_runs: tuple[TableSelectionRun, ...] = Field(
+        default=(),
+        validation_alias=AliasChoices("table_selection_runs", "m5_selection_runs"),
+    )
     canonical_table_artifacts: tuple[CanonicalTableArtifact, ...] = ()
     token_manifest: tuple[TokenManifestEntryV2, ...] = ()
     evidence: tuple[EvidenceRefV2, ...] = ()
@@ -681,6 +1144,24 @@ class ExtractionResultV6(ContractModel):
     worker_release_revision: str | None = None
     semantic_validation: dict[str, Any] | None = None
     validation_recovery_attempted: bool | None = None
+
+    @property
+    def table_candidate_evaluations(self) -> tuple[TableCandidateScore, ...]:
+        """Compatibility alias for the score records' descriptive name."""
+
+        return self.table_candidate_scores
+
+    @property
+    def m5_match_edges(self) -> tuple[TableMatchEdge, ...]:
+        return self.table_match_edges
+
+    @property
+    def m5_candidate_scores(self) -> tuple[TableCandidateScore, ...]:
+        return self.table_candidate_scores
+
+    @property
+    def m5_selection_runs(self) -> tuple[TableSelectionRun, ...]:
+        return self.table_selection_runs
 
     @model_validator(mode="after")
     def validate_v6_references(self) -> ExtractionResultV6:
@@ -732,6 +1213,7 @@ class ExtractionResultV6(ContractModel):
             for artifact_id in (run.uvdoc_artifact_id, run.enhanced_artifact_id)
             if artifact_id is not None
         }
+        self._validate_m5_records(manifest, shadow_artifact_ids)
         for table in self.canonical_table_artifacts:
             expected = manifest.get(table.artifact.artifact_id)
             if expected is None:
@@ -784,6 +1266,20 @@ class ExtractionResultV6(ContractModel):
         referenced.update(item.artifact_id for item in self.token_manifest)
         referenced.update(item.source_page_artifact_id for item in self.token_manifest)
         referenced.update(item.input_artifact_id for item in self.adapter_inputs)
+        # M5 observations are not authoritative, but their artifact references
+        # still keep the candidate nodes in the manifest closure.  UVDoc IDs
+        # are therefore retained for audit while the checks above prevent them
+        # from owning any canonical output.
+        referenced.update(item.anchor_artifact_id for item in self.table_match_edges)
+        referenced.update(item.candidate_artifact_id for item in self.table_match_edges)
+        referenced.update(item.candidate_artifact_id for item in self.table_candidate_scores)
+        for run in self.table_selection_runs:
+            for table in run.tables:
+                referenced.update(edge.anchor_artifact_id for edge in table.match_edges)
+                referenced.update(edge.candidate_artifact_id for edge in table.match_edges)
+                referenced.update(
+                    item.candidate_artifact_id for item in table.candidate_evaluations
+                )
 
         evidence_items: list[EvidenceRefV2] = list(self.evidence)
         for row in self.rows:
@@ -835,6 +1331,129 @@ class ExtractionResultV6(ContractModel):
             raise ValueError("artifact manifest contains unreferenced orphan nodes")
         return self
 
+    def _validate_m5_records(
+        self,
+        manifest: dict[str, ArtifactRef],
+        shadow_artifact_ids: set[str],
+    ) -> None:
+        """Validate M5 observation references without promoting shadow data.
+
+        This runs inside the V6 envelope validator so an M5 record cannot be
+        parsed successfully in isolation and then become authoritative merely
+        because it is copied into a result payload.
+        """
+
+        expected_kinds = {
+            variant: ArtifactKind(variant.value.upper()) for variant in TableCandidateVariant
+        }
+        known_logical_tables = {
+            (item.page_number, item.logical_table_id) for item in self.canonical_table_artifacts
+        }
+        known_logical_tables.update(
+            (item.page_number, item.table_id) for item in self.source_tables
+        )
+        # A standalone shadow fixture may contain only M5 records.  Once an
+        # authoritative table is declared, however, every M5 reference must
+        # point at one of those declared logical tables.
+        enforce_logical_reference = bool(known_logical_tables)
+
+        def variant_for_artifact(artifact_id: str) -> TableCandidateVariant:
+            artifact = manifest.get(artifact_id)
+            if artifact is None:
+                raise ValueError("M5 record references an unknown artifact")
+            try:
+                return TableCandidateVariant(artifact.artifact_kind.value)
+            except ValueError as error:
+                raise ValueError(
+                    "M5 match edge artifact must be a page candidate variant"
+                ) from error
+
+        def check_artifact(
+            artifact_id: str,
+            *,
+            variant: TableCandidateVariant,
+            page_number: int,
+            selected: bool,
+        ) -> None:
+            artifact = manifest.get(artifact_id)
+            if artifact is None:
+                raise ValueError("M5 record references an unknown artifact")
+            if artifact.artifact_kind is not expected_kinds[variant]:
+                raise ValueError("M5 candidate variant does not match artifact kind")
+            if page_number > self.pages:
+                raise ValueError("M5 record page number exceeds envelope pages")
+
+        def check_logical(page_number: int, logical_table_id: str) -> None:
+            if enforce_logical_reference and (
+                page_number,
+                logical_table_id,
+            ) not in known_logical_tables:
+                raise ValueError("M5 record references an unknown logical table")
+
+        edge_ids: set[str] = set()
+        for edge in self.table_match_edges:
+            if edge.edge_id in edge_ids:
+                raise ValueError("M5 match edge IDs must be unique")
+            edge_ids.add(edge.edge_id)
+            check_logical(edge.page_number, edge.logical_table_id)
+            check_artifact(
+                edge.anchor_artifact_id,
+                variant=variant_for_artifact(edge.anchor_artifact_id),
+                page_number=edge.page_number,
+                selected=False,
+            )
+            check_artifact(
+                edge.candidate_artifact_id,
+                variant=edge.candidate_variant,
+                page_number=edge.page_number,
+                selected=False,
+            )
+
+        score_ids: set[str] = set()
+        for score in self.table_candidate_scores:
+            if score.evaluation_id in score_ids:
+                raise ValueError("M5 candidate evaluation IDs must be unique")
+            score_ids.add(score.evaluation_id)
+            check_logical(score.page_number, score.logical_table_id)
+            check_artifact(
+                score.candidate_artifact_id,
+                variant=score.candidate_variant,
+                page_number=score.page_number,
+                selected=score.selected,
+            )
+
+        run_ids: set[str] = set()
+        for run in self.table_selection_runs:
+            if run.run_id in run_ids:
+                raise ValueError("M5 selection run IDs must be unique")
+            run_ids.add(run.run_id)
+            if run.source_sha256 is not None and run.source_sha256 != self.source_sha256:
+                raise ValueError("M5 selection run source hash differs from envelope")
+            for table in run.tables:
+                check_logical(table.page_number, table.logical_table_id)
+                for edge in table.match_edges:
+                    check_logical(edge.page_number, edge.logical_table_id)
+                    check_artifact(
+                        edge.anchor_artifact_id,
+                        variant=variant_for_artifact(edge.anchor_artifact_id),
+                        page_number=edge.page_number,
+                        selected=False,
+                    )
+                    check_artifact(
+                        edge.candidate_artifact_id,
+                        variant=edge.candidate_variant,
+                        page_number=edge.page_number,
+                        selected=False,
+                    )
+                for score in table.candidate_evaluations:
+                    check_logical(score.page_number, score.logical_table_id)
+                    check_artifact(
+                        score.candidate_artifact_id,
+                        variant=score.candidate_variant,
+                        page_number=score.page_number,
+                        selected=score.selected,
+                    )
+
 
 __all__ = [
     "ArtifactKind",
@@ -846,6 +1465,19 @@ __all__ = [
     "ArtifactRef",
     "ArtifactManifest",
     "PageArtifact",
+    "TableCandidateVariant",
+    "TableMatchDecision",
+    "TableSelectionDecision",
+    "TableMatchEdge",
+    "TableMatchEdgeV1",
+    "TableCandidateScore",
+    "TableCandidateScoreV1",
+    "TableCandidateEvaluation",
+    "TableCandidateEvaluationV1",
+    "LogicalTableSelection",
+    "TableSelectionTable",
+    "TableSelectionRun",
+    "TableSelectionRunV1",
     "UvdocShadowRun",
     "UvdocShadowStatus",
     "CanonicalTableArtifact",

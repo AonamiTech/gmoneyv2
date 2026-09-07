@@ -794,6 +794,7 @@ def ready(response: Response) -> dict[str, Any]:
     worker_status_updated_at: str | None = None
     worker_uvdoc_mode: str | None = None
     worker_uvdoc_configuration_status: str | None = None
+    worker_table_selection_mode: str | None = None
     release_consistent = True
     worker_ready = True
     if WORKER_STATUS_PATH is not None:
@@ -802,6 +803,9 @@ def ready(response: Response) -> dict[str, Any]:
             worker_release_revision = str(worker_status["release_revision"])
             worker_status_updated_at = str(worker_status["updated_at"])
             worker_uvdoc_mode = str(worker_status.get("uvdoc_mode") or "off")
+            worker_table_selection_mode = str(
+                worker_status.get("table_selection_mode") or "off"
+            )
             worker_uvdoc_configuration_status = str(
                 worker_status.get("uvdoc_configuration_status") or "off"
             )
@@ -827,6 +831,7 @@ def ready(response: Response) -> dict[str, Any]:
         "worker_status_max_age_seconds": WORKER_STATUS_MAX_AGE_SECONDS,
         "worker_status_future_skew_seconds": WORKER_STATUS_FUTURE_SKEW_SECONDS,
         "worker_uvdoc_mode": worker_uvdoc_mode,
+        "worker_table_selection_mode": worker_table_selection_mode,
         "worker_uvdoc_configuration_status": worker_uvdoc_configuration_status,
         "release_consistent": release_consistent,
         "profile_revision": profiles.revision,

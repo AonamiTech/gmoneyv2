@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     gemini_prompt_version: str = "phase3-grounded-v1"
     gemini_redaction_version: str = "phase3-redaction-v1"
     gemini_promotion_path: Path | None = None
+    table_selection_mode: Literal["off", "shadow", "enabled"] = "off"
     uvdoc_mode: Literal["off", "shadow", "enabled"] = "off"
     uvdoc_model_dir: Path | None = None
     uvdoc_preregistration_path: Path | None = None
