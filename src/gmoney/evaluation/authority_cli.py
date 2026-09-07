@@ -35,6 +35,7 @@ try:  # The authority contracts land alongside this CLI but remain optional for 
         ReviewDecision,
         ReviewRecordV1,
         ReviewState,
+        source_document_id_for,
     )
 except ImportError:  # pragma: no cover - exercised only by an older checkout.
     BaselineManifestV1 = None  # type: ignore[assignment,misc]
@@ -43,6 +44,7 @@ except ImportError:  # pragma: no cover - exercised only by an older checkout.
     ReviewDecision = None  # type: ignore[assignment,misc]
     ReviewRecordV1 = None  # type: ignore[assignment,misc]
     ReviewState = None  # type: ignore[assignment,misc]
+    source_document_id_for = None  # type: ignore[assignment,misc]
 
 app = typer.Typer(no_args_is_help=True)
 
@@ -55,8 +57,24 @@ SEAL_VERSION = "gmoney_authority_seal_v1"
 BASELINE_VERSION = "gmoney_authority_baseline_v1"
 EVALUATION_VERSION = "gmoney_authority_evaluation_v1"
 GATE_VERSION = "gmoney_authority_gate_m0_m4_v1"
+INTAKE_VERSION = "gmoney_authority_intake_v1"
+WORKING_INVENTORY_VERSION = "gmoney_authority_working_inventory_v1"
+ASSIGNMENT_VERSION = "gmoney_authority_assignment_v1"
+REVIEW_QUEUE_VERSION = "gmoney_authority_review_queue_v1"
+SEAL_READINESS_VERSION = "gmoney_authority_seal_readiness_v1"
 COHORT_COUNTS = {"production14": 14, "passing36": 36, "staging159": 159}
 MASTER_COHORT = "staging159"
+WORKING_INVENTORY_NAME = "working152"
+WORKING_INVENTORY_COUNT = 152
+REVIEW_KINDS = ("independent_a", "independent_b", "adjudicator", "red_team")
+NON_AUTHORITATIVE_INVENTORY_STATUSES = frozenset(
+    {
+        "non_authoritative_working152",
+        "non_authoritative_partial_assignment",
+        "non_authoritative_partial_inventory",
+        "working152",
+    }
+)
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
 
@@ -313,6 +331,307 @@ def _parse_assignments(
     return assignments
 
 
+def _sha256_values(values: Iterable[str], *, label: str) -> list[str]:
+    """Parse repeatable/comma-separated source hash options deterministically."""
+
+    parsed: list[str] = []
+    for value in values:
+        for candidate in re.split(r"[,\s]+", value.strip()):
+            if not candidate:
+                continue
+            candidate = candidate.removeprefix("sha256:")
+            if not SHA256_RE.fullmatch(candidate):
+                raise AuthorityError(f"{label} contains an invalid source hash: {candidate}")
+            parsed.append(candidate)
+    if len(parsed) != len(set(parsed)):
+        raise AuthorityError(f"{label} contains duplicate source hashes")
+    return sorted(parsed)
+
+
+def _json_records(raw: Any, *, labels: tuple[str, ...], label: str) -> list[dict[str, Any]]:
+    """Return records from the small set of manifest envelopes used by intake tooling."""
+
+    value: Any = raw
+    if isinstance(raw, dict):
+        for key in labels:
+            if key in raw:
+                value = raw[key]
+                break
+    if isinstance(value, dict):
+        # A digest-keyed mapping is convenient for a review worksheet.  Keep
+        # the key in each record so callers cannot accidentally omit identity.
+        if all(isinstance(item, dict) for item in value.values()):
+            records = []
+            for key, item in value.items():
+                record = dict(item)
+                record.setdefault("source_sha256", key)
+                records.append(record)
+            return records
+        raise AuthorityError(f"{label} must contain a list or digest-keyed object")
+    if not isinstance(value, list):
+        raise AuthorityError(f"{label} must contain a list or digest-keyed object")
+    records: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise AuthorityError(f"{label} records must be JSON objects")
+        records.append(dict(item))
+    return records
+
+
+def _record_source_digest(record: dict[str, Any], *, label: str) -> str:
+    value = record.get("source_sha256", record.get("document_sha256", record.get("sha256")))
+    if not isinstance(value, str):
+        raise AuthorityError(f"{label} is missing source_sha256")
+    value = value.removeprefix("sha256:")
+    if not SHA256_RE.fullmatch(value):
+        raise AuthorityError(f"{label} has an invalid source hash: {value}")
+    return value
+
+
+def _bool_field(record: dict[str, Any], keys: tuple[str, ...], *, label: str) -> tuple[bool, bool]:
+    """Return (present, value), rejecting non-boolean safety decisions."""
+
+    for key in keys:
+        if key in record:
+            value = record[key]
+            if not isinstance(value, bool):
+                raise AuthorityError(f"{label}.{key} must be a boolean")
+            return True, value
+    return False, False
+
+
+def _eligibility_decision(
+    record: dict[str, Any],
+    *,
+    defaults: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Validate one explicit non-synthetic, non-duplicate intake decision."""
+
+    defaults = defaults or {}
+    digest = _record_source_digest(record, label="eligibility record")
+    eligible_value = record.get("eligible", record.get("is_eligible", defaults.get("eligible")))
+    status = record.get(
+        "eligibility_status",
+        record.get("status", record.get("decision", defaults.get("eligibility_status"))),
+    )
+    if not isinstance(eligible_value, bool):
+        raise AuthorityError(f"eligibility record is missing explicit eligible boolean: {digest}")
+    if not eligible_value:
+        raise AuthorityError(f"source is not eligible for authority intake: {digest}")
+    if status is not None and (
+        not isinstance(status, str) or status.casefold() not in {"eligible", "accepted", "include"}
+    ):
+        raise AuthorityError(f"source eligibility decision is not accepted: {digest}")
+
+    synthetic_present, synthetic = _bool_field(
+        record,
+        ("synthetic", "is_synthetic", "synthetic_source", "generated", "fixture"),
+        label=f"eligibility record {digest}",
+    )
+    if not synthetic_present:
+        synthetic_present, synthetic = _bool_field(
+            defaults,
+            ("synthetic", "is_synthetic", "synthetic_source", "generated", "fixture"),
+            label=f"eligibility defaults {digest}",
+        )
+    if not synthetic_present:
+        raise AuthorityError(
+            f"eligibility record must explicitly mark synthetic=false: {digest}"
+        )
+    if synthetic:
+        raise AuthorityError(f"synthetic source cannot enter authority intake: {digest}")
+
+    duplicate_present, duplicate = _bool_field(
+        record,
+        ("duplicate", "is_duplicate"),
+        label=f"eligibility record {digest}",
+    )
+    if not duplicate_present:
+        duplicate_present, duplicate = _bool_field(
+            defaults,
+            ("duplicate", "is_duplicate"),
+            label=f"eligibility defaults {digest}",
+        )
+    if not duplicate_present and (
+        "duplicate_of" in record or "duplicate_sha256" in record or "duplicate_of" in defaults
+    ):
+        # An explicit null duplicate reference is an equally clear negative
+        # decision and is common in hash-keyed eligibility worksheets.
+        duplicate_present = True
+        duplicate = False
+    if not duplicate_present:
+        raise AuthorityError(
+            f"eligibility record must explicitly mark duplicate=false: {digest}"
+        )
+    duplicate_of = record.get(
+        "duplicate_of",
+        record.get("duplicate_sha256", defaults.get("duplicate_of")),
+    )
+    if duplicate_of is not None:
+        if not isinstance(duplicate_of, str) or not SHA256_RE.fullmatch(
+            duplicate_of.removeprefix("sha256:")
+        ):
+            raise AuthorityError(f"eligibility duplicate_of is invalid: {digest}")
+        duplicate = True
+    if duplicate_present and duplicate:
+        raise AuthorityError(f"duplicate source cannot enter authority intake: {digest}")
+    if duplicate_of is not None:
+        raise AuthorityError(f"duplicate source cannot enter authority intake: {digest}")
+
+    return {
+        "source_sha256": digest,
+        "eligible": True,
+        "synthetic": False,
+        "duplicate": False,
+        "duplicate_of": None,
+        "eligibility_status": "eligible",
+        "reason": record.get("reason", defaults.get("reason")),
+    }
+
+
+def _load_eligibility_manifest(path: Path) -> tuple[dict[str, Any], str, dict[str, dict[str, Any]]]:
+    path = _safe_existing_file(path, label="eligibility manifest")
+    raw = _read_json(path, label="eligibility manifest")
+    if not isinstance(raw, dict):
+        raise AuthorityError("eligibility manifest must be an object")
+    records = _json_records(
+        raw,
+        labels=("documents", "eligibility", "records", "items"),
+        label="eligibility manifest",
+    )
+    defaults = {
+        key: raw[key]
+        for key in (
+            "eligible",
+            "is_eligible",
+            "eligibility_status",
+            "synthetic",
+            "is_synthetic",
+            "synthetic_source",
+            "generated",
+            "fixture",
+            "duplicate",
+            "is_duplicate",
+            "duplicate_of",
+            "reason",
+        )
+        if key in raw and not isinstance(raw[key], (list, dict))
+    }
+    decisions: dict[str, dict[str, Any]] = {}
+    for record in records:
+        digest = _record_source_digest(record, label="eligibility record")
+        if digest in decisions:
+            raise AuthorityError(f"duplicate eligibility decision: {digest}")
+        decisions[digest] = _eligibility_decision(record, defaults=defaults)
+    if not decisions:
+        raise AuthorityError("eligibility manifest contains no decisions")
+    return raw, sha256_file(path), decisions
+
+
+def _discover_intake_pdfs(source_roots: list[Path]) -> list[dict[str, Any]]:
+    """Discover unique PDF bytes without following links or mutating the vault."""
+
+    if not source_roots:
+        raise AuthorityError("working intake requires at least one source root")
+    discovered: list[dict[str, Any]] = []
+    by_digest: dict[str, dict[str, Any]] = {}
+    for root_value in source_roots:
+        root = _assert_external(root_value, label="intake source root")
+        root = _safe_directory(root, label="intake source root")
+        for source in _iter_regular_files(root):
+            if source.suffix.casefold() != ".pdf":
+                continue
+            digest = sha256_file(source)
+            if digest in by_digest:
+                prior = by_digest[digest]
+                raise AuthorityError(
+                    "duplicate PDF content cannot enter working intake: "
+                    f"{digest} ({prior['source_relpath']} and "
+                    f"{source.relative_to(root).as_posix()})"
+                )
+            try:
+                pdf = fitz.open(source)
+                page_count = pdf.page_count
+                pdf.close()
+            except Exception as error:
+                raise AuthorityError(f"source is not a readable PDF: {source}") from error
+            if page_count < 1:
+                raise AuthorityError(f"source PDF has no pages: {source}")
+            relative = _assert_relative(
+                source.relative_to(root).as_posix(), label="intake source relative path"
+            )
+            item = {
+                "source": source,
+                "source_sha256": digest,
+                "source_relpath": relative,
+                "size_bytes": source.stat().st_size,
+                "page_count": page_count,
+            }
+            by_digest[digest] = item
+            discovered.append(item)
+    return sorted(discovered, key=lambda item: item["source_sha256"])
+
+
+def _working_inventory_payload(
+    vault: Path,
+    discovered: list[dict[str, Any]],
+    *,
+    eligibility_digest: str,
+    expected_count: int,
+) -> dict[str, Any]:
+    documents: list[dict[str, Any]] = []
+    for item in discovered:
+        object_path = _store_object(vault, item["source"], item["source_sha256"], ".pdf")
+        documents.append(
+            {
+                "source_sha256": item["source_sha256"],
+                "cohorts": [],
+                "object_relpath": object_path.relative_to(vault).as_posix(),
+                "source_relpath": item["source_relpath"],
+                "source_relpaths": {"working152": item["source_relpath"]},
+                "size_bytes": item["size_bytes"],
+                "page_count": item["page_count"],
+                "eligibility_status": "eligible",
+                "synthetic": False,
+                "duplicate": False,
+            }
+        )
+    counts = {name: 0 for name in COHORT_COUNTS}
+    return {
+        "vault_version": VAULT_VERSION,
+        "inventory_version": WORKING_INVENTORY_VERSION,
+        "inventory_kind": WORKING_INVENTORY_NAME,
+        "authority_status": "non_authoritative_working152",
+        "authority_claim": "never_authoritative",
+        "authoritative": False,
+        "working_target_count": expected_count,
+        "documents": documents,
+        "cohort_counts": counts,
+        "unassigned_count": len(documents),
+        "master_unique_documents": 0,
+        "membership_gaps": dict(COHORT_COUNTS),
+        "membership_complete": False,
+        "intake": {
+            "intake_version": INTAKE_VERSION,
+            "eligibility_manifest_sha256": eligibility_digest,
+            "discovered_count": len(documents),
+            "eligible_count": len(documents),
+            "rejected_count": 0,
+            "duplicate_count": 0,
+            "synthetic_count": 0,
+            "source_sha256s": [item["source_sha256"] for item in documents],
+        },
+    }
+
+
+def _inventory_non_authoritative(payload: dict[str, Any]) -> bool:
+    return (
+        payload.get("authority_status") in NON_AUTHORITATIVE_INVENTORY_STATUSES
+        or payload.get("inventory_kind") == WORKING_INVENTORY_NAME
+        or payload.get("inventory_version") == WORKING_INVENTORY_VERSION
+    )
+
+
 def _discover_cohorts(root: Path) -> dict[str, Path]:
     children = {
         child.name: child
@@ -325,7 +644,10 @@ def _discover_cohorts(root: Path) -> dict[str, Path]:
 def _load_inventory(vault: Path, explicit: Path | None = None) -> tuple[dict[str, Any], Path, str]:
     path = _find_control(vault, ("inventory.json",), explicit)
     payload = _read_json(path, label="inventory")
-    if not isinstance(payload, dict) or payload.get("inventory_version") != INVENTORY_VERSION:
+    if not isinstance(payload, dict) or payload.get("inventory_version") not in {
+        INVENTORY_VERSION,
+        WORKING_INVENTORY_VERSION,
+    }:
         raise AuthorityError("invalid authority inventory version")
     return payload, path, sha256_file(path)
 
@@ -429,6 +751,18 @@ def _validate_membership(inventory: dict[str, Any], *, require_complete: bool) -
     counts: Counter[str] = Counter()
     for document in documents:
         cohorts = document["cohorts"]
+        if require_complete:
+            cohort_set = set(cohorts)
+            if "production14" in cohort_set and "passing36" not in cohort_set:
+                raise AuthorityError(
+                    "production14 documents must also belong to passing36: "
+                    f"{document['source_sha256']}"
+                )
+            if "passing36" in cohort_set and MASTER_COHORT not in cohort_set:
+                raise AuthorityError(
+                    "passing36 documents must also belong to staging159: "
+                    f"{document['source_sha256']}"
+                )
         if require_complete and MASTER_COHORT not in cohorts:
             raise AuthorityError(
                 f"authority cohort subsets must belong to {MASTER_COHORT}: "
@@ -1007,10 +1341,35 @@ def inventory(
         list[Path] | None, typer.Option("--source-root", "--input-root")
     ] = None,
     cohort: Annotated[list[str] | None, typer.Option("--cohort")] = None,
+    working: Annotated[
+        bool,
+        typer.Option(
+            "--working",
+            help="Use the explicit non-authoritative working152 intake boundary.",
+        ),
+    ] = False,
+    eligibility: Annotated[
+        Path | None, typer.Option("--eligibility", "--eligibility-manifest")
+    ] = None,
+    expected_count: Annotated[
+        int, typer.Option("--expected-count", min=1)
+    ] = WORKING_INVENTORY_COUNT,
     output: Annotated[Path | None, typer.Option("--output")] = None,
     vault_override: Annotated[Path | None, typer.Option("--vault")] = None,
 ) -> None:
     vault = _effective_vault(ctx, vault_override)
+    if working:
+        if cohort:
+            raise typer.BadParameter("--working cannot be combined with --cohort")
+        intake(
+            ctx,
+            source_root=source_root,
+            eligibility=eligibility,
+            expected_count=expected_count,
+            output=output,
+            vault_override=vault_override,
+        )
+        return
     assignments = _parse_assignments(cohort or [], option="--cohort")
     source_roots = list(source_root or [])
     if assignments and source_roots:
@@ -1105,6 +1464,10 @@ def inventory(
         },
         "membership_complete": membership_complete,
     }
+    if payload["unassigned_count"]:
+        payload["authority_status"] = "non_authoritative_partial_inventory"
+        payload["authority_claim"] = "not_sealed"
+        payload["authoritative"] = False
     destination = _assert_external(
         output or _control_path(vault, "inventory.json"), label="inventory output"
     )
@@ -1118,6 +1481,328 @@ def inventory(
                 "cohort_counts": payload["cohort_counts"],
                 "membership_gaps": payload["membership_gaps"],
                 "membership_complete": membership_complete,
+            }
+        )
+    )
+
+
+@app.command("intake")
+def intake(
+    ctx: typer.Context,
+    source_root: Annotated[
+        list[Path] | None, typer.Option("--source-root", "--input-root")
+    ] = None,
+    eligibility: Annotated[
+        Path | None, typer.Option("--eligibility", "--eligibility-manifest")
+    ] = None,
+    expected_count: Annotated[
+        int, typer.Option("--expected-count", min=1)
+    ] = WORKING_INVENTORY_COUNT,
+    output: Annotated[Path | None, typer.Option("--output")] = None,
+    vault_override: Annotated[Path | None, typer.Option("--vault")] = None,
+) -> None:
+    """Intake an explicitly non-authoritative working152 source inventory.
+
+    This command deliberately requires an eligibility worksheet and refuses
+    synthetic, duplicate, rejected, or unclassified sources.  It writes only
+    content-addressed PDFs and control JSON under the external vault; it never
+    creates gold or a seal.
+    """
+
+    vault = _effective_vault(ctx, vault_override)
+    if eligibility is None:
+        raise AuthorityError(
+            "working152 intake requires --eligibility with explicit "
+            "eligible/synthetic/duplicate decisions"
+        )
+    raw_eligibility, eligibility_digest, decisions = _load_eligibility_manifest(eligibility)
+    discovered = _discover_intake_pdfs(list(source_root or []))
+    discovered_hashes = {item["source_sha256"] for item in discovered}
+    decision_hashes = set(decisions)
+    missing = sorted(discovered_hashes - decision_hashes)
+    unknown = sorted(decision_hashes - discovered_hashes)
+    if missing:
+        raise AuthorityError(
+            "eligibility manifest is incomplete; every discovered PDF needs a decision: "
+            + ", ".join(missing)
+        )
+    if unknown:
+        raise AuthorityError(
+            "eligibility manifest contains sources outside intake roots: " + ", ".join(unknown)
+        )
+    if len(discovered) != expected_count:
+        raise AuthorityError(
+            f"{WORKING_INVENTORY_NAME} requires exactly {expected_count} unique eligible PDFs; "
+            f"found {len(discovered)}"
+        )
+
+    payload = _working_inventory_payload(
+        vault,
+        discovered,
+        eligibility_digest=eligibility_digest,
+        expected_count=expected_count,
+    )
+    payload["intake"]["eligibility_source_sha256"] = eligibility_digest
+    payload["intake"]["manifest_version"] = raw_eligibility.get("manifest_version")
+    payload["intake"]["decisions"] = [decisions[digest] for digest in sorted(decisions)]
+    destination = _assert_external(
+        output or _control_path(vault, "working152-inventory.json"),
+        label="working inventory output",
+    )
+    digest = _write_json(destination, payload)
+    typer.echo(
+        json.dumps(
+            {
+                "inventory": str(destination),
+                "sha256": digest,
+                "authority_status": payload["authority_status"],
+                "inventory_kind": WORKING_INVENTORY_NAME,
+                "documents": len(discovered),
+                "seal_allowed": False,
+            }
+        )
+    )
+
+
+@app.command("working-inventory")
+def working_inventory_alias(
+    ctx: typer.Context,
+    source_root: Annotated[
+        list[Path] | None, typer.Option("--source-root", "--input-root")
+    ] = None,
+    eligibility: Annotated[
+        Path | None, typer.Option("--eligibility", "--eligibility-manifest")
+    ] = None,
+    expected_count: Annotated[
+        int, typer.Option("--expected-count", min=1)
+    ] = WORKING_INVENTORY_COUNT,
+    output: Annotated[Path | None, typer.Option("--output")] = None,
+    vault_override: Annotated[Path | None, typer.Option("--vault")] = None,
+) -> None:
+    """Alias for :func:`intake` used by corpus operators."""
+
+    intake(
+        ctx,
+        source_root=source_root,
+        eligibility=eligibility,
+        expected_count=expected_count,
+        output=output,
+        vault_override=vault_override,
+    )
+
+
+def _assignment_manifest_sets(raw: Any) -> dict[str, list[str]]:
+    if not isinstance(raw, dict):
+        raise AuthorityError("assignment manifest must be an object")
+    result: dict[str, list[str]] = {}
+    source = raw.get("assignments", raw.get("cohorts", raw))
+    if isinstance(source, dict):
+        for name in COHORT_COUNTS:
+            if name in source:
+                values = source[name]
+                if not isinstance(values, list):
+                    raise AuthorityError(f"assignment {name} must be a list")
+                result[name] = _sha256_values(
+                    [str(value) for value in values], label=f"assignment {name}"
+                )
+    documents = raw.get("documents")
+    if documents is not None:
+        if not isinstance(documents, list):
+            raise AuthorityError("assignment documents must be a list")
+        for item in documents:
+            if not isinstance(item, dict):
+                raise AuthorityError("assignment document must be an object")
+            digest = _record_source_digest(item, label="assignment document")
+            cohorts = item.get("cohorts", item.get("memberships"))
+            if cohorts is None and item.get("cohort") is not None:
+                cohorts = [item["cohort"]]
+            if not isinstance(cohorts, list):
+                raise AuthorityError(f"assignment document has no cohorts: {digest}")
+            for name in cohorts:
+                if name not in COHORT_COUNTS:
+                    raise AuthorityError(f"assignment document has unknown cohort: {name}")
+                result.setdefault(name, []).append(digest)
+        for name in tuple(result):
+            result[name] = _sha256_values(result[name], label=f"assignment {name}")
+    return result
+
+
+def _load_assignment_manifest(path: Path) -> tuple[dict[str, Any], str, dict[str, list[str]]]:
+    path = _safe_existing_file(path, label="assignment manifest")
+    raw = _read_json(path, label="assignment manifest")
+    assignments = _assignment_manifest_sets(raw)
+    if not assignments:
+        raise AuthorityError("assignment manifest contains no cohort assignments")
+    return raw, sha256_file(path), assignments
+
+
+def _assign_documents(
+    inventory: dict[str, Any],
+    assignments: dict[str, list[str]],
+    *,
+    allow_incomplete: bool,
+) -> tuple[dict[str, Any], dict[str, int]]:
+    documents = _inventory_documents(inventory)
+    by_digest = {item["source_sha256"]: item for item in documents}
+    all_known = set(by_digest)
+    sets = {name: set(values) for name, values in assignments.items()}
+    for name in COHORT_COUNTS:
+        sets.setdefault(name, set())
+    assigned = set().union(*sets.values())
+    unknown = sorted(assigned - all_known)
+    if unknown:
+        raise AuthorityError(
+            "assignment references sources outside inventory: " + ", ".join(unknown)
+        )
+    if any(len(values) != len(sets[name]) for name, values in assignments.items()):
+        raise AuthorityError("assignment contains duplicate source hashes")
+    if not sets["production14"] <= sets["passing36"]:
+        raise AuthorityError("production14 assignment must be a subset of passing36")
+    if not sets["passing36"] <= sets["staging159"]:
+        raise AuthorityError("passing36 assignment must be a subset of staging159")
+    expected = COHORT_COUNTS
+    wrong = {
+        name: (len(sets[name]), expected[name])
+        for name in expected
+        if len(sets[name]) != expected[name]
+    }
+    if wrong and not allow_incomplete:
+        raise AuthorityError(
+            "assignment does not satisfy exact authority cohort counts: "
+            + json.dumps(wrong, sort_keys=True)
+        )
+    if not allow_incomplete and set(sets["staging159"]) != all_known:
+        missing = sorted(all_known - sets["staging159"])
+        extra = sorted(sets["staging159"] - all_known)
+        raise AuthorityError(
+            "exact staging159 assignment must include every inventory document; "
+            f"missing={missing}, extra={extra}"
+        )
+    assigned_documents: list[dict[str, Any]] = []
+    for original in documents:
+        document = dict(original)
+        document["cohorts"] = [
+            name for name in COHORT_COUNTS if original["source_sha256"] in sets[name]
+        ]
+        assigned_documents.append(document)
+    assigned_documents.sort(key=lambda item: item["source_sha256"])
+    counts = {
+        name: sum(name in item["cohorts"] for item in assigned_documents)
+        for name in COHORT_COUNTS
+    }
+    payload = dict(inventory)
+    payload["documents"] = assigned_documents
+    payload["cohort_counts"] = counts
+    payload["unassigned_count"] = sum(not item["cohorts"] for item in assigned_documents)
+    payload["master_unique_documents"] = counts[MASTER_COHORT]
+    payload["membership_gaps"] = {
+        name: max(expected[name] - counts[name], 0) for name in expected
+    }
+    payload["membership_complete"] = not wrong and not payload["unassigned_count"]
+    return payload, counts
+
+
+@app.command("assign")
+def assign(
+    ctx: typer.Context,
+    inventory_path: Annotated[Path | None, typer.Option("--inventory")] = None,
+    assignment_path: Annotated[
+        Path | None, typer.Option("--assignment", "--assignment-manifest")
+    ] = None,
+    production14: Annotated[
+        list[str] | None, typer.Option("--production14", "--production")
+    ] = None,
+    passing36: Annotated[list[str] | None, typer.Option("--passing36", "--passing")] = None,
+    staging159: Annotated[list[str] | None, typer.Option("--staging159", "--staging")] = None,
+    auto: Annotated[bool, typer.Option("--auto")] = False,
+    allow_incomplete: Annotated[
+        bool,
+        typer.Option(
+            "--allow-incomplete", help="Write a non-authoritative partial assignment."
+        ),
+    ] = False,
+    output: Annotated[Path | None, typer.Option("--output")] = None,
+    vault_override: Annotated[Path | None, typer.Option("--vault")] = None,
+) -> None:
+    """Assign deterministic nested authority cohorts without changing source bytes."""
+
+    vault = _effective_vault(ctx, vault_override)
+    inventory_payload, _inventory_file, inventory_digest = _load_inventory(vault, inventory_path)
+    explicit_options = any((production14, passing36, staging159))
+    if assignment_path is not None and explicit_options:
+        raise AuthorityError("use --assignment or explicit cohort options, not both")
+    assignments: dict[str, list[str]] = {}
+    assignment_manifest_digest: str | None = None
+    if assignment_path is not None:
+        _raw, assignment_manifest_digest, assignments = _load_assignment_manifest(assignment_path)
+    elif explicit_options:
+        assignments = {
+            "production14": _sha256_values(production14 or [], label="--production14"),
+            "passing36": _sha256_values(passing36 or [], label="--passing36"),
+            "staging159": _sha256_values(staging159 or [], label="--staging159"),
+        }
+    elif auto:
+        hashes = sorted(item["source_sha256"] for item in _inventory_documents(inventory_payload))
+        if len(hashes) != COHORT_COUNTS[MASTER_COHORT]:
+            raise AuthorityError(
+                "--auto requires exactly 159 inventory documents before deterministic assignment"
+            )
+        assignments = {
+            "production14": hashes[: COHORT_COUNTS["production14"]],
+            "passing36": hashes[: COHORT_COUNTS["passing36"]],
+            "staging159": hashes,
+        }
+    else:
+        assignments = {
+            name: [
+                item["source_sha256"]
+                for item in _inventory_documents(inventory_payload)
+                if name in item.get("cohorts", [])
+            ]
+            for name in COHORT_COUNTS
+        }
+
+    payload, counts = _assign_documents(
+        inventory_payload, assignments, allow_incomplete=allow_incomplete
+    )
+    complete = all(counts[name] == COHORT_COUNTS[name] for name in COHORT_COUNTS) and not any(
+        not item.get("cohorts") for item in payload["documents"]
+    )
+    payload["assignment_version"] = ASSIGNMENT_VERSION
+    payload["inventory_sha256"] = inventory_digest
+    payload["assignment"] = {
+        "assignment_manifest_sha256": assignment_manifest_digest,
+        "strategy": "lexicographic_source_sha256" if auto else "explicit_source_sha256",
+        "nested": True,
+        "exact": complete,
+        "cohort_counts": counts,
+        "cohorts": {
+            name: sorted(
+                item["source_sha256"]
+                for item in payload["documents"]
+                if name in item.get("cohorts", [])
+            )
+            for name in COHORT_COUNTS
+        },
+    }
+    payload["authority_status"] = (
+        "assigned_pending_reviews" if complete else "non_authoritative_partial_assignment"
+    )
+    payload["authority_claim"] = "not_sealed"
+    payload["authoritative"] = False
+    destination = _assert_external(
+        output or _control_path(vault, "assigned-inventory.json"), label="assigned inventory output"
+    )
+    digest = _write_json(destination, payload)
+    typer.echo(
+        json.dumps(
+            {
+                "inventory": str(destination),
+                "sha256": digest,
+                "cohort_counts": counts,
+                "membership_complete": complete,
+                "authority_status": payload["authority_status"],
+                "seal_allowed": False,
             }
         )
     )
@@ -1266,6 +1951,287 @@ def render(
             {"render_manifest": str(destination), "sha256": digest, "documents": len(rendered)}
         )
     )
+
+
+def _review_queue_payload(
+    inventory: dict[str, Any],
+    inventory_digest: str,
+    render_manifest: dict[str, Any],
+    render_digest: str,
+    *,
+    requested: set[str] | None = None,
+) -> dict[str, Any]:
+    documents = _inventory_documents(inventory)
+    render_documents = {
+        item.get("document_sha256"): item
+        for item in render_manifest.get("documents", [])
+        if isinstance(item, dict)
+    }
+    document_hashes = {item["source_sha256"] for item in documents}
+    if set(render_documents) - document_hashes:
+        raise AuthorityError("render manifest contains documents outside the inventory")
+    selected = [
+        item
+        for item in documents
+        if requested is None or item["source_sha256"] in requested
+    ]
+    if requested is not None and requested - {item["source_sha256"] for item in selected}:
+        raise AuthorityError("review queue source hash is not in inventory")
+    selected.sort(key=lambda item: item["source_sha256"])
+    items: list[dict[str, Any]] = []
+    for document in selected:
+        digest = document["source_sha256"]
+        rendered = render_documents.get(digest)
+        if not isinstance(rendered, dict):
+            raise AuthorityError(f"review queue source has no rendered document: {digest}")
+        pages = _rendered_page_hashes(rendered, digest)
+        page_items = [
+            {
+                "page_number": page["page_number"],
+                "image_sha256": page["sha256"],
+                "image_relative_path": page["relative_path"],
+                "width": page.get("width"),
+                "height": page.get("height"),
+                "dpi": page.get("dpi"),
+                "colorspace": page.get("colorspace"),
+            }
+            for page in pages
+        ]
+        item = {
+            "source_sha256": digest,
+            "document_id": source_document_id_for(digest)
+            if source_document_id_for is not None
+            else digest,
+            "cohorts": list(document.get("cohorts", [])),
+            "state": "pending",
+            "pages": page_items,
+        }
+        items.append(item)
+    if not items:
+        raise AuthorityError("review queue requires at least one rendered inventory document")
+    passes = []
+    pass_metadata = {
+        "independent_a": {"blind": True, "independent_first": False},
+        "independent_b": {"blind": True, "independent_first": False},
+        "adjudicator": {"blind": False, "independent_first": True},
+        "red_team": {"blind": True, "independent_first": False},
+    }
+    for kind in REVIEW_KINDS:
+        passes.append(
+            {
+                "review_kind": kind,
+                **pass_metadata[kind],
+                "machine_output_allowed": False,
+                "items": items,
+            }
+        )
+    return {
+        "vault_version": VAULT_VERSION,
+        "queue_version": REVIEW_QUEUE_VERSION,
+        "authority_status": "non_authoritative_review_queue",
+        "authority_claim": "queue_only_no_gold_or_seal",
+        "authoritative": False,
+        "inventory_sha256": inventory_digest,
+        "render_manifest_sha256": render_digest,
+        "document_count": len(items),
+        "page_count": sum(len(item["pages"]) for item in items),
+        "review_kinds": list(REVIEW_KINDS),
+        "passes": passes,
+        # The mapping is intentionally duplicated as a convenience for
+        # operators and consumers that prefer keyed queues.  Both forms are
+        # generated from the same sorted item list and validated together.
+        "queues": {item["review_kind"]: item["items"] for item in passes},
+    }
+
+
+def _validate_review_queue_payload(
+    payload: dict[str, Any],
+    *,
+    inventory_digest: str,
+    render_digest: str,
+    inventory_sources: set[str] | None = None,
+    render_pages: dict[str, list[str]] | None = None,
+) -> None:
+    if payload.get("queue_version") != REVIEW_QUEUE_VERSION:
+        raise AuthorityError("invalid authority review queue version")
+    if payload.get("authority_status") != "non_authoritative_review_queue":
+        raise AuthorityError("review queue must remain non-authoritative")
+    if payload.get("inventory_sha256") != inventory_digest:
+        raise AuthorityError("review queue inventory identity mismatch")
+    if payload.get("render_manifest_sha256") != render_digest:
+        raise AuthorityError("review queue render identity mismatch")
+    passes = payload.get("passes")
+    if not isinstance(passes, list) or [item.get("review_kind") for item in passes] != list(
+        REVIEW_KINDS
+    ):
+        raise AuthorityError("review queue must contain the four canonical Luna passes")
+    queues = payload.get("queues")
+    if not isinstance(queues, dict):
+        raise AuthorityError("review queue keyed queues are missing")
+    source_order: list[str] | None = None
+    expected_page_count: int | None = None
+    for item in passes:
+        if not isinstance(item, dict) or item.get("machine_output_allowed") is not False:
+            raise AuthorityError("review queue allows machine output")
+        entries = item.get("items")
+        if not isinstance(entries, list):
+            raise AuthorityError("review queue pass items are missing")
+        current_sources = []
+        page_count = 0
+        for entry in entries:
+            if not isinstance(entry, dict) or not SHA256_RE.fullmatch(
+                str(entry.get("source_sha256", ""))
+            ):
+                raise AuthorityError("review queue item has an invalid source hash")
+            source = entry["source_sha256"]
+            if inventory_sources is not None and source not in inventory_sources:
+                raise AuthorityError(f"review queue source is not in inventory: {source}")
+            current_sources.append(source)
+            pages = entry.get("pages")
+            if not isinstance(pages, list) or not pages:
+                raise AuthorityError(f"review queue item has no pages: {source}")
+            page_numbers = [page.get("page_number") for page in pages if isinstance(page, dict)]
+            if page_numbers != list(range(1, len(pages) + 1)):
+                raise AuthorityError(f"review queue page order is not deterministic: {source}")
+            if render_pages is not None and [
+                page.get("image_sha256") for page in pages
+            ] != render_pages.get(source):
+                raise AuthorityError(f"review queue page hashes do not match render: {source}")
+            page_count += len(pages)
+        if current_sources != sorted(current_sources):
+            raise AuthorityError("review queue source order is not deterministic")
+        if source_order is None:
+            source_order = current_sources
+            expected_page_count = page_count
+        elif source_order != current_sources or expected_page_count != page_count:
+            raise AuthorityError("review queues do not cover the same page set")
+        if queues.get(item["review_kind"]) != entries:
+            raise AuthorityError("review queue keyed and ordered forms differ")
+    if payload.get("document_count") != len(source_order or []):
+        raise AuthorityError("review queue document count is incorrect")
+    if payload.get("page_count") != (expected_page_count or 0):
+        raise AuthorityError("review queue page count is incorrect")
+
+
+def _write_review_queue(
+    ctx: typer.Context,
+    *,
+    inventory_path: Path | None,
+    render_manifest_path: Path | None,
+    source_sha256: list[str] | None,
+    output: Path | None,
+    vault_override: Path | None,
+) -> None:
+    vault = _effective_vault(ctx, vault_override)
+    inventory, _inventory_file, inventory_digest = _load_inventory(vault, inventory_path)
+    render_manifest, _render_file, render_digest = _load_render_manifest(
+        vault, render_manifest_path
+    )
+    if render_manifest.get("inventory_sha256") != inventory_digest:
+        raise AuthorityError("render manifest inventory identity mismatch")
+    _validate_render_manifest_documents(vault, render_manifest)
+    requested = set(_sha256_values(source_sha256 or [], label="--source-sha256"))
+    payload = _review_queue_payload(
+        inventory,
+        inventory_digest,
+        render_manifest,
+        render_digest,
+        requested=requested or None,
+    )
+    destination = _assert_external(
+        output or _control_path(vault, "review-queues.json"), label="review queue output"
+    )
+    digest = _write_json(destination, payload)
+    typer.echo(
+        json.dumps(
+            {
+                "review_queues": str(destination),
+                "sha256": digest,
+                "documents": payload["document_count"],
+                "pages": payload["page_count"],
+                "review_kinds": list(REVIEW_KINDS),
+                "authority_status": payload["authority_status"],
+            }
+        )
+    )
+
+
+@app.command("review-queue")
+def review_queue(
+    ctx: typer.Context,
+    inventory_path: Annotated[Path | None, typer.Option("--inventory")] = None,
+    render_manifest_path: Annotated[Path | None, typer.Option("--render-manifest")] = None,
+    source_sha256: Annotated[list[str] | None, typer.Option("--source-sha256", "--source")] = None,
+    output: Annotated[Path | None, typer.Option("--output")] = None,
+    vault_override: Annotated[Path | None, typer.Option("--vault")] = None,
+) -> None:
+    """Create deterministic, non-authoritative queues for all four Luna passes."""
+
+    _write_review_queue(
+        ctx,
+        inventory_path=inventory_path,
+        render_manifest_path=render_manifest_path,
+        source_sha256=source_sha256,
+        output=output,
+        vault_override=vault_override,
+    )
+
+
+@app.command("review-queues")
+def review_queues_alias(
+    ctx: typer.Context,
+    inventory_path: Annotated[Path | None, typer.Option("--inventory")] = None,
+    render_manifest_path: Annotated[Path | None, typer.Option("--render-manifest")] = None,
+    source_sha256: Annotated[list[str] | None, typer.Option("--source-sha256", "--source")] = None,
+    output: Annotated[Path | None, typer.Option("--output")] = None,
+    vault_override: Annotated[Path | None, typer.Option("--vault")] = None,
+) -> None:
+    """Plural alias for :func:`review_queue`."""
+
+    review_queue(
+        ctx,
+        inventory_path=inventory_path,
+        render_manifest_path=render_manifest_path,
+        source_sha256=source_sha256,
+        output=output,
+        vault_override=vault_override,
+    )
+
+
+@app.command("validate-review-queue")
+def validate_review_queue(
+    ctx: typer.Context,
+    queue_path: Annotated[Path | None, typer.Option("--queue", "--review-queues")] = None,
+    inventory_path: Annotated[Path | None, typer.Option("--inventory")] = None,
+    render_manifest_path: Annotated[Path | None, typer.Option("--render-manifest")] = None,
+    vault_override: Annotated[Path | None, typer.Option("--vault")] = None,
+) -> None:
+    """Validate queue identities and the four-pass, machine-blind shape."""
+
+    vault = _effective_vault(ctx, vault_override)
+    inventory, _inventory_file, inventory_digest = _load_inventory(vault, inventory_path)
+    render_manifest, _render_file, render_digest = _load_render_manifest(
+        vault, render_manifest_path
+    )
+    if render_manifest.get("inventory_sha256") != inventory_digest:
+        raise AuthorityError("render manifest inventory identity mismatch")
+    _validate_render_manifest_documents(vault, render_manifest)
+    path = _find_control(vault, ("review-queues.json",), queue_path)
+    payload = _read_json(path, label="review queue")
+    if not isinstance(payload, dict):
+        raise AuthorityError("review queue must be an object")
+    _validate_review_queue_payload(
+        payload,
+        inventory_digest=inventory_digest,
+        render_digest=render_digest,
+        inventory_sources={item["source_sha256"] for item in _inventory_documents(inventory)},
+        render_pages={
+            item["document_sha256"]: [page["sha256"] for page in item.get("pages", [])]
+            for item in render_manifest.get("documents", [])
+            if isinstance(item, dict)
+        },
+    )
+    typer.echo(json.dumps({"review_queues": str(path), "valid": True}))
 
 
 @app.command("validate-review")
@@ -1481,6 +2447,11 @@ def seal(
 ) -> None:
     vault = _effective_vault(ctx, vault_override)
     inventory, inventory_file, inventory_digest = _load_inventory(vault, inventory_path)
+    if _inventory_non_authoritative(inventory):
+        raise AuthorityError(
+            "non-authoritative working/partial inventory cannot be sealed; "
+            "use an exact assigned inventory after all reviews are frozen"
+        )
     review, review_file, review_digest = _read_report(
         vault, ("review-report.json",), review_report_path
     )
@@ -1624,6 +2595,333 @@ def seal(
     digest = _write_json(destination, payload)
     typer.echo(
         json.dumps({"seal": str(destination), "sha256": digest, "documents": len(documents)})
+    )
+
+
+def _optional_control_report(
+    vault: Path,
+    names: tuple[str, ...],
+    explicit: Path | None,
+) -> tuple[dict[str, Any] | None, Path | None, str | None, str | None]:
+    try:
+        path = _find_control(vault, names, explicit)
+    except AuthorityError as error:
+        return None, None, None, str(error)
+    try:
+        payload = _read_json(path, label="authority report")
+    except AuthorityError as error:
+        return None, path, None, str(error)
+    if not isinstance(payload, dict):
+        return None, path, None, "authority report must be an object"
+    return payload, path, sha256_file(path), None
+
+
+def _readiness_review_coverage(
+    vault: Path,
+    inventory: dict[str, Any],
+    render_manifest: dict[str, Any] | None,
+    review: dict[str, Any] | None,
+) -> dict[str, Any]:
+    documents = _inventory_documents(inventory)
+    expected_sources = {item["source_sha256"] for item in documents}
+    annotations = review.get("annotations") if isinstance(review, dict) else None
+    annotation_items = annotations if isinstance(annotations, list) else []
+    by_source: dict[str, dict[str, Any]] = {}
+    invalid = 0
+    for item in annotation_items:
+        if not isinstance(item, dict) or not isinstance(item.get("source_sha256"), str):
+            invalid += 1
+            continue
+        source = item["source_sha256"]
+        if source in by_source or source not in expected_sources:
+            invalid += 1
+            continue
+        by_source[source] = item
+    complete = 0
+    object_valid = 0
+    if render_manifest is not None:
+        render_documents = {
+            item.get("document_sha256"): item
+            for item in render_manifest.get("documents", [])
+            if isinstance(item, dict)
+        }
+        for source, summary in by_source.items():
+            rendered = render_documents.get(source)
+            if rendered is None:
+                continue
+            try:
+                _validated_review_objects(
+                    vault,
+                    summary,
+                    source_sha256=source,
+                    rendered_document=rendered,
+                )
+            except AuthorityError:
+                continue
+            complete += 1
+            object_valid += len(REVIEW_KINDS)
+    expected_records = len(documents) * len(REVIEW_KINDS)
+    return {
+        "documents": len(documents),
+        "annotations": len(by_source),
+        "complete_documents": complete,
+        "invalid_annotations": invalid,
+        "expected_review_records": expected_records,
+        "validated_review_records": object_valid,
+        "missing_review_documents": max(len(documents) - complete, 0),
+        "full_four_pass_complete": complete == len(documents) and len(documents) > 0,
+        "review_report_passed": bool(isinstance(review, dict) and review.get("passed") is True),
+    }
+
+
+def _seal_readiness_payload(
+    vault: Path,
+    *,
+    inventory: dict[str, Any] | None,
+    inventory_digest: str | None,
+    inventory_error: str | None,
+    render_manifest: dict[str, Any] | None,
+    render_digest: str | None,
+    render_error: str | None,
+    review: dict[str, Any] | None,
+    review_digest: str | None,
+    review_error: str | None,
+) -> dict[str, Any]:
+    blockers: list[dict[str, Any]] = []
+    counts = {name: 0 for name in COHORT_COUNTS}
+    documents: list[dict[str, Any]] = []
+    coverage_inventory: dict[str, Any] = {"documents": []}
+    membership_complete = False
+    if inventory is None:
+        blockers.append(
+            {
+                "code": "inventory_missing_or_invalid",
+                "message": inventory_error or "authority inventory is unavailable",
+            }
+        )
+    else:
+        try:
+            documents = _inventory_documents(inventory)
+            coverage_inventory = inventory
+            counts = _validate_membership(inventory, require_complete=False)
+        except AuthorityError as error:
+            blockers.append({"code": "inventory_invalid", "message": str(error)})
+        try:
+            _validate_membership(inventory, require_complete=True)
+            membership_complete = True
+        except AuthorityError as error:
+            blockers.append({"code": "nested_cohort_membership_incomplete", "message": str(error)})
+        if _inventory_non_authoritative(inventory):
+            blockers.append(
+                {
+                    "code": "non_authoritative_inventory",
+                    "message": "working152/partial inventories can never be sealed",
+                }
+            )
+        if inventory.get("inventory_kind") == WORKING_INVENTORY_NAME:
+            working_count = len(documents)
+            if working_count != WORKING_INVENTORY_COUNT:
+                blockers.append(
+                    {
+                        "code": "working152_count_mismatch",
+                        "observed": working_count,
+                        "required": WORKING_INVENTORY_COUNT,
+                    }
+                )
+        unsafe = [
+            item["source_sha256"]
+            for item in documents
+            if item.get("eligibility_status") not in (None, "eligible")
+            or item.get("synthetic") is True
+            or item.get("duplicate") is True
+        ]
+        if unsafe:
+            blockers.append(
+                {
+                    "code": "ineligible_synthetic_or_duplicate_sources",
+                    "count": len(unsafe),
+                    "source_sha256s": sorted(unsafe),
+                }
+            )
+
+    unique_pdf_gap = max(COHORT_COUNTS[MASTER_COHORT] - len(documents), 0)
+    staging_gap = max(COHORT_COUNTS[MASTER_COHORT] - counts[MASTER_COHORT], 0)
+    if unique_pdf_gap:
+        blockers.append(
+            {
+                "code": "missing_pdfs",
+                "count": unique_pdf_gap,
+                "required": COHORT_COUNTS[MASTER_COHORT],
+                "observed": len(documents),
+                "message": f"{unique_pdf_gap} PDFs are still missing from the 159-document master",
+            }
+        )
+    if staging_gap:
+        blockers.append(
+            {
+                "code": "staging159_short",
+                "count": staging_gap,
+                "required": COHORT_COUNTS[MASTER_COHORT],
+                "observed": counts[MASTER_COHORT],
+            }
+        )
+    for name, expected in COHORT_COUNTS.items():
+        if counts[name] != expected:
+            blockers.append(
+                {
+                    "code": f"{name}_count_mismatch",
+                    "cohort": name,
+                    "required": expected,
+                    "observed": counts[name],
+                    "missing": max(expected - counts[name], 0),
+                }
+            )
+
+    if render_manifest is None:
+        blockers.append(
+            {
+                "code": "render_manifest_missing_or_invalid",
+                "message": render_error or "render manifest is unavailable",
+            }
+        )
+    elif inventory_digest is not None:
+        if render_manifest.get("inventory_sha256") != inventory_digest:
+            blockers.append({"code": "render_inventory_identity_mismatch"})
+        try:
+            _validate_render_manifest_documents(vault, render_manifest)
+        except AuthorityError as error:
+            blockers.append({"code": "render_manifest_invalid", "message": str(error)})
+
+    review_coverage = _readiness_review_coverage(
+        vault, coverage_inventory, render_manifest, review
+    )
+    if review is None:
+        blockers.append(
+            {
+                "code": "full_four_pass_reviews_missing",
+                "count": review_coverage["expected_review_records"],
+                "message": review_error or "review report is unavailable",
+            }
+        )
+    else:
+        if review.get("review_version") != REVIEW_VERSION or review.get("passed") is not True:
+            blockers.append({"code": "review_report_not_passed"})
+        if inventory_digest is not None and review.get("inventory_sha256") != inventory_digest:
+            blockers.append({"code": "review_inventory_identity_mismatch"})
+        if render_digest is not None and review.get("render_manifest_sha256") != render_digest:
+            blockers.append({"code": "review_render_identity_mismatch"})
+        if review_coverage["missing_review_documents"]:
+            blockers.append(
+                {
+                    "code": "full_four_pass_reviews_missing",
+                    "count": review_coverage["missing_review_documents"],
+                    "missing_records": review_coverage["missing_review_documents"]
+                    * len(REVIEW_KINDS),
+                    "message": (
+                        "every document requires independent A, independent B, adjudicator, "
+                        "and red-team reviews"
+                    ),
+                }
+            )
+
+    seal_path = _control_path(vault, "authority-seal.json")
+    seal_present = seal_path.is_file() and not seal_path.is_symlink()
+    readable_blockers = [
+        item.get("message", item["code"])
+        for item in blockers
+        if isinstance(item, dict) and item.get("code")
+    ]
+    ready = not blockers and membership_complete and review_coverage["full_four_pass_complete"]
+    return {
+        "vault_version": VAULT_VERSION,
+        "readiness_version": SEAL_READINESS_VERSION,
+        "authority_status": "seal_ready" if ready else "not_ready",
+        "authority_claim": "no_authority_seal_claimed",
+        "authoritative": False,
+        "seal_ready": ready,
+        "ready": ready,
+        "seal_claim_allowed": False,
+        "authority_seal_present": seal_present,
+        "inventory_sha256": inventory_digest,
+        "render_manifest_sha256": render_digest,
+        "review_report_sha256": review_digest,
+        "required_cohort_counts": dict(COHORT_COUNTS),
+        "required_counts": dict(COHORT_COUNTS),
+        "cohort_counts": counts,
+        "observed_counts": counts,
+        "documents": len(documents),
+        "membership_complete": membership_complete,
+        "review_coverage": review_coverage,
+        "authority_contract": {
+            "cohort_counts": dict(COHORT_COUNTS),
+            "nested": "production14 ⊆ passing36 ⊆ staging159",
+            "seal_requires_exact_counts": True,
+        },
+        "remaining_blockers": blockers,
+        "blocking_reasons": readable_blockers,
+        "sensitive_objects_in_git": False,
+    }
+
+
+@app.command("seal-readiness")
+def seal_readiness(
+    ctx: typer.Context,
+    inventory_path: Annotated[Path | None, typer.Option("--inventory")] = None,
+    render_manifest_path: Annotated[Path | None, typer.Option("--render-manifest")] = None,
+    review_report_path: Annotated[Path | None, typer.Option("--review-report")] = None,
+    output: Annotated[Path | None, typer.Option("--output")] = None,
+    vault_override: Annotated[Path | None, typer.Option("--vault")] = None,
+) -> None:
+    """Write an exact readiness report without emitting or claiming a seal."""
+
+    vault = _effective_vault(ctx, vault_override)
+    inventory, _inventory_file, inventory_digest, inventory_error = _optional_control_report(
+        vault,
+        ("assigned-inventory.json", "working152-inventory.json", "inventory.json"),
+        inventory_path,
+    )
+    render_manifest, _render_file, render_digest, render_error = _optional_control_report(
+        vault, ("render-manifest.json",), render_manifest_path
+    )
+    review, _review_file, review_digest, review_error = _optional_control_report(
+        vault, ("review-report.json",), review_report_path
+    )
+    payload = _seal_readiness_payload(
+        vault,
+        inventory=inventory,
+        inventory_digest=inventory_digest,
+        inventory_error=inventory_error,
+        render_manifest=render_manifest,
+        render_digest=render_digest,
+        render_error=render_error,
+        review=review,
+        review_digest=review_digest,
+        review_error=review_error,
+    )
+    destination = _assert_external(
+        output or _control_path(vault, "seal-readiness.json"), label="seal readiness output"
+    )
+    _write_report_or_exit(destination, payload, passed=bool(payload["seal_ready"]))
+
+
+@app.command("seal-ready")
+def seal_ready_alias(
+    ctx: typer.Context,
+    inventory_path: Annotated[Path | None, typer.Option("--inventory")] = None,
+    render_manifest_path: Annotated[Path | None, typer.Option("--render-manifest")] = None,
+    review_report_path: Annotated[Path | None, typer.Option("--review-report")] = None,
+    output: Annotated[Path | None, typer.Option("--output")] = None,
+    vault_override: Annotated[Path | None, typer.Option("--vault")] = None,
+) -> None:
+    """Short alias for :func:`seal_readiness`."""
+
+    seal_readiness(
+        ctx,
+        inventory_path=inventory_path,
+        render_manifest_path=render_manifest_path,
+        review_report_path=review_report_path,
+        output=output,
+        vault_override=vault_override,
     )
 
 
@@ -2077,17 +3375,30 @@ def gate_m0_m4(
 
 
 __all__ = [
+    "ASSIGNMENT_VERSION",
     "AuthorityError",
     "COHORT_COUNTS",
     "DEFAULT_VAULT",
+    "INTAKE_VERSION",
+    "REVIEW_KINDS",
+    "REVIEW_QUEUE_VERSION",
+    "SEAL_READINESS_VERSION",
+    "WORKING_INVENTORY_COUNT",
+    "WORKING_INVENTORY_NAME",
+    "WORKING_INVENTORY_VERSION",
     "app",
+    "assign",
     "baseline",
     "evaluate",
     "gate_m0_m4",
+    "intake",
     "inventory",
     "render",
+    "review_queue",
     "seal",
+    "seal_readiness",
     "validate_review",
+    "validate_review_queue",
 ]
 
 

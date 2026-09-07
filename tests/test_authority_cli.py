@@ -381,3 +381,202 @@ def test_machine_output_cannot_supply_authority_gold(tmp_path: Path) -> None:
 
     assert result.exit_code != 0
     assert "may not supply authority-controlled gold" in str(result.exception)
+
+
+def _eligibility_manifest(paths: list[Path], *, synthetic: bool = False) -> dict[str, object]:
+    return {
+        "manifest_version": "working152_eligibility_v1",
+        "documents": [
+            {
+                "source_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                "eligible": True,
+                "synthetic": synthetic,
+                "duplicate": False,
+            }
+            for path in paths
+        ],
+    }
+
+
+def test_working_intake_requires_explicit_safe_decisions_and_stays_non_authoritative(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "working"
+    source_root.mkdir()
+    sources = [source_root / "a.pdf", source_root / "b.pdf"]
+    _pdf(sources[0], "first")
+    _pdf(sources[1], "second")
+    eligibility = tmp_path / "eligibility.json"
+    eligibility.write_text(json.dumps(_eligibility_manifest(sources)))
+    vault = tmp_path / "vault"
+
+    result = _run(
+        vault,
+        "intake",
+        "--source-root",
+        str(source_root),
+        "--eligibility",
+        str(eligibility),
+        "--expected-count",
+        "2",
+    )
+    assert result.exit_code == 0, result.stdout
+    payload = json.loads((vault / "control" / "working152-inventory.json").read_text())
+    assert payload["inventory_version"] == authority_cli.WORKING_INVENTORY_VERSION
+    assert payload["authority_status"] == "non_authoritative_working152"
+    assert payload["authority_claim"] == "never_authoritative"
+    assert payload["intake"]["eligible_count"] == 2
+    assert payload["intake"]["synthetic_count"] == 0
+    assert payload["intake"]["duplicate_count"] == 0
+
+    blocked = _run(
+        vault,
+        "seal",
+        "--inventory",
+        str(vault / "control" / "working152-inventory.json"),
+    )
+    assert blocked.exit_code != 0
+    assert "non-authoritative" in str(blocked.exception)
+
+
+def test_working_intake_rejects_synthetic_and_duplicate_bytes(tmp_path: Path) -> None:
+    source_root = tmp_path / "working"
+    source_root.mkdir()
+    source = source_root / "source.pdf"
+    _pdf(source)
+    eligibility = tmp_path / "synthetic.json"
+    eligibility.write_text(json.dumps(_eligibility_manifest([source], synthetic=True)))
+    synthetic = _run(
+        tmp_path / "synthetic-vault",
+        "intake",
+        "--source-root",
+        str(source_root),
+        "--eligibility",
+        str(eligibility),
+        "--expected-count",
+        "1",
+    )
+    assert synthetic.exit_code != 0
+    assert "synthetic" in str(synthetic.exception).lower()
+
+    duplicate_root = tmp_path / "duplicates"
+    duplicate_root.mkdir()
+    shutil.copyfile(source, duplicate_root / "same.pdf")
+    duplicate_eligibility = tmp_path / "duplicate.json"
+    duplicate_eligibility.write_text(
+        json.dumps(_eligibility_manifest([source, duplicate_root / "same.pdf"]))
+    )
+    duplicate = _run(
+        tmp_path / "duplicate-vault",
+        "intake",
+        "--source-root",
+        str(source_root),
+        "--source-root",
+        str(duplicate_root),
+        "--eligibility",
+        str(duplicate_eligibility),
+        "--expected-count",
+        "2",
+    )
+    assert duplicate.exit_code != 0
+    assert "duplicate" in str(duplicate.exception).lower()
+
+
+def test_nested_assignment_is_deterministic_and_rejects_non_nested_sets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        authority_cli,
+        "COHORT_COUNTS",
+        {"production14": 1, "passing36": 2, "staging159": 3},
+    )
+    vault = tmp_path / "vault"
+    source_root = tmp_path / "sources"
+    source_root.mkdir()
+    paths = [source_root / f"{name}.pdf" for name in ("c", "a", "b")]
+    for path in paths:
+        _pdf(path, path.stem)
+    inventory = _run(vault, "inventory", "--source-root", str(source_root))
+    assert inventory.exit_code == 0, inventory.stdout
+    digests = sorted(hashlib.sha256(path.read_bytes()).hexdigest() for path in paths)
+    assigned = _run(
+        vault,
+        "assign",
+        "--production14",
+        digests[0],
+        "--passing36",
+        ",".join(digests[:2]),
+        "--staging159",
+        ",".join(digests),
+    )
+    assert assigned.exit_code == 0, assigned.stdout
+    payload = json.loads((vault / "control" / "assigned-inventory.json").read_text())
+    assert payload["membership_complete"] is True
+    assert payload["assignment"]["strategy"] == "explicit_source_sha256"
+    assert [item["source_sha256"] for item in payload["documents"]] == digests
+    for item in payload["documents"]:
+        if item["source_sha256"] == digests[0]:
+            assert item["cohorts"] == ["production14", "passing36", "staging159"]
+        elif item["source_sha256"] == digests[1]:
+            assert item["cohorts"] == ["passing36", "staging159"]
+        else:
+            assert item["cohorts"] == ["staging159"]
+
+    non_nested = _run(
+        vault,
+        "assign",
+        "--production14",
+        digests[0],
+        "--passing36",
+        digests[1],
+        "--staging159",
+        ",".join(digests),
+        "--output",
+        str(tmp_path / "bad-assignment.json"),
+    )
+    assert non_nested.exit_code != 0
+    assert "subset" in str(non_nested.exception)
+
+
+def test_review_queue_and_readiness_are_explicitly_non_authoritative(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        authority_cli,
+        "COHORT_COUNTS",
+        {"production14": 1, "passing36": 1, "staging159": 1},
+    )
+    vault = tmp_path / "vault"
+    source_root = tmp_path / "sources"
+    source_root.mkdir()
+    source = source_root / "bill.pdf"
+    _pdf(source)
+    inventory = _run(
+        vault,
+        "inventory",
+        "--cohort",
+        f"production14={source_root}",
+        "--cohort",
+        f"passing36={source_root}",
+        "--cohort",
+        f"staging159={source_root}",
+    )
+    assert inventory.exit_code == 0, inventory.stdout
+    rendered = _run(vault, "render")
+    assert rendered.exit_code == 0, rendered.stdout
+    queued = _run(vault, "review-queue")
+    assert queued.exit_code == 0, queued.stdout
+    queue = json.loads((vault / "control" / "review-queues.json").read_text())
+    assert queue["authority_status"] == "non_authoritative_review_queue"
+    assert queue["review_kinds"] == list(authority_cli.REVIEW_KINDS)
+    assert len(queue["passes"]) == 4
+    assert all(item["machine_output_allowed"] is False for item in queue["passes"])
+    assert _run(vault, "validate-review-queue").exit_code == 0
+
+    readiness = _run(vault, "seal-readiness", "--output", str(tmp_path / "readiness.json"))
+    assert readiness.exit_code == 1
+    report = json.loads((tmp_path / "readiness.json").read_text())
+    assert report["seal_ready"] is False
+    assert report["seal_claim_allowed"] is False
+    assert report["authority_claim"] == "no_authority_seal_claimed"
+    assert report["review_coverage"]["full_four_pass_complete"] is False
