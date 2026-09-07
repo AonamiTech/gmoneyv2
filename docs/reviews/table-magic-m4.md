@@ -1,7 +1,7 @@
 # Table Magic M4 Review
 
 Status: hold
-Date: 2026-09-04 UTC
+Date: 2026-09-07 UTC
 Owner: Codex
 Git SHAs: `1e3fced0a8e12a6a93e9f8a7c5682978f065c554`,
 `6ae7e4d20531a177895b3be4046aedda0f462057`,
@@ -11,7 +11,9 @@ Image digest: `sha256:d7f1b7c780746ef4c29a975da238591b1ca4caa1892aa441b4673d67c0
 Corpus manifest SHA-256: unavailable — inherited M2 external-data hold
 Gold/evaluator versions: unavailable
 Component/config versions: `gmoney_uvdoc_shadow_v1`, `gmoney_uvdoc_hf_to_paddle_v1`,
-`gmoney_uvdoc_preregistration_v1`, `gmoney_uvdoc_accuracy_v1`, `gmoney_uvdoc_gate_v1`;
+`gmoney_uvdoc_preregistration_v1` (diagnostic only), `gmoney_uvdoc_accuracy_v1` (diagnostic
+only), `gmoney_uvdoc_gate_v1` (non-promoting), `gmoney_uvdoc_preregistration_v2`,
+`gmoney_uvdoc_accuracy_v2`;
 model repository
 `PaddlePaddle/UVDoc_safetensors` at revision
 `7b8c629d7a15656889d0b21c73df206ac8a732b5`
@@ -20,9 +22,10 @@ model repository
 
 Hold M4 at the accuracy boundary. The adapter, exact-grid capture, independent reproduction,
 shadow-only V6 lineage, preregistration contract, and fail-closed gate runner are implemented.
-The isolated GPU substrate gate passes. M4 cannot move to `shadow` until the authoritative sealed
-14/36/159 corpus, audited detailed gold, evaluator identity, and baseline are available to prove
-curved gain and flat non-regression.
+The isolated GPU substrate gate passes. An isolated candidate may and should run in `shadow` mode
+for substrate and integration testing, but that does not promote M4. M4 cannot pass its accuracy
+boundary until the authoritative sealed 14/36/159 corpus, audited detailed gold, evaluator
+identity, and baseline are available to prove curved gain and flat non-regression.
 
 ## Change evaluated
 
@@ -35,6 +38,9 @@ curved gain and flat non-regression.
 - Prohibited shadow artifacts from production table, adapter, token, and evidence lineage.
 - Added a digest-bound gate runner that returns `hold` when authoritative accuracy evidence is
   missing and considers primary `UVDOC`, not the enhanced exploratory branch, for promotion.
+- Made the v1 gate explicitly diagnostic-only and non-promoting. The v2 gate recomputes the full
+  report from typed gold, baseline/candidate outputs, evaluator/baseline manifests, frozen cohort
+  evidence, and shadow downstream proofs before it can emit an M4 report.
 - Added a complete, shape-checked safetensors-to-Paddle checkpoint mapping after GPU testing found
   that PaddleX's generic loader silently left the pinned checkpoint unused.
 
@@ -78,7 +84,9 @@ current 168-test worker/UVDoc suite passed locally.
 
 ## Gate decision and rollback condition
 
-Keep `GMONEY_UVDOC_MODE=off`. The M4 gate requires every accepted image to reproduce from its
-stored grid, at least one preregistered curved failure to improve under primary `UVDOC`, no new
-critical error or lost previously-correct flat control, and unchanged authoritative output.
-Failure of any condition keeps M4 held and prohibits `enabled` mode.
+Keep `GMONEY_UVDOC_MODE=off` in the live production stack. Set it to `shadow` in an isolated
+candidate stack when testing so the actual UVDoc path, artifacts, and telemetry are exercised
+without changing canonical publication. The M4 gate requires every accepted image to reproduce
+from its stored grid, at least one preregistered curved failure to improve under primary `UVDOC`,
+no new critical error or lost previously-correct flat control, and unchanged authoritative
+output. Failure of any condition keeps M4 held and prohibits `enabled` mode.

@@ -6,7 +6,7 @@
 | --- | --- |
 | Status | Active technical roadmap |
 | Current milestone | M2 frozen-corpus hold; M3 dense-transform foundation promoted |
-| Last updated | 2026-09-04 |
+| Last updated | 2026-09-07 |
 | Primary problem | Curved or wavy photographed bills that defeat one global projective transform |
 | Scope | Extraction accuracy, evidence geometry, recovery, evaluation, and promotion gates |
 | Out of scope | Replacing GMoney's deterministic extractor, hospital-specific repair rules, and unsupported value invention |
@@ -46,7 +46,7 @@ unsafe assumptions:
 
 ## Current verified state
 
-The following facts are true of the implementation as of 2026-09-04:
+The following facts are true of the implementation as of 2026-09-07:
 
 - [`OfflineExtractor`](src/gmoney/extraction/offline.py) generates raw, geometry-normalized,
   and enhanced page candidates, then chooses one candidate for the whole page.
@@ -65,6 +65,9 @@ The following facts are true of the implementation as of 2026-09-04:
 - PaddleOCR 3.7.0, PaddleX 3.7.2, and PaddlePaddle 3.2.2 are installed. Table Recognition V2,
   UVDoc, and a llama.cpp-backed PaddleOCR-VL client are available but not integrated into
   GMoney's published extraction path.
+- The external authority-v1 vault contains 142 unique candidate PDFs rendered as 967 immutable
+  300-DPI sRGB pages. Both independent Luna visual-QA passes cover all 113 pages in the known
+  `production14` set. These image checks are non-authoritative and do not replace audited gold.
 
 ## Problem statement
 
@@ -641,7 +644,7 @@ Allowed states are `not_started`, `in_progress`, `blocked`, `shadow`, `promoted`
 | M1 | Canonical-image consistency | in_progress | All table adapters share one crop hash; no flat regression | `afe8caa`; frozen non-regression report pending |
 | M2 | Artifact and evidence V6 | in_progress | V5 read compatibility; tamper-safe lineage; <=2 px linear mapping error | `077d8e6`, `b947332`, `ec17b07`; integrity gates pass, frozen accuracy gate held in `docs/reviews/table-magic-m2.md` |
 | M3 | Dense transform foundation | promoted | Synthetic dense mappings pass and invalid grids fail closed | `057b6cf`, `5da09b6`, `76de77d`; local and isolated GPU-host certification in `docs/reviews/table-magic-m3.md` |
-| M4 | UVDoc feasibility/shadow | blocked | Reproducible grid, valid geometry, curved gain, no critical regression | Local and isolated GPU substrate gates pass at `0c8650a`; authoritative M2 corpus accuracy gate remains held in `docs/reviews/table-magic-m4.md` |
+| M4 | UVDoc feasibility/shadow | blocked | Reproducible grid, valid geometry, curved gain, no critical regression | Local and isolated GPU substrate gates pass; v1 is diagnostic-only and v2 recomputes sealed structural evidence; authoritative M2 corpus accuracy gate remains held in `docs/reviews/table-magic-m4.md` |
 | M5 | Per-table matching/selection | not_started | Stable identity, no lost/duplicate tables, holdout improvement | TBD |
 | M6 | Table V2 shadow benchmark | not_started | Unique recoveries and acceptable GPU/latency cost | TBD |
 | M7 | PaddleOCR-VL client A/B | not_started | Frozen metric winner selected; direct adapter retained on tie | TBD |
@@ -734,8 +737,11 @@ The 2026-09-04 isolated GPU review completed items 1, 2, 4, 5, and 6. It also fo
 artifact binding and replay timestamp defects before producing a passing final candidate. That
 candidate was stopped without a live cutover. Item 3 remains blocked because the authoritative
 sealed 14/36/159 inputs, audited gold, evaluator identity, and baseline are absent locally and on
-the GPU host. A source inventory found only 129 unique PDFs and no defensible audited replacement.
-See `docs/reviews/table-magic-m2.md`; M2 therefore remains `in_progress`.
+the GPU host. A broader 2026-09-07 inventory recovered 142 unique candidate PDFs and rendered all
+967 pages, leaving a shortage of at least 17 documents before eligibility and near-duplicate
+review. The external-vault bootstrap and independent image QA are recorded in
+`docs/reviews/table-magic-authority-bootstrap-2026-09-07.md`. See
+`docs/reviews/table-magic-m2.md`; M2 therefore remains `in_progress`.
 
 The user authorized M3 infrastructure work on 2026-09-04 despite this external-data hold. The
 exception permits the dormant dense-transform substrate and its synthetic certification only;
@@ -868,6 +874,10 @@ within one pixel per channel, UVDoc remains experimental and cannot be selected.
 
 Gate: at least one pre-registered curved failure improves without a new critical error on the
 frozen flat cohort. Passing this gate permits continued shadow evaluation, not a 95% claim.
+
+The production default remains `GMONEY_UVDOC_MODE=off` until this gate passes. Testing must use
+`GMONEY_UVDOC_MODE=shadow` in an isolated candidate stack so UVDoc artifacts and telemetry are
+actually exercised without affecting canonical publication. `enabled` remains prohibited.
 
 ### M5 — Match logical tables and select per table
 

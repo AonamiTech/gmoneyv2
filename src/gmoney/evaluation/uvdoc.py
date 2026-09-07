@@ -153,11 +153,17 @@ def evaluate_uvdoc_gate(
         if not curved_improvements:
             accuracy_failures.append("no_preregistered_curved_improvement")
 
-    passed = not shadow_failures and not accuracy_failures
+    diagnostic_passed = not shadow_failures and not accuracy_failures
     return {
         "report_version": "gmoney_uvdoc_gate_v1",
-        "status": "shadow" if passed else "hold",
-        "passed": passed,
+        "status": "diagnostic" if diagnostic_passed else "hold",
+        # V1 accepts caller-supplied failure IDs and is retained only for
+        # substrate diagnostics.  It can never authorize M4; v2 derives the
+        # comparison from sealed authority evaluator outcomes.
+        "passed": False,
+        "diagnostic_passed": diagnostic_passed,
+        "authority_status": "legacy_non_authoritative",
+        "promotion_permitted": False,
         "shadow_failures": shadow_failures,
         "accuracy_failures": sorted(set(accuracy_failures)),
         "improved_curved_failure_ids": sorted(curved_improvements),
@@ -201,7 +207,7 @@ def evaluate(
     )
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
-    if not report["passed"]:
+    if not report["diagnostic_passed"]:
         raise typer.Exit(1)
 
 

@@ -301,7 +301,10 @@ def test_uvdoc_gate_uses_primary_branch_and_flat_non_regression(
         ),
     )
     report = evaluate_uvdoc_gate(preregistration, tmp_path, accuracy)
-    assert report["status"] == "shadow"
+    assert report["status"] == "diagnostic"
+    assert report["diagnostic_passed"] is True
+    assert report["passed"] is False
+    assert report["promotion_permitted"] is False
     assert report["improved_curved_failure_ids"] == ["missing-row-1"]
 
     regressed = accuracy.model_copy(
