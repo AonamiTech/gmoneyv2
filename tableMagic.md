@@ -645,7 +645,7 @@ Allowed states are `not_started`, `in_progress`, `blocked`, `shadow`, `promoted`
 | M2 | Artifact and evidence V6 | in_progress | V5 read compatibility; tamper-safe lineage; <=2 px linear mapping error | `077d8e6`, `b947332`, `ec17b07`; integrity gates pass, frozen accuracy gate held in `docs/reviews/table-magic-m2.md` |
 | M3 | Dense transform foundation | promoted | Synthetic dense mappings pass and invalid grids fail closed | `057b6cf`, `5da09b6`, `76de77d`; local and isolated GPU-host certification in `docs/reviews/table-magic-m3.md` |
 | M4 | UVDoc feasibility/shadow | blocked | Reproducible grid, valid geometry, curved gain, no critical regression | `64bdf9c` passed isolated GPU shadow integration twice; v1 is diagnostic-only and v2 recomputes structural authority evidence; authoritative M2 corpus accuracy gate remains held in `docs/reviews/table-magic-m4.md` |
-| M5 | Per-table matching/selection | not_started | Stable identity, no lost/duplicate tables, holdout improvement | TBD |
+| M5 | Per-table matching/selection | in_progress | Stable identity, no lost/duplicate tables, holdout improvement | `32e4ad6`, `c879192`; contracts/runtime and local verification pass, authoritative/GPU accuracy gate held in `docs/reviews/table-magic-m5.md` |
 | M6 | Table V2 shadow benchmark | not_started | Unique recoveries and acceptable GPU/latency cost | TBD |
 | M7 | PaddleOCR-VL client A/B | not_started | Frozen metric winner selected; direct adapter retained on tie | TBD |
 | M8 | Targeted disagreement recovery | not_started | Recall gain without precision or grounding regression | TBD |
@@ -898,6 +898,15 @@ Deliverables:
 
 Gate: repeated runs produce identical matches; no source table is silently lost or duplicated;
 ambiguous matches abstain; curved-table metrics improve without violating release floors.
+
+The initial M5 implementation is shadow-only. `GMONEY_TABLE_SELECTION_MODE=off` remains the
+default; `shadow` persists stable logical identities, complete match edges, top-two rankings, and
+hypothetical whole-table winners without changing canonical V6 output. The runtime rejects
+`enabled` until a future authority-bound promotion exists. Local verification passed, and the GPU
+host was safely prepared without deploying M5. Corpus accuracy and GPU qualification remain held
+until the exact sealed 14/36/159 authority, evaluator, and baseline exist. The audited working
+inventory now contains 152 eligible real PDFs, leaving exactly seven genuine PDFs plus cohort,
+four-pass gold, evaluator, and baseline work before that gate can open.
 
 ### M6 — Benchmark Table Recognition V2
 
