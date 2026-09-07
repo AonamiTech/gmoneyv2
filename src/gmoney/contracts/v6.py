@@ -869,6 +869,280 @@ TableSelectionTable = LogicalTableSelection
 TableSelectionRunV1 = TableSelectionRun
 
 
+class M5ShadowReconstructionV1(ContractModel):
+    """Complete reconstruction retained for evaluation-only M5 scoring."""
+
+    reconstruction_version: Literal["m5_reconstruction_v1"] = "m5_reconstruction_v1"
+    proposal_id: str = Field(min_length=1)
+    source_sha256: str = Field(pattern=SHA256_PATTERN)
+    page_number: int = Field(ge=1)
+    variant: TableCandidateVariant
+    artifact_sha256: str = Field(pattern=SHA256_PATTERN)
+    source_box: tuple[float, float, float, float]
+    candidate_box: tuple[int, int, int, int] | None = None
+    schema: dict[str, Any] | None = None
+    diagnostics: dict[str, Any] = Field(default_factory=dict)
+    source_tables: tuple[dict[str, Any], ...] = ()
+    rows: tuple[dict[str, Any], ...] = ()
+    reconstruction_sha256: str = Field(default="", pattern=SHA256_PATTERN)
+
+    @model_validator(mode="before")
+    @classmethod
+    def fill_reconstruction_hash(cls, value: Any) -> Any:
+        data = dict(value)
+        data.setdefault("reconstruction_version", "m5_reconstruction_v1")
+        data.setdefault("candidate_box", None)
+        data.setdefault("schema", None)
+        data.setdefault("diagnostics", {})
+        data.setdefault("source_tables", ())
+        data.setdefault("rows", ())
+        if data.get("source_box") is not None:
+            data["source_box"] = tuple(float(value) for value in data["source_box"])
+        if data.get("candidate_box") is not None:
+            data["candidate_box"] = tuple(int(value) for value in data["candidate_box"])
+        if not data.get("reconstruction_sha256"):
+            payload = {
+                key: item for key, item in data.items() if key != "reconstruction_sha256"
+            }
+            data["reconstruction_sha256"] = canonical_sha256(payload)
+        return data
+
+    @model_validator(mode="after")
+    def validate_reconstruction(self) -> M5ShadowReconstructionV1:
+        left, top, right, bottom = self.source_box
+        if any(not math.isfinite(value) for value in self.source_box):
+            raise ValueError("M5 reconstruction source box must be finite")
+        if left < 0 or top < 0 or right <= left or bottom <= top:
+            raise ValueError("M5 reconstruction source box is invalid")
+        if self.candidate_box is not None:
+            candidate_left, candidate_top, candidate_right, candidate_bottom = self.candidate_box
+            if (
+                candidate_left < 0
+                or candidate_top < 0
+                or candidate_right <= candidate_left
+                or candidate_bottom <= candidate_top
+            ):
+                raise ValueError("M5 reconstruction candidate box is invalid")
+        payload = self.model_dump(mode="json", exclude={"reconstruction_sha256"})
+        expected = canonical_sha256(payload)
+        if self.reconstruction_sha256 != expected:
+            raise ValueError("M5 reconstruction digest does not match content")
+        return self
+
+
+class M5ShadowProposalV1(ContractModel):
+    """Source/artifact lineage for one M5 proposal."""
+
+    proposal_id: str = Field(min_length=1)
+    source_sha256: str = Field(pattern=SHA256_PATTERN)
+    page_number: int = Field(ge=1)
+    variant: TableCandidateVariant
+    artifact_sha256: str = Field(pattern=SHA256_PATTERN)
+    source_box: tuple[float, float, float, float]
+    candidate_box: tuple[int, int, int, int] | None = None
+    reading_order: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def validate_proposal(self) -> M5ShadowProposalV1:
+        left, top, right, bottom = self.source_box
+        if any(not math.isfinite(value) for value in self.source_box):
+            raise ValueError("M5 proposal source box must be finite")
+        if left < 0 or top < 0 or right <= left or bottom <= top:
+            raise ValueError("M5 proposal source box is invalid")
+        if self.candidate_box is not None:
+            candidate_left, candidate_top, candidate_right, candidate_bottom = self.candidate_box
+            if (
+                candidate_left < 0
+                or candidate_top < 0
+                or candidate_right <= candidate_left
+                or candidate_bottom <= candidate_top
+            ):
+                raise ValueError("M5 proposal candidate box is invalid")
+        return self
+
+
+class M5ShadowTableProjectionV1(ContractModel):
+    """One whole-table M5 decision and its evaluation reconstruction."""
+
+    logical_table_id: str = Field(min_length=1)
+    source_sha256: str = Field(pattern=SHA256_PATTERN)
+    page_number: int = Field(ge=1)
+    anchor_proposal_id: str | None = None
+    proposal_ids: tuple[str, ...] = ()
+    proposals: tuple[M5ShadowProposalV1, ...] = ()
+    baseline_proposal_id: str | None = None
+    selected_proposal_id: str | None = None
+    baseline_artifact_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
+    selected_artifact_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
+    baseline_variant: TableCandidateVariant | None = None
+    selected_variant: TableCandidateVariant | None = None
+    decision: Literal["selected", "baseline_fallback", "abstained"]
+    ambiguous: bool = False
+    ambiguity_reason: str | None = None
+    selected_metrics: dict[str, Any] = Field(default_factory=dict)
+    candidate_ranking: tuple[dict[str, Any], ...] = ()
+    baseline_reconstruction: M5ShadowReconstructionV1 | None = None
+    selected_reconstruction: M5ShadowReconstructionV1 | None = None
+
+    @model_validator(mode="after")
+    def validate_table(self) -> M5ShadowTableProjectionV1:
+        if len(set(self.proposal_ids)) != len(self.proposal_ids):
+            raise ValueError("M5 table proposal IDs must be unique")
+        proposal_map = {item.proposal_id: item for item in self.proposals}
+        if set(proposal_map) != set(self.proposal_ids):
+            raise ValueError("M5 table proposal lineage is incomplete")
+        if any(item.source_sha256 != self.source_sha256 for item in self.proposals):
+            raise ValueError("M5 proposal source hash differs from table source")
+        if any(item.page_number != self.page_number for item in self.proposals):
+            raise ValueError("M5 proposal page differs from table page")
+        if self.anchor_proposal_id is not None and self.anchor_proposal_id not in proposal_map:
+            raise ValueError("M5 anchor proposal is missing from lineage")
+        if self.baseline_proposal_id is not None and self.baseline_proposal_id not in proposal_map:
+            raise ValueError("M5 baseline proposal is missing from lineage")
+        if self.selected_proposal_id is not None and self.selected_proposal_id not in proposal_map:
+            raise ValueError("M5 selected proposal is missing from lineage")
+        if self.baseline_reconstruction is not None:
+            if self.baseline_proposal_id != self.baseline_reconstruction.proposal_id:
+                raise ValueError("M5 baseline reconstruction does not match proposal")
+            if self.baseline_artifact_sha256 != self.baseline_reconstruction.artifact_sha256:
+                raise ValueError("M5 baseline artifact does not match reconstruction")
+            if self.baseline_variant is not self.baseline_reconstruction.variant:
+                raise ValueError("M5 baseline variant does not match reconstruction")
+        if self.selected_reconstruction is not None:
+            if self.selected_proposal_id != self.selected_reconstruction.proposal_id:
+                raise ValueError("M5 selected reconstruction does not match proposal")
+            if self.selected_artifact_sha256 != self.selected_reconstruction.artifact_sha256:
+                raise ValueError("M5 selected artifact does not match reconstruction")
+            if self.selected_variant is not self.selected_reconstruction.variant:
+                raise ValueError("M5 selected variant does not match reconstruction")
+        if self.decision == "selected":
+            if (
+                self.ambiguous
+                or self.selected_proposal_id is None
+                or self.selected_reconstruction is None
+            ):
+                raise ValueError("selected M5 table requires a complete winner")
+        elif self.decision == "baseline_fallback":
+            if not self.ambiguous or not self.ambiguity_reason or not self.ambiguity_reason.strip():
+                raise ValueError("M5 baseline fallback requires an ambiguity reason")
+            if self.baseline_proposal_id != self.selected_proposal_id:
+                raise ValueError("M5 ambiguity fallback must select the baseline proposal")
+            if self.selected_reconstruction is None:
+                raise ValueError("M5 ambiguity fallback requires baseline reconstruction")
+        else:
+            if self.ambiguous or self.selected_proposal_id is not None:
+                raise ValueError("abstained M5 table cannot name an ambiguous winner")
+            if self.selected_reconstruction is not None:
+                raise ValueError("abstained M5 table cannot carry selected reconstruction")
+        if self.ambiguous != (self.decision == "baseline_fallback"):
+            raise ValueError("M5 ambiguity state does not match decision")
+        return self
+
+
+class M5ShadowPageProjectionV1(ContractModel):
+    """One page's shadow run, including failed runs for omission detection."""
+
+    page_number: int = Field(ge=1)
+    status: Literal["complete", "failed"]
+    reason: str | None = None
+    tables: tuple[M5ShadowTableProjectionV1, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_page(self) -> M5ShadowPageProjectionV1:
+        if len({item.logical_table_id for item in self.tables}) != len(self.tables):
+            raise ValueError("M5 logical table IDs must be unique per page")
+        if self.status == "failed" and not self.reason:
+            raise ValueError("failed M5 page runs require a reason")
+        if self.status == "complete" and self.reason is not None:
+            raise ValueError("complete M5 page runs cannot carry a failure reason")
+        return self
+
+
+class M5ShadowProjectionV1(ContractModel):
+    """Content-addressed, non-canonical M5 projection sidecar."""
+
+    projection_version: Literal["m5_shadow_projection_v1"] = "m5_shadow_projection_v1"
+    document_id: str = Field(min_length=1)
+    source_sha256: str = Field(pattern=SHA256_PATTERN)
+    source_name: str = Field(min_length=1)
+    policy_version: str = Field(min_length=1)
+    mode: Literal["shadow"] = "shadow"
+    authority: Literal["non_canonical"] = "non_canonical"
+    canonical_publication: Literal[False] = False
+    expected_page_count: int | None = Field(default=None, ge=1)
+    pages: tuple[M5ShadowPageProjectionV1, ...] = ()
+    projection_sha256: str = Field(default="", pattern=SHA256_PATTERN)
+
+    @model_validator(mode="before")
+    @classmethod
+    def fill_projection_hash(cls, value: Any) -> Any:
+        data = dict(value)
+        data.setdefault("projection_version", "m5_shadow_projection_v1")
+        data.setdefault("mode", "shadow")
+        data.setdefault("authority", "non_canonical")
+        data.setdefault("canonical_publication", False)
+        data.setdefault("expected_page_count", None)
+        data.setdefault("pages", ())
+        data["pages"] = tuple(
+            M5ShadowPageProjectionV1.model_validate(item).model_dump(mode="json")
+            for item in data["pages"]
+        )
+        if not data.get("projection_sha256"):
+            payload = {key: item for key, item in data.items() if key != "projection_sha256"}
+            data["projection_sha256"] = canonical_sha256(payload)
+        return data
+
+    @model_validator(mode="after")
+    def validate_projection(self) -> M5ShadowProjectionV1:
+        page_numbers = tuple(item.page_number for item in self.pages)
+        if len(set(page_numbers)) != len(page_numbers):
+            raise ValueError("M5 projection pages must be unique")
+        if self.expected_page_count is not None and page_numbers != tuple(
+            range(1, self.expected_page_count + 1)
+        ):
+            raise ValueError("M5 projection pages are incomplete or out of order")
+        logical_ids = tuple(
+            table.logical_table_id for page in self.pages for table in page.tables
+        )
+        if len(set(logical_ids)) != len(logical_ids):
+            raise ValueError("M5 projection logical table IDs must be unique")
+        for page in self.pages:
+            for table in page.tables:
+                if table.source_sha256 != self.source_sha256:
+                    raise ValueError("M5 table source hash differs from projection")
+        payload = self.model_dump(mode="json", exclude={"projection_sha256"})
+        expected = canonical_sha256(payload)
+        if self.projection_sha256 != expected:
+            raise ValueError("M5 projection digest does not match content")
+        return self
+
+    @property
+    def tables(self) -> tuple[M5ShadowTableProjectionV1, ...]:
+        """Return deterministic table order independent of page nesting."""
+
+        return tuple(
+            table
+            for page in self.pages
+            for table in sorted(page.tables, key=lambda item: item.logical_table_id)
+        )
+
+    def authority_document(self) -> dict[str, Any]:
+        """Project selected source tables for read-only authority scoring."""
+
+        source_tables = [
+            source_table
+            for table in self.tables
+            if table.selected_reconstruction is not None
+            for source_table in table.selected_reconstruction.source_tables
+        ]
+        return {
+            "document_id": self.document_id,
+            "source_sha256": self.source_sha256,
+            "source_name": self.source_name,
+            "tables": source_tables,
+        }
+
+
 class UvdocShadowStatus(StrEnum):
     VALID = "valid"
     INVALID = "invalid"

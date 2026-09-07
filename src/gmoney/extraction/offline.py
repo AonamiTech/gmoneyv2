@@ -6,10 +6,11 @@ import re
 from collections import Counter, defaultdict
 from collections.abc import Callable, Collection
 from copy import deepcopy
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, is_dataclass, replace
 from datetime import date
 from decimal import Decimal
 from difflib import SequenceMatcher
+from enum import Enum
 from pathlib import Path
 from statistics import median
 from typing import Annotated, Any
@@ -76,6 +77,7 @@ from gmoney.contracts.v6 import (
     HomographyMapping,
     IdentityMapping,
     LogicalTableSelection,
+    M5ShadowProjectionV1,
     RawTotalCandidateV2,
     SourceCellV2,
     SourceColumnV2,
@@ -614,6 +616,66 @@ def _m5_reconstruction_metrics(reconstruction: ReconstructionResult) -> dict[str
     }
 
 
+def _m5_shadow_json_value(value: Any) -> Any:
+    """Make an in-memory reconstruction deterministic and JSON-compatible."""
+
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, Decimal):
+        return str(value)
+    if hasattr(value, "model_dump"):
+        return _m5_shadow_json_value(value.model_dump(mode="json"))
+    if is_dataclass(value) and not isinstance(value, type):
+        return _m5_shadow_json_value(asdict(value))
+    if isinstance(value, dict):
+        return {
+            str(key): _m5_shadow_json_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (tuple, list)):
+        return [_m5_shadow_json_value(item) for item in value]
+    return value
+
+
+def _m5_reconstruction_payload(
+    reconstruction: ReconstructionResult,
+    proposal: TableProposal,
+) -> dict[str, Any]:
+    """Snapshot a complete winner before the local reconstruction map is dropped."""
+
+    schema = (
+        _m5_shadow_json_value(asdict(reconstruction.schema))
+        if reconstruction.schema is not None
+        else None
+    )
+    rows = [
+        {
+            "candidate": _m5_shadow_json_value(row.candidate),
+            "field_token_ids": _m5_shadow_json_value(row.field_token_ids),
+            "evidence_token_ids": list(row.evidence_token_ids),
+            "evidence_box": _m5_shadow_json_value(row.evidence_box),
+            "grounding_ratio": row.grounding_ratio,
+            "source_routes": list(row.source_routes),
+        }
+        for row in reconstruction.rows
+    ]
+    return {
+        "proposal_id": proposal.proposal_id,
+        "source_sha256": proposal.source_sha256,
+        "page_number": proposal.page_number,
+        "variant": proposal.variant.value,
+        "artifact_sha256": proposal.page_artifact_sha256,
+        "source_box": list(proposal.source_box),
+        "candidate_box": list(proposal.candidate_box) if proposal.candidate_box else None,
+        "schema": schema,
+        "diagnostics": _m5_shadow_json_value(reconstruction.diagnostics),
+        "source_tables": [
+            _m5_shadow_json_value(table) for table in reconstruction.source_tables
+        ],
+        "rows": rows,
+    }
+
+
 def _m5_linear_shadow_decision(
     *,
     source_sha256: str,
@@ -726,6 +788,33 @@ def _m5_linear_shadow_decision(
             for proposal in finalists
         )
         winner, winner_metrics = select_stage_two(scored)
+        ambiguity_reasons = tuple(
+            sorted(
+                {
+                    str(edge.reason)
+                    for edge in matching.edges
+                    if edge.anchor_proposal_id == logical.anchor_proposal_id
+                    and edge.reason == "abstained_ambiguous"
+                }
+            )
+        )
+        baseline = (
+            proposal_by_id.get(logical.anchor_proposal_id)
+            if logical.anchor_proposal_id is not None
+            else None
+        )
+        if ambiguity_reasons and baseline is not None:
+            winner = baseline
+            winner_metrics = _m5_reconstruction_metrics(reconstructions[baseline.proposal_id])
+        baseline_reconstruction = (
+            _m5_reconstruction_payload(reconstructions[baseline.proposal_id], baseline)
+            if baseline is not None
+            else None
+        )
+        selected_reconstruction = _m5_reconstruction_payload(
+            reconstructions[winner.proposal_id],
+            winner,
+        )
         ranked = sorted(scored, key=lambda item: stage_two_key(item[0], item[1]), reverse=True)
         logical_tables.append(
             {
@@ -738,6 +827,14 @@ def _m5_linear_shadow_decision(
                 "selected_proposal_id": winner.proposal_id,
                 "selected_variant": winner.variant.value,
                 "selected_metrics": dict(winner_metrics),
+                "ambiguous": bool(ambiguity_reasons),
+                "ambiguity_reason": (
+                    ",".join(ambiguity_reasons) if ambiguity_reasons else None
+                ),
+                "decision": "baseline_fallback" if ambiguity_reasons and baseline else "selected",
+                "baseline_proposal_id": baseline.proposal_id if baseline else None,
+                "baseline_reconstruction": baseline_reconstruction,
+                "selected_reconstruction": selected_reconstruction,
                 "candidate_ranking": [
                     {
                         "proposal_id": proposal.proposal_id,
@@ -753,12 +850,15 @@ def _m5_linear_shadow_decision(
         "policy_version": MATCH_POLICY_VERSION,
         "mode": "shadow",
         "status": "complete",
+        "source_sha256": source_sha256,
         "page_number": page_asset.page_number,
         "proposal_count": len(proposals),
         "logical_tables": logical_tables,
         "proposals": [
             {
                 "proposal_id": item.proposal_id,
+                "source_sha256": item.source_sha256,
+                "page_number": item.page_number,
                 "variant": item.variant.value,
                 "source_box": list(item.source_box),
                 "candidate_box": list(item.candidate_box or ()),
@@ -4899,6 +4999,7 @@ class ExtractionDraft:
     validation_recovery_attempted: bool | None = None
     uvdoc_shadow_runs: tuple[UvdocPreparedRun, ...] = ()
     table_selection_runs: tuple[dict[str, Any], ...] = ()
+    m5_shadow_projection: M5ShadowProjectionV1 | None = None
 
     @property
     def result(self) -> dict[str, Any]:
@@ -7889,6 +7990,7 @@ class OfflineExtractor:
                             "policy_version": MATCH_POLICY_VERSION,
                             "mode": "shadow",
                             "status": "failed",
+                            "source_sha256": document_id,
                             "page_number": page_asset.page_number,
                             "reason": f"table_selection_{type(error).__name__}",
                             "proposal_count": 0,
@@ -9214,6 +9316,21 @@ class OfflineExtractor:
             "provider_usage": provider_usage,
             "recovery": recovery_metadata,
         }
+        m5_shadow_projection = None
+        if self.table_selection_mode == "shadow" and baseline_draft is None:
+            from gmoney.evaluation.m5_shadow import (
+                project_m5_shadow_runs,
+                write_m5_shadow_projection,
+            )
+
+            m5_shadow_projection = project_m5_shadow_runs(
+                document_id=document_id,
+                source_sha256=document_id,
+                source_name=source.name,
+                runs=tuple(table_selection_runs),
+                expected_page_count=len(manifest.pages),
+            )
+            write_m5_shadow_projection(artifact_root, m5_shadow_projection)
         if _draft_sink is not None:
             baseline_units = baseline_units_by_page
             canonical_crops_by_table = {
@@ -9338,6 +9455,7 @@ class OfflineExtractor:
             _draft_sink["artifact_root"] = artifact_root
             _draft_sink["uvdoc_shadow_runs"] = tuple(uvdoc_shadow_runs)
             _draft_sink["table_selection_runs"] = tuple(table_selection_runs)
+            _draft_sink["m5_shadow_projection"] = m5_shadow_projection
         if _draft_sink is None:
             return _project_result_v6(
                 result,
@@ -9378,6 +9496,7 @@ class OfflineExtractor:
             artifact_root=Path(artifact_root),
             uvdoc_shadow_runs=sink["uvdoc_shadow_runs"],
             table_selection_runs=sink["table_selection_runs"],
+            m5_shadow_projection=sink.get("m5_shadow_projection"),
         )
 
     def recover_draft(
@@ -9424,6 +9543,7 @@ class OfflineExtractor:
             artifact_root=Path(artifact_root),
             uvdoc_shadow_runs=draft.uvdoc_shadow_runs,
             table_selection_runs=draft.table_selection_runs,
+            m5_shadow_projection=draft.m5_shadow_projection,
         )
         from gmoney.extraction.validation import validate_extraction_result
 
@@ -9608,6 +9728,7 @@ class OfflineExtractor:
             suppressed_repeated_source_tables=(selected.suppressed_repeated_source_tables),
             recovery_metadata=recovery_metadata,
             artifact_root=selected.artifact_root,
+            m5_shadow_projection=selected.m5_shadow_projection,
         )
 
 
