@@ -25,6 +25,7 @@ from gmoney.contracts.extraction import (
     SourceRow,
     SourceTable,
     TableType,
+    TokenManifestEntry,
 )
 from gmoney.contracts.v6 import (
     ArtifactKind,
@@ -42,6 +43,7 @@ from gmoney.extraction.offline import (
     PageExtractionUnit,
     TableExtractionUnit,
     _financial_inventory_matches,
+    _materialize_printed_cell_fragments,
     _merge_targeted_page_units,
     _project_result_v6,
     _recovery_preserves_grounded_charges,
@@ -1042,6 +1044,171 @@ def test_v6_projection_binds_unassigned_crop_token_to_its_source_artifact(
     assert projected["table_selection_runs"][0]["logical_tables"][0][
         "logical_table_id"
     ] == "f" * 64
+
+
+def test_v6_projection_preserves_fragment_derivative_lineage(
+    tmp_path: Path,
+) -> None:
+    """A printed fragment and its recovery parent must share crop ownership."""
+    _source, artifact_root, result = _fixture(tmp_path)
+    page = result["page_assets"][0]
+    assert isinstance(page, dict)
+    page_sha = str(page["artifact_sha256"])
+    quality = {
+        "page_number": 1,
+        "artifact_sha256": page_sha,
+        "width": 100,
+        "height": 200,
+        "dpi": 300,
+        "mean_luminance": 200,
+        "contrast_stddev": 40,
+        "laplacian_variance": 100,
+        "edge_density": 0.05,
+        "estimated_skew_degrees": 0,
+    }
+    transform = {
+        "page_number": 1,
+        "source_width": 100,
+        "source_height": 200,
+        "derived_width": 100,
+        "derived_height": 200,
+        "forward_matrix": ((1, 0, 0), (0, 1, 0), (0, 0, 1)),
+        "inverse_matrix": ((1, 0, 0), (0, 1, 0), (0, 0, 1)),
+    }
+    result["page_preprocessing"] = [
+        {
+            "page_number": 1,
+            "raw_artifact_sha256": page_sha,
+            "raw_artifact_relative_path": page["relative_path"],
+            "raw_quality": quality,
+            "candidates": [
+                {
+                    "variant": "raw",
+                    "artifact_sha256": page_sha,
+                    "artifact_relative_path": page["relative_path"],
+                    "width": 100,
+                    "height": 200,
+                    "dpi": 300,
+                    "transform": transform,
+                    "quality": quality,
+                    "selected": True,
+                }
+            ],
+            "selected_variant": "raw",
+        }
+    ]
+    crop_path = artifact_root / "crops" / "p1-t1.png"
+    crop_path.parent.mkdir()
+    crop_path.write_bytes(b"canonical crop")
+    crop_sha = _sha(crop_path.read_bytes())
+    crop_polygon = Polygon(
+        points=(
+            Point(x=1, y=1),
+            Point(x=49, y=1),
+            Point(x=49, y=49),
+            Point(x=1, y=49),
+        )
+    )
+    result["table_crops"] = [
+        {
+            "page_number": 1,
+            "table_id": "p1-t1",
+            "source_page_artifact_sha256": page_sha,
+            "selected_page_artifact_sha256": page_sha,
+            "selected_variant": "raw",
+            "artifact_sha256": crop_sha,
+            "artifact_relative_path": "crops/p1-t1.png",
+            "width": 50,
+            "height": 50,
+            "candidate_box": (0, 0, 50, 50),
+            "source_box": (0, 0, 50, 50),
+            "source_polygon": crop_polygon.model_dump(mode="json"),
+            "crop_to_source_matrix": ((1, 0, 0), (0, 1, 0), (0, 0, 1)),
+        }
+    ]
+
+    source_table = SourceTable.model_validate(result["source_tables"][0])
+    materialization_rows = []
+    for source_row in source_table.rows:
+        materialization_rows.append(
+            source_row.model_copy(
+                update={
+                    "cells": tuple(
+                        cell.model_copy(
+                            update={
+                                "evidence": tuple(
+                                    evidence.model_copy(
+                                        update={
+                                            "token_ids": (
+                                                f"{cell.column_id}-token",
+                                            )
+                                        }
+                                    )
+                                    for evidence in cell.evidence
+                                )
+                            }
+                        )
+                        for cell in source_row.cells
+                    )
+                }
+            )
+        )
+    materialization_table = source_table.model_copy(
+        update={"rows": tuple(materialization_rows)}
+    )
+
+    token_payloads = result["token_manifest"]
+    assert isinstance(token_payloads, list)
+    for token in token_payloads:
+        if token["token_id"] not in {"description-token", "amount-token"}:
+            continue
+        token.update(
+            source_artifact_sha256=crop_sha,
+            source_artifact_relative_path="crops/p1-t1.png",
+            source_polygon=token["polygon"],
+            source_width=50,
+            source_height=50,
+            source_to_page_matrix=((1, 0, 0), (0, 1, 0), (0, 0, 1)),
+        )
+    token_lookup = {
+        token.token_id: token
+        for token in (TokenManifestEntry.model_validate(item) for item in token_payloads)
+    }
+    _tables, fragments, _assignments = _materialize_printed_cell_fragments(
+        (materialization_table,),
+        token_lookup,
+    )
+    assert {item.fragment_role for item in fragments} == {"description", "amount"}
+    fragments_by_role = {str(item.fragment_role): item for item in fragments}
+    for token in token_payloads:
+        replacement_role = {
+            "description-fragment": "description",
+            "amount-fragment": "amount",
+        }.get(token["token_id"])
+        replacement = fragments_by_role.get(replacement_role) if replacement_role else None
+        if replacement is not None:
+            token.update(
+                TokenManifestEntry.model_validate(
+                    replacement.model_copy(update={"token_id": token["token_id"]})
+                ).model_dump(mode="json")
+            )
+
+    row_payload = result["rows"][0]
+    row_payload["evidence"][0]["token_ids"] = [
+        "description-fragment",
+        "description-token",
+        "amount-fragment",
+        "amount-token",
+    ]
+    projected = _project_result_v6(result, artifact_root)
+
+    projected_tokens = {item["token_id"]: item for item in projected["token_manifest"]}
+    assert (
+        projected_tokens["description-fragment"]["artifact_id"]
+        == projected_tokens["description-token"]["artifact_id"]
+        == projected_tokens["amount-fragment"]["artifact_id"]
+        == projected_tokens["amount-token"]["artifact_id"]
+    )
 
 
 def test_revision_four_preprocessing_raw_page_must_match_page_asset(

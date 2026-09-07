@@ -3883,15 +3883,45 @@ def _materialize_printed_cell_fragments(
             )
         )
 
-    def span_polygon(token: TokenManifestEntry, start: int, end: int) -> Polygon:
-        left, top, right, bottom = bounds(token.polygon)
-        length = max(1, len(token.text))
+    def span_polygon_for(
+        polygon: Polygon,
+        text: str,
+        start: int,
+        end: int,
+    ) -> Polygon:
+        left, top, right, bottom = bounds(polygon)
+        length = max(1, len(text))
         width = right - left
         return rectangle(
             left + width * start / length,
             top,
             left + width * end / length,
             bottom,
+        )
+
+    def span_polygon(token: TokenManifestEntry, start: int, end: int) -> Polygon:
+        return span_polygon_for(token.polygon, token.text, start, end)
+
+    def source_identity(token: TokenManifestEntry) -> tuple[Any, ...]:
+        """Identify the derivative artifact that owns a token's source polygon."""
+
+        return (
+            token.source_artifact_sha256,
+            token.source_artifact_relative_path,
+            token.source_width,
+            token.source_height,
+            token.source_to_page_matrix,
+        )
+
+    def union_polygon(polygons: Collection[Polygon]) -> Polygon:
+        all_bounds = tuple(bounds(polygon) for polygon in polygons)
+        if not all_bounds:
+            raise ValueError("cannot build a fragment without source geometry")
+        return rectangle(
+            min(item[0] for item in all_bounds),
+            min(item[1] for item in all_bounds),
+            max(item[2] for item in all_bounds),
+            max(item[3] for item in all_bounds),
         )
 
     for table in tables:
@@ -4047,6 +4077,26 @@ def _materialize_printed_cell_fragments(
                     )
                     materialized_cells.append(cell)
                     continue
+                parent_source_identities = {
+                    source_identity(parent) for parent in selected_parents
+                }
+                if len(parent_source_identities) > 1:
+                    # A composite fragment cannot truthfully claim one source
+                    # artifact when its parents came from different derivative
+                    # images. Keep the original cell evidence and fail closed;
+                    # silently assigning the first parent's provenance would
+                    # make the V6 boundary check meaningless.
+                    cell = cell.model_copy(
+                        update={
+                            "validation_flags": tuple(
+                                dict.fromkeys(
+                                    (*cell.validation_flags, "fragment_occurrence_ambiguous")
+                                )
+                            )
+                        }
+                    )
+                    materialized_cells.append(cell)
+                    continue
                 identity = hashlib.sha256(
                     json.dumps(
                         {
@@ -4071,6 +4121,46 @@ def _materialize_printed_cell_fragments(
                         "parent_token_ids": tuple(item.token_id for item in selected_parents),
                         "parent_character_spans": selected_spans,
                     }
+                source_identity_value = next(iter(parent_source_identities))
+                if source_identity_value[0] is not None:
+                    source_polygons = tuple(
+                        span_polygon_for(
+                            parent.source_polygon,
+                            parent.text,
+                            start,
+                            end,
+                        )
+                        for parent, (start, end) in zip(
+                            selected_parents,
+                            selected_spans,
+                            strict=True,
+                        )
+                    )
+                    source_polygon = union_polygon(source_polygons)
+                    source_to_page = source_identity_value[4]
+                    assert source_to_page is not None
+                    fragment_polygon = Polygon(
+                        points=tuple(
+                            Point(x=x, y=y)
+                            for x, y in apply_matrix(
+                                source_to_page,
+                                tuple(
+                                    (point.x, point.y)
+                                    for point in source_polygon.points
+                                ),
+                            )
+                        )
+                    )
+                    fragment_kwargs.update(
+                        {
+                            "source_artifact_sha256": source_identity_value[0],
+                            "source_artifact_relative_path": source_identity_value[1],
+                            "source_polygon": source_polygon,
+                            "source_width": source_identity_value[2],
+                            "source_height": source_identity_value[3],
+                            "source_to_page_matrix": source_identity_value[4],
+                        }
+                    )
                 fragments[fragment_id] = TokenManifestEntry(
                     token_id=fragment_id,
                     page_number=first.page_number,
