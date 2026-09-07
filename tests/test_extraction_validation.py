@@ -982,7 +982,54 @@ def test_v6_projection_binds_unassigned_crop_token_to_its_source_artifact(
         }
     )
 
-    projected = _project_result_v6(result, artifact_root)
+    m5_runs = (
+        {
+            "policy_version": "table_magic_match_v1",
+            "mode": "shadow",
+            "status": "complete",
+            "page_number": 1,
+            "proposal_count": 1,
+            "proposals": [
+                {
+                    "proposal_id": "oriented-proposal",
+                    "variant": "oriented_raw",
+                    "source_box": [0, 0, 50, 50],
+                    "candidate_box": [0, 0, 50, 50],
+                    "reading_order": 0,
+                    "page_artifact_sha256": page_sha,
+                    "header_tokens": ["Description", "Amount"],
+                    "table_type": "ledger",
+                    "transform_valid": True,
+                    "distortion": 0,
+                    "stage_one_metrics": {},
+                    "stage_two_metrics": {},
+                }
+            ],
+            "edges": [],
+            "logical_tables": [
+                {
+                    "logical_table_id": "f" * 64,
+                    "anchor_proposal_id": "oriented-proposal",
+                    "proposal_ids": ["oriented-proposal"],
+                    "derivative_only": False,
+                    "grounded_rescue": False,
+                    "finalist_proposal_ids": ["oriented-proposal"],
+                    "selected_proposal_id": "oriented-proposal",
+                    "selected_variant": "oriented_raw",
+                    "selected_metrics": {},
+                    "candidate_ranking": [
+                        {
+                            "proposal_id": "oriented-proposal",
+                            "rank": 1,
+                            "selected": True,
+                            "metrics": {},
+                        }
+                    ],
+                }
+            ],
+        },
+    )
+    projected = _project_result_v6(result, artifact_root, table_selection_runs=m5_runs)
 
     token = next(
         item
@@ -992,6 +1039,9 @@ def test_v6_projection_binds_unassigned_crop_token_to_its_source_artifact(
     table_artifact = projected["canonical_table_artifacts"][0]["artifact"]
     assert token["artifact_id"] == table_artifact["artifact_id"]
     assert token["artifact_sha256"] == crop_sha
+    assert projected["table_selection_runs"][0]["logical_tables"][0][
+        "logical_table_id"
+    ] == "f" * 64
 
 
 def test_revision_four_preprocessing_raw_page_must_match_page_asset(

@@ -15,11 +15,14 @@ from gmoney.contracts.evidence import (
     PreprocessingVariant,
     TransformChain,
 )
+from gmoney.contracts.v6 import DenseBackwardGridMapping
 from gmoney.evaluation.corpus import sha256_file
 from gmoney.extraction import offline as offline_module
 from gmoney.extraction.offline import (
     OfflineExtractor,
     PageInferenceBundle,
+    _m5_linear_shadow_decision,
+    _m5_map_uvdoc_box_to_source,
     _orientation_correction,
     _select_page_inference,
 )
@@ -239,6 +242,85 @@ def test_candidate_selection_accepts_better_reconstructed_structure() -> None:
         2,
         2,
     )
+
+
+def test_m5_shadow_matches_and_ranks_per_table_without_changing_page_selection() -> None:
+    page = PageAsset(
+        document_sha256="f" * 64,
+        page_number=1,
+        artifact_sha256="a" * 64,
+        relative_path="pages/page-1.png",
+        width=100,
+        height=200,
+        dpi=300,
+        renderer="test",
+        renderer_version="1",
+    )
+    raw = _bundle(
+        PreprocessingVariant.RAW,
+        "a" * 64,
+        ("DESCRIPTION", "100.00", "TOTAL"),
+        0.80,
+        1,
+    )
+    projective = _bundle(
+        PreprocessingVariant.GEOMETRY_300,
+        "b" * 64,
+        ("DESCRIPTION", "100.00", "TOTAL"),
+        0.90,
+        1,
+    )
+
+    first = _m5_linear_shadow_decision(
+        source_sha256="f" * 64,
+        page_asset=page,
+        bundles=(raw, projective),
+        prior_schemas=(),
+    )
+    second = _m5_linear_shadow_decision(
+        source_sha256="f" * 64,
+        page_asset=page,
+        bundles=(raw, projective),
+        prior_schemas=(),
+    )
+
+    assert first == second
+    assert first["status"] == "complete"
+    assert first["proposal_count"] == 2
+    assert len(first["logical_tables"]) == 1
+    assert len(first["logical_tables"][0]["finalist_proposal_ids"]) == 2
+    assert any(edge["accepted"] for edge in first["edges"])
+
+
+def test_m5_uvdoc_box_mapping_accepts_full_image_bounds() -> None:
+    mapping = DenseBackwardGridMapping(
+        grid_relative_path="dense/identity.npz",
+        grid_sha256="d" * 64,
+        grid_shape=(2, 2, 2),
+        child_width=100,
+        child_height=200,
+        parent_width=100,
+        parent_height=200,
+        padding_mode="zeros",
+    )
+    grid = np.asarray(
+        [
+            [[-1.0, -1.0], [1.0, -1.0]],
+            [[-1.0, 1.0], [1.0, 1.0]],
+        ],
+        dtype=np.float32,
+    )
+
+    mapped = _m5_map_uvdoc_box_to_source(
+        (0, 0, 100, 200),
+        mapping=mapping,
+        grid=grid,
+        oriented_to_source=identity(),
+        source_width=100,
+        source_height=200,
+    )
+
+    assert mapped == (0, 0, 100, 200)
 
 
 def test_revision_four_preprocessing_record_requires_exactly_one_selection() -> None:

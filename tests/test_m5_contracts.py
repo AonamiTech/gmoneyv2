@@ -101,6 +101,52 @@ def test_m5_selection_is_whole_table_and_matches_artifact_variant() -> None:
     assert envelope.table_selection_runs[0].tables[0].whole_table is True
 
 
+def test_shadow_run_can_introduce_stable_logical_id_without_rewriting_legacy_table() -> None:
+    source = _artifact(ArtifactKind.SOURCE_RAW, "a")
+    oriented = _artifact(ArtifactKind.ORIENTED_RAW, "b", parent=source.artifact_id)
+    score = TableCandidateScore(
+        logical_table_id="f" * 64,
+        page_number=1,
+        candidate_id="oriented-proposal",
+        candidate_artifact_id=oriented.artifact_id,
+        candidate_variant="ORIENTED_RAW",
+        score=1,
+        selected=True,
+        evaluation_status="selected",
+    )
+    run = TableSelectionRun(
+        document_id="doc",
+        source_sha256="e" * 64,
+        mode="shadow",
+        logical_tables=(
+            LogicalTableSelection(
+                logical_table_id="f" * 64,
+                page_number=1,
+                candidate_evaluations=(score,),
+                decision="selected",
+                selected_candidate_id=score.candidate_id,
+                selected_candidate_variant=score.candidate_variant,
+                selected_artifact_id=oriented.artifact_id,
+            ),
+        ),
+    )
+
+    envelope = ExtractionResultV6(
+        document_id="doc",
+        source_sha256="e" * 64,
+        source_name="bill.pdf",
+        pages=1,
+        artifact_manifest=ArtifactManifest(artifacts=(source, oriented)),
+        page_artifacts=(
+            PageArtifact(artifact=source, page_number=1, dpi=300),
+            PageArtifact(artifact=oriented, page_number=1, dpi=300, role="ORIENTED_RAW"),
+        ),
+        table_selection_runs=(run,),
+    )
+
+    assert envelope.table_selection_runs[0].tables[0].logical_table_id == "f" * 64
+
+
 def test_m5_rejects_ambiguous_winner_and_uvdoc_winner() -> None:
     with pytest.raises(ValidationError, match="ambiguity reason"):
         TableMatchEdge(

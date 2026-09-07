@@ -521,6 +521,7 @@ class TableMatchEdge(ContractModel):
     overlap_score: float | None = Field(default=None, ge=0, le=1)
     center_distance_score: float | None = Field(default=None, ge=0, le=1)
     reading_order_score: float | None = Field(default=None, ge=0, le=1)
+    table_type_score: float | None = Field(default=None, ge=0, le=1)
     header_similarity_score: float | None = Field(default=None, ge=0, le=1)
     decision: TableMatchDecision = Field(
         default=TableMatchDecision.REJECTED,
@@ -1430,9 +1431,15 @@ class ExtractionResultV6(ContractModel):
             if run.source_sha256 is not None and run.source_sha256 != self.source_sha256:
                 raise ValueError("M5 selection run source hash differs from envelope")
             for table in run.tables:
-                check_logical(table.page_number, table.logical_table_id)
+                # Shadow runs introduce the stable source-derived M5 identity
+                # alongside legacy sequential table IDs.  Only an enabled run
+                # may claim that its logical ID already owns authoritative V6
+                # output.
+                if run.mode == "enabled":
+                    check_logical(table.page_number, table.logical_table_id)
                 for edge in table.match_edges:
-                    check_logical(edge.page_number, edge.logical_table_id)
+                    if run.mode == "enabled":
+                        check_logical(edge.page_number, edge.logical_table_id)
                     check_artifact(
                         edge.anchor_artifact_id,
                         variant=variant_for_artifact(edge.anchor_artifact_id),
@@ -1446,7 +1453,8 @@ class ExtractionResultV6(ContractModel):
                         selected=False,
                     )
                 for score in table.candidate_evaluations:
-                    check_logical(score.page_number, score.logical_table_id)
+                    if run.mode == "enabled":
+                        check_logical(score.page_number, score.logical_table_id)
                     check_artifact(
                         score.candidate_artifact_id,
                         variant=score.candidate_variant,

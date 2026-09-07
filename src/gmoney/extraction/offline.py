@@ -75,12 +75,16 @@ from gmoney.contracts.v6 import (
     ExtractionResultV6,
     HomographyMapping,
     IdentityMapping,
+    LogicalTableSelection,
     RawTotalCandidateV2,
     SourceCellV2,
     SourceColumnV2,
     SourceRowV2,
     SourceTableV2,
     TableAdapterInputV2,
+    TableCandidateScore,
+    TableMatchEdge,
+    TableSelectionRun,
     TokenManifestEntryV2,
     UvdocShadowRun,
     canonical_json,
@@ -137,6 +141,15 @@ from gmoney.extraction.recovery import (
 )
 from gmoney.extraction.rows import extract_candidate_rows
 from gmoney.extraction.spatial import AlignedLedgerRow, align_candidate_rows
+from gmoney.extraction.table_selection import (
+    MATCH_POLICY_VERSION,
+    TableCandidateVariant,
+    TableProposal,
+    match_logical_tables,
+    select_stage_one,
+    select_stage_two,
+    stage_two_key,
+)
 from gmoney.extraction.typed_values import (
     parse_decimal,
     parse_quantity,
@@ -148,6 +161,7 @@ from gmoney.geometry.crop import (
     crop_region,
     resize_region,
 )
+from gmoney.geometry.dense import load_dense_grid, map_dense_points
 from gmoney.geometry.normalize import normalize_quadrilateral_region
 from gmoney.geometry.preprocess import (
     ORIENTATION_CONFIDENCE_THRESHOLD,
@@ -552,6 +566,448 @@ def _select_page_inference(
             )
         )
     return selected, tuple(annotated)
+
+
+def _m5_variant(variant: PreprocessingVariant) -> TableCandidateVariant:
+    return {
+        PreprocessingVariant.RAW: TableCandidateVariant.ORIENTED_RAW,
+        PreprocessingVariant.GEOMETRY_300: TableCandidateVariant.PROJECTIVE,
+        PreprocessingVariant.CAMERA_400: TableCandidateVariant.PROJECTIVE_ENHANCED,
+    }[variant]
+
+
+def _m5_header_tokens(
+    tokens: tuple[OcrToken, ...], box: tuple[int, int, int, int]
+) -> tuple[str, ...]:
+    scoped = tokens_in_box(tokens, box)
+    top_limit = box[1] + (box[3] - box[1]) * 0.2
+    return tuple(
+        token.text
+        for token in scoped
+        if min(point.y for point in token.polygon.points) <= top_limit
+    )
+
+
+def _m5_reconstruction_metrics(reconstruction: ReconstructionResult) -> dict[str, int]:
+    quality = reconstruction_quality(reconstruction)
+    required_columns = (
+        len(reconstruction.schema.column_centers) if reconstruction.schema is not None else 0
+    )
+    publishable_rows = max(0, quality[1])
+    grounded_rows = max(0, quality[5])
+    populated_cells = max(0, quality[4])
+    evidence_linkage = (
+        round(grounded_rows * 1_000_000 / publishable_rows) if publishable_rows else 0
+    )
+    return {
+        "critical_error_count": max(0, -quality[0]),
+        "required_column_count": required_columns,
+        "grounded_complete_row_count": grounded_rows,
+        "evidence_linkage_ppm": evidence_linkage,
+        "arithmetic_consistency_count": int(quality[0] == 0 and populated_cells > 0),
+        "cross_channel_agreement_ppm": 0,
+        "conflict_count": max(0, -quality[2]),
+        "duplicate_row_count": 0,
+        "missing_row_count": max(0, publishable_rows - grounded_rows),
+        "publishable_row_count": publishable_rows,
+        "populated_cell_count": populated_cells,
+    }
+
+
+def _m5_linear_shadow_decision(
+    *,
+    source_sha256: str,
+    page_asset: PageAsset,
+    bundles: tuple[PageInferenceBundle, ...],
+    prior_schemas: tuple[TableSchemaState, ...],
+    extra_proposals: tuple[TableProposal, ...] = (),
+    extra_reconstructions: dict[str, ReconstructionResult] | None = None,
+) -> dict[str, Any]:
+    """Build the M5 decision graph without changing the published page selection."""
+
+    proposals: list[TableProposal] = []
+    reconstructions: dict[str, ReconstructionResult] = {}
+    for bundle in bundles:
+        variant = _m5_variant(bundle.candidate.contract.variant)
+        source_boxes = _merge_table_boxes(list(bundle.layout_boxes), list(bundle.geometry_boxes))
+        for reading_order, raw_box in enumerate(source_boxes):
+            source_box = _safe_box(
+                raw_box,
+                page_asset.width,
+                page_asset.height,
+                horizontal_padding=20,
+                vertical_padding=100,
+            )
+            candidate_box = _bounded_mapped_box(
+                source_box,
+                bundle.candidate.contract.transform.forward_matrix,
+                width=bundle.candidate.contract.width,
+                height=bundle.candidate.contract.height,
+            )
+            proposal_id = canonical_sha256(
+                {
+                    "policy": MATCH_POLICY_VERSION,
+                    "source_sha256": source_sha256,
+                    "page_number": page_asset.page_number,
+                    "variant": variant.value,
+                    "page_artifact_sha256": bundle.candidate.contract.artifact_sha256,
+                    "source_box": source_box,
+                    "reading_order": reading_order,
+                }
+            )
+            reconstruction = reconstruct_ocr_rows(
+                tokens_in_box(bundle.tokens, source_box),
+                page_number=page_asset.page_number,
+                table_id=proposal_id,
+                box=source_box,
+                prior_schemas=prior_schemas,
+            )
+            reconstructions[proposal_id] = reconstruction
+            quality = reconstruction_quality(reconstruction)
+            financial_count = sum(
+                1
+                for token in tokens_in_box(bundle.tokens, source_box)
+                if parse_decimal(token.text) is not None
+            )
+            proposals.append(
+                TableProposal(
+                    proposal_id=proposal_id,
+                    source_sha256=source_sha256,
+                    page_number=page_asset.page_number,
+                    page_width=page_asset.width,
+                    page_height=page_asset.height,
+                    variant=variant,
+                    source_box=tuple(float(value) for value in source_box),
+                    reading_order=reading_order,
+                    header_tokens=_m5_header_tokens(bundle.tokens, source_box),
+                    table_type=(
+                        reconstruction.schema.table_type.value
+                        if reconstruction.schema is not None
+                        else str(reconstruction.diagnostics.get("table_type") or "unknown")
+                    ),
+                    page_artifact_sha256=bundle.candidate.contract.artifact_sha256,
+                    candidate_box=candidate_box,
+                    transform_valid=True,
+                    distortion=abs(bundle.candidate.contract.quality.estimated_skew_degrees),
+                    metrics={
+                        "lineage_valid": True,
+                        "reconstruction_score": quality,
+                        "financial_token_count": financial_count,
+                        "header_token_count": len(_m5_header_tokens(bundle.tokens, source_box)),
+                        "table_confidence_ppm": 1_000_000,
+                        "ocr_coverage_ppm": min(
+                            1_000_000,
+                            len(tokens_in_box(bundle.tokens, source_box)) * 10_000,
+                        ),
+                        "ocr_confidence_ppm": round(
+                            median(
+                                [
+                                    token.confidence
+                                    for token in tokens_in_box(bundle.tokens, source_box)
+                                ]
+                                or [0.0]
+                            )
+                            * 1_000_000
+                        ),
+                    },
+                )
+            )
+
+    proposals.extend(extra_proposals)
+    reconstructions.update(extra_reconstructions or {})
+    matching = match_logical_tables(tuple(proposals))
+    proposal_by_id = {item.proposal_id: item for item in proposals}
+    logical_tables: list[dict[str, Any]] = []
+    for logical in matching.logical_tables:
+        group = [proposal_by_id[item] for item in logical.proposal_ids]
+        finalists = select_stage_one(group)
+        scored = tuple(
+            (proposal, _m5_reconstruction_metrics(reconstructions[proposal.proposal_id]))
+            for proposal in finalists
+        )
+        winner, winner_metrics = select_stage_two(scored)
+        ranked = sorted(scored, key=lambda item: stage_two_key(item[0], item[1]), reverse=True)
+        logical_tables.append(
+            {
+                "logical_table_id": logical.logical_table_id,
+                "anchor_proposal_id": logical.anchor_proposal_id,
+                "proposal_ids": list(logical.proposal_ids),
+                "derivative_only": logical.derivative_only,
+                "grounded_rescue": logical.grounded_rescue,
+                "finalist_proposal_ids": [item.proposal_id for item in finalists],
+                "selected_proposal_id": winner.proposal_id,
+                "selected_variant": winner.variant.value,
+                "selected_metrics": dict(winner_metrics),
+                "candidate_ranking": [
+                    {
+                        "proposal_id": proposal.proposal_id,
+                        "rank": rank,
+                        "selected": proposal.proposal_id == winner.proposal_id,
+                        "metrics": dict(metrics),
+                    }
+                    for rank, (proposal, metrics) in enumerate(ranked, 1)
+                ],
+            }
+        )
+    return {
+        "policy_version": MATCH_POLICY_VERSION,
+        "mode": "shadow",
+        "status": "complete",
+        "page_number": page_asset.page_number,
+        "proposal_count": len(proposals),
+        "logical_tables": logical_tables,
+        "proposals": [
+            {
+                "proposal_id": item.proposal_id,
+                "variant": item.variant.value,
+                "source_box": list(item.source_box),
+                "candidate_box": list(item.candidate_box or ()),
+                "reading_order": item.reading_order,
+                "page_artifact_sha256": item.page_artifact_sha256,
+                "header_tokens": list(item.header_tokens),
+                "table_type": item.table_type,
+                "transform_valid": item.transform_valid,
+                "distortion": item.distortion,
+                "stage_one_metrics": dict(item.metrics),
+                "stage_two_metrics": _m5_reconstruction_metrics(
+                    reconstructions[item.proposal_id]
+                ),
+            }
+            for item in sorted(proposals, key=lambda value: value.proposal_id)
+        ],
+        "edges": [
+            {
+                "anchor_proposal_id": edge.anchor_proposal_id,
+                "candidate_proposal_id": edge.candidate_proposal_id,
+                "candidate_variant": edge.candidate_variant.value,
+                "features": asdict(edge.features),
+                "accepted": edge.accepted,
+                "reason": edge.reason,
+            }
+            for edge in matching.edges
+        ],
+    }
+
+
+def _m5_map_uvdoc_box_to_source(
+    box: tuple[int, int, int, int],
+    *,
+    mapping: DenseBackwardGridMapping,
+    grid: Any,
+    oriented_to_source: Matrix,
+    source_width: int,
+    source_height: int,
+) -> tuple[int, int, int, int]:
+    left, top, right, bottom = box
+    def bounded_child(x: int, y: int) -> tuple[float, float]:
+        return (
+            float(max(0, min(mapping.child_width - 1, x))),
+            float(max(0, min(mapping.child_height - 1, y))),
+        )
+
+    child_points = (
+        bounded_child(left, top),
+        bounded_child(right - 1, top),
+        bounded_child(right - 1, bottom - 1),
+        bounded_child(left, bottom - 1),
+    )
+    oriented = map_dense_points(mapping, grid, child_points)
+    source = apply_matrix(oriented_to_source, oriented)
+    xs = [point[0] for point in source]
+    ys = [point[1] for point in source]
+    return (
+        max(0, min(source_width - 1, int(min(xs)))),
+        max(0, min(source_height - 1, int(min(ys)))),
+        max(1, min(source_width, int(max(xs)) + 1)),
+        max(1, min(source_height, int(max(ys)) + 1)),
+    )
+
+
+def _m5_uvdoc_shadow_materials(
+    *,
+    source_sha256: str,
+    page_asset: PageAsset,
+    run: UvdocPreparedRun | None,
+    artifact_root: Path,
+    orientation_degrees: int,
+    prior_schemas: tuple[TableSchemaState, ...],
+    ocr: PaddleOcrV6Adapter,
+    layout: PaddleDocLayoutV3Adapter,
+) -> tuple[tuple[TableProposal, ...], dict[str, ReconstructionResult]]:
+    """Screen valid UVDoc branches and map their observations back to SOURCE_RAW."""
+
+    if (
+        run is None
+        or run.status != "valid"
+        or run.image_relative_path is None
+        or run.image_sha256 is None
+        or run.enhanced_relative_path is None
+        or run.enhanced_sha256 is None
+        or run.grid_relative_path is None
+        or run.grid_sha256 is None
+        or run.grid_shape is None
+        or run.width is None
+        or run.height is None
+    ):
+        return (), {}
+    orientation_matrix, oriented_width, oriented_height = right_angle_rotation(
+        orientation_degrees, page_asset.width, page_asset.height
+    )
+    oriented_to_source = invert(orientation_matrix)
+    mapping = DenseBackwardGridMapping(
+        grid_relative_path=run.grid_relative_path,
+        grid_sha256=run.grid_sha256,
+        grid_shape=run.grid_shape,
+        child_width=run.width,
+        child_height=run.height,
+        parent_width=oriented_width,
+        parent_height=oriented_height,
+        padding_mode="zeros",
+    )
+    grid = load_dense_grid(artifact_root, mapping)
+    proposals: list[TableProposal] = []
+    reconstructions: dict[str, ReconstructionResult] = {}
+    branches = (
+        (
+            TableCandidateVariant.UVDOC,
+            artifact_root / run.image_relative_path,
+            run.image_sha256,
+        ),
+        (
+            TableCandidateVariant.UVDOC_ENHANCED,
+            artifact_root / run.enhanced_relative_path,
+            run.enhanced_sha256,
+        ),
+    )
+    for variant, path, artifact_sha256 in branches:
+        suffix = variant.value
+        request = InferenceRequest(
+            request_id=str(uuid4()),
+            artifact_sha256=artifact_sha256,
+            image_path=str(path.resolve()),
+            page_number=page_asset.page_number,
+            options={"preprocessing_policy": MATCH_POLICY_VERSION, "table_stage": "m5_screen"},
+        )
+        ocr_response, _ocr_cache_hit = _cached_prediction(
+            artifact_root / "inference" / f"page-{page_asset.page_number}.{suffix}.ocr.json",
+            request,
+            ocr,
+        )
+        layout_response, _layout_cache_hit = _cached_prediction(
+            artifact_root / "inference" / f"page-{page_asset.page_number}.{suffix}.layout.json",
+            request,
+            layout,
+        )
+        child_tokens = paddle_ocr_tokens(
+            ocr_response.output,
+            page_asset.page_number,
+            artifact_sha256,
+        )
+        mapped_tokens: list[OcrToken] = []
+        for token in child_tokens:
+            child_points = tuple(
+                (
+                    max(0.0, min(float(mapping.child_width - 1), point.x)),
+                    max(0.0, min(float(mapping.child_height - 1), point.y)),
+                )
+                for point in token.polygon.points
+            )
+            oriented = map_dense_points(mapping, grid, child_points)
+            source_points = apply_matrix(oriented_to_source, oriented)
+            mapped_tokens.append(
+                token.model_copy(
+                    update={
+                        "artifact_sha256": page_asset.artifact_sha256,
+                        "polygon": Polygon(
+                            points=tuple(Point(x=point[0], y=point[1]) for point in source_points)
+                        ),
+                    }
+                )
+            )
+        child_boxes = _merge_table_boxes(
+            list(_layout_boxes(layout_response.output)),
+            list(_ocr_geometry_boxes(ocr_response.output, transform_identity())),
+        )
+        for reading_order, child_box in enumerate(child_boxes):
+            source_box = _m5_map_uvdoc_box_to_source(
+                child_box,
+                mapping=mapping,
+                grid=grid,
+                oriented_to_source=oriented_to_source,
+                source_width=page_asset.width,
+                source_height=page_asset.height,
+            )
+            source_box = _safe_box(
+                source_box,
+                page_asset.width,
+                page_asset.height,
+                horizontal_padding=20,
+                vertical_padding=100,
+            )
+            proposal_id = canonical_sha256(
+                {
+                    "policy": MATCH_POLICY_VERSION,
+                    "source_sha256": source_sha256,
+                    "page_number": page_asset.page_number,
+                    "variant": variant.value,
+                    "page_artifact_sha256": artifact_sha256,
+                    "source_box": source_box,
+                    "reading_order": reading_order,
+                }
+            )
+            scoped_tokens = tokens_in_box(tuple(mapped_tokens), source_box)
+            reconstruction = reconstruct_ocr_rows(
+                scoped_tokens,
+                page_number=page_asset.page_number,
+                table_id=proposal_id,
+                box=source_box,
+                prior_schemas=prior_schemas,
+            )
+            reconstructions[proposal_id] = reconstruction
+            quality = reconstruction_quality(reconstruction)
+            transform_metrics = run.transform_metrics or {}
+            distortion = float(transform_metrics.get("max_displacement_px", 0.0)) / max(
+                1, max(run.width, run.height)
+            )
+            proposals.append(
+                TableProposal(
+                    proposal_id=proposal_id,
+                    source_sha256=source_sha256,
+                    page_number=page_asset.page_number,
+                    page_width=page_asset.width,
+                    page_height=page_asset.height,
+                    variant=variant,
+                    source_box=tuple(float(value) for value in source_box),
+                    reading_order=reading_order,
+                    header_tokens=_m5_header_tokens(tuple(mapped_tokens), source_box),
+                    table_type=(
+                        reconstruction.schema.table_type.value
+                        if reconstruction.schema is not None
+                        else str(reconstruction.diagnostics.get("table_type") or "unknown")
+                    ),
+                    page_artifact_sha256=artifact_sha256,
+                    candidate_box=child_box,
+                    transform_valid=True,
+                    distortion=distortion,
+                    metrics={
+                        "lineage_valid": True,
+                        "reconstruction_score": quality,
+                        "financial_token_count": sum(
+                            parse_decimal(token.text) is not None for token in scoped_tokens
+                        ),
+                        "header_token_count": len(
+                            _m5_header_tokens(tuple(mapped_tokens), source_box)
+                        ),
+                        "table_confidence_ppm": 1_000_000,
+                        "ocr_coverage_ppm": min(1_000_000, len(scoped_tokens) * 10_000),
+                        "ocr_confidence_ppm": round(
+                            median([token.confidence for token in scoped_tokens] or [0.0])
+                            * 1_000_000
+                        ),
+                    },
+                )
+            )
+    return tuple(proposals), reconstructions
 
 
 def _raw_only_preprocessing_record(
@@ -4442,6 +4898,7 @@ class ExtractionDraft:
     worker_release_revision: str | None = None
     validation_recovery_attempted: bool | None = None
     uvdoc_shadow_runs: tuple[UvdocPreparedRun, ...] = ()
+    table_selection_runs: tuple[dict[str, Any], ...] = ()
 
     @property
     def result(self) -> dict[str, Any]:
@@ -4601,13 +5058,19 @@ def _project_extraction_draft(draft: ExtractionDraft) -> dict[str, Any]:
         len(unit.table_units) for unit in draft.page_units
     ):
         return result
-    return _project_result_v6(result, draft.artifact_root, draft.uvdoc_shadow_runs)
+    return _project_result_v6(
+        result,
+        draft.artifact_root,
+        draft.uvdoc_shadow_runs,
+        draft.table_selection_runs,
+    )
 
 
 def _project_result_v6(
     result: dict[str, Any],
     artifact_root: Path,
     uvdoc_runs: tuple[UvdocPreparedRun, ...] = (),
+    table_selection_runs: tuple[dict[str, Any], ...] = (),
 ) -> dict[str, Any]:
     """Build the deterministic V6 graph and convert the complete V5 payload.
 
@@ -5270,6 +5733,154 @@ def _project_result_v6(
         )
     )
     artifact_manifest = ArtifactManifest(artifacts=tuple(artifacts))
+    page_candidate_by_key = {
+        (item.page_number, item.artifact.artifact_kind): item.artifact for item in page_artifacts
+    }
+    candidate_kind_by_variant = {
+        "oriented_raw": ArtifactKind.ORIENTED_RAW,
+        "projective": ArtifactKind.PROJECTIVE,
+        "projective_enhanced": ArtifactKind.PROJECTIVE_ENHANCED,
+        "uvdoc": ArtifactKind.UVDOC,
+        "uvdoc_enhanced": ArtifactKind.UVDOC_ENHANCED,
+    }
+
+    def m5_artifact(page_number: int, proposal: dict[str, Any]) -> ArtifactRef:
+        variant = str(proposal["variant"])
+        kind = candidate_kind_by_variant[variant]
+        candidates = [
+            artifact
+            for artifact in artifact_by_sha.get(str(proposal.get("page_artifact_sha256")), ())
+            if artifact.artifact_kind is kind
+        ]
+        if candidates:
+            return candidates[0]
+        fallback = page_candidate_by_key.get((page_number, kind))
+        if fallback is None:
+            raise RuntimeError("m5_candidate_artifact_missing")
+        return fallback
+
+    m5_tables: list[LogicalTableSelection] = []
+    for raw_run in table_selection_runs:
+        if raw_run.get("status") != "complete":
+            continue
+        page_number = int(raw_run["page_number"])
+        proposals_by_id = {
+            str(item["proposal_id"]): item for item in raw_run.get("proposals", ())
+        }
+        edges_by_anchor: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for edge in raw_run.get("edges", ()):
+            edges_by_anchor[str(edge["anchor_proposal_id"])].append(edge)
+        for table in raw_run.get("logical_tables", ()):
+            logical_id = str(table["logical_table_id"])
+            anchor_id = table.get("anchor_proposal_id")
+            typed_edges: list[TableMatchEdge] = []
+            for edge in edges_by_anchor.get(str(anchor_id), ()) if anchor_id else ():
+                anchor = proposals_by_id[str(edge["anchor_proposal_id"])]
+                candidate = proposals_by_id[str(edge["candidate_proposal_id"])]
+                features = edge["features"]
+                reason = str(edge["reason"])
+                ambiguous = reason == "abstained_ambiguous"
+                typed_edges.append(
+                    TableMatchEdge(
+                        logical_table_id=logical_id,
+                        page_number=page_number,
+                        anchor_proposal_id=edge["anchor_proposal_id"],
+                        candidate_proposal_id=edge["candidate_proposal_id"],
+                        anchor_artifact_id=m5_artifact(page_number, anchor).artifact_id,
+                        candidate_artifact_id=m5_artifact(page_number, candidate).artifact_id,
+                        candidate_variant=edge["candidate_variant"],
+                        match_score=features["weighted_score"],
+                        overlap_score=features["polygon_iou"],
+                        center_distance_score=features["center_proximity"],
+                        reading_order_score=features["reading_order"],
+                        table_type_score=features["table_type"],
+                        header_similarity_score=features["header_similarity"],
+                        decision=(
+                            "accepted"
+                            if edge["accepted"]
+                            else ("ambiguous" if ambiguous else "rejected")
+                        ),
+                        ambiguous=ambiguous,
+                        ambiguity_reason=reason if ambiguous else None,
+                    )
+                )
+            evaluations: list[TableCandidateScore] = []
+            for ranking in table.get("candidate_ranking", ()):
+                proposal = proposals_by_id[str(ranking["proposal_id"])]
+                metrics = ranking["metrics"]
+                components = {
+                    "critical_safety": 1.0
+                    / (1.0 + float(metrics.get("critical_error_count", 0))),
+                    "column_coverage": min(
+                        1.0, float(metrics.get("required_column_count", 0)) / 5.0
+                    ),
+                    "grounded_rows": min(
+                        1.0, float(metrics.get("grounded_complete_row_count", 0)) / 20.0
+                    ),
+                    "evidence_linkage": min(
+                        1.0, float(metrics.get("evidence_linkage_ppm", 0)) / 1_000_000.0
+                    ),
+                    "arithmetic_consistency": min(
+                        1.0, float(metrics.get("arithmetic_consistency_count", 0))
+                    ),
+                    "cross_channel_agreement": min(
+                        1.0,
+                        float(metrics.get("cross_channel_agreement_ppm", 0)) / 1_000_000.0,
+                    ),
+                    "conflict_safety": 1.0
+                    / (1.0 + float(metrics.get("conflict_count", 0))),
+                    "duplicate_safety": 1.0
+                    / (1.0 + float(metrics.get("duplicate_row_count", 0))),
+                    "completeness": 1.0
+                    / (1.0 + float(metrics.get("missing_row_count", 0))),
+                    "distortion_safety": 1.0 / (1.0 + float(proposal.get("distortion", 0))),
+                }
+                selected_in_shadow = bool(ranking["selected"])
+                evaluations.append(
+                    TableCandidateScore(
+                        logical_table_id=logical_id,
+                        page_number=page_number,
+                        candidate_id=proposal["proposal_id"],
+                        candidate_artifact_id=m5_artifact(page_number, proposal).artifact_id,
+                        candidate_variant=proposal["variant"],
+                        score=round(sum(components.values()) / len(components), 12),
+                        rank=int(ranking["rank"]),
+                        selected=selected_in_shadow,
+                        evaluation_status=("selected" if selected_in_shadow else "eligible"),
+                        score_components=components,
+                    )
+                )
+            selected = next((item for item in evaluations if item.selected), None)
+            m5_tables.append(
+                LogicalTableSelection(
+                    logical_table_id=logical_id,
+                    page_number=page_number,
+                    match_edges=tuple(typed_edges),
+                    candidate_evaluations=tuple(evaluations),
+                    decision="selected" if selected is not None else "no_candidate",
+                    selected_candidate_id=(selected.candidate_id if selected is not None else None),
+                    selected_candidate_variant=(
+                        selected.candidate_variant if selected is not None else None
+                    ),
+                    selected_artifact_id=(
+                        selected.candidate_artifact_id if selected is not None else None
+                    ),
+                )
+            )
+    typed_m5_runs = (
+        (
+            TableSelectionRun(
+                document_id=result["document_id"],
+                source_sha256=result["source_sha256"],
+                mode="shadow",
+                logical_tables=tuple(
+                    sorted(m5_tables, key=lambda item: (item.page_number, item.logical_table_id))
+                ),
+            ),
+        )
+        if m5_tables
+        else ()
+    )
     diagnostics = tuple(
         ExtractionDiagnostic.model_validate(item) for item in result.get("diagnostics", ())
     )
@@ -5283,6 +5894,7 @@ def _project_result_v6(
         artifact_manifest=artifact_manifest,
         page_artifacts=tuple(page_artifacts),
         uvdoc_shadow_runs=tuple(sorted(uvdoc_records, key=lambda item: item.page_number)),
+        table_selection_runs=typed_m5_runs,
         canonical_table_artifacts=tuple(table_artifacts),
         token_manifest=tuple(v2_tokens),
         evidence=tuple(all_evidence.values()),
@@ -5917,11 +6529,19 @@ class OfflineExtractor:
         gemini_adapter: AdjudicationAdapter | None = None,
         settings: Settings | None = None,
         uvdoc_mode: str | None = None,
+        table_selection_mode: str | None = None,
         uvdoc_adapter: PaddleUvdocAdapter | None = None,
         uvdoc_preregistration: UvdocPreregistration | None = None,
     ) -> None:
         self.settings = settings or get_settings()
         self.uvdoc_mode = uvdoc_mode or self.settings.uvdoc_mode
+        self.table_selection_mode = table_selection_mode or getattr(
+            self.settings, "table_selection_mode", "off"
+        )
+        if self.table_selection_mode not in {"off", "shadow", "enabled"}:
+            raise ValueError("table_selection_mode_invalid")
+        if self.table_selection_mode == "enabled":
+            raise ValueError("table_selection_enabled_not_promoted")
         if self.uvdoc_mode == "enabled":
             raise ValueError("uvdoc_enabled_not_promoted")
         self.uvdoc_adapter = uvdoc_adapter
@@ -6919,6 +7539,7 @@ class OfflineExtractor:
         canonical_token_manifest: dict[str, TokenManifestEntry] = {}
         document_total_candidates: list[DocumentTotalCandidate] = []
         uvdoc_shadow_runs: list[UvdocPreparedRun] = []
+        table_selection_runs: list[dict[str, Any]] = []
         diagnostics: list[dict[str, Any]] = []
         schema_states: list[TableSchemaState] = []
         baseline_rows = tuple(
@@ -7057,25 +7678,24 @@ class OfflineExtractor:
                 if orientation_confidence >= ORIENTATION_CONFIDENCE_THRESHOLD
                 else 0
             )
+            uvdoc_page_run: UvdocPreparedRun | None = None
             if self.uvdoc_mode == "shadow":
                 if self.uvdoc_initialization_error is not None:
-                    uvdoc_shadow_runs.append(
-                        UvdocPreparedRun(
-                            page_number=page_asset.page_number,
-                            status="failed",
-                            reason_code=self.uvdoc_initialization_error,
-                        )
+                    uvdoc_page_run = UvdocPreparedRun(
+                        page_number=page_asset.page_number,
+                        status="failed",
+                        reason_code=self.uvdoc_initialization_error,
                     )
+                    uvdoc_shadow_runs.append(uvdoc_page_run)
                 elif self.uvdoc_preregistration is None or not self.uvdoc_preregistration.eligible(
                     document_id, page_asset.page_number
                 ):
-                    uvdoc_shadow_runs.append(
-                        UvdocPreparedRun(
-                            page_number=page_asset.page_number,
-                            status="ineligible",
-                            reason_code="uvdoc_not_preregistered",
-                        )
+                    uvdoc_page_run = UvdocPreparedRun(
+                        page_number=page_asset.page_number,
+                        status="ineligible",
+                        reason_code="uvdoc_not_preregistered",
                     )
+                    uvdoc_shadow_runs.append(uvdoc_page_run)
                 else:
                     oriented_path = page_path
                     if applied_orientation:
@@ -7098,21 +7718,19 @@ class OfflineExtractor:
                             raise RuntimeError("oriented_raw_image_write_failed")
                     try:
                         assert self.uvdoc_adapter is not None
-                        uvdoc_shadow_runs.append(
-                            self.uvdoc_adapter.predict(
-                                oriented_path,
-                                artifact_root,
-                                page_number=page_asset.page_number,
-                            )
+                        uvdoc_page_run = self.uvdoc_adapter.predict(
+                            oriented_path,
+                            artifact_root,
+                            page_number=page_asset.page_number,
                         )
+                        uvdoc_shadow_runs.append(uvdoc_page_run)
                     except Exception as error:  # shadow inference cannot change publication
-                        uvdoc_shadow_runs.append(
-                            UvdocPreparedRun(
-                                page_number=page_asset.page_number,
-                                status="failed",
-                                reason_code=f"uvdoc_inference_{type(error).__name__}",
-                            )
+                        uvdoc_page_run = UvdocPreparedRun(
+                            page_number=page_asset.page_number,
+                            status="failed",
+                            reason_code=f"uvdoc_inference_{type(error).__name__}",
                         )
+                        uvdoc_shadow_runs.append(uvdoc_page_run)
             prepared_candidates = prepare_page_candidates(
                 source_pdf=source,
                 raw_path=page_path,
@@ -7243,6 +7861,42 @@ class OfflineExtractor:
                         ),
                     )
                 )
+            if self.table_selection_mode == "shadow":
+                try:
+                    uvdoc_proposals, uvdoc_reconstructions = _m5_uvdoc_shadow_materials(
+                        source_sha256=document_id,
+                        page_asset=page_asset,
+                        run=uvdoc_page_run,
+                        artifact_root=artifact_root,
+                        orientation_degrees=applied_orientation,
+                        prior_schemas=tuple(schema_states),
+                        ocr=self.ocr,
+                        layout=self.layout,
+                    )
+                    table_selection_runs.append(
+                        _m5_linear_shadow_decision(
+                            source_sha256=document_id,
+                            page_asset=page_asset,
+                            bundles=tuple(bundles),
+                            prior_schemas=tuple(schema_states),
+                            extra_proposals=uvdoc_proposals,
+                            extra_reconstructions=uvdoc_reconstructions,
+                        )
+                    )
+                except Exception as error:  # M5 shadow cannot change baseline publication
+                    table_selection_runs.append(
+                        {
+                            "policy_version": MATCH_POLICY_VERSION,
+                            "mode": "shadow",
+                            "status": "failed",
+                            "page_number": page_asset.page_number,
+                            "reason": f"table_selection_{type(error).__name__}",
+                            "proposal_count": 0,
+                            "logical_tables": [],
+                            "proposals": [],
+                            "edges": [],
+                        }
+                    )
             selected_bundle, annotated_candidates = _select_page_inference(tuple(bundles))
             selected_candidate = next(
                 candidate for candidate in annotated_candidates if candidate.selected
@@ -8683,8 +9337,14 @@ class OfflineExtractor:
             _draft_sink["recovery_metadata"] = recovery_metadata
             _draft_sink["artifact_root"] = artifact_root
             _draft_sink["uvdoc_shadow_runs"] = tuple(uvdoc_shadow_runs)
+            _draft_sink["table_selection_runs"] = tuple(table_selection_runs)
         if _draft_sink is None:
-            return _project_result_v6(result, artifact_root, tuple(uvdoc_shadow_runs))
+            return _project_result_v6(
+                result,
+                artifact_root,
+                tuple(uvdoc_shadow_runs),
+                tuple(table_selection_runs),
+            )
         return result
 
     def extract_draft(
@@ -8717,6 +9377,7 @@ class OfflineExtractor:
             recovery_metadata=sink["recovery_metadata"],
             artifact_root=Path(artifact_root),
             uvdoc_shadow_runs=sink["uvdoc_shadow_runs"],
+            table_selection_runs=sink["table_selection_runs"],
         )
 
     def recover_draft(
@@ -8762,6 +9423,7 @@ class OfflineExtractor:
             recovery_metadata=sink["recovery_metadata"],
             artifact_root=Path(artifact_root),
             uvdoc_shadow_runs=draft.uvdoc_shadow_runs,
+            table_selection_runs=draft.table_selection_runs,
         )
         from gmoney.extraction.validation import validate_extraction_result
 
