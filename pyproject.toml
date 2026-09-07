@@ -64,6 +64,7 @@ gmoney-phase3-evaluate = "gmoney.evaluation.phase3_cli:app"
 gmoney-release-corpus = "gmoney.evaluation.release_gate:app"
 gmoney-uvdoc-evaluate = "gmoney.evaluation.uvdoc:app"
 gmoney-recertify = "gmoney.demo.recertify:app"
+gmoney-authority = "gmoney.evaluation.authority_cli:app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/gmoney"]
