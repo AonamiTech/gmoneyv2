@@ -644,7 +644,7 @@ Allowed states are `not_started`, `in_progress`, `blocked`, `shadow`, `promoted`
 | M1 | Canonical-image consistency | in_progress | All table adapters share one crop hash; no flat regression | `afe8caa`; frozen non-regression report pending |
 | M2 | Artifact and evidence V6 | in_progress | V5 read compatibility; tamper-safe lineage; <=2 px linear mapping error | `077d8e6`, `b947332`, `ec17b07`; integrity gates pass, frozen accuracy gate held in `docs/reviews/table-magic-m2.md` |
 | M3 | Dense transform foundation | promoted | Synthetic dense mappings pass and invalid grids fail closed | `057b6cf`, `5da09b6`, `76de77d`; local and isolated GPU-host certification in `docs/reviews/table-magic-m3.md` |
-| M4 | UVDoc feasibility/shadow | blocked | Reproducible grid, valid geometry, curved gain, no critical regression | Local and isolated GPU substrate gates pass; v1 is diagnostic-only and v2 recomputes sealed structural evidence; authoritative M2 corpus accuracy gate remains held in `docs/reviews/table-magic-m4.md` |
+| M4 | UVDoc feasibility/shadow | blocked | Reproducible grid, valid geometry, curved gain, no critical regression | `64bdf9c` passed isolated GPU shadow integration twice; v1 is diagnostic-only and v2 recomputes structural authority evidence; authoritative M2 corpus accuracy gate remains held in `docs/reviews/table-magic-m4.md` |
 | M5 | Per-table matching/selection | not_started | Stable identity, no lost/duplicate tables, holdout improvement | TBD |
 | M6 | Table V2 shadow benchmark | not_started | Unique recoveries and acceptable GPU/latency cost | TBD |
 | M7 | PaddleOCR-VL client A/B | not_started | Frozen metric winner selected; direct adapter retained on tie | TBD |
@@ -878,6 +878,14 @@ frozen flat cohort. Passing this gate permits continued shadow evaluation, not a
 The production default remains `GMONEY_UVDOC_MODE=off` until this gate passes. Testing must use
 `GMONEY_UVDOC_MODE=shadow` in an isolated candidate stack so UVDoc artifacts and telemetry are
 actually exercised without affecting canonical publication. `enabled` remains prohibited.
+
+On 2026-09-07, an isolated candidate for `64bdf9c` ran two de-identified synthetic-ledger jobs on
+the Tesla T4 with `GMONEY_UVDOC_MODE=shadow`. Both persisted deterministic UVDoc images and dense
+grids, reproduced within one value per channel, passed V6 validation, and left UVDoc artifacts
+unselected from canonical publication. The candidate was stopped and live remained ready and
+unchanged. This proves shadow-path integration, not curved accuracy: no sealed gold was used and
+the processed fixture was a flat control. Exact evidence and setup failures are recorded in
+`docs/reviews/table-magic-m4.md`.
 
 ### M5 — Match logical tables and select per table
 
