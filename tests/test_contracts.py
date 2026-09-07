@@ -78,6 +78,21 @@ def test_canonical_table_crop_rejects_adapter_bound_to_another_crop() -> None:
         )
 
 
+def test_adapter_derivative_metadata_is_all_or_none() -> None:
+    with pytest.raises(
+        ValidationError,
+        match="adapter derivative artifact metadata must be complete",
+    ):
+        TableAdapterInput(
+            adapter_name="test",
+            stage="crop_recovery",
+            recognition_variant="high_resolution",
+            input_artifact_sha256="a" * 64,
+            canonical_crop_sha256="b" * 64,
+            input_artifact_relative_path="crops/recovery.png",
+        )
+
+
 def test_gold_amount_is_decimal() -> None:
     annotation = GoldAnnotation.model_validate(
         {
@@ -129,9 +144,7 @@ def test_gold_source_grid_rejects_unreadable_asserted_value() -> None:
                 "rows": [
                     {
                         "order": 0,
-                        "cells": [
-                            {"column_id": "c1", "raw_value": "guess", "readable": False}
-                        ],
+                        "cells": [{"column_id": "c1", "raw_value": "guess", "readable": False}],
                     }
                 ],
             }

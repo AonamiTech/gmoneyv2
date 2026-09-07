@@ -1,11 +1,18 @@
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
 
 from gmoney.contracts.extraction import RowRole
-from gmoney.extraction.offline import VlAsset, _cached_prediction, _safe_box, _vertical_vl_tiles
+from gmoney.extraction.offline import (
+    VlAsset,
+    _cached_prediction,
+    _safe_box,
+    _vertical_vl_tiles,
+    _vl_asset,
+)
 from gmoney.extraction.otsl import parse_otsl, split_otsl_tables
 from gmoney.extraction.rows import extract_candidate_rows
 from gmoney.extraction.typed_values import (
@@ -241,9 +248,38 @@ def test_dense_vlm_asset_is_split_into_overlapping_vertical_tiles(tmp_path: Path
     source = tmp_path / "table.png"
     assert cv2.imwrite(str(source), np.zeros((3300, 100, 3), dtype=np.uint8))
     tiles = _vertical_vl_tiles(
-        VlAsset(source, "a" * 64, "fixture"),
+        VlAsset(
+            source,
+            "a" * 64,
+            "fixture",
+            100,
+            3300,
+            ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+        ),
         tmp_path,
         "p1-t1",
     )
     assert len(tiles) == 3
     assert all(tile.path.exists() and len(tile.artifact_sha256) == 64 for tile in tiles)
+    assert [tile.input_to_canonical_matrix[1][2] for tile in tiles] == [0, 1440, 2880]
+
+
+def test_rotated_vlm_asset_retains_child_to_canonical_mapping(tmp_path: Path) -> None:
+    source = tmp_path / "table.png"
+    assert cv2.imwrite(str(source), np.zeros((40, 80, 3), dtype=np.uint8))
+    work = SimpleNamespace(
+        crop_path=source,
+        crop_sha256="a" * 64,
+        table_id="p1-t1",
+        crop_width=80,
+        crop_height=40,
+    )
+
+    asset = _vl_asset(work, tmp_path, "clockwise_90")
+
+    assert (asset.width, asset.height) == (40, 80)
+    assert asset.input_to_canonical_matrix == (
+        (0.0, 1.0, 0.0),
+        (-1.0, 0.0, 39.0),
+        (0.0, 0.0, 1.0),
+    )

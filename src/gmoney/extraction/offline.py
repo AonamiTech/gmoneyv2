@@ -274,6 +274,21 @@ class VlAsset:
     path: Path
     artifact_sha256: str
     identity: str
+    width: int
+    height: int
+    input_to_canonical_matrix: Matrix
+
+
+@dataclass(frozen=True)
+class RecoveredCropCandidate:
+    variant: str
+    artifact_sha256: str
+    cache_hit: bool
+    latency_ms: int
+    tokens: tuple[OcrToken, ...]
+    reconstruction: ReconstructionResult
+    token_manifest: tuple[TokenManifestEntry, ...]
+    adapter_input_indexes: tuple[int, ...]
 
 
 def _should_attempt_crop_recovery(
@@ -669,9 +684,7 @@ def _m5_reconstruction_payload(
         "candidate_box": list(proposal.candidate_box) if proposal.candidate_box else None,
         "schema": schema,
         "diagnostics": _m5_shadow_json_value(reconstruction.diagnostics),
-        "source_tables": [
-            _m5_shadow_json_value(table) for table in reconstruction.source_tables
-        ],
+        "source_tables": [_m5_shadow_json_value(table) for table in reconstruction.source_tables],
         "rows": rows,
     }
 
@@ -828,9 +841,7 @@ def _m5_linear_shadow_decision(
                 "selected_variant": winner.variant.value,
                 "selected_metrics": dict(winner_metrics),
                 "ambiguous": bool(ambiguity_reasons),
-                "ambiguity_reason": (
-                    ",".join(ambiguity_reasons) if ambiguity_reasons else None
-                ),
+                "ambiguity_reason": (",".join(ambiguity_reasons) if ambiguity_reasons else None),
                 "decision": "baseline_fallback" if ambiguity_reasons and baseline else "selected",
                 "baseline_proposal_id": baseline.proposal_id if baseline else None,
                 "baseline_reconstruction": baseline_reconstruction,
@@ -869,9 +880,7 @@ def _m5_linear_shadow_decision(
                 "transform_valid": item.transform_valid,
                 "distortion": item.distortion,
                 "stage_one_metrics": dict(item.metrics),
-                "stage_two_metrics": _m5_reconstruction_metrics(
-                    reconstructions[item.proposal_id]
-                ),
+                "stage_two_metrics": _m5_reconstruction_metrics(reconstructions[item.proposal_id]),
             }
             for item in sorted(proposals, key=lambda value: value.proposal_id)
         ],
@@ -899,6 +908,7 @@ def _m5_map_uvdoc_box_to_source(
     source_height: int,
 ) -> tuple[int, int, int, int]:
     left, top, right, bottom = box
+
     def bounded_child(x: int, y: int) -> tuple[float, float]:
         return (
             float(max(0, min(mapping.child_width - 1, x))),
@@ -1394,28 +1404,53 @@ def _merge_table_boxes(
     return sorted(merged, key=lambda box: (box[1], box[0]))
 
 
-def _write_vl_image(image, output: Path) -> VlAsset:
+def _write_vl_image(
+    image,
+    output: Path,
+    *,
+    input_to_canonical_matrix: Matrix,
+) -> VlAsset:
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_name(f".{output.stem}.tmp{output.suffix}")
     if not cv2.imwrite(str(temporary), image):
         raise RuntimeError(f"failed to write VLM image: {temporary}")
     temporary.replace(output)
-    return VlAsset(output, sha256_file(output), output.stem)
+    height, width = image.shape[:2]
+    return VlAsset(
+        output,
+        sha256_file(output),
+        output.stem,
+        width,
+        height,
+        input_to_canonical_matrix,
+    )
 
 
 def _vl_asset(work: TableWork, artifact_root: Path, orientation: str) -> VlAsset:
     if orientation == "upright":
-        return VlAsset(work.crop_path, work.crop_sha256, work.table_id)
+        return VlAsset(
+            work.crop_path,
+            work.crop_sha256,
+            work.table_id,
+            work.crop_width,
+            work.crop_height,
+            transform_identity(),
+        )
     image = cv2.imread(str(work.crop_path), cv2.IMREAD_COLOR)
     if image is None:
         raise ValueError(f"cannot read table crop: {work.crop_path}")
-    rotation = (
-        cv2.ROTATE_90_CLOCKWISE if orientation == "clockwise_90" else cv2.ROTATE_90_COUNTERCLOCKWISE
-    )
+    clockwise = orientation == "clockwise_90"
+    rotation = cv2.ROTATE_90_CLOCKWISE if clockwise else cv2.ROTATE_90_COUNTERCLOCKWISE
     rotated = cv2.rotate(image, rotation)
+    canonical_to_input, _, _ = right_angle_rotation(
+        90 if clockwise else 270,
+        work.crop_width,
+        work.crop_height,
+    )
     return _write_vl_image(
         rotated,
         artifact_root / "crops" / f"{work.table_id}-oriented.png",
+        input_to_canonical_matrix=invert(canonical_to_input),
     )
 
 
@@ -1442,6 +1477,10 @@ def _vertical_vl_tiles(
             _write_vl_image(
                 image[top:bottom],
                 artifact_root / "crops" / f"{table_id}-tile-{index}.png",
+                input_to_canonical_matrix=compose(
+                    translation(0, top),
+                    asset.input_to_canonical_matrix,
+                ),
             )
         )
         if bottom == height:
@@ -4077,9 +4116,7 @@ def _materialize_printed_cell_fragments(
                     )
                     materialized_cells.append(cell)
                     continue
-                parent_source_identities = {
-                    source_identity(parent) for parent in selected_parents
-                }
+                parent_source_identities = {source_identity(parent) for parent in selected_parents}
                 if len(parent_source_identities) > 1:
                     # A composite fragment cannot truthfully claim one source
                     # artifact when its parents came from different derivative
@@ -4144,10 +4181,7 @@ def _materialize_printed_cell_fragments(
                             Point(x=x, y=y)
                             for x, y in apply_matrix(
                                 source_to_page,
-                                tuple(
-                                    (point.x, point.y)
-                                    for point in source_polygon.points
-                                ),
+                                tuple((point.x, point.y) for point in source_polygon.points),
                             )
                         )
                     )
@@ -5885,14 +5919,99 @@ def _project_result_v6(
             all_evidence[canonical_json(ref).decode()] = ref
 
     adapter_inputs: list[TableAdapterInputV2] = []
+
+    def artifact_for_adapter_input(
+        trace: TableAdapterInput,
+        crop_ref: ArtifactRef,
+        *,
+        page_number: int,
+        table_id: str,
+    ) -> ArtifactRef:
+        if trace.input_artifact_id is not None:
+            matching_id = next(
+                (item for item in artifacts if item.artifact_id == trace.input_artifact_id),
+                None,
+            )
+            if matching_id is None:
+                raise ValueError("adapter input artifact ID is missing from the manifest")
+            if matching_id.image_sha256 != trace.input_artifact_sha256:
+                raise ValueError("adapter input artifact ID does not match its hash")
+            return matching_id
+        if trace.input_artifact_sha256 == crop_ref.image_sha256:
+            return crop_ref
+        metadata = (
+            trace.input_artifact_relative_path,
+            trace.input_artifact_width,
+            trace.input_artifact_height,
+            trace.input_to_canonical_matrix,
+        )
+        if not all(value is not None for value in metadata):
+            raise ValueError(
+                "distinct adapter input requires complete derivative artifact metadata"
+            )
+        assert trace.input_artifact_relative_path is not None
+        assert trace.input_artifact_width is not None
+        assert trace.input_artifact_height is not None
+        assert trace.input_to_canonical_matrix is not None
+        relative_path = _relative_artifact_path(
+            artifact_root,
+            trace.input_artifact_relative_path,
+        )
+        mapping = HomographyMapping(
+            child_to_parent_matrix=trace.input_to_canonical_matrix,
+        )
+        reusable = next(
+            (
+                item
+                for item in artifact_by_sha.get(trace.input_artifact_sha256, ())
+                if item.parent_artifact_id == crop_ref.artifact_id
+                and item.artifact_relative_path == relative_path
+                and item.width == trace.input_artifact_width
+                and item.height == trace.input_artifact_height
+                and item.child_to_parent_mapping == mapping
+            ),
+            None,
+        )
+        if reusable is not None:
+            return reusable
+        return add_artifact(
+            ArtifactRef(
+                artifact_kind=ArtifactKind.CELL_CROP,
+                image_sha256=trace.input_artifact_sha256,
+                artifact_relative_path=relative_path,
+                width=trace.input_artifact_width,
+                height=trace.input_artifact_height,
+                parent_artifact_id=crop_ref.artifact_id,
+                producer=trace.adapter_name,
+                producer_version=trace.adapter_version or "legacy-v5",
+                configuration_sha256=trace.configuration_sha256
+                or canonical_sha256(
+                    {
+                        "page_number": page_number,
+                        "logical_table_id": table_id,
+                        "adapter": trace.adapter_name,
+                        "stage": trace.stage,
+                        "recognition_variant": trace.recognition_variant,
+                    }
+                ),
+                child_to_parent_mapping=mapping,
+            )
+        )
+
     for crop in crops:
         crop_ref = table_artifact_by_key[(crop.page_number, crop.table_id)]
         for trace in crop.adapter_inputs:
+            input_ref = artifact_for_adapter_input(
+                trace,
+                crop_ref,
+                page_number=crop.page_number,
+                table_id=crop.table_id,
+            )
             adapter_inputs.append(
                 TableAdapterInputV2(
                     page_number=crop.page_number,
                     logical_table_id=crop.table_id,
-                    input_artifact_id=trace.input_artifact_id or crop_ref.artifact_id,
+                    input_artifact_id=input_ref.artifact_id,
                     input_artifact_sha256=trace.input_artifact_sha256,
                     adapter_name=trace.adapter_name,
                     adapter_version=trace.adapter_version or "legacy-v5",
@@ -5955,9 +6074,7 @@ def _project_result_v6(
         if raw_run.get("status") != "complete":
             continue
         page_number = int(raw_run["page_number"])
-        proposals_by_id = {
-            str(item["proposal_id"]): item for item in raw_run.get("proposals", ())
-        }
+        proposals_by_id = {str(item["proposal_id"]): item for item in raw_run.get("proposals", ())}
         edges_by_anchor: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for edge in raw_run.get("edges", ()):
             edges_by_anchor[str(edge["anchor_proposal_id"])].append(edge)
@@ -6000,8 +6117,7 @@ def _project_result_v6(
                 proposal = proposals_by_id[str(ranking["proposal_id"])]
                 metrics = ranking["metrics"]
                 components = {
-                    "critical_safety": 1.0
-                    / (1.0 + float(metrics.get("critical_error_count", 0))),
+                    "critical_safety": 1.0 / (1.0 + float(metrics.get("critical_error_count", 0))),
                     "column_coverage": min(
                         1.0, float(metrics.get("required_column_count", 0)) / 5.0
                     ),
@@ -6018,12 +6134,9 @@ def _project_result_v6(
                         1.0,
                         float(metrics.get("cross_channel_agreement_ppm", 0)) / 1_000_000.0,
                     ),
-                    "conflict_safety": 1.0
-                    / (1.0 + float(metrics.get("conflict_count", 0))),
-                    "duplicate_safety": 1.0
-                    / (1.0 + float(metrics.get("duplicate_row_count", 0))),
-                    "completeness": 1.0
-                    / (1.0 + float(metrics.get("missing_row_count", 0))),
+                    "conflict_safety": 1.0 / (1.0 + float(metrics.get("conflict_count", 0))),
+                    "duplicate_safety": 1.0 / (1.0 + float(metrics.get("duplicate_row_count", 0))),
+                    "completeness": 1.0 / (1.0 + float(metrics.get("missing_row_count", 0))),
                     "distortion_safety": 1.0 / (1.0 + float(proposal.get("distortion", 0))),
                 }
                 selected_in_shadow = bool(ranking["selected"])
@@ -6981,6 +7094,62 @@ class OfflineExtractor:
         tuple[TokenManifestEntry, ...],
     ]:
         attempts: list[RecoveryAttempt] = []
+
+        def record_adapter_input(
+            *,
+            response: Any,
+            variant: str,
+            image_path: Path,
+            artifact_sha256: str,
+            width: int,
+            height: int,
+            source_to_page_matrix: Matrix,
+            cache_hit: bool,
+        ) -> int:
+            response_spec = getattr(response, "spec", None)
+            adapter_spec = getattr(self.ocr, "spec", None)
+            adapter_name = str(
+                getattr(response_spec, "model_name", None)
+                or getattr(adapter_spec, "model_name", None)
+                or "ocr"
+            )
+            adapter_version = str(
+                getattr(response_spec, "model_version", None)
+                or getattr(adapter_spec, "model_version", None)
+                or "legacy-v5"
+            )
+            index = len(work.adapter_inputs)
+            work.adapter_inputs.append(
+                TableAdapterInput(
+                    adapter_name=adapter_name,
+                    adapter_version=adapter_version,
+                    stage="crop_recovery",
+                    recognition_variant=variant,
+                    input_artifact_sha256=artifact_sha256,
+                    canonical_crop_sha256=work.crop_sha256,
+                    cache_hit=cache_hit,
+                    accepted=False,
+                    configuration_sha256=canonical_sha256(
+                        {
+                            "adapter": adapter_name,
+                            "stage": "crop_recovery",
+                            "recognition_variant": variant,
+                        }
+                    ),
+                    latency_ms=int(getattr(response, "latency_ms", 0)),
+                    input_artifact_relative_path=str(
+                        image_path.resolve().relative_to(artifact_root.resolve())
+                    ),
+                    input_artifact_width=width,
+                    input_artifact_height=height,
+                    input_to_canonical_matrix=compose(
+                        source_to_page_matrix,
+                        invert(work.crop_to_source_matrix),
+                    ),
+                )
+            )
+            return index
+
         try:
             high_resolution = resize_region(
                 work.crop_path,
@@ -7097,17 +7266,7 @@ class OfflineExtractor:
                     reason=f"table_perspective:{type(error).__name__}",
                 )
             )
-        reconstructed: list[
-            tuple[
-                str,
-                str,
-                bool,
-                int,
-                tuple[OcrToken, ...],
-                ReconstructionResult,
-                tuple[TokenManifestEntry, ...],
-            ]
-        ] = []
+        reconstructed: list[RecoveredCropCandidate] = []
 
         def manifest_entries(
             local_tokens: tuple[OcrToken, ...],
@@ -7215,6 +7374,16 @@ class OfflineExtractor:
                     source_to_page_matrix,
                     page_artifact_sha256,
                 )
+                adapter_index = record_adapter_input(
+                    response=response,
+                    variant=variant,
+                    image_path=image_path,
+                    artifact_sha256=artifact_sha256,
+                    width=image.shape[1],
+                    height=image.shape[0],
+                    source_to_page_matrix=source_to_page_matrix,
+                    cache_hit=cache_hit,
+                )
                 reconstruction = reconstruct_ocr_rows(
                     mapped_tokens,
                     page_number=work.page_number,
@@ -7235,14 +7404,14 @@ class OfflineExtractor:
                 )
                 continue
             reconstructed.append(
-                (
-                    variant,
-                    artifact_sha256,
-                    cache_hit,
-                    response.latency_ms,
-                    mapped_tokens,
-                    reconstruction,
-                    manifest_entries(
+                RecoveredCropCandidate(
+                    variant=variant,
+                    artifact_sha256=artifact_sha256,
+                    cache_hit=cache_hit,
+                    latency_ms=response.latency_ms,
+                    tokens=mapped_tokens,
+                    reconstruction=reconstruction,
+                    token_manifest=manifest_entries(
                         local_tokens,
                         mapped_tokens,
                         image_path=image_path,
@@ -7251,6 +7420,7 @@ class OfflineExtractor:
                         height=image.shape[0],
                         source_to_page_matrix=source_to_page_matrix,
                     ),
+                    adapter_input_indexes=(adapter_index,),
                 )
             )
         targeted_inputs = tuple(
@@ -7259,7 +7429,7 @@ class OfflineExtractor:
                 tuple(
                     dict.fromkeys(
                         description_lane_recovery_regions(
-                            item[-2],
+                            item.reconstruction,
                             table_box=work.box,
                         )
                     )
@@ -7267,7 +7437,7 @@ class OfflineExtractor:
             )
             for item in reconstructed
             if description_lane_recovery_regions(
-                item[-2],
+                item.reconstruction,
                 table_box=work.box,
             )
         )
@@ -7303,17 +7473,10 @@ class OfflineExtractor:
                     )
                 )
                 for item, regions in targeted_inputs:
-                    (
-                        variant,
-                        _,
-                        _,
-                        _,
-                        _,
-                        _,
-                        _,
-                    ) = item
+                    variant = item.variant
                     recovered_tokens: list[OcrToken] = []
                     recovered_manifest: list[TokenManifestEntry] = []
+                    target_adapter_indexes: list[int] = []
                     target_cache_hits: list[bool] = []
                     target_latency_ms = 0
                     source_to_overlay = compose(
@@ -7383,6 +7546,18 @@ class OfflineExtractor:
                                 high_resolution.transform.inverse_matrix,
                                 work.crop_to_source_matrix,
                             )
+                            target_adapter_indexes.append(
+                                record_adapter_input(
+                                    response=target_response,
+                                    variant=f"description_lane:{region_slug}",
+                                    image_path=targeted_crop.output_path,
+                                    artifact_sha256=targeted_crop.artifact_sha256,
+                                    width=target_image.shape[1],
+                                    height=target_image.shape[0],
+                                    source_to_page_matrix=target_to_source,
+                                    cache_hit=target_cache_hit,
+                                )
+                            )
                             mapped_target_tokens = map_transformed_tokens_to_page(
                                 local_target_tokens,
                                 target_to_source,
@@ -7439,14 +7614,15 @@ class OfflineExtractor:
                         )
                         continue
                     reconstructed.append(
-                        (
-                            f"{variant}+description_lane",
-                            overlay_suppressed.artifact_sha256,
-                            all(target_cache_hits),
-                            target_latency_ms,
-                            combined_tokens,
-                            reconstruction,
-                            tuple(recovered_manifest),
+                        RecoveredCropCandidate(
+                            variant=f"{variant}+description_lane",
+                            artifact_sha256=overlay_suppressed.artifact_sha256,
+                            cache_hit=all(target_cache_hits),
+                            latency_ms=target_latency_ms,
+                            tokens=combined_tokens,
+                            reconstruction=reconstruction,
+                            token_manifest=tuple(recovered_manifest),
+                            adapter_input_indexes=tuple(target_adapter_indexes),
                         )
                     )
         sign_targets = return_sign_recovery_targets(
@@ -7458,6 +7634,7 @@ class OfflineExtractor:
             recovered_sign_manifest: list[TokenManifestEntry] = []
             recovered_sign_regions: list[tuple[int, int, int, int]] = []
             sign_cache_hits: list[bool] = []
+            sign_adapter_indexes: list[int] = []
             sign_latency_ms = 0
             sign_artifact_sha256 = page_artifact_sha256
             source_to_high_resolution = compose(
@@ -7547,6 +7724,18 @@ class OfflineExtractor:
                         high_resolution.transform.inverse_matrix,
                         work.crop_to_source_matrix,
                     )
+                    sign_adapter_indexes.append(
+                        record_adapter_input(
+                            response=sign_response,
+                            variant=f"return_sign_800dpi_clahe:{region_slug}",
+                            image_path=enhanced_sign.output_path,
+                            artifact_sha256=enhanced_sign.artifact_sha256,
+                            width=sign_image.shape[1],
+                            height=sign_image.shape[0],
+                            source_to_page_matrix=sign_to_source,
+                            cache_hit=sign_cache_hit,
+                        )
+                    )
                     mapped_sign_tokens = map_transformed_tokens_to_page(
                         prefixed_sign_tokens,
                         sign_to_source,
@@ -7578,29 +7767,21 @@ class OfflineExtractor:
                     )
             if recovered_sign_tokens:
                 sign_bases = (
-                    (
-                        "baseline",
-                        page_artifact_sha256,
-                        True,
-                        0,
-                        baseline_tokens,
-                        baseline,
-                        (),
+                    RecoveredCropCandidate(
+                        variant="baseline",
+                        artifact_sha256=page_artifact_sha256,
+                        cache_hit=True,
+                        latency_ms=0,
+                        tokens=baseline_tokens,
+                        reconstruction=baseline,
+                        token_manifest=(),
+                        adapter_input_indexes=(),
                     ),
                     *tuple(reconstructed),
                 )
                 for item in sign_bases:
-                    (
-                        variant,
-                        _,
-                        cache_hit,
-                        latency_ms,
-                        candidate_tokens,
-                        _,
-                        candidate_manifest,
-                    ) = item
                     combined_tokens = replace_tokens_in_regions(
-                        candidate_tokens,
+                        item.tokens,
                         tuple(recovered_sign_tokens),
                         regions=tuple(recovered_sign_regions),
                     )
@@ -7626,60 +7807,62 @@ class OfflineExtractor:
                         )
                         continue
                     reconstructed.append(
-                        (
-                            f"{variant}+return_sign_800dpi_clahe",
-                            sign_artifact_sha256,
-                            cache_hit and all(sign_cache_hits),
-                            latency_ms + sign_latency_ms,
-                            combined_tokens,
-                            reconstruction,
-                            tuple((*candidate_manifest, *recovered_sign_manifest)),
+                        RecoveredCropCandidate(
+                            variant=f"{item.variant}+return_sign_800dpi_clahe",
+                            artifact_sha256=sign_artifact_sha256,
+                            cache_hit=item.cache_hit and all(sign_cache_hits),
+                            latency_ms=item.latency_ms + sign_latency_ms,
+                            tokens=combined_tokens,
+                            reconstruction=reconstruction,
+                            token_manifest=tuple((*item.token_manifest, *recovered_sign_manifest)),
+                            adapter_input_indexes=tuple(
+                                (*item.adapter_input_indexes, *sign_adapter_indexes)
+                            ),
                         )
                     )
         safe_candidates = [
             item
             for item in reconstructed
-            if safely_improves_reconstruction(baseline, item[-2])
+            if safely_improves_reconstruction(baseline, item.reconstruction)
             or (
-                item[0].startswith("table_perspective")
-                and safely_realigns_perspective_reconstruction(baseline, item[-2])
+                item.variant.startswith("table_perspective")
+                and safely_realigns_perspective_reconstruction(
+                    baseline,
+                    item.reconstruction,
+                )
             )
         ]
         selected_item = max(
             safe_candidates,
-            key=lambda item: reconstruction_quality(item[-2]),
+            key=lambda item: reconstruction_quality(item.reconstruction),
             default=None,
         )
         for item in reconstructed:
-            (
-                variant,
-                artifact_sha256,
-                cache_hit,
-                latency_ms,
-                _,
-                reconstruction,
-                _,
-            ) = item
             selected = item is selected_item
             attempts.append(
                 RecoveryAttempt(
                     stage=RecoveryStage.CROP_OCR,
-                    artifact_sha256=artifact_sha256,
+                    artifact_sha256=item.artifact_sha256,
                     canonical_crop_sha256=work.crop_sha256,
-                    cache_hit=cache_hit,
-                    latency_ms=latency_ms,
-                    produced_rows=len(reconstruction.rows),
-                    accepted_rows=len(reconstruction.rows) if selected else 0,
+                    cache_hit=item.cache_hit,
+                    latency_ms=item.latency_ms,
+                    produced_rows=len(item.reconstruction.rows),
+                    accepted_rows=len(item.reconstruction.rows) if selected else 0,
                     status=(
                         "recovered"
                         if selected
-                        else ("no_improvement" if reconstruction.rows else "no_rows")
+                        else ("no_improvement" if item.reconstruction.rows else "no_rows")
                     ),
-                    reason=f"input_variant:{variant}",
+                    reason=f"input_variant:{item.variant}",
                 )
             )
-        selected = selected_item[-2] if selected_item is not None else None
-        selected_manifest = selected_item[-1] if selected_item is not None else ()
+        if selected_item is not None:
+            for index in selected_item.adapter_input_indexes:
+                work.adapter_inputs[index] = work.adapter_inputs[index].model_copy(
+                    update={"accepted": True}
+                )
+        selected = selected_item.reconstruction if selected_item is not None else None
+        selected_manifest = selected_item.token_manifest if selected_item is not None else ()
         return selected, tuple(attempts), selected_manifest
 
     def extract(
@@ -8475,26 +8658,6 @@ class OfflineExtractor:
                         baseline_tokens=work.tokens,
                     )
                     recovery_attempts.extend(attempts)
-                    work.adapter_inputs.extend(
-                        TableAdapterInput(
-                            adapter_name=self.ocr.spec.model_name,
-                            stage="crop_recovery",
-                            recognition_variant=(
-                                attempt.reason.removeprefix("input_variant:")
-                                if attempt.reason and attempt.reason.startswith("input_variant:")
-                                else "recovery"
-                            ),
-                            input_artifact_sha256=attempt.artifact_sha256,
-                            canonical_crop_sha256=work.crop_sha256,
-                            cache_hit=attempt.cache_hit,
-                            accepted=attempt.status == "recovered",
-                        )
-                        for attempt in attempts
-                        if attempt.stage is RecoveryStage.CROP_OCR
-                        and attempt.artifact_sha256 is not None
-                        and attempt.reason is not None
-                        and attempt.reason.startswith("input_variant:")
-                    )
                     if recovered is not None:
                         recovery_token_manifest.update(
                             {item.token_id: item for item in recovered_manifest}
@@ -8706,6 +8869,7 @@ class OfflineExtractor:
                         work.adapter_inputs.append(
                             TableAdapterInput(
                                 adapter_name=self.vl.spec.model_name,
+                                adapter_version=self.vl.spec.model_version,
                                 stage="local_vlm",
                                 recognition_variant=asset.identity,
                                 input_artifact_sha256=vl_response.input_artifact_sha256,
@@ -8714,6 +8878,20 @@ class OfflineExtractor:
                                 accepted=bool(
                                     response_candidate_count and not profile_heavy_sample
                                 ),
+                                configuration_sha256=canonical_sha256(
+                                    {
+                                        "adapter": self.vl.spec.model_name,
+                                        "stage": "local_vlm",
+                                        "recognition_variant": asset.identity,
+                                    }
+                                ),
+                                latency_ms=vl_response.latency_ms,
+                                input_artifact_relative_path=str(
+                                    asset.path.resolve().relative_to(artifact_root.resolve())
+                                ),
+                                input_artifact_width=asset.width,
+                                input_artifact_height=asset.height,
+                                input_to_canonical_matrix=(asset.input_to_canonical_matrix),
                             )
                         )
                         response_truncated = bool(vl_response.output.get("truncated"))
@@ -8888,12 +9066,32 @@ class OfflineExtractor:
                                 work.adapter_inputs.append(
                                     TableAdapterInput(
                                         adapter_name=self.gemini.model,
+                                        adapter_version=self.settings.gemini_prompt_version,
                                         stage="gemini",
                                         recognition_variant="redacted",
                                         input_artifact_sha256=redaction.artifact_sha256,
                                         canonical_crop_sha256=(response.canonical_crop_sha256),
                                         cache_hit=gemini_cache_hit,
                                         accepted=False,
+                                        configuration_sha256=canonical_sha256(
+                                            {
+                                                "adapter": self.gemini.model,
+                                                "stage": "gemini",
+                                                "recognition_variant": "redacted",
+                                                "redaction_version": (
+                                                    self.settings.gemini_redaction_version
+                                                ),
+                                            }
+                                        ),
+                                        latency_ms=response.latency_ms,
+                                        input_artifact_relative_path=str(
+                                            redaction.path.resolve().relative_to(
+                                                artifact_root.resolve()
+                                            )
+                                        ),
+                                        input_artifact_width=work.crop_width,
+                                        input_artifact_height=work.crop_height,
+                                        input_to_canonical_matrix=transform_identity(),
                                     )
                                 )
                                 gemini_trace_index = len(work.adapter_inputs) - 1

@@ -282,6 +282,31 @@ class TableAdapterInput(ContractModel):
     configuration_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
     latency_ms: int = Field(default=0, ge=0)
     input_artifact_id: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    input_artifact_relative_path: str | None = Field(default=None, min_length=1)
+    input_artifact_width: int | None = Field(default=None, gt=0)
+    input_artifact_height: int | None = Field(default=None, gt=0)
+    input_to_canonical_matrix: (
+        tuple[
+            tuple[float, float, float],
+            tuple[float, float, float],
+            tuple[float, float, float],
+        ]
+        | None
+    ) = None
+
+    @model_validator(mode="after")
+    def require_complete_derivative_artifact(self) -> "TableAdapterInput":
+        metadata = (
+            self.input_artifact_relative_path,
+            self.input_artifact_width,
+            self.input_artifact_height,
+            self.input_to_canonical_matrix,
+        )
+        if any(value is not None for value in metadata) and not all(
+            value is not None for value in metadata
+        ):
+            raise ValueError("adapter derivative artifact metadata must be complete")
+        return self
 
 
 class CanonicalTableCrop(ContractModel):
@@ -320,10 +345,7 @@ class CanonicalTableCrop(ContractModel):
             len(row) != 3 for row in self.crop_to_source_matrix
         ):
             raise ValueError("canonical crop transform must be 3x3")
-        if any(
-            item.canonical_crop_sha256 != self.artifact_sha256
-            for item in self.adapter_inputs
-        ):
+        if any(item.canonical_crop_sha256 != self.artifact_sha256 for item in self.adapter_inputs):
             raise ValueError("table adapter canonical crop hash differs from crop record")
         return self
 
@@ -577,9 +599,7 @@ class ExtractionResultV5(ContractModel):
             identities = [(item.page_number, item.table_id) for item in self.table_crops]
             if len(identities) != len(set(identities)):
                 raise ValueError("canonical table crop identities must be unique")
-            published_tables = {
-                (item.page_number, item.table_id) for item in self.source_tables
-            }
+            published_tables = {(item.page_number, item.table_id) for item in self.source_tables}
             if not published_tables.issubset(set(identities)):
                 raise ValueError("every published source table requires a canonical crop")
             assets = {item.page_number: item for item in self.page_assets}
@@ -589,10 +609,14 @@ class ExtractionResultV5(ContractModel):
                 record = preprocessing.get(crop.page_number)
                 if page is None or crop.source_page_artifact_sha256 != page.artifact_sha256:
                     raise ValueError("canonical crop source page artifact is invalid")
-                selected = next(
-                    (candidate for candidate in record.candidates if candidate.selected),
-                    None,
-                ) if record is not None else None
+                selected = (
+                    next(
+                        (candidate for candidate in record.candidates if candidate.selected),
+                        None,
+                    )
+                    if record is not None
+                    else None
+                )
                 if (
                     selected is None
                     or crop.selected_page_artifact_sha256 != selected.artifact_sha256

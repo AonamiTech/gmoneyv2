@@ -1493,6 +1493,19 @@ def test_crop_recovery_isolates_and_ranks_grounded_variants(
         ["failed", "recovered"] if bad_first_variant else ["no_improvement", "recovered"]
     )
     assert [attempt.accepted_rows for attempt in crop_attempts] == [0, 1]
+    assert [trace.recognition_variant for trace in work.adapter_inputs] == (
+        ["photometric"] if bad_first_variant else ["high_resolution", "photometric"]
+    )
+    assert all(
+        trace.input_artifact_relative_path
+        and trace.input_artifact_width == 200
+        and trace.input_artifact_height == 100
+        and trace.input_to_canonical_matrix is not None
+        for trace in work.adapter_inputs
+    )
+    assert [trace.accepted for trace in work.adapter_inputs] == (
+        [True] if bad_first_variant else [False, True]
+    )
 
 
 def test_crop_recovery_uses_targeted_description_lane_for_grounded_financial_rows(

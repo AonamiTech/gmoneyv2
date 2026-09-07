@@ -462,9 +462,7 @@ def _v6_page_inventory_fixture(tmp_path: Path) -> tuple[Path, Path, dict[str, ob
         "source_sha256": _sha(source_pdf.read_bytes()),
         "source_name": "source.pdf",
         "pages": 1,
-        "artifact_manifest": ArtifactManifest(
-            artifacts=(source, oriented)
-        ).model_dump(mode="json"),
+        "artifact_manifest": ArtifactManifest(artifacts=(source, oriented)).model_dump(mode="json"),
         "page_artifacts": [
             PageArtifact(
                 artifact=source,
@@ -884,6 +882,161 @@ def test_recovery_token_retains_crop_identity_and_page_transform(
     assert "recovery_token_provenance_invalid" in {issue.code for issue in failed.issues}
 
 
+def _add_projectable_table_crop(
+    artifact_root: Path,
+    result: dict[str, object],
+) -> str:
+    page = result["page_assets"][0]
+    assert isinstance(page, dict)
+    page_sha = str(page["artifact_sha256"])
+    quality = {
+        "page_number": 1,
+        "artifact_sha256": page_sha,
+        "width": 100,
+        "height": 200,
+        "dpi": 300,
+        "mean_luminance": 200,
+        "contrast_stddev": 40,
+        "laplacian_variance": 100,
+        "edge_density": 0.05,
+        "estimated_skew_degrees": 0,
+    }
+    transform = {
+        "page_number": 1,
+        "source_width": 100,
+        "source_height": 200,
+        "derived_width": 100,
+        "derived_height": 200,
+        "forward_matrix": ((1, 0, 0), (0, 1, 0), (0, 0, 1)),
+        "inverse_matrix": ((1, 0, 0), (0, 1, 0), (0, 0, 1)),
+    }
+    result["page_preprocessing"] = [
+        {
+            "page_number": 1,
+            "raw_artifact_sha256": page_sha,
+            "raw_artifact_relative_path": page["relative_path"],
+            "raw_quality": quality,
+            "candidates": [
+                {
+                    "variant": "raw",
+                    "artifact_sha256": page_sha,
+                    "artifact_relative_path": page["relative_path"],
+                    "width": 100,
+                    "height": 200,
+                    "dpi": 300,
+                    "transform": transform,
+                    "quality": quality,
+                    "selected": True,
+                }
+            ],
+            "selected_variant": "raw",
+        }
+    ]
+    crop_path = artifact_root / "crops" / "p1-t1.png"
+    crop_path.parent.mkdir(exist_ok=True)
+    crop_path.write_bytes(b"canonical crop")
+    crop_sha = _sha(crop_path.read_bytes())
+    crop_polygon = Polygon(
+        points=(
+            Point(x=1, y=1),
+            Point(x=49, y=1),
+            Point(x=49, y=49),
+            Point(x=1, y=49),
+        )
+    )
+    result["table_crops"] = [
+        {
+            "page_number": 1,
+            "table_id": "p1-t1",
+            "source_page_artifact_sha256": page_sha,
+            "selected_page_artifact_sha256": page_sha,
+            "selected_variant": "raw",
+            "artifact_sha256": crop_sha,
+            "artifact_relative_path": "crops/p1-t1.png",
+            "width": 50,
+            "height": 50,
+            "candidate_box": (0, 0, 50, 50),
+            "source_box": (0, 0, 50, 50),
+            "source_polygon": crop_polygon.model_dump(mode="json"),
+            "crop_to_source_matrix": ((1, 0, 0), (0, 1, 0), (0, 0, 1)),
+            "adapter_inputs": [],
+        }
+    ]
+    return crop_sha
+
+
+def test_v6_projection_materializes_distinct_adapter_derivatives(
+    tmp_path: Path,
+) -> None:
+    _source, artifact_root, result = _fixture(tmp_path)
+    crop_sha = _add_projectable_table_crop(artifact_root, result)
+    inputs = []
+    for index, variant in enumerate(("high_resolution", "photometric"), start=1):
+        path = artifact_root / "crops" / f"p1-t1-{variant}.png"
+        path.write_bytes(variant.encode())
+        inputs.append(
+            {
+                "adapter_name": "test-ocr",
+                "adapter_version": "1",
+                "stage": "crop_recovery",
+                "recognition_variant": variant,
+                "input_artifact_sha256": _sha(path.read_bytes()),
+                "canonical_crop_sha256": crop_sha,
+                "accepted": False,
+                "input_artifact_relative_path": f"crops/{path.name}",
+                "input_artifact_width": 100,
+                "input_artifact_height": 100,
+                "input_to_canonical_matrix": (
+                    (0.5, 0, index),
+                    (0, 0.5, index),
+                    (0, 0, 1),
+                ),
+            }
+        )
+    result["table_crops"][0]["adapter_inputs"] = inputs
+
+    projected = _project_result_v6(result, artifact_root)
+
+    artifacts = {item["artifact_id"]: item for item in projected["artifact_manifest"]["artifacts"]}
+    table_id = projected["canonical_table_artifacts"][0]["artifact"]["artifact_id"]
+    assert len(projected["adapter_inputs"]) == 2
+    for trace in projected["adapter_inputs"]:
+        artifact = artifacts[trace["input_artifact_id"]]
+        expected = next(
+            item for item in inputs if item["recognition_variant"] == trace["recognition_variant"]
+        )
+        assert artifact["artifact_kind"] == "CELL_CROP"
+        assert artifact["image_sha256"] == trace["input_artifact_sha256"]
+        assert artifact["parent_artifact_id"] == table_id
+        assert artifact["artifact_relative_path"] == expected["input_artifact_relative_path"]
+        assert artifact["child_to_parent_mapping"]["child_to_parent_matrix"] == [
+            list(row) for row in expected["input_to_canonical_matrix"]
+        ]
+        assert trace["accepted"] is False
+
+
+def test_v6_projection_rejects_distinct_adapter_hash_without_metadata(
+    tmp_path: Path,
+) -> None:
+    _source, artifact_root, result = _fixture(tmp_path)
+    crop_sha = _add_projectable_table_crop(artifact_root, result)
+    result["table_crops"][0]["adapter_inputs"] = [
+        {
+            "adapter_name": "test-ocr",
+            "stage": "crop_recovery",
+            "recognition_variant": "high_resolution",
+            "input_artifact_sha256": "f" * 64,
+            "canonical_crop_sha256": crop_sha,
+        }
+    ]
+
+    with pytest.raises(
+        ValueError,
+        match="distinct adapter input requires complete derivative artifact metadata",
+    ):
+        _project_result_v6(result, artifact_root)
+
+
 def test_v6_projection_binds_unassigned_crop_token_to_its_source_artifact(
     tmp_path: Path,
 ) -> None:
@@ -1034,16 +1187,12 @@ def test_v6_projection_binds_unassigned_crop_token_to_its_source_artifact(
     projected = _project_result_v6(result, artifact_root, table_selection_runs=m5_runs)
 
     token = next(
-        item
-        for item in projected["token_manifest"]
-        if item["token_id"] == "unassigned-crop-token"
+        item for item in projected["token_manifest"] if item["token_id"] == "unassigned-crop-token"
     )
     table_artifact = projected["canonical_table_artifacts"][0]["artifact"]
     assert token["artifact_id"] == table_artifact["artifact_id"]
     assert token["artifact_sha256"] == crop_sha
-    assert projected["table_selection_runs"][0]["logical_tables"][0][
-        "logical_table_id"
-    ] == "f" * 64
+    assert projected["table_selection_runs"][0]["logical_tables"][0]["logical_table_id"] == "f" * 64
 
 
 def test_v6_projection_preserves_fragment_derivative_lineage(
@@ -1138,11 +1287,7 @@ def test_v6_projection_preserves_fragment_derivative_lineage(
                             update={
                                 "evidence": tuple(
                                     evidence.model_copy(
-                                        update={
-                                            "token_ids": (
-                                                f"{cell.column_id}-token",
-                                            )
-                                        }
+                                        update={"token_ids": (f"{cell.column_id}-token",)}
                                     )
                                     for evidence in cell.evidence
                                 )
@@ -1153,9 +1298,7 @@ def test_v6_projection_preserves_fragment_derivative_lineage(
                 }
             )
         )
-    materialization_table = source_table.model_copy(
-        update={"rows": tuple(materialization_rows)}
-    )
+    materialization_table = source_table.model_copy(update={"rows": tuple(materialization_rows)})
 
     token_payloads = result["token_manifest"]
     assert isinstance(token_payloads, list)
