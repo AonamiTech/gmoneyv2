@@ -163,7 +163,7 @@ from gmoney.geometry.crop import (
     crop_region,
     resize_region,
 )
-from gmoney.geometry.dense import load_dense_grid, map_dense_points
+from gmoney.geometry.dense import DenseGridError, load_dense_grid, map_dense_points
 from gmoney.geometry.normalize import normalize_quadrilateral_region
 from gmoney.geometry.preprocess import (
     ORIENTATION_CONFIDENCE_THRESHOLD,
@@ -6917,7 +6917,8 @@ class OfflineExtractor:
                 if actual_identity != registered_identity:
                     raise ValueError("uvdoc_preregistered_model_identity_mismatch")
             except Exception as error:  # shadow initialization cannot stop baseline extraction
-                self.uvdoc_initialization_error = f"uvdoc_initialization_{type(error).__name__}"
+                detail = error.code if isinstance(error, DenseGridError) else type(error).__name__
+                self.uvdoc_initialization_error = f"uvdoc_initialization_{detail}"
                 self.uvdoc_adapter = None
         self.hospital_id = hospital_id
         self.alias_registry = alias_registry
@@ -8135,10 +8136,15 @@ class OfflineExtractor:
                         )
                         uvdoc_shadow_runs.append(uvdoc_page_run)
                     except Exception as error:  # shadow inference cannot change publication
+                        detail = (
+                            error.code
+                            if isinstance(error, DenseGridError)
+                            else type(error).__name__
+                        )
                         uvdoc_page_run = UvdocPreparedRun(
                             page_number=page_asset.page_number,
                             status="failed",
-                            reason_code=f"uvdoc_inference_{type(error).__name__}",
+                            reason_code=f"uvdoc_inference_{detail}",
                         )
                         uvdoc_shadow_runs.append(uvdoc_page_run)
             prepared_candidates = prepare_page_candidates(

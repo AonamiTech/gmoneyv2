@@ -88,6 +88,18 @@ def test_replay_uvdoc_identity_preserves_rgb_conversion() -> None:
     assert np.array_equal(replayed, parent_bgr[..., ::-1])
 
 
+def test_replay_uvdoc_expands_an_align_corners_control_grid() -> None:
+    parent_bgr = np.arange(4 * 5 * 3, dtype=np.uint8).reshape(4, 5, 3)
+
+    replayed = replay_uvdoc(
+        parent_bgr,
+        _identity_grid(2, 2),
+        output_size=parent_bgr.shape[:2],
+    )
+
+    assert np.max(np.abs(replayed.astype(int) - parent_bgr[..., ::-1].astype(int))) <= 1
+
+
 @pytest.mark.parametrize(
     ("source", "target"),
     (
@@ -129,17 +141,20 @@ def test_adapter_captures_and_replays_exact_grid(tmp_path: Path, monkeypatch) ->
     parent_bgr = np.arange(4 * 5 * 3, dtype=np.uint8).reshape(4, 5, 3)
     input_path = tmp_path / "input.png"
     assert cv2.imwrite(str(input_path), parent_bgr)
-    grid = _identity_grid(4, 5)
+    grid = _identity_grid(2, 2)
     monkeypatch.setattr(
         adapter,
         "_forward",
-        lambda batch: (replay_uvdoc(parent_bgr, grid), grid),
+        lambda batch: (
+            replay_uvdoc(parent_bgr, grid, output_size=parent_bgr.shape[:2]),
+            grid,
+        ),
     )
 
     run = adapter.predict(input_path, tmp_path / "artifacts", page_number=1)
     assert run.status == "valid"
     assert run.reproduction_max_error_by_channel == (0, 0, 0)
-    assert run.grid_shape == (4, 5, 2)
+    assert run.grid_shape == (2, 2, 2)
     assert run.transform_metrics["foldover_count"] == 0
 
 

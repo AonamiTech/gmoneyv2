@@ -183,15 +183,60 @@ def _enhance_rgb(image: NDArray[np.uint8]) -> NDArray[np.uint8]:
     return cv2.addWeighted(enhanced, 1.5, blurred, -0.5, 0)
 
 
-def replay_uvdoc(parent_bgr: NDArray[np.uint8], grid: NDArray[np.float32]) -> NDArray[np.uint8]:
-    """Independently reproduce Paddle grid_sample with bounded zero-padded chunks."""
+def _expanded_grid_chunk(
+    grid: NDArray[np.float32],
+    *,
+    output_height: int,
+    output_width: int,
+    start: int,
+    end: int,
+) -> NDArray[np.float32]:
+    """Expand an align-corners control grid without materializing the full grid."""
+
+    grid_height, grid_width = grid.shape[:2]
+    if (grid_height, grid_width) == (output_height, output_width):
+        return grid[start:end]
+    x = np.linspace(0.0, grid_width - 1, output_width, dtype=np.float64)
+    y = np.linspace(0.0, grid_height - 1, output_height, dtype=np.float64)[start:end]
+    x0 = np.floor(x).astype(np.int64)
+    y0 = np.floor(y).astype(np.int64)
+    x1 = np.minimum(x0 + 1, grid_width - 1)
+    y1 = np.minimum(y0 + 1, grid_height - 1)
+    wx = x - x0
+    wy = y - y0
+    expanded = (
+        grid[y0[:, None], x0[None, :]]
+        * ((1.0 - wy)[:, None] * (1.0 - wx)[None, :])[..., None]
+        + grid[y0[:, None], x1[None, :]]
+        * ((1.0 - wy)[:, None] * wx[None, :])[..., None]
+        + grid[y1[:, None], x0[None, :]]
+        * (wy[:, None] * (1.0 - wx)[None, :])[..., None]
+        + grid[y1[:, None], x1[None, :]] * (wy[:, None] * wx[None, :])[..., None]
+    )
+    return np.ascontiguousarray(expanded, dtype=np.float32)
+
+
+def replay_uvdoc(
+    parent_bgr: NDArray[np.uint8],
+    grid: NDArray[np.float32],
+    *,
+    output_size: tuple[int, int] | None = None,
+) -> NDArray[np.uint8]:
+    """Independently reproduce Paddle grid_sample from a bounded control grid."""
 
     height, width = parent_bgr.shape[:2]
+    output_height, output_width = output_size or grid.shape[:2]
     source = parent_bgr.astype(np.float64) / 255.0
-    output = np.empty((*grid.shape[:2], 3), dtype=np.uint8)
-    for start in range(0, grid.shape[0], 128):
-        end = min(start + 128, grid.shape[0])
-        chunk = grid[start:end]
+    output = np.empty((output_height, output_width, 3), dtype=np.uint8)
+    for start in range(0, output_height, 128):
+        end = min(start + 128, output_height)
+        chunk = _expanded_grid_chunk(
+            grid,
+            output_height=output_height,
+            output_width=output_width,
+            start=start,
+            end=end,
+        )
         x = (chunk[..., 0].astype(np.float64) + 1.0) * 0.5 * (width - 1)
         y = (chunk[..., 1].astype(np.float64) + 1.0) * 0.5 * (height - 1)
         x0 = np.floor(x).astype(np.int64)
@@ -411,7 +456,8 @@ class PaddleUvdocAdapter:
             )
             feature_maps = self.model.backbone(resized)
             predicted = self.model.head(paddle.concat(feature_maps, axis=1))
-            grid = functional.interpolate(
+            control_grid = predicted.transpose([0, 2, 3, 1])
+            sampling_grid = functional.interpolate(
                 predicted,
                 size=(height, width),
                 mode=self.model.upsample_mode,
@@ -419,13 +465,16 @@ class PaddleUvdocAdapter:
             ).transpose([0, 2, 3, 1])
             result = functional.grid_sample(
                 image,
-                grid,
+                sampling_grid,
                 mode="bilinear",
                 padding_mode="zeros",
                 align_corners=True,
             )
         rgb = result.cpu().numpy()[0].transpose(1, 2, 0)[..., ::-1]
-        return (np.clip(rgb * 255.0, 0, 255).astype(np.uint8), grid.cpu().numpy()[0])
+        return (
+            np.clip(rgb * 255.0, 0, 255).astype(np.uint8),
+            control_grid.cpu().numpy()[0],
+        )
 
     def predict(
         self,
@@ -440,7 +489,14 @@ class PaddleUvdocAdapter:
         height, width = parent.shape[:2]
         batch = np.ascontiguousarray(parent.transpose(2, 0, 1)[None], dtype=np.float32) / 255.0
         output, grid = self._forward(batch)
-        if grid.shape != (height, width, 2) or grid.dtype != np.float32:
+        if (
+            grid.ndim != 3
+            or grid.shape[0] < 2
+            or grid.shape[1] < 2
+            or grid.shape[2] != 2
+            or grid.dtype != np.float32
+            or output.shape != (height, width, 3)
+        ):
             raise RuntimeError("uvdoc_incompatible_output_tensor")
         mapping_template = {
             "grid_relative_path": f"lineage/uvdoc/page-{page_number:04d}.grid.npz",
@@ -458,7 +514,7 @@ class PaddleUvdocAdapter:
             raise ValueError("uvdoc_grid_foldover")
         if diagnostics.out_of_bounds_rate > 0.005:
             raise ValueError("uvdoc_grid_out_of_bounds")
-        replay = replay_uvdoc(parent, grid)
+        replay = replay_uvdoc(parent, grid, output_size=(height, width))
         errors = tuple(
             int(np.max(np.abs(replay[..., channel].astype(int) - output[..., channel].astype(int))))
             for channel in range(3)
