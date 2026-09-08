@@ -167,6 +167,21 @@ def test_swapped_values_emit_wrong_column_instead_of_a_lucky_match() -> None:
     assert any("wrong_column" in row.issues for row in report.rows)
 
 
+def test_critical_exact_requires_a_critical_prediction_role() -> None:
+    gold = _document([_row()])
+    actual_row = _row()
+    actual_row["cells"][1]["canonical_field"] = "description"
+
+    report = metrics.evaluate_document(gold, _document([actual_row]))
+
+    assert report.metrics["critical_gold"] == 1
+    assert report.metrics["critical_actual"] == 0
+    assert report.metrics["critical_exact"] == 0
+    assert report.metrics["critical_numeric_cell_recall"] == 0.0
+    assert report.floors["critical_numeric_cell_precision"] is False
+    assert metrics.EVALUATOR_VERSION == "authority_metrics_v3"
+
+
 def test_unreadable_gold_cell_is_excluded_from_value_recall_but_not_completeness() -> None:
     gold_row = _row(readable=False, amount=None)
     actual_row = _row(readable=False, amount=None)

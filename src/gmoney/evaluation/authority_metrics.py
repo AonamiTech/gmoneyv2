@@ -31,7 +31,7 @@ from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from enum import Enum
 from typing import Any
 
-EVALUATOR_VERSION = "authority_metrics_v2"
+EVALUATOR_VERSION = "authority_metrics_v3"
 
 # These are the frozen Table Magic accuracy floors.  Keep the names stable because a
 # promotion manifest refers to these keys rather than to display labels.
@@ -1106,6 +1106,8 @@ class CellOutcome(AlignmentOutcome):
     exact: bool = False
     canonical_role: str = ""
     value_type: str = "text"
+    gold_critical: bool = False
+    actual_critical: bool = False
 
 
 @dataclass(frozen=True)
@@ -1419,6 +1421,8 @@ def _evaluate_document(
         actual_cell: Any | None,
         *,
         role_hint: str = "",
+        gold_role_hint: str = "",
+        actual_role_hint: str = "",
         gold_index: int | None,
         actual_index: int | None,
         row_gold_index: int | None,
@@ -1426,8 +1430,8 @@ def _evaluate_document(
         column_gold_index: int | None,
         column_actual_index: int | None,
     ) -> CellOutcome:
-        gold_role = _role(gold_cell) if gold_cell is not None else ""
-        actual_role = _role(actual_cell) if actual_cell is not None else ""
+        gold_role = (_role(gold_cell) if gold_cell is not None else "") or gold_role_hint
+        actual_role = (_role(actual_cell) if actual_cell is not None else "") or actual_role_hint
         role = gold_role or actual_role or role_hint
         value_type = _value_type(gold_cell or actual_cell, role)
         gold_unreadable = gold_cell is not None and _unreadable_marker(gold_cell)
@@ -1448,6 +1452,16 @@ def _evaluate_document(
         )
         gold_has = gold_cell is not None and _has_asserted_value(gold_cell)
         actual_has = actual_cell is not None and _has_actual_value(actual_cell)
+        gold_critical = bool(
+            gold_has
+            and not gold_unreadable
+            and _critical(gold_role, _value_type(gold_cell, gold_role))
+        )
+        actual_critical = bool(
+            actual_has
+            and not actual_unreadable
+            and _critical(actual_role, _value_type(actual_cell, actual_role))
+        )
         exact = (gold_unreadable and actual_unreadable and not actual_has) or (
             not gold_unreadable and gold_has and actual_has and gold_value == actual_value
         )
@@ -1503,6 +1517,8 @@ def _evaluate_document(
             exact=exact,
             canonical_role=role,
             value_type=value_type,
+            gold_critical=gold_critical,
+            actual_critical=actual_critical,
         )
 
     for gi, ai_score in sorted(table_matches.items()):
@@ -1636,6 +1652,8 @@ def _evaluate_document(
                     gcell_pair[1] if gcell_pair else None,
                     acell_pair[1] if acell_pair else None,
                     role_hint=_role(gold_column) or _role(actual_column),
+                    gold_role_hint=_role(gold_column),
+                    actual_role_hint=_role(actual_column),
                     gold_index=gcell_pair[0] if gcell_pair else None,
                     actual_index=acell_pair[0] if acell_pair else None,
                     row_gold_index=gri,
@@ -1942,7 +1960,8 @@ def _evaluate_document(
             outcome.gold_index is not None
             and outcome.actual_index is not None
             and outcome.exact
-            and _critical(outcome.canonical_role, outcome.value_type)
+            and outcome.gold_critical
+            and outcome.actual_critical
         ):
             critical_exact += 1
 
