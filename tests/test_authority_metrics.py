@@ -428,3 +428,70 @@ def test_authority_v2_models_are_consumed_without_projection() -> None:
     assert report.metrics["matched_tables"] == 1
     assert report.metrics["exact_cells"] == 2
     assert report.metrics["critical_numeric_cell_recall"] == 1.0
+
+
+def test_v6_source_tables_use_canonical_artifact_geometry_instead_of_list_order() -> None:
+    top_row = _row(description="Top service", amount="100.00")
+    bottom_row = _row(description="Bottom service", amount="200.00")
+    gold = {
+        "source_sha256": "a" * 64,
+        "tables": [
+            _table([top_row], table_id="gold-top", polygon=[0, 0, 100, 40]),
+            _table([bottom_row], table_id="gold-bottom", polygon=[0, 60, 100, 100]),
+        ],
+    }
+
+    actual_top = _table([deepcopy(top_row)], table_id="actual-top")
+    actual_bottom = _table([deepcopy(bottom_row)], table_id="actual-bottom")
+    actual_top.pop("polygon")
+    actual_bottom.pop("polygon")
+    actual = {
+        "source_sha256": "a" * 64,
+        # Producer order is intentionally opposite source-space order.
+        "source_tables": [actual_bottom, actual_top],
+        "canonical_table_artifacts": [
+            {
+                "page_number": 1,
+                "logical_table_id": "actual-top",
+                "crop_polygon_in_source_raw": [0, 0, 100, 40],
+            },
+            {
+                "page_number": 1,
+                "logical_table_id": "actual-bottom",
+                "crop_polygon_in_source_raw": [0, 60, 100, 100],
+            },
+        ],
+    }
+
+    report = metrics.evaluate_document(gold, actual)
+
+    assert report.metrics["matched_tables"] == 2
+    assert report.metrics["exact_cells"] == 4
+    assert [(item.gold_id, item.actual_id) for item in report.tables] == [
+        ("gold-top", "actual-top"),
+        ("gold-bottom", "actual-bottom"),
+    ]
+
+
+def test_v6_geometry_join_does_not_invent_ambiguous_source_table_geometry() -> None:
+    table = _table([_row()], table_id="actual")
+    table.pop("polygon")
+    actual = {
+        "source_tables": [table],
+        "canonical_table_artifacts": [
+            {
+                "page_number": 1,
+                "logical_table_id": "actual",
+                "crop_polygon_in_source_raw": [0, 0, 40, 40],
+            },
+            {
+                "page_number": 1,
+                "logical_table_id": "actual",
+                "crop_polygon_in_source_raw": [60, 60, 100, 100],
+            },
+        ],
+    }
+
+    enriched = metrics._tables(actual)
+
+    assert metrics._geometry(enriched[0]) is None

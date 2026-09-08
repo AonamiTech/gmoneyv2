@@ -31,7 +31,7 @@ from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from enum import Enum
 from typing import Any
 
-EVALUATOR_VERSION = "authority_metrics_v1"
+EVALUATOR_VERSION = "authority_metrics_v2"
 
 # These are the frozen Table Magic accuracy floors.  Keep the names stable because a
 # promotion manifest refers to these keys rather than to display labels.
@@ -612,9 +612,59 @@ def _sequence_from_document(document: Any, names: Sequence[str]) -> list[Any]:
     return []
 
 
+def _source_tables_with_v6_geometry(document: Any, tables: Sequence[Any]) -> list[Any]:
+    """Join V6 source tables to their source-page crop polygons.
+
+    ``SourceTableV2`` deliberately contains the reconstructed table rather than
+    duplicating artifact geometry.  Its source-space polygon lives on the
+    corresponding ``CanonicalTableArtifact``.  Authority matching is geometric,
+    so retain that normalized V6 relationship when evaluating the public
+    envelope instead of silently falling back to producer list order.
+
+    A missing or ambiguous relationship is left untouched.  Valid V6 envelopes
+    guarantee uniqueness; this defensive behavior keeps the generic evaluator
+    compatible with partial diagnostic dictionaries without inventing geometry.
+    """
+
+    artifacts = _sequence_from_document(document, ("canonical_table_artifacts",))
+    if not artifacts:
+        return list(tables)
+
+    geometry_by_key: dict[tuple[int, str], list[Any]] = {}
+    for artifact in artifacts:
+        logical_table_id = _text(_get(artifact, "logical_table_id", default=""))
+        page_number = _page(artifact)
+        geometry = _get(artifact, "crop_polygon_in_source_raw", default=None)
+        if not logical_table_id or page_number is None or _polygon(geometry) is None:
+            continue
+        geometry_by_key.setdefault((page_number, logical_table_id), []).append(geometry)
+
+    enriched: list[Any] = []
+    for table in tables:
+        if _geometry(table) is not None:
+            enriched.append(table)
+            continue
+        table_id = _text(_get(table, "table_id", "logical_table_id", default=""))
+        page_number = _page(table)
+        candidates = geometry_by_key.get((page_number, table_id), [])
+        if len(candidates) != 1:
+            enriched.append(table)
+            continue
+        table_payload = dict(_mapping(table))
+        table_payload["source_polygon"] = candidates[0]
+        enriched.append(table_payload)
+    return enriched
+
+
 def _tables(document: Any) -> list[Any]:
+    direct = _sequence_from_document(document, ("tables",))
+    if direct:
+        return direct
+    source_tables = _sequence_from_document(document, ("source_tables",))
+    if source_tables:
+        return _source_tables_with_v6_geometry(document, source_tables)
     direct = _sequence_from_document(
-        document, ("tables", "source_tables", "logical_tables", "table_records", "table_regions")
+        document, ("logical_tables", "table_records", "table_regions")
     )
     if direct:
         return direct
