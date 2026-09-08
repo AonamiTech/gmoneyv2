@@ -86,7 +86,13 @@ def resize_region(
     if not cv2.imwrite(str(temporary), resized):
         raise RuntimeError(f"failed to write resized crop: {temporary}")
     temporary.replace(output)
-    forward = ((scale, 0.0, 0.0), (0.0, scale, 0.0), (0.0, 0.0, 1.0))
+    if (width == 1) != (derived_width == 1) or (height == 1) != (derived_height == 1):
+        raise ValueError("resized one-pixel axes cannot have an invertible endpoint mapping")
+    scale_x = (derived_width - 1) / (width - 1) if width > 1 else 1.0
+    scale_y = (derived_height - 1) / (height - 1) if height > 1 else 1.0
+    # Geometry uses pixel-index coordinates.  Bind the transform to the actual
+    # rounded output dimensions so both raster endpoints remain in bounds.
+    forward = ((scale_x, 0.0, 0.0), (0.0, scale_y, 0.0), (0.0, 0.0, 1.0))
     transform = TransformChain(
         page_number=page_number,
         source_width=width,
@@ -139,8 +145,13 @@ def render_pdf_region(
             source_width, source_height = source_size
     finally:
         document.close()
-    scale = output_dpi / source_dpi
-    scale_matrix = ((scale, 0.0, 0.0), (0.0, scale, 0.0), (0.0, 0.0, 1.0))
+    source_crop_width = right - left
+    source_crop_height = bottom - top
+    if source_crop_width <= 1 or source_crop_height <= 1:
+        raise ValueError("rendered region must span at least two pixels on each axis")
+    scale_x = (pixmap.width - 1) / (source_crop_width - 1)
+    scale_y = (pixmap.height - 1) / (source_crop_height - 1)
+    scale_matrix = ((scale_x, 0.0, 0.0), (0.0, scale_y, 0.0), (0.0, 0.0, 1.0))
     forward = compose(translation(-left, -top), scale_matrix)
     transform = TransformChain(
         page_number=page_number,

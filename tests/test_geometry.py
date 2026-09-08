@@ -109,10 +109,50 @@ def test_canonical_recovery_resize_retains_inverse_crop_mapping(tmp_path: Path) 
     image = np.full((80, 120, 3), 255, dtype=np.uint8)
     assert cv2.imwrite(str(source), image)
     result = resize_region(source, tmp_path / "resized.png", 1, 2.0)
-    original = ((0.0, 0.0), (120.0, 80.0), (30.0, 20.0))
+    original = ((0.0, 0.0), (119.0, 79.0), (30.0, 20.0))
     resized = apply_matrix(result.transform.forward_matrix, original)
-    assert resized == ((0.0, 0.0), (240.0, 160.0), (60.0, 40.0))
-    assert apply_matrix(result.transform.inverse_matrix, resized) == original
+    assert resized[0] == (0.0, 0.0)
+    assert resized[1] == (239.0, 159.0)
+    restored = apply_matrix(result.transform.inverse_matrix, resized)
+    for expected, actual in zip(original, restored, strict=True):
+        assert actual == pytest.approx(expected)
+
+
+def test_canonical_recovery_resize_binds_rounded_output_endpoints(tmp_path: Path) -> None:
+    source = tmp_path / "crop.png"
+    image = np.full((732, 2306, 3), 255, dtype=np.uint8)
+    assert cv2.imwrite(str(source), image)
+
+    result = resize_region(source, tmp_path / "resized.png", 1, 4 / 3)
+
+    assert (result.transform.derived_width, result.transform.derived_height) == (3075, 976)
+    child_endpoints = ((0.0, 0.0), (3074.0, 975.0))
+    restored = apply_matrix(result.transform.inverse_matrix, child_endpoints)
+    for expected, actual in zip(((0.0, 0.0), (2305.0, 731.0)), restored, strict=True):
+        assert actual == pytest.approx(expected)
+
+
+def test_canonical_recovery_identity_resize_preserves_pixel_coordinates(tmp_path: Path) -> None:
+    source = tmp_path / "crop.png"
+    image = np.full((7, 11, 3), 255, dtype=np.uint8)
+    assert cv2.imwrite(str(source), image)
+
+    result = resize_region(source, tmp_path / "resized.png", 1, 1.0)
+
+    assert result.transform.forward_matrix == (
+        (1.0, 0.0, 0.0),
+        (0.0, 1.0, 0.0),
+        (0.0, 0.0, 1.0),
+    )
+
+
+def test_canonical_recovery_resize_rejects_expanded_one_pixel_axis(tmp_path: Path) -> None:
+    source = tmp_path / "crop.png"
+    image = np.full((7, 1, 3), 255, dtype=np.uint8)
+    assert cv2.imwrite(str(source), image)
+
+    with pytest.raises(ValueError, match="one-pixel axes"):
+        resize_region(source, tmp_path / "resized.png", 1, 2.0)
 
 
 def test_color_overlay_suppression_fades_colored_marks_and_preserves_dark_text(
@@ -158,6 +198,13 @@ def test_400_dpi_region_rerender_round_trips_to_300_dpi_page(tmp_path: Path) -> 
     restored = apply_matrix(result.transform.inverse_matrix, crop_points)
     for expected, actual in zip(page_points, restored, strict=True):
         assert actual == pytest.approx(expected)
+    child_endpoints = (
+        (0.0, 0.0),
+        (result.transform.derived_width - 1.0, result.transform.derived_height - 1.0),
+    )
+    parent_endpoints = apply_matrix(result.transform.inverse_matrix, child_endpoints)
+    assert parent_endpoints[0] == pytest.approx((100.0, 150.0))
+    assert parent_endpoints[1] == pytest.approx((599.0, 899.0))
 
 
 def test_all_right_angle_orientations_round_trip_and_swap_dimensions() -> None:

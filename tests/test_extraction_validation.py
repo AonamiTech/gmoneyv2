@@ -31,6 +31,7 @@ from gmoney.contracts.v6 import (
     ArtifactKind,
     ArtifactManifest,
     ArtifactRef,
+    HomographyMapping,
     IdentityMapping,
     PageArtifact,
     canonical_sha256,
@@ -497,6 +498,95 @@ def test_v6_publication_requires_explicit_page_roles_and_one_selection(tmp_path:
     codes = {issue.code for issue in report.issues}
     assert "v6_oriented_page_inventory_invalid" in codes
     assert "v6_selected_page_inventory_invalid" in codes
+
+
+@pytest.mark.parametrize(
+    "artifact_kind",
+    (ArtifactKind.PROJECTIVE, ArtifactKind.PROJECTIVE_ENHANCED),
+)
+def test_v6_rejected_projective_candidate_may_include_replicated_border(
+    tmp_path: Path,
+    artifact_kind: ArtifactKind,
+) -> None:
+    source_pdf, artifact_root, result = _v6_page_inventory_fixture(tmp_path)
+    manifest = ArtifactManifest.model_validate(result["artifact_manifest"])
+    oriented = next(
+        item for item in manifest.artifacts if item.artifact_kind is ArtifactKind.ORIENTED_RAW
+    )
+    projective = ArtifactRef(
+        artifact_kind=artifact_kind,
+        image_sha256=oriented.image_sha256,
+        artifact_relative_path=oriented.artifact_relative_path,
+        width=oriented.width,
+        height=oriented.height,
+        parent_artifact_id=oriented.artifact_id,
+        producer="test.deskew",
+        producer_version="1",
+        configuration_sha256="c" * 64,
+        child_to_parent_mapping=HomographyMapping(
+            child_to_parent_matrix=((1, 0, -1), (0, 1, 0), (0, 0, 1))
+        ),
+    )
+    result["artifact_manifest"] = ArtifactManifest(
+        artifacts=(*manifest.artifacts, projective)
+    ).model_dump(mode="json")
+    page_artifacts = result["page_artifacts"]
+    assert isinstance(page_artifacts, list)
+    page_artifacts.append(
+        PageArtifact(
+            artifact=projective,
+            page_number=1,
+            dpi=72,
+            role="CANDIDATE",
+            selected=False,
+        ).model_dump(mode="json")
+    )
+
+    report = validate_extraction_result(source_pdf, result, artifact_root)
+
+    assert report.status == "passed"
+    assert "v6_mapping_out_of_bounds" not in {issue.code for issue in report.issues}
+
+
+def test_v6_non_projective_derivative_must_remain_inside_parent(tmp_path: Path) -> None:
+    source_pdf, artifact_root, result = _v6_page_inventory_fixture(tmp_path)
+    manifest = ArtifactManifest.model_validate(result["artifact_manifest"])
+    oriented = next(
+        item for item in manifest.artifacts if item.artifact_kind is ArtifactKind.ORIENTED_RAW
+    )
+    derivative = ArtifactRef(
+        artifact_kind=ArtifactKind.CELL_CROP,
+        image_sha256=oriented.image_sha256,
+        artifact_relative_path=oriented.artifact_relative_path,
+        width=oriented.width,
+        height=oriented.height,
+        parent_artifact_id=oriented.artifact_id,
+        producer="test.recovery",
+        producer_version="1",
+        configuration_sha256="c" * 64,
+        child_to_parent_mapping=HomographyMapping(
+            child_to_parent_matrix=((1, 0, -1), (0, 1, 0), (0, 0, 1))
+        ),
+    )
+    result["artifact_manifest"] = ArtifactManifest(
+        artifacts=(*manifest.artifacts, derivative)
+    ).model_dump(mode="json")
+    page_artifacts = result["page_artifacts"]
+    assert isinstance(page_artifacts, list)
+    page_artifacts.append(
+        PageArtifact(
+            artifact=derivative,
+            page_number=1,
+            dpi=72,
+            role="CANDIDATE",
+            selected=False,
+        ).model_dump(mode="json")
+    )
+
+    report = validate_extraction_result(source_pdf, result, artifact_root)
+
+    assert report.status == "failed"
+    assert "v6_mapping_out_of_bounds" in {issue.code for issue in report.issues}
 
 
 def test_validation_returns_a_complete_structured_report(tmp_path: Path) -> None:
@@ -1013,6 +1103,139 @@ def test_v6_projection_materializes_distinct_adapter_derivatives(
             list(row) for row in expected["input_to_canonical_matrix"]
         ]
         assert trace["accepted"] is False
+
+
+def test_v6_projection_clips_pixel_edge_tokens_and_evidence_to_crop_bounds(
+    tmp_path: Path,
+) -> None:
+    _source, artifact_root, result = _fixture(tmp_path)
+    crop_sha = _add_projectable_table_crop(artifact_root, result)
+    edge_polygon = {
+        "points": [
+            {"x": 1, "y": 48},
+            {"x": 20, "y": 48},
+            {"x": 20, "y": 50},
+            {"x": 1, "y": 50},
+        ]
+    }
+    tokens = result["token_manifest"]
+    assert isinstance(tokens, list)
+    for token in tokens:
+        token.update(
+            polygon=edge_polygon,
+            source_artifact_sha256=crop_sha,
+            source_artifact_relative_path="crops/p1-t1.png",
+            source_polygon=edge_polygon,
+            source_width=50,
+            source_height=50,
+            source_to_page_matrix=((1, 0, 0), (0, 1, 0), (0, 0, 1)),
+        )
+
+    def move_evidence_to_edge(value: object) -> None:
+        if isinstance(value, dict):
+            if {"page_number", "artifact_sha256", "token_ids", "polygon"} <= value.keys():
+                value["polygon"] = edge_polygon
+            for child in value.values():
+                move_evidence_to_edge(child)
+        elif isinstance(value, list):
+            for child in value:
+                move_evidence_to_edge(child)
+
+    move_evidence_to_edge(result["rows"])
+    move_evidence_to_edge(result["source_tables"])
+
+    projected = _project_result_v6(result, artifact_root)
+
+    crop_artifact_id = projected["canonical_table_artifacts"][0]["artifact"]["artifact_id"]
+    crop_tokens = [
+        token for token in projected["token_manifest"] if token["artifact_id"] == crop_artifact_id
+    ]
+    crop_evidence = [
+        evidence
+        for evidence in projected["evidence"]
+        if evidence["artifact_id"] == crop_artifact_id
+    ]
+    assert crop_tokens and crop_evidence
+    for item in (*crop_tokens, *crop_evidence):
+        assert max(point["y"] for point in item["canonical_polygon"]["points"]) == 49
+        assert max(point["y"] for point in item["source_page_polygon"]["points"]) == 50
+
+
+def test_v6_projection_normalizes_source_page_half_open_edges_and_rejects_overshoot(
+    tmp_path: Path,
+) -> None:
+    source, artifact_root, result = _fixture(tmp_path)
+    page = result["page_assets"][0]
+    assert isinstance(page, dict)
+    old_page_sha = str(page["artifact_sha256"])
+    page_path = artifact_root / str(page["relative_path"])
+    image = np.full((200, 100, 3), 255, dtype=np.uint8)
+    assert cv2.imwrite(str(page_path), image)
+    new_page_sha = _sha(page_path.read_bytes())
+
+    def replace_digest(value: object) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if child == old_page_sha:
+                    value[key] = new_page_sha
+                else:
+                    replace_digest(child)
+        elif isinstance(value, list):
+            for child in value:
+                replace_digest(child)
+
+    replace_digest(result)
+    _add_projectable_table_crop(artifact_root, result)
+    crop_path = artifact_root / "crops" / "p1-t1.png"
+    crop_image = np.full((50, 50, 3), 255, dtype=np.uint8)
+    assert cv2.imwrite(str(crop_path), crop_image)
+    result["table_crops"][0]["artifact_sha256"] = _sha(crop_path.read_bytes())
+    edge_polygon = {
+        "points": [
+            {"x": 0, "y": 0},
+            {"x": 100, "y": 0},
+            {"x": 100, "y": 200},
+            {"x": 0, "y": 200},
+        ]
+    }
+    tokens = result["token_manifest"]
+    assert isinstance(tokens, list)
+    for token in tokens:
+        token["polygon"] = edge_polygon
+
+    def move_evidence_to_edge(value: object) -> None:
+        if isinstance(value, dict):
+            if {"page_number", "artifact_sha256", "token_ids", "polygon"} <= value.keys():
+                value["polygon"] = edge_polygon
+            for child in value.values():
+                move_evidence_to_edge(child)
+        elif isinstance(value, list):
+            for child in value:
+                move_evidence_to_edge(child)
+
+    move_evidence_to_edge(result["rows"])
+    move_evidence_to_edge(result["source_tables"])
+    projected = _project_result_v6(result, artifact_root)
+
+    report = validate_extraction_result(source, projected, artifact_root)
+
+    assert report.status == "passed"
+    for item in (*projected["token_manifest"], *projected["evidence"]):
+        assert max(point["x"] for point in item["canonical_polygon"]["points"]) == 99
+        assert max(point["y"] for point in item["canonical_polygon"]["points"]) == 199
+        assert max(point["x"] for point in item["source_page_polygon"]["points"]) == 99
+        assert max(point["y"] for point in item["source_page_polygon"]["points"]) == 199
+
+    tokens[0]["polygon"] = {
+        "points": [
+            {"x": 0, "y": 0},
+            {"x": 102, "y": 0},
+            {"x": 102, "y": 10},
+            {"x": 0, "y": 10},
+        ]
+    }
+    with pytest.raises(ValueError, match="outside the 100-pixel raster"):
+        _project_result_v6(result, artifact_root)
 
 
 def test_v6_projection_rejects_distinct_adapter_hash_without_metadata(

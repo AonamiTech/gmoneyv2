@@ -765,7 +765,19 @@ def _validate_extraction_result_v6(
             )
             try:
                 mapped = apply_matrix(mapping.child_to_parent_matrix, corners)
-                if not _v6_in_bounds(mapped, parent.width, parent.height):
+                # Full-frame projective candidates use border replication for
+                # deskew/perspective correction, so their outer corners may
+                # map beyond the source raster.  Cited polygons are still
+                # required to project inside SOURCE_RAW below.  Crops and
+                # orientation transforms, which cannot own synthetic border
+                # pixels, retain the strict whole-artifact containment gate.
+                permits_projective_border = artifact.artifact_kind in {
+                    ArtifactKind.PROJECTIVE,
+                    ArtifactKind.PROJECTIVE_ENHANCED,
+                }
+                if not permits_projective_border and not _v6_in_bounds(
+                    mapped, parent.width, parent.height
+                ):
                     _v6_fatal(
                         issues,
                         "v6_mapping_out_of_bounds",

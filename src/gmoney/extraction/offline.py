@@ -5741,14 +5741,40 @@ def _project_result_v6(
             item for item in artifacts if item.artifact_id == page_raw_ids[token.page_number]
         )
 
+    def bounded_raster_polygon(polygon: Polygon, artifact: ArtifactRef) -> Polygon:
+        """Normalize half-open raster edges and reject geometry beyond them."""
+        def bound(value: float, size: int, axis: str) -> float:
+            epsilon = 1e-6
+            if value < -epsilon or value > size + epsilon:
+                raise ValueError(
+                    f"V6 {axis} coordinate {value} is outside the {size}-pixel raster"
+                )
+            return min(float(size - 1), max(0.0, value))
+
+        return Polygon(
+            points=tuple(
+                Point(
+                    x=bound(point.x, artifact.width, "x"),
+                    y=bound(point.y, artifact.height, "y"),
+                )
+                for point in polygon.points
+            )
+        )
+
     v2_tokens: list[TokenManifestEntryV2] = []
     for raw_token in result.get("token_manifest", ()):
         token = TokenManifestEntry.model_validate(raw_token)
         ensure_recovery_artifact(token)
         artifact = artifact_for_token(token)
-        canonical_polygon = token.source_polygon or token.polygon
-        source_polygon = token.polygon
+        canonical_polygon = bounded_raster_polygon(
+            token.source_polygon or token.polygon,
+            artifact,
+        )
         source_artifact_id = page_raw_ids[token.page_number]
+        source_artifact = next(
+            item for item in artifacts if item.artifact_id == source_artifact_id
+        )
+        source_polygon = bounded_raster_polygon(token.polygon, source_artifact)
         v2 = TokenManifestEntryV2(
             token_id=token.token_id,
             page_number=token.page_number,
@@ -5804,14 +5830,24 @@ def _project_result_v6(
             source_to_artifact,
             tuple((point.x, point.y) for point in raw.polygon.points),
         )
-        canonical_polygon = Polygon(
-            points=tuple(Point(x=max(0.0, x), y=max(0.0, y)) for x, y in canonical_points)
+        canonical_polygon = bounded_raster_polygon(
+            Polygon(
+                points=tuple(Point(x=max(0.0, x), y=max(0.0, y)) for x, y in canonical_points)
+            ),
+            artifact,
         )
         return EvidenceRefV2(
             artifact_id=artifact_id,
             artifact_sha256=artifact.image_sha256,
             canonical_polygon=canonical_polygon,
-            source_page_polygon=raw.polygon,
+            source_page_polygon=bounded_raster_polygon(
+                raw.polygon,
+                next(
+                    item
+                    for item in artifacts
+                    if item.artifact_id == page_raw_ids[raw.page_number]
+                ),
+            ),
             source_page_number=raw.page_number,
             source_page_artifact_id=page_raw_ids[raw.page_number],
             ocr_token_ids=raw.token_ids,
