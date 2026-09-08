@@ -9,6 +9,7 @@ from pydantic import ValidationError
 from gmoney.contracts.v6 import M5ShadowProjectionV1
 from gmoney.evaluation.authority_metrics import AuthorityDocumentReport
 from gmoney.evaluation.m5_shadow import (
+    evaluate_m5_shadow_projection,
     project_m5_shadow_runs,
     summarize_authority_reports,
     verify_m5_shadow_projection,
@@ -207,6 +208,109 @@ def test_projection_json_round_trip_revalidates() -> None:
         json.dumps(projection.model_dump(mode="json"))
     )
     assert restored == projection
+
+
+def test_authority_projection_preserves_source_geometry_when_logical_order_differs() -> None:
+    def proposal(proposal_id: str, artifact: str, source_box: list[int]) -> dict[str, object]:
+        return {
+            **_proposal(proposal_id, artifact),
+            "source_box": source_box,
+        }
+
+    def reconstruction(
+        proposal_id: str,
+        artifact: str,
+        source_box: list[int],
+        value: str,
+    ) -> dict[str, object]:
+        return {
+            **_reconstruction(proposal_id, artifact, value),
+            "source_box": source_box,
+            "source_tables": [
+                {
+                    "table_id": proposal_id,
+                    "page_number": 1,
+                    "rows": [{"cells": [{"raw_value": value}]}],
+                }
+            ],
+        }
+
+    def logical_table(
+        logical_id: str,
+        baseline_id: str,
+        candidate_id: str,
+        source_box: list[int],
+        value: str,
+    ) -> dict[str, object]:
+        baseline_artifact = ("b" if value == "bottom" else "d") * 64
+        candidate_artifact = ("c" if value == "bottom" else "e") * 64
+        return {
+            "logical_table_id": logical_id,
+            "anchor_proposal_id": baseline_id,
+            "proposal_ids": [baseline_id, candidate_id],
+            "selected_proposal_id": candidate_id,
+            "baseline_proposal_id": baseline_id,
+            "baseline_reconstruction": reconstruction(
+                baseline_id, baseline_artifact, source_box, value
+            ),
+            "selected_reconstruction": reconstruction(
+                candidate_id, candidate_artifact, source_box, value
+            ),
+        }
+
+    bottom_box = [0, 60, 100, 100]
+    top_box = [0, 0, 100, 40]
+    projection = project_m5_shadow_runs(
+        document_id=SOURCE,
+        source_sha256=SOURCE,
+        source_name="bill.pdf",
+        runs=[
+            _run(
+                tables=[
+                    # Logical ordering intentionally places the lower table first.
+                    logical_table(
+                        "logical-a", "bottom-base", "bottom-candidate", bottom_box, "bottom"
+                    ),
+                    logical_table("logical-z", "top-base", "top-candidate", top_box, "top"),
+                ],
+                proposals=[
+                    proposal("bottom-base", "b" * 64, bottom_box),
+                    proposal("bottom-candidate", "c" * 64, bottom_box),
+                    proposal("top-base", "d" * 64, top_box),
+                    proposal("top-candidate", "e" * 64, top_box),
+                ],
+            )
+        ],
+    )
+    gold = {
+        "source_sha256": SOURCE,
+        "tables": [
+            {
+                "table_id": "gold-top",
+                "page_number": 1,
+                "polygon": top_box,
+                "rows": [{"cells": [{"raw_value": "top"}]}],
+            },
+            {
+                "table_id": "gold-bottom",
+                "page_number": 1,
+                "polygon": bottom_box,
+                "rows": [{"cells": [{"raw_value": "bottom"}]}],
+            },
+        ],
+    }
+
+    authority = projection.authority_document()
+    report = evaluate_m5_shadow_projection(gold, projection)
+
+    assert [table["source_polygon"] for table in authority["tables"]] == [
+        tuple(float(value) for value in bottom_box),
+        tuple(float(value) for value in top_box),
+    ]
+    assert [(item.gold_id, item.actual_id) for item in report.tables] == [
+        ("gold-top", "top-candidate"),
+        ("gold-bottom", "bottom-candidate"),
+    ]
 
 
 def test_expected_page_count_rejects_silent_page_omission() -> None:

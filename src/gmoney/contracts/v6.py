@@ -1130,7 +1130,12 @@ class M5ShadowProjectionV1(ContractModel):
         """Project selected source tables for read-only authority scoring."""
 
         source_tables = [
-            source_table
+            {
+                **source_table,
+                "source_polygon": source_table.get(
+                    "source_polygon", table.selected_reconstruction.source_box
+                ),
+            }
             for table in self.tables
             if table.selected_reconstruction is not None
             for source_table in table.selected_reconstruction.source_tables
