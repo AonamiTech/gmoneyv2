@@ -1,16 +1,18 @@
 # Table Magic M4 Review
 
 Status: hold
-Date: 2026-09-07 UTC
+Date: 2026-09-08 UTC
 Owner: Codex
 Git SHAs: `1e3fced0a8e12a6a93e9f8a7c5682978f065c554`,
 `6ae7e4d20531a177895b3be4046aedda0f462057`,
 `8dfdd4ae3b11aa03c41e0a3e4a41e2b60853f6b5`,
 `0c8650a40e24e1881b10ad839d8645d769c4a1b5`,
-`64bdf9cb0461c61bb8884ddf9d2ad60e6ac6d65d` (current GPU shadow target)
-Image digest: `sha256:d7f1b7c780746ef4c29a975da238591b1ca4caa1892aa441b4673d67c03847c9`
+`64bdf9cb0461c61bb8884ddf9d2ad60e6ac6d65d`,
+`40bb6ee2fbb21a73af78ea6b4ca92a2a7c60e376` (current GPU shadow target)
+Candidate image digest: `sha256:7599977d08d2876fcf892d566e7a8163ea72b14519aa1a776e4326dd7d8833e4`
 Corpus manifest SHA-256: unavailable — inherited M2 external-data hold
-Gold/evaluator versions: unavailable
+Gold/evaluator versions: four-pass audited non-authoritative two-document pilot only;
+`authority_metrics_v2` is frozen with the pilot and `authority_metrics_v3` requires a new baseline
 Component/config versions: `gmoney_uvdoc_shadow_v1`, `gmoney_uvdoc_hf_to_paddle_v1`,
 `gmoney_uvdoc_preregistration_v1` (diagnostic only), `gmoney_uvdoc_accuracy_v1` (diagnostic
 only), `gmoney_uvdoc_gate_v1` (non-promoting), `gmoney_uvdoc_preregistration_v2`,
@@ -114,6 +116,33 @@ Evidence is retained at
 manifest has SHA-256 `24f790eab05ab06af196cfecfb53b9d9f733fc48c9d26e81ef93ea003683a013`.
 This is a shadow integration/substrate result only. The synthetic flat control does not establish
 curved improvement or authoritative flat non-regression.
+
+### 2026-09-08 audited curved/flat GPU pilot
+
+Exact revision `40bb6ee2fbb21a73af78ea6b4ca92a2a7c60e376` replaced full-resolution
+grid persistence with the model's bounded native control grid and deterministic chunked
+`align_corners` expansion. The isolated T4 canary then ran the only two four-pass audited pilot
+bills twice each with `GMONEY_UVDOC_MODE=shadow`.
+
+- All four UVDoc runs were valid, reproduced within `(1, 1, 1)`, and had zero foldovers and zero
+  out-of-bounds samples. V6 validation passed without issues, and artifact identities repeated
+  exactly. The curved control grid was 10,484 bytes rather than the rejected roughly 298 MiB
+  full-resolution representation.
+- Visual review found the curved bill readable and visibly flatter. The already-flat bill was
+  unnecessarily warped and clipped at the page edges.
+- Downstream selection retained `ORIENTED_RAW` for both curved tables but chose `UVDOC` for both
+  flat tables. Frozen pooled critical precision/recall fell from `100.00%/82.98%` to
+  `48.72%/40.43%`; the pilot therefore proves runtime feasibility but fails the curved-gain and
+  flat-non-regression gate.
+- All jobs were sequential with zero worker restarts or OOMs. Production remained healthy and
+  unchanged on `da20ceec63211559ea1707a16c831f600479c592`. The failed gate stopped the wider
+  working152 campaign.
+
+Evidence is retained under
+`/home/azureuser/gmoney-corpus-vault/working152-audit-20260908/pilot-shadow-40bb6ee-20260908`;
+the archive `SHA256SUMS` file has SHA-256
+`1ee27be1eab0de1fd4e11f97d8094d658d916d240674906015c5735e6506a4c6`.
+This clears the bounded-grid GPU integration blocker, not the M4 accuracy or authority blockers.
 
 ## Gate decision and rollback condition
 

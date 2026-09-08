@@ -644,8 +644,8 @@ Allowed states are `not_started`, `in_progress`, `blocked`, `shadow`, `promoted`
 | M1 | Canonical-image consistency | in_progress | All table adapters share one crop hash; no flat regression | `afe8caa`; frozen non-regression report pending |
 | M2 | Artifact and evidence V6 | in_progress | V5 read compatibility; tamper-safe lineage; <=2 px linear mapping error | `077d8e6`, `b947332`, `ec17b07`; integrity gates pass, frozen accuracy gate held in `docs/reviews/table-magic-m2.md` |
 | M3 | Dense transform foundation | promoted | Synthetic dense mappings pass and invalid grids fail closed | `057b6cf`, `5da09b6`, `76de77d`; local and isolated GPU-host certification in `docs/reviews/table-magic-m3.md` |
-| M4 | UVDoc feasibility/shadow | blocked | Reproducible grid, valid geometry, curved gain, no critical regression | `64bdf9c` passed isolated GPU shadow integration twice; v1 is diagnostic-only and v2 recomputes structural authority evidence; authoritative M2 corpus accuracy gate remains held in `docs/reviews/table-magic-m4.md` |
-| M5 | Per-table matching/selection | in_progress | Stable identity, no lost/duplicate tables, holdout improvement | `32e4ad6`, `c879192`; contracts/runtime and local verification pass, authoritative/GPU accuracy gate held in `docs/reviews/table-magic-m5.md` |
+| M4 | UVDoc feasibility/shadow | blocked | Reproducible grid, valid geometry, curved gain, no critical regression | `40bb6ee` passed exact GPU bounded-grid replay on two curved and two flat runs; the accuracy gate failed and the authoritative M2 corpus gate remains held in `docs/reviews/table-magic-m4.md` |
+| M5 | Per-table matching/selection | in_progress | Stable identity, no lost/duplicate tables, holdout improvement | `cf40033`, `40bb6ee`, `259b4cc`; exact GPU repeatability passed but the candidate selected UVDoc on flat tables and severely regressed critical metrics, so this candidate is rejected in `docs/reviews/table-magic-m5.md` |
 | M6 | Table V2 shadow benchmark | not_started | Unique recoveries and acceptable GPU/latency cost | TBD |
 | M7 | PaddleOCR-VL client A/B | not_started | Frozen metric winner selected; direct adapter retained on tie | TBD |
 | M8 | Targeted disagreement recovery | not_started | Recall gain without precision or grounding regression | TBD |
@@ -907,6 +907,23 @@ host was safely prepared without deploying M5. Corpus accuracy and GPU qualifica
 until the exact sealed 14/36/159 authority, evaluator, and baseline exist. The audited working
 inventory now contains 152 eligible real PDFs, leaving exactly seven genuine PDFs plus cohort,
 four-pass gold, evaluator, and baseline work before that gate can open.
+
+On 2026-09-08, exact revision `40bb6ee2fbb21a73af78ea6b4ca92a2a7c60e376` ran a
+preregistered non-authoritative GPU pilot twice on one audited curved bill and twice on one
+audited flat bill. Bounded UVDoc grids, V6 validation, transform validity, replay within one value
+per channel, and deterministic M5 projection identities all passed. The selector retained raw
+reconstruction for both curved tables but selected UVDoc for both flat tables. Frozen pooled
+critical precision/recall fell from `100.00%/82.98%` to `48.72%/40.43%`; cell-value
+precision/recall fell from `81.25%/56.52%` to `43.30%/30.43%`. The candidate was stopped before
+the working152 campaign and production remained unchanged. A discovered v2 evaluator
+per-document precision defect must also be corrected and resealed. Exact evidence and limitations
+are recorded in `docs/reviews/table-magic-m5.md`.
+
+Commit `259b4cc` corrects that defect for `authority_metrics_v3` by requiring a critical exact
+match to be critical in both gold and prediction. A post-pilot diagnostic produces bounded counts:
+baseline `36/39/47` (92.31% precision, 76.60% recall) and candidate `16/39/47` (41.03%
+precision, 34.04% recall). This does not rewrite the frozen v2 pilot; v3 and a new baseline must be
+sealed before the next campaign.
 
 ### M6 — Benchmark Table Recognition V2
 
