@@ -285,3 +285,33 @@ class PaddleOcrVlAdapter:
             peak_rss_bytes=None,
             memory_scope="remote_unmeasured",
         )
+
+
+TELEOCR_TABLE_PROMPT = "This is the image of a table. Please output the table in OTSL format."
+
+
+class TeleOcrAdapter(PaddleOcrVlAdapter):
+    """Client for the separate TeleOCR service (OpenAI-compatible chat completions)."""
+
+    spec = ModelSpec(
+        kind=ModelKind.DOCUMENT_VLM,
+        provider="stardoc",
+        model_name="StarDoc-AI/TeleOCR",
+        model_version="1.2b",
+        backend="transformers",
+        device="remote",
+    )
+
+    def __init__(
+        self,
+        base_url: str = "http://127.0.0.1:8112",
+        timeout_seconds: float = 900,
+        device: str = "remote",
+    ) -> None:
+        super().__init__(base_url=base_url, timeout_seconds=timeout_seconds, device=device)
+
+    def predict(self, request: InferenceRequest) -> InferenceResponse:
+        options = {"prompt": TELEOCR_TABLE_PROMPT, "max_tokens": 8192, **request.options}
+        response = super().predict(request.model_copy(update={"options": options}))
+        content = str(response.output.get("content") or "").split("<|im_end|>", 1)[0].strip()
+        return response.model_copy(update={"output": {**response.output, "content": content}})

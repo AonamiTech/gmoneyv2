@@ -33,30 +33,33 @@ LEDGER_ROLES = GRANULAR_ROLES | {"category_rollup"}
 DOCUMENT_TOTAL_KINDS = {"bill_total", "gross_total"}
 ONE_RUPEE = Decimal("1.00")
 # Printed totals that are not sums of preceding charges.  They are reported for the
-# reviewer but never required to reconcile.
-SETTLEMENT_WORDS = (
-    "advance",
-    "balance",
-    "cgst",
-    "claim",
-    "company",
-    "concession",
-    "copay",
-    "deposit",
-    "discount",
-    "due",
-    "gst",
-    "paid",
-    "payable",
-    "payer",
-    "receiv",
-    "recelv",
-    "round",
-    "settlement",
-    "sgst",
-    "tax",
-    "tpa",
+# reviewer but never required to reconcile.  Matched as whole words (or stems below).
+SETTLEMENT_WORDS = frozenset(
+    {
+        "advance",
+        "balance",
+        "cgst",
+        "claim",
+        "company",
+        "concession",
+        "copay",
+        "deposit",
+        "discount",
+        "due",
+        "gst",
+        "igst",
+        "paid",
+        "payable",
+        "payer",
+        "round",
+        "roundoff",
+        "settlement",
+        "sgst",
+        "tax",
+        "tpa",
+    }
 )
+SETTLEMENT_STEMS = ("receiv", "recelv", "settle", "payab", "rounding")
 STRUCTURED_FIELDS = {"service_date_raw", "request_no", "service_code", "hsn_code"}
 
 
@@ -290,8 +293,11 @@ def _summary_check(rows: list[dict[str, Any]], printed: list[dict[str, Any]]) ->
     )
 
 
-def _is_settlement_label(label: str) -> bool:
-    return any(word in label for word in SETTLEMENT_WORDS)
+def is_settlement_label(label: str) -> bool:
+    return any(
+        word in SETTLEMENT_WORDS or word.startswith(SETTLEMENT_STEMS)
+        for word in normalized_label(label).split()
+    )
 
 
 def _is_checkable_total_label(label: str) -> bool:
@@ -354,7 +360,7 @@ def _section_checks(
             label, net_values, all_values = _row_label_and_targets(table, source_row)
             if not all_values or not label:
                 continue
-            if _is_settlement_label(label):
+            if is_settlement_label(label):
                 reported.append(
                     {
                         "label": label,

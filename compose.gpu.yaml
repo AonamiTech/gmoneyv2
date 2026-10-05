@@ -42,12 +42,48 @@ services:
               count: 1
               capabilities: [gpu]
 
+  # Optional TeleOCR table reader; start with --profile teleocr (see docs/TELEOCR_RUNBOOK.md).
+  teleocr:
+    profiles: ["teleocr"]
+    image: gmoney-v2-teleocr:${GMONEY_IMAGE_TAG:-local}
+    build:
+      context: .
+      dockerfile: infra/docker/teleocr.Dockerfile
+    environment:
+      TELEOCR_MODEL_PATH: /models/teleocr
+      TELEOCR_DEVICE: cuda:0
+      # auto = float16 on GPUs without bf16 (T4), bfloat16 otherwise.
+      TELEOCR_DTYPE: "${GMONEY_TELEOCR_DTYPE:-auto}"
+      TELEOCR_MAX_CONCURRENCY: "${GMONEY_TELEOCR_MAX_CONCURRENCY:-1}"
+      TELEOCR_MAX_NEW_TOKENS: "${GMONEY_TELEOCR_MAX_TOKENS:-8192}"
+    volumes:
+      - ${GMONEY_MODEL_ROOT:-/home/ubuntu/gmoneyv2-runtime/model-cache}/teleocr:/models/teleocr:ro
+    ports:
+      - "127.0.0.1:8112:8112"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent http://127.0.0.1:8112/health >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 120s
+    deploy:
+      resources:
+        limits:
+          memory: 12G
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
   api:
     build:
       args:
         GMONEY_REQUIRE_BUILD_REVISION: "1"
     environment:
       GMONEY_WORKER_CAPACITY: "${GMONEY_GPU_WORKER_CONCURRENCY:-1}"
+      GMONEY_RECONCILIATION_GATE: "${GMONEY_RECONCILIATION_GATE:-auto}"
 
   profile-admin:
     build:
@@ -65,6 +101,15 @@ services:
       GMONEY_PADDLE_DEVICE: gpu:0
       GMONEY_VL_DEVICE: cuda:0
       GMONEY_WORKER_CONCURRENCY: "${GMONEY_GPU_WORKER_CONCURRENCY:-1}"
+      GMONEY_TABLE_READER: "${GMONEY_TABLE_READER:-heuristic}"
+      GMONEY_TELEOCR_URL: "${GMONEY_TELEOCR_URL:-http://teleocr:8112}"
+      GMONEY_RECONCILIATION_GATE: "${GMONEY_RECONCILIATION_GATE:-auto}"
+      GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
+      GMONEY_GEMINI_MODEL: "${GMONEY_GEMINI_MODEL:-gemini-3.5-flash}"
+      GMONEY_GEMINI_INPUT_COST_USD_PER_MILLION: "${GMONEY_GEMINI_INPUT_COST_USD_PER_MILLION:-0}"
+      GMONEY_GEMINI_OUTPUT_COST_USD_PER_MILLION: "${GMONEY_GEMINI_OUTPUT_COST_USD_PER_MILLION:-0}"
+      GMONEY_GEMINI_READER_MAX_COST_INR_PER_PAGE: "${GMONEY_GEMINI_READER_MAX_COST_INR_PER_PAGE:-0.30}"
+      GMONEY_INR_PER_USD: "${GMONEY_INR_PER_USD:-88}"
       OMP_NUM_THREADS: "4"
       MKL_NUM_THREADS: "4"
       FLAGS_paddle_num_threads: "4"

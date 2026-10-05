@@ -183,6 +183,9 @@ def _run_job(
     }
     if alias_registry is not None:
         extractor_options["alias_registry"] = alias_registry
+    table_reader = os.environ.get("GMONEY_TABLE_READER")
+    if table_reader and table_reader != "heuristic":
+        extractor_options["table_reader"] = table_reader
     if is_gpu_device(paddle_device):
         _gpu_inference_lock = store.acquire_inference_lock(lambda: store.abort_requested(job_id))
         return _extract_and_publish(
@@ -380,6 +383,7 @@ def run_worker_loop(
     release_revision = build_revision()
     uvdoc_mode = os.environ.get("GMONEY_UVDOC_MODE", "off")
     table_selection_mode = os.environ.get("GMONEY_TABLE_SELECTION_MODE", "off")
+    table_reader = os.environ.get("GMONEY_TABLE_READER", "heuristic")
     worker_started_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
     last_worker_status = float("-inf")
     logger.info(
@@ -390,6 +394,7 @@ def run_worker_loop(
                 "paddle_device": paddle_device,
                 "concurrency": concurrency,
                 "table_selection_mode": table_selection_mode,
+                "table_reader": table_reader,
                 "uvdoc_mode": uvdoc_mode,
             },
             sort_keys=True,
@@ -412,6 +417,7 @@ def run_worker_loop(
                 "paddle_device": paddle_device,
                 "concurrency": concurrency,
                 "table_selection_mode": table_selection_mode,
+                "table_reader": table_reader,
                 "uvdoc_mode": uvdoc_mode,
                 "uvdoc_configuration_status": (
                     "off"
