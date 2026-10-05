@@ -6267,6 +6267,8 @@ def _project_result_v6(
         worker_release_revision=result.get("worker_release_revision"),
         semantic_validation=result.get("semantic_validation"),
         validation_recovery_attempted=result.get("validation_recovery_attempted"),
+        reconciliation=result.get("reconciliation"),
+        table_reader=result.get("table_reader"),
     )
     return envelope.model_dump(mode="json")
 

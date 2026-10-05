@@ -1424,6 +1424,8 @@ class ExtractionResultV6(ContractModel):
     worker_release_revision: str | None = None
     semantic_validation: dict[str, Any] | None = None
     validation_recovery_attempted: bool | None = None
+    reconciliation: dict[str, Any] | None = None
+    table_reader: str | None = None
 
     @property
     def table_candidate_evaluations(self) -> tuple[TableCandidateScore, ...]:

@@ -2438,3 +2438,56 @@ def test_worker_process_survives_registry_outage_and_recovers_later_job(
             process.terminate()
             process.join(timeout=5)
     assert process.exitcode == 0
+
+
+@pytest.mark.parametrize(
+    ("table_reader", "printed_total", "expected_status"),
+    [
+        (None, "120.00", "complete"),
+        ("teleocr", "120.00", "needs_review"),
+        ("teleocr", "100.00", "complete"),
+    ],
+)
+def test_reconciliation_gate_sets_job_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    table_reader: str | None,
+    printed_total: str,
+    expected_status: str,
+) -> None:
+    store = JobStore(tmp_path)
+    job_id = _create_worker_job(store, "Reconcile.pdf")
+    assert store.claim_queued(job_id) is not None
+
+    class ReaderExtractor:
+        def extract(self, source: Path, artifact_root: Path, progress: Any, **_: Any):
+            result: dict[str, Any] = {
+                "output_version": "offline_accuracy_spine_v5",
+                "rows": [
+                    {
+                        "id": "row-1",
+                        "role": "detail",
+                        "review_disposition": "accepted",
+                        "net_amount": "100.00",
+                    }
+                ],
+                "document_total": {"amount": printed_total, "label": "Total Bill Amount"},
+                "hospital": None,
+            }
+            if table_reader:
+                result["table_reader"] = table_reader
+            return result
+
+    def passed(*_args: object) -> ValidationReport:
+        return ValidationReport(status=ValidationStatus.PASSED, issues=())
+
+    monkeypatch.setattr(worker_module, "validate_extraction_result", passed)
+    monkeypatch.setattr(validation_module, "validate_extraction_result", passed)
+
+    worker_module._extract_and_publish(store=store, job_id=job_id, extractor=ReaderExtractor())
+
+    state = store.read(job_id)
+    assert state["status"] == expected_status
+    result = json.loads((store.job_dir(job_id) / "result.json").read_text())
+    assert result["reconciliation"]["enforced"] is bool(table_reader)
+    assert state["reconciliation_status"] == result["reconciliation"]["status"]

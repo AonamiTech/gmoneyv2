@@ -567,6 +567,8 @@ class ExtractionResultV5(ContractModel):
     worker_release_revision: str | None = None
     semantic_validation: dict[str, Any] | None = None
     validation_recovery_attempted: bool | None = None
+    reconciliation: dict[str, Any] | None = None
+    table_reader: str | None = None
 
     @model_validator(mode="after")
     def require_revision_four_preprocessing(self) -> "ExtractionResultV5":

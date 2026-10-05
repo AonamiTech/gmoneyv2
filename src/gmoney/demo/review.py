@@ -14,6 +14,7 @@ from typing import Any
 from uuid import uuid4
 
 from gmoney.demo.store import JobStore, JobTransactionError, utc_now
+from gmoney.extraction.reconciliation import is_enforced, reconcile, recorded_or_computed
 
 EDITABLE_TEXT_FIELDS = {
     "description",
@@ -430,6 +431,32 @@ def totals_summary(
     }
 
 
+def reconciliation_override(review: dict[str, Any]) -> dict[str, Any] | None:
+    override = review.get("reconciliation_override")
+    if isinstance(override, dict) and str(override.get("reason") or "").strip():
+        return override
+    return None
+
+
+def reconciliation_summary(
+    result: dict[str, Any],
+    review: dict[str, Any],
+    rows: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Recompute the reconciliation gate on the reviewer-projected rows."""
+    projected = rows if rows is not None else project_rows(result, review)
+    report = reconcile(result, projected)
+    override = reconciliation_override(review)
+    enforced = is_enforced(result)
+    return {
+        **report,
+        "machine_status": recorded_or_computed(result)["status"],
+        "enforced": enforced,
+        "override": override,
+        "blocking": bool(enforced and report["status"] != "verified" and override is None),
+    }
+
+
 def structural_issues(result: dict[str, Any], review: dict[str, Any]) -> list[dict[str, Any]]:
     issues: list[dict[str, Any]] = []
     overrides = review.get("issue_overrides", {})
@@ -701,6 +728,8 @@ def approval_blockers(
         for issue in structural_issues(result, review)
     ):
         blockers.append("open_structural_issues")
+    if reconciliation_summary(result, review, rows)["blocking"]:
+        blockers.append("reconciliation_unverified")
     assets = result.get("page_assets", [])
     if len(assets) != int(result.get("pages") or 0):
         blockers.append("incomplete_page_inventory")

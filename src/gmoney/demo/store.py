@@ -688,6 +688,7 @@ class JobStore:
         artifact_root: Path | None = None,
         publish_fatal_report: bool = False,
     ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        from gmoney.extraction.reconciliation import is_enforced, recorded_or_computed
         from gmoney.extraction.validation import (
             ValidationStatus,
             validate_extraction_result,
@@ -762,12 +763,23 @@ class JobStore:
                     artifact_root=artifact_root,
                 )
             )
+        reconciliation = None if report.fatal else recorded_or_computed(result)
+        reconciliation_clear = bool(
+            reconciliation is None
+            or reconciliation["status"] == "verified"
+            or not is_enforced(result)
+        )
         state_fields = {
             "status": (
                 "failed"
                 if report.fatal
-                else ("complete" if report.status is ValidationStatus.PASSED else "needs_review")
+                else (
+                    "complete"
+                    if report.status is ValidationStatus.PASSED and reconciliation_clear
+                    else "needs_review"
+                )
             ),
+            "reconciliation_status": reconciliation["status"] if reconciliation else None,
             "error": "extraction_integrity_failed" if report.fatal else None,
             "page": page_count,
             "pages": page_count,
