@@ -66,6 +66,7 @@ gmoney-uvdoc-evaluate = "gmoney.evaluation.uvdoc:app"
 gmoney-recertify = "gmoney.demo.recertify:app"
 gmoney-authority = "gmoney.evaluation.authority_cli:app"
 gmoney-m5-shadow = "gmoney.evaluation.m5_shadow:app"
+gmoney-compare = "gmoney.evaluation.compare:app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/gmoney"]

@@ -59,6 +59,15 @@ API and evidence-review behavior. See
 [docs/GPU_DEMO_DEPLOYMENT.md](docs/GPU_DEMO_DEPLOYMENT.md) for host preparation,
 storage constraints, release commands, and acceptance gates.
 
+## Table readers and the reconciliation gate
+
+Every result carries a reconciliation report that checks extracted rows against the bill's own
+printed totals (grand total, printed section sub-totals, summary roll-ups; row arithmetic is
+report-only). `GMONEY_TABLE_READER` selects the table reader: `heuristic` (default, unchanged),
+`teleocr` (TeleOCR service reads every table), or `teleocr_gemini` (Gemini as an independent
+second reader of redacted table crops). See [docs/TELEOCR_RUNBOOK.md](docs/TELEOCR_RUNBOOK.md)
+for the GPU setup and the `gmoney-compare` evaluation command.
+
 ## Editable client demo
 
 The demo Compose project exposes the Next.js evidence desk and FastAPI review API on
