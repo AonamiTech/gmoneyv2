@@ -31,6 +31,7 @@ from gmoney.demo.review import (
     project_legacy_evidence_tree,
     project_rows,
     public_page_assets,
+    reconciliation_summary,
     review_summary,
     reviewer_row,
     structural_issues,
@@ -157,6 +158,11 @@ class BulkRowsPatch(BaseModel):
 
 class IssuePatch(BaseModel):
     status: Literal["open", "resolved"]
+    reason: str = Field(min_length=3, max_length=500)
+
+
+class ReconciliationOverridePatch(BaseModel):
+    status: Literal["overridden", "cleared"]
     reason: str = Field(min_length=3, max_length=500)
 
 
@@ -1062,6 +1068,7 @@ def get_rows(
     totals = totals_summary(result, review, rows)
     if result.get("output_version") == "offline_accuracy_spine_v6":
         totals = project_legacy_evidence_tree(result, totals)
+    reconciliation = reconciliation_summary(result, review, rows)
     if query:
         needle = query.casefold().strip()
         rows = [
@@ -1106,6 +1113,7 @@ def get_rows(
         "hospital": project_hospital(result, review),
         "review_revision": review["revision"],
         "totals": totals,
+        "reconciliation": reconciliation,
         "total": total,
         "populated_fields": populated_fields,
         "offset": offset,
@@ -1227,6 +1235,7 @@ def get_review(job_id: str) -> dict[str, Any]:
         state=state,
     )
     summary = review_summary(result, review)
+    summary["reconciliation"] = reconciliation_summary(result, review)
     summary["approval_blockers"] = blockers
     summary["approval_effective"] = bool(review.get("approval")) and not blockers
     summary["export_eligible"] = summary["approval_effective"]
@@ -2149,6 +2158,46 @@ def update_issue(
     review = _mutate(job_id, expected, mutation)
     issue = next(item for item in structural_issues(result, review) if item["id"] == issue_id)
     return {"review_revision": review["revision"], "issue": issue}
+
+
+@app.patch("/api/v2/documents/{job_id}/reconciliation")
+def update_reconciliation_override(
+    job_id: str,
+    payload: ReconciliationOverridePatch,
+    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
+) -> dict[str, Any]:
+    result, _ = _complete_result(job_id)
+    expected = _expected_revision(if_match)
+    reason = payload.reason.strip()
+
+    def mutation(review: dict[str, Any]) -> dict[str, Any]:
+        if not reason:
+            raise ReviewValidationError("A reconciliation override requires a reason")
+        if payload.status == "overridden":
+            review["reconciliation_override"] = {
+                "reason": reason,
+                "updated_at": utc_now(),
+                "machine_status": reconciliation_summary(result, review)["status"],
+            }
+        else:
+            review.pop("reconciliation_override", None)
+        review["approval"] = None
+        review["events"].append(
+            _event(
+                expected + 1,
+                f"reconciliation_{payload.status}",
+                job_id,
+                reason,
+                {"status": payload.status},
+            )
+        )
+        return review
+
+    review = _mutate(job_id, expected, mutation)
+    return {
+        "review_revision": review["revision"],
+        "reconciliation": reconciliation_summary(result, review),
+    }
 
 
 @app.post("/api/v2/documents/{job_id}/approval")

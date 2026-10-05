@@ -1237,6 +1237,11 @@ def _migrate_review(
     archived.update(
         {issue_id: old_issue_overrides[issue_id] for issue_id in sorted(missing_issues)}
     )
+    if "reconciliation_override" in migrated:
+        # An override justified a specific machine result; a new result needs a new decision.
+        migrated.setdefault("archived_reconciliation_overrides", []).append(
+            migrated.pop("reconciliation_override")
+        )
     migrated["approval"] = None
     migrated.setdefault("events", []).append(
         {

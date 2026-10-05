@@ -253,3 +253,127 @@ def cached_adjudication(
     temporary.write_text(json.dumps(envelope, indent=2, sort_keys=True) + "\n")
     temporary.replace(cache_path)
     return response, False
+
+
+TABLE_READER_PROMPT_VERSION = "table-reader-v1"
+TABLE_READER_PROMPT = (
+    "This image is one table cropped from a hospital bill. Transcribe every printed charge "
+    "row exactly as printed, top to bottom. Use null for a value that is not printed; never "
+    "compute or repair numbers. Join a description that wraps onto several lines. Set "
+    "section to the nearest printed section heading above the row. Set is_return to true "
+    "for rows under a return/refund heading. Set is_total to true for printed total, "
+    "sub-total, discount, advance, or payable lines. Amounts are plain decimals without "
+    "currency symbols or thousands separators."
+)
+
+
+class TableReaderRow(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    description: str | None = None
+    quantity: str | None = None
+    unit_price: str | None = None
+    discount: str | None = None
+    amount: str | None = None
+    section: str | None = None
+    is_return: bool = False
+    is_total: bool = False
+
+
+class _TableReaderPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    rows: list[TableReaderRow]
+
+
+class TableReadResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    model: str
+    rows: tuple[TableReaderRow, ...]
+    input_tokens: int = 0
+    output_tokens: int = 0
+    measured_cost_usd: Decimal = Decimal(0)
+    latency_ms: int = 0
+    input_sha256: str
+    rejected_reasons: tuple[str, ...] = ()
+
+
+class GeminiTableReader:
+    """Independent second reader: structured rows from one redacted table crop only."""
+
+    provider = "google_genai"
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        model: str = "gemini-3.5-flash",
+        timeout_seconds: float = 120,
+        input_cost_usd_per_million: float = 0,
+        output_cost_usd_per_million: float = 0,
+        client: Any | None = None,
+    ) -> None:
+        if not api_key and client is None:
+            raise ValueError("Gemini API key is required")
+        self.model = model
+        self.input_cost = Decimal(str(input_cost_usd_per_million))
+        self.output_cost = Decimal(str(output_cost_usd_per_million))
+        self.config_identity = hashlib.sha256(
+            json.dumps(
+                {
+                    "adapter": "google_genai_table_reader_v1",
+                    "model": model,
+                    "prompt_version": TABLE_READER_PROMPT_VERSION,
+                    "response_schema": _TableReaderPayload.model_json_schema(),
+                },
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()
+        if client is None:
+            from google import genai
+
+            client = genai.Client(api_key=api_key, http_options={"timeout": timeout_seconds * 1000})
+        self._client = client
+
+    def estimated_cost_usd(self, input_tokens: int, output_tokens: int) -> Decimal:
+        return (
+            self.input_cost * Decimal(input_tokens) + self.output_cost * Decimal(output_tokens)
+        ) / Decimal(1_000_000)
+
+    def read_table(self, crop_bytes: bytes, mime_type: str = "image/png") -> TableReadResponse:
+        from google.genai import types
+
+        started = time.perf_counter()
+        response = self._client.models.generate_content(
+            model=self.model,
+            contents=[
+                TABLE_READER_PROMPT,
+                types.Part.from_bytes(data=crop_bytes, mime_type=mime_type),
+            ],
+            config=types.GenerateContentConfig(
+                temperature=0,
+                response_mime_type="application/json",
+                response_json_schema=_TableReaderPayload.model_json_schema(),
+            ),
+        )
+        latency_ms = round((time.perf_counter() - started) * 1000)
+        text = str(getattr(response, "text", "") or "")
+        try:
+            rows = tuple(_TableReaderPayload.model_validate_json(text).rows)
+            rejected: tuple[str, ...] = ()
+        except (ValidationError, ValueError) as error:
+            rows = ()
+            rejected = (f"invalid_response_schema:{type(error).__name__}",)
+        input_tokens = _usage(response, "prompt_token_count")
+        output_tokens = _usage(response, "candidates_token_count")
+        return TableReadResponse(
+            model=self.model,
+            rows=rows,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            measured_cost_usd=self.estimated_cost_usd(input_tokens, output_tokens),
+            latency_ms=latency_ms,
+            input_sha256=hashlib.sha256(crop_bytes).hexdigest(),
+            rejected_reasons=rejected,
+        )

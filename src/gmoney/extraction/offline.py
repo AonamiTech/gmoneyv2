@@ -126,6 +126,8 @@ from gmoney.extraction.ocr_rows import (
 )
 from gmoney.extraction.ocr_tokens import paddle_ocr_tokens
 from gmoney.extraction.otsl import parse_otsl, split_otsl_tables
+from gmoney.extraction.reader_consensus import PageBudget
+from gmoney.extraction.reader_pipeline import READER_MODES, finish_reader_table
 from gmoney.extraction.recovery import (
     decide_recovery,
     description_lane_recovery_regions,
@@ -141,7 +143,7 @@ from gmoney.extraction.recovery import (
     safely_improves_reconstruction,
     safely_realigns_perspective_reconstruction,
 )
-from gmoney.extraction.rows import extract_candidate_rows
+from gmoney.extraction.rows import CandidateLedgerRow, extract_candidate_rows
 from gmoney.extraction.spatial import AlignedLedgerRow, align_candidate_rows
 from gmoney.extraction.table_selection import (
     MATCH_POLICY_VERSION,
@@ -151,6 +153,12 @@ from gmoney.extraction.table_selection import (
     select_stage_one,
     select_stage_two,
     stage_two_key,
+)
+from gmoney.extraction.teleocr_reader import (
+    drop_rows_already_read,
+    needs_full_page_read,
+    read_otsl_rows,
+    uncovered_band,
 )
 from gmoney.extraction.typed_values import (
     parse_decimal,
@@ -187,15 +195,18 @@ from gmoney.inference.contracts import InferenceRequest, InferenceResponse
 from gmoney.inference.gemini import (
     AdjudicationAdapter,
     GeminiAdjudicationAdapter,
+    GeminiTableReader,
     cached_adjudication,
     validate_promotion,
 )
 from gmoney.inference.ocr_table_fallback import propose_tables_from_ocr
 from gmoney.inference.paddle import (
+    TELEOCR_TABLE_PROMPT,
     PaddleDocLayoutV3Adapter,
     PaddleDocOrientationAdapter,
     PaddleOcrV6Adapter,
     PaddleOcrVlAdapter,
+    TeleOcrAdapter,
 )
 from gmoney.inference.redaction import redact_crop
 from gmoney.inference.uvdoc import (
@@ -1423,6 +1434,23 @@ def _write_vl_image(
         width,
         height,
         input_to_canonical_matrix,
+    )
+
+
+def _full_page_vl_asset(page_path: Path, artifact_root: Path, work: TableWork) -> VlAsset:
+    """Full selected page for the missed-table guard; rows ground in the work's band crop."""
+    image = cv2.imread(str(page_path), cv2.IMREAD_COLOR)
+    if image is None:
+        raise ValueError(f"cannot read page image: {page_path}")
+    left, top = work.candidate_box[0], work.candidate_box[1]
+    return _write_vl_image(
+        image,
+        artifact_root / "crops" / f"{work.table_id}-fullpage.png",
+        input_to_canonical_matrix=(
+            (1.0, 0.0, -float(left)),
+            (0.0, 1.0, -float(top)),
+            (0.0, 0.0, 1.0),
+        ),
     )
 
 
@@ -6267,6 +6295,8 @@ def _project_result_v6(
         worker_release_revision=result.get("worker_release_revision"),
         semantic_validation=result.get("semantic_validation"),
         validation_recovery_attempted=result.get("validation_recovery_attempted"),
+        reconciliation=result.get("reconciliation"),
+        table_reader=result.get("table_reader"),
     )
     return envelope.model_dump(mode="json")
 
@@ -6872,8 +6902,14 @@ class OfflineExtractor:
         table_selection_mode: str | None = None,
         uvdoc_adapter: PaddleUvdocAdapter | None = None,
         uvdoc_preregistration: UvdocPreregistration | None = None,
+        table_reader: str | None = None,
+        teleocr_adapter: Any | None = None,
+        gemini_table_reader: Any | None = None,
     ) -> None:
         self.settings = settings or get_settings()
+        self.table_reader = table_reader or getattr(self.settings, "table_reader", "heuristic")
+        if self.table_reader not in READER_MODES:
+            raise ValueError("table_reader_invalid")
         self.uvdoc_mode = uvdoc_mode or self.settings.uvdoc_mode
         self.table_selection_mode = table_selection_mode or getattr(
             self.settings, "table_selection_mode", "off"
@@ -6938,6 +6974,28 @@ class OfflineExtractor:
         self.layout = PaddleDocLayoutV3Adapter(device=paddle_device)
         self.orientation = PaddleDocOrientationAdapter(device="cpu")
         self.vl = PaddleOcrVlAdapter(base_url=vl_url, device=vl_device)
+        # TeleOCR is the primary table reader outside the default heuristic mode; Gemini is
+        # an independent second reader only in the explicit teleocr_gemini mode, which
+        # does not use (or need) the Phase-3 gemini_mode promotion file.
+        self.teleocr = teleocr_adapter
+        if self.teleocr is None and self.table_reader != "heuristic":
+            self.teleocr = TeleOcrAdapter(
+                base_url=self.settings.teleocr_url,
+                timeout_seconds=self.settings.teleocr_timeout_seconds,
+            )
+        self.gemini_table_reader = gemini_table_reader
+        if (
+            self.gemini_table_reader is None
+            and self.table_reader == "teleocr_gemini"
+            and self.settings.gemini_api_key
+        ):
+            self.gemini_table_reader = GeminiTableReader(
+                api_key=self.settings.gemini_api_key,
+                model=self.settings.gemini_model,
+                timeout_seconds=self.settings.gemini_timeout_seconds,
+                input_cost_usd_per_million=self.settings.gemini_input_cost_usd_per_million,
+                output_cost_usd_per_million=self.settings.gemini_output_cost_usd_per_million,
+            )
         self.profile_registry_revision: int | None = None
         if profiles is not None:
             self.profiles = profiles
@@ -8014,6 +8072,10 @@ class OfflineExtractor:
         quality_by_page = {quality.page_number: quality for quality in manifest.quality}
         recovery_token_manifest: dict[str, TokenManifestEntry] = {}
         precanonical_fragment_manifest: dict[str, TokenManifestEntry] = {}
+        reader_mode = self.table_reader != "heuristic"
+        # Missed-table guard works: (page, table_id) -> full selected page image path.
+        reader_guard_pages: dict[tuple[int, str], Path] = {}
+        reader_budgets: dict[int, PageBudget] = {}
         for page_asset in manifest.pages:
             abort_checkpoint()
             page_path = artifact_root / "pages" / page_asset.relative_path
@@ -8450,6 +8512,27 @@ class OfflineExtractor:
                     )
                     for table_index, box in enumerate(candidate_boxes)
                 )
+                if reader_mode and work_boxes:
+                    # Amount-like tokens outside every detected table mean a table was
+                    # missed; TeleOCR re-reads the full page and its rows are grounded in
+                    # the uncovered band (deduped against tables already read).
+                    detected_boxes = [box for _table_id, box in work_boxes]
+                    band = (
+                        uncovered_band(
+                            selected_bundle.source_tokens,
+                            detected_boxes,
+                            width=selected_candidate.width,
+                            height=selected_candidate.height,
+                        )
+                        if needs_full_page_read(selected_bundle.source_tokens, detected_boxes)
+                        else None
+                    )
+                    if band is not None and band[3] - band[1] > 1:
+                        guard_id = f"p{page_asset.page_number}-t{len(work_boxes) + 1}"
+                        work_boxes.append((guard_id, band))
+                        reader_guard_pages[(page_asset.page_number, guard_id)] = (
+                            selected_bundle.candidate.path
+                        )
             for table_id, candidate_box in work_boxes:
                 work = self._canonical_table_work(
                     artifact_root=artifact_root,
@@ -8820,15 +8903,34 @@ class OfflineExtractor:
                         )
                     )
                 )
+                reader_table = bool(
+                    reader_mode
+                    and (
+                        reconstruction.schema is None
+                        or reconstruction.schema.table_type is not TableType.METADATA
+                        or (work.page_number, work.table_id) in reader_guard_pages
+                    )
+                )
+                if reader_table:
+                    use_vl = True
+                table_vl = self.teleocr if reader_table else self.vl
+                reader_candidates: list[CandidateLedgerRow] = []
+                reader_diagnostic: dict[str, Any] = {}
                 rows_before_vl = len(parsed_rows)
                 if use_vl:
                     scoped_tokens = work.tokens
                     vl_cache_hits: list[bool] = []
                     vl_contents: list[str] = []
                     orientation = str(reconstruction.diagnostics.get("orientation") or "upright")
-                    primary_asset = _vl_asset(work, artifact_root, orientation)
+                    guard_page = reader_guard_pages.get((work.page_number, work.table_id))
+                    primary_asset = (
+                        _full_page_vl_asset(guard_page, artifact_root, work)
+                        if reader_table and guard_page is not None
+                        else _vl_asset(work, artifact_root, orientation)
+                    )
+                    vl_suffix = "teleocr" if reader_table else "vl"
                     vl_jobs: list[tuple[VlAsset, str, int | None]] = [
-                        (primary_asset, f"{work.table_id}.vl.json", None)
+                        (primary_asset, f"{work.table_id}.{vl_suffix}.json", None)
                     ]
                     job_index = 0
                     while job_index < len(vl_jobs):
@@ -8841,9 +8943,19 @@ class OfflineExtractor:
                             image_path=str(asset.path.resolve()),
                             page_number=work.page_number,
                             options={
-                                "prompt": "Table Recognition:",
-                                "prompt_version": "phase2-grounded-v2",
-                                "max_tokens": 8192 if tile_index is not None else 16384,
+                                "prompt": (
+                                    TELEOCR_TABLE_PROMPT if reader_table else "Table Recognition:"
+                                ),
+                                "prompt_version": (
+                                    "teleocr-table-otsl-v1"
+                                    if reader_table
+                                    else "phase2-grounded-v2"
+                                ),
+                                "max_tokens": (
+                                    self.settings.teleocr_max_tokens
+                                    if reader_table
+                                    else (8192 if tile_index is not None else 16384)
+                                ),
                                 "context_total": 24576,
                                 "parallel_slots": 1,
                                 "tiling_policy": "orientation-aware-overlap-v2",
@@ -8855,7 +8967,7 @@ class OfflineExtractor:
                             vl_response, cache_hit = _cached_prediction(
                                 artifact_root / "inference" / cache_name,
                                 vl_request,
-                                self.vl,
+                                table_vl,
                             )
                             abort_checkpoint()
                         except ExtractionAborted:
@@ -8869,7 +8981,27 @@ class OfflineExtractor:
                         response_content = str(vl_response.output.get("content") or "")
                         vl_contents.append(response_content)
                         response_candidate_count = 0
-                        for table in split_otsl_tables(parse_otsl(response_content)):
+                        if reader_table:
+                            tile_candidates = read_otsl_rows(response_content)
+                            if job_index > 0:
+                                # Overlapping tiles repeat their boundary rows.
+                                tile_candidates = (
+                                    *drop_rows_already_read(
+                                        tile_candidates[:3],
+                                        [
+                                            (row.description, row.amount)
+                                            for row in reader_candidates[-3:]
+                                        ],
+                                    ),
+                                    *tile_candidates[3:],
+                                )
+                            reader_candidates.extend(tile_candidates)
+                            response_candidate_count = len(tile_candidates)
+                        for table in (
+                            ()
+                            if reader_table
+                            else split_otsl_tables(parse_otsl(response_content))
+                        ):
                             candidates = extract_candidate_rows(table)
                             if reconstruction.schema is not None:
                                 candidates = tuple(
@@ -8910,19 +9042,20 @@ class OfflineExtractor:
                         candidate_count += response_candidate_count
                         work.adapter_inputs.append(
                             TableAdapterInput(
-                                adapter_name=self.vl.spec.model_name,
-                                adapter_version=self.vl.spec.model_version,
+                                adapter_name=table_vl.spec.model_name,
+                                adapter_version=table_vl.spec.model_version,
                                 stage="local_vlm",
                                 recognition_variant=asset.identity,
                                 input_artifact_sha256=vl_response.input_artifact_sha256,
                                 canonical_crop_sha256=work.crop_sha256,
                                 cache_hit=cache_hit,
                                 accepted=bool(
-                                    response_candidate_count and not profile_heavy_sample
+                                    response_candidate_count
+                                    and (reader_table or not profile_heavy_sample)
                                 ),
                                 configuration_sha256=canonical_sha256(
                                     {
-                                        "adapter": self.vl.spec.model_name,
+                                        "adapter": table_vl.spec.model_name,
                                         "stage": "local_vlm",
                                         "recognition_variant": asset.identity,
                                     }
@@ -8941,6 +9074,9 @@ class OfflineExtractor:
                         if job_index == 0:
                             vl_finish_reason = vl_response.output.get("finish_reason")
                             if response_truncated or response_candidate_count == 0:
+                                if reader_table and response_truncated:
+                                    # A truncated read is replaced by complete tile reads.
+                                    reader_candidates.clear()
                                 vl_retry_reason = (
                                     "truncated" if response_truncated else "no_candidates"
                                 )
@@ -8985,12 +9121,80 @@ class OfflineExtractor:
                             reason=vl_retry_reason,
                         )
                     )
+                if reader_table:
+                    if reader_candidates:
+                        page_budget = reader_budgets.setdefault(
+                            work.page_number,
+                            PageBudget.from_inr(
+                                self.settings.gemini_reader_max_cost_inr_per_page,
+                                self.settings.inr_per_usd,
+                            ),
+                        )
+                        reader_outcome = finish_reader_table(
+                            document_id=document_id,
+                            page_number=work.page_number,
+                            table_id=work.table_id,
+                            page_artifact_sha256=work.page_artifact_sha256,
+                            candidates=tuple(reader_candidates),
+                            tokens=work.tokens,
+                            starting_order=0,
+                            table_type=(
+                                reconstruction.schema.table_type
+                                if reconstruction.schema is not None
+                                else None
+                            ),
+                            existing_page_rows=tuple(
+                                (row.description, row.net_amount)
+                                for row in all_rows
+                                if row.page_number == work.page_number
+                            ),
+                            is_guard=(work.page_number, work.table_id) in reader_guard_pages,
+                            gemini_reader=(
+                                self.gemini_table_reader
+                                if self.table_reader == "teleocr_gemini"
+                                else None
+                            ),
+                            gemini_allowed=allow_gemini,
+                            budget=page_budget,
+                            crop_path=work.crop_path,
+                            crop_tokens=work.canonical_tokens,
+                            crop_size=(work.crop_width, work.crop_height),
+                            crop_box=work.candidate_box,
+                            page_size=(selected_candidate.width, selected_candidate.height),
+                            redaction_output=(
+                                artifact_root / "crops" / f"{work.table_id}-reader-redacted.png"
+                            ),
+                        )
+                        # The reader's rows are the primary rows for this table.
+                        parsed_rows = list(reader_outcome.rows)
+                        gemini_calls += reader_outcome.gemini_calls
+                        gemini_cost += reader_outcome.gemini_cost_usd
+                        reader_diagnostic = reader_outcome.diagnostic
+                        if reader_outcome.ungrounded:
+                            recovery_attempts.append(
+                                RecoveryAttempt(
+                                    stage=RecoveryStage.REVIEW,
+                                    status="pending",
+                                    reason="reader_rows_ungrounded",
+                                )
+                            )
+                    elif parsed_rows:
+                        # The reader saw no rows where PP-OCR did: keep them, flagged.
+                        recovery_attempts.append(
+                            RecoveryAttempt(
+                                stage=RecoveryStage.REVIEW,
+                                status="pending",
+                                reason="reader_no_rows",
+                            )
+                        )
+                        reader_diagnostic = {"reader_candidate_count": 0}
+                    reader_diagnostic["table_reader"] = self.table_reader
                 profile_heavy_disagreement = bool(
                     profile_heavy_sample and _heavy_disagrees(reconstruction, provider_candidates)
                 )
                 fused_rows = (
                     reconstruction.rows
-                    if profile_heavy_sample
+                    if profile_heavy_sample or reader_table
                     else fuse_provider_descriptions(
                         reconstruction.rows,
                         tuple(provider_candidates),
@@ -9341,6 +9545,7 @@ class OfflineExtractor:
                         "content": content,
                         **(no_table_assessment or {}),
                         **reconstruction.diagnostics,
+                        **reader_diagnostic,
                     }
                 )
                 abort_checkpoint()
@@ -9525,7 +9730,11 @@ class OfflineExtractor:
         abort_checkpoint()
         provider_usage = _provider_usage_payload(
             baseline_usage=(baseline_draft.provider_usage if baseline_draft else None),
-            gemini_mode=self.gemini_mode.value,
+            gemini_mode=(
+                "second_reader"
+                if self.table_reader == "teleocr_gemini" and self.gemini_mode is GeminiMode.OFF
+                else self.gemini_mode.value
+            ),
             gemini_allowed=allow_gemini,
             gemini_calls=gemini_calls,
             gemini_cost=gemini_cost,
@@ -9644,6 +9853,7 @@ class OfflineExtractor:
             "receipt_duplicate_pairs": receipt_duplicate_pairs,
             "diagnostics": diagnostics,
             "provider_usage": provider_usage,
+            **({"table_reader": self.table_reader} if reader_mode else {}),
             "recovery": recovery_metadata,
         }
         m5_shadow_projection = None

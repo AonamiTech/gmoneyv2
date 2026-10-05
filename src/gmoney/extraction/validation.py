@@ -37,6 +37,11 @@ from gmoney.contracts.v6 import (
 )
 from gmoney.evaluation.corpus import sha256_file
 from gmoney.extraction.date_context import service_date_from_context
+from gmoney.extraction.total_labels import (
+    TOTAL_LABELS,
+    TOTAL_PREFIXES,
+    is_section_subtotal_label,
+)
 from gmoney.extraction.typed_values import parse_decimal, parse_quantity, parse_service_date
 from gmoney.geometry.artifacts import map_polygon_to_source, max_round_trip_error
 from gmoney.geometry.dense import DenseGridError, DenseGridResolver, analyze_dense_grid
@@ -1488,24 +1493,8 @@ def _unlinked_financial_row_is_explained(
         "hsn_code",
     }
     fields_by_column = {column.id: column.canonical_field for column in table.columns}
-    total_labels = {
-        "bill amount",
-        "bill total",
-        "total",
-        "totals",
-        "sub total",
-        "subtotal",
-    }
-    total_prefixes = (
-        "grand total",
-        "gross bill amount",
-        "net bill amount",
-        "net medical amount",
-        "net payable",
-        "total bill amount",
-        "total gross bill value",
-        "total payable amount",
-    )
+    total_labels = TOTAL_LABELS
+    total_prefixes = TOTAL_PREFIXES
 
     def is_structured_identifier_cell(cell: Any) -> bool:
         return fields_by_column.get(cell.column_id) in structured_fields
@@ -1514,11 +1503,6 @@ def _unlinked_financial_row_is_explained(
         if not is_structured_identifier_cell(cell):
             return True
         return _normalized(cell.raw_value or "") in total_labels
-
-    def is_section_subtotal_label(value: str) -> bool:
-        return value in {"bill total", "sub total", "subtotal"} or value.startswith(
-            ("sub total ", "subtotal ")
-        )
 
     label_values = tuple(
         cell.raw_value.strip()
