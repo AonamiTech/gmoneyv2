@@ -14,7 +14,12 @@ from typing import Any
 from uuid import uuid4
 
 from gmoney.demo.store import JobStore, JobTransactionError, utc_now
-from gmoney.extraction.reconciliation import is_enforced, reconcile, recorded_or_computed
+from gmoney.extraction.reconciliation import (
+    is_enforced,
+    is_reader_refund,
+    reconcile,
+    recorded_or_computed,
+)
 
 EDITABLE_TEXT_FIELDS = {
     "description",
@@ -335,8 +340,8 @@ def totals_summary(
         if parsed is None or not parsed.is_finite():
             missing_amounts += 1
         else:
-            # Refunds printed positive are stored as printed; they reduce the total.
-            item_total += -abs(parsed) if row.get("role") == "refund" else parsed
+            # Table-reader refunds are stored as printed (positive); they reduce the total.
+            item_total += -abs(parsed) if is_reader_refund(row) else parsed
 
     machine_total = result.get("document_total")
     machine_totals = result.get("document_totals")

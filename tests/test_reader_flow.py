@@ -393,8 +393,12 @@ def test_positive_printed_refunds_reduce_review_totals_like_reconciliation() -> 
     totals = totals_summary(result, {"row_overrides": {}, "added_rows": {}}, rows)
     assert (totals["items_total"], totals["comparison"]) == ("4873.44", "match")
     assert report["status"] == "verified"
-    assert signed_field_value({"role": "refund", "net_amount": "126.56"}) == Decimal("-126.56")
-    # Heuristic refunds are printed negative and are unchanged.
+    reader = {"role": "refund", "net_amount": "126.56", "source_routes": ["teleocr_otsl"]}
+    assert signed_field_value(reader) == Decimal("-126.56")
+    # Rows from every other route are used exactly as stored (heuristic unchanged),
+    # including a heuristic/VLM refund printed positive.
+    heuristic = {"role": "refund", "net_amount": "40.00", "source_routes": ["provider_otsl"]}
+    assert signed_field_value(heuristic) == Decimal("40.00")
     assert signed_field_value({"role": "refund", "net_amount": "-126.56"}) == Decimal("-126.56")
     assert signed_field_value({"role": "detail", "net_amount": "126.56"}) == Decimal("126.56")
 

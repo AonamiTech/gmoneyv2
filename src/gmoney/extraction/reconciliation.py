@@ -74,7 +74,12 @@ def _decimal(value: object) -> Decimal | None:
 
 
 def _text(value: Decimal | None) -> str | None:
-    return None if value is None else format(value.quantize(Decimal("0.01")), "f")
+    if value is None:
+        return None
+    try:
+        return format(value.quantize(Decimal("0.01")), "f")
+    except InvalidOperation:  # beyond Decimal context precision
+        return format(value, "f")
 
 
 def match_outcome(expected: Decimal, actual: Decimal) -> str:
@@ -94,15 +99,24 @@ def signed_amount(row: dict[str, Any]) -> Decimal | None:
     return -abs(amount) if row.get("role") == "refund" else amount
 
 
-def signed_field_value(row: dict[str, Any], field: str = "net_amount") -> Decimal | None:
-    """A ledger amount with refunds counted negative.
+READER_ROUTES = frozenset({"teleocr_otsl", "gemini_table_reader"})
 
-    Refund rows keep the amount exactly as printed (evidence must match the printed
-    token), so a return printed as "126.56" is stored positive with role ``refund``.
-    Heuristic refunds are printed negative already and are unchanged by this.
+
+def is_reader_refund(row: dict[str, Any]) -> bool:
+    """A refund row produced by the TeleOCR/Gemini table readers."""
+    return row.get("role") == "refund" and bool(READER_ROUTES & set(row.get("source_routes") or ()))
+
+
+def signed_field_value(row: dict[str, Any], field: str = "net_amount") -> Decimal | None:
+    """A ledger amount with table-reader refunds counted negative.
+
+    Reader refund rows keep the amount exactly as printed (evidence must match the
+    printed token), so a return printed as "126.56" is stored positive with role
+    ``refund``.  Rows from every other route are returned exactly as stored, so
+    heuristic validation and reprocessing are unchanged.
     """
     value = _decimal(row.get(field))
-    if value is not None and row.get("role") == "refund":
+    if value is not None and is_reader_refund(row):
         return -abs(value)
     return value
 
@@ -116,7 +130,7 @@ def return_total_targets(value: Decimal, rows: Iterable[dict[str, Any]], sign: i
     """
     targets = {value}
     if sign < 0 and any(
-        row.get("role") == "refund" and (_decimal(row.get("net_amount")) or 0) > 0 for row in rows
+        is_reader_refund(row) and (_decimal(row.get("net_amount")) or 0) > 0 for row in rows
     ):
         targets.add(-abs(value))
     return targets

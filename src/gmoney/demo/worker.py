@@ -133,8 +133,17 @@ def _extract_and_publish(
     result["worker_release_revision"] = build_revision()
     result["semantic_validation"] = report.model_dump(mode="json")
     result["validation_recovery_attempted"] = recovery_attempted
+    try:
+        reconciliation = reconcile(result)
+    except Exception as error:  # the gate must never fail an extraction
+        logger.exception("reconciliation_failed job_id=%s", job_id)
+        reconciliation = {
+            "status": "unprovable",
+            "checks": [],
+            "reasons": [f"reconciliation_error:{type(error).__name__}"],
+        }
     result["reconciliation"] = {
-        **reconcile(result),
+        **reconciliation,
         "enforced": gate_enforced(result.get("table_reader")),
     }
     hospital = result.get("hospital") or {}
