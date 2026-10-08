@@ -567,3 +567,14 @@ def test_summary_rollup_cannot_stand_in_for_dropped_detail_rows() -> None:
     ]
     report = reconcile({"document_total": _total("1000.00"), "rows": rows})
     assert report["status"] == "flagged"
+
+
+def test_positive_returns_total_matches_printed_positive_refunds_only() -> None:
+    from gmoney.extraction.reconciliation import return_total_targets
+
+    reader_refunds = [{"role": "refund", "net_amount": "126.56"}]
+    heuristic_refunds = [{"role": "refund", "net_amount": "-126.56"}]
+    assert Decimal("-126.56") in return_total_targets(Decimal("126.56"), reader_refunds, -1)
+    # Heuristic behaviour is unchanged: only the printed value itself.
+    assert return_total_targets(Decimal("126.56"), heuristic_refunds, -1) == {Decimal("126.56")}
+    assert return_total_targets(Decimal("500.00"), reader_refunds, 1) == {Decimal("500.00")}

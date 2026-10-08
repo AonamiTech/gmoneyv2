@@ -410,14 +410,15 @@ def test_return_policy_text_does_not_demand_refund_rows(footer: str) -> None:
     assert report["status"] == "verified"
 
 
-def test_lab_tests_named_total_stay_charges() -> None:
+def test_lab_tests_named_total_stay_charges_and_section_totals_stay_totals() -> None:
     rows = read_otsl_rows(
         _otsl(
-            ["Test Name", "Amount"],
-            ["Bilirubin Total", "250.00"],
-            ["Protein Total", "150.00"],
-            ["Lab Total", "400.00"],
-            ["Item Issues Total", "400.00"],
+            ["Test Name", "Qty", "Rate", "Amount"],
+            ["Bilirubin Total", "1", "250.00", "250.00"],
+            ["Protein Total", "1", "150.00", "150.00"],
+            ["Lab Total", "", "", "400.00"],
+            ["Blood Bank Total", "", "", "900.00"],
+            ["Item Issues Total", "", "", "400.00"],
         )
     )
     assert [row.description for row in rows if row.role is RowRole.DETAIL] == [
@@ -426,5 +427,75 @@ def test_lab_tests_named_total_stay_charges() -> None:
     ]
     assert [row.description for row in rows if row.role is RowRole.SECTION_TOTAL] == [
         "Lab Total",
+        "Blood Bank Total",
         "Item Issues Total",
     ]
+
+
+def test_return_amount_line_is_a_total_not_a_second_refund() -> None:
+    rows = read_otsl_rows(
+        _otsl(
+            ["Item Name", "Qty", "Amount"],
+            ["Return Item", "", ""],
+            ["Bifilac", "1", "126.56"],
+            ["Return Amount", "", "126.56"],
+        )
+    )
+    assert [row.description for row in rows if row.role is RowRole.REFUND] == ["Bifilac"]
+
+
+def test_zero_returns_total_is_reported_not_checked() -> None:
+    from gmoney.extraction.reconciliation import reconcile as reconcile_rows
+
+    table = {
+        "id": "t",
+        "table_id": "t",
+        "page_number": 1,
+        "columns": [
+            {"id": "c0", "label": "Item", "order": 0, "canonical_field": "description"},
+            {"id": "c1", "label": "Amount", "order": 1, "canonical_field": "net_amount"},
+        ],
+        "rows": [
+            {"id": "s0", "order": 0, "canonical_row_id": "a", "cells": []},
+            {
+                "id": "s1",
+                "order": 1,
+                "canonical_row_id": None,
+                "cells": [
+                    {"column_id": "c0", "raw_value": "Item Issues Total"},
+                    {"column_id": "c1", "raw_value": "5120.00"},
+                ],
+            },
+            {
+                "id": "s2",
+                "order": 2,
+                "canonical_row_id": None,
+                "cells": [
+                    {"column_id": "c0", "raw_value": "Item Returns Total"},
+                    {"column_id": "c1", "raw_value": "0.00"},
+                ],
+            },
+        ],
+    }
+    result = {
+        "document_total": {"amount": "5120.00", "label": "Total Bill Amount"},
+        "rows": [
+            {"id": "a", "role": "detail", "review_disposition": "accepted", "net_amount": "5120.00"}
+        ],
+        "source_tables": [table],
+    }
+    report = reconcile_rows(result)
+    assert report["status"] == "verified", report["reasons"]
+    assert any(item["kind"] == "printed_zero_total" for item in report["reported"])
+
+
+def test_returns_context_ends_at_the_next_section_heading() -> None:
+    rows = read_otsl_rows(
+        _otsl(
+            ["Item Name", "Qty", "Amount"],
+            ["Item Returns", "", ""],
+            ["Consumables", "", ""],
+            ["Syringe 5ml", "2", "40.00"],
+        )
+    )
+    assert [(row.role, row.section) for row in rows] == [(RowRole.DETAIL, "Consumables")]

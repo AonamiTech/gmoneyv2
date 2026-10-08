@@ -107,6 +107,21 @@ def signed_field_value(row: dict[str, Any], field: str = "net_amount") -> Decima
     return value
 
 
+def return_total_targets(value: Decimal, rows: Iterable[dict[str, Any]], sign: int) -> set[Decimal]:
+    """Printed values a returns sub-total may equal.
+
+    Heuristic refunds are printed negative and their returns total matches the negative
+    sum.  Reader refunds keep a positive printed amount, and bills print the returns
+    total positive too, so the positive figure matches the negative refund sum.
+    """
+    targets = {value}
+    if sign < 0 and any(
+        row.get("role") == "refund" and (_decimal(row.get("net_amount")) or 0) > 0 for row in rows
+    ):
+        targets.add(-abs(value))
+    return targets
+
+
 def _active(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     return [row for row in rows if row.get("review_disposition") != "rejected"]
 
@@ -542,6 +557,12 @@ def _section_checks(
             if not _is_checkable_total_label(label):
                 continue
             targets = net_values or all_values
+            if all(value == 0 for value in targets):
+                # "Item Returns Total 0.00": nothing to prove; reported, segments untouched.
+                reported.append(
+                    {"label": label, "amount": "0.00", "page": page, "kind": "printed_zero_total"}
+                )
+                continue
             grand_total = label.startswith(TOTAL_PREFIXES) or any(
                 value in document_amounts for value in targets
             )
@@ -702,9 +723,15 @@ def _returns_check(result: dict[str, Any], rows: list[dict[str, Any]]) -> dict[s
                 printed_return = False
                 for following in source_rows[index + 1 :]:
                     _label, _n, following_values = _row_label_and_targets(table, following)
-                    if following.get("canonical_row_id") is None and _is_checkable_total_label(
-                        _label
+                    if following.get("canonical_row_id") is None and (
+                        _is_checkable_total_label(_label)
+                        or (
+                            not following_values
+                            and _is_section_heading(_label)
+                            and not RETURN_WORDS & set(_label.split())
+                        )
                     ):
+                        # The next total or section heading ends the return section.
                         break
                     if following.get("canonical_row_id") is not None or any(
                         value != 0 for value in following_values

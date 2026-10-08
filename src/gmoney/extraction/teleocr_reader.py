@@ -69,6 +69,7 @@ IDENTIFIER_LABEL = re.compile(
 )
 # Printed bill/gross/payable total labels from the document-total detector.
 DOCUMENT_TOTAL_TERMS = tuple(sorted({spec[0] for spec in FINAL_LABELS}))
+RETURN_WORDS_SET = frozenset({"return", "returns", "returned"})
 TOTAL_QUALIFIER_WORDS = frozenset(
     {
         "item",
@@ -272,8 +273,13 @@ def _is_identifier_row(label: str, numbers: list[str]) -> bool:
     return all("." not in value for value in numbers)
 
 
-def _is_total_row_label(label: str) -> bool:
-    """A printed total, never an item whose name merely contains "total"."""
+def _is_total_row_label(label: str, *, priced_line: bool = False) -> bool:
+    """A printed total, never an item whose name merely contains "total".
+
+    ``priced_line`` is True when the row prints a quantity or rate: a label ending in
+    "total" on such a row is an item ("Bilirubin Total"), otherwise a section total
+    ("Blood Bank Total").
+    """
     if is_total_label(label) or any(
         label == term or label.startswith(f"{term} ") for term in DOCUMENT_TOTAL_TERMS
     ):
@@ -292,14 +298,21 @@ def _is_total_row_label(label: str) -> bool:
         )
 
     if words[-1] in {"total", "totals", "subtotal"}:
-        return qualifiers(words[:-2] if words[-2:-1] == ["sub"] else words[:-1])
+        return not priced_line or qualifiers(words[:-2] if words[-2:-1] == ["sub"] else words[:-1])
+    if RETURN_WORDS_SET & set(words) and set(words) <= RETURN_WORDS_SET | {"amount", "value"}:
+        return len(words) > 1  # "Return Amount", "Returns Value"
+
     if words[0] in {"total", "subtotal"} or words[:2] == ["sub", "total"]:
         return qualifiers(words[2:] if words[:2] == ["sub", "total"] else words[1:])
     return False
 
 
 def _classify_numeric_row(
-    cells: tuple[str, ...], description: str | None, context: _Context
+    cells: tuple[str, ...],
+    description: str | None,
+    context: _Context,
+    *,
+    priced_line: bool = False,
 ) -> tuple[RowRole, tuple[str, ...]]:
     label = _row_label(cells)
     numbers = [cell for cell in cells if _is_number(cell)]
@@ -311,7 +324,7 @@ def _classify_numeric_row(
         and (not description or normalized_label(description) == label)
     ):
         return RowRole.PAYMENT, ()
-    if label and _is_total_row_label(label):
+    if label and _is_total_row_label(label, priced_line=priced_line):
         return (
             RowRole.DOCUMENT_TOTAL
             if is_total_label(label) and "grand" in label
@@ -380,7 +393,16 @@ def _table_rows(
                 match = DATE_PATTERN.search(text)
                 context.service_date = match.group(0) if match else context.service_date
                 continue
-            if _is_section_heading(text, spanned=_spans_columns(raw)):
+            words = normalized_label(text).split()
+            ends_returns = bool(
+                context.returns
+                and only_text
+                and 0 < len(words) <= 4
+                and any(word.startswith(SECTION_WORDS) for word in words)
+                and not SECTION_RETURN.search(text)
+            )
+            if ends_returns or _is_section_heading(text, spanned=_spans_columns(raw)):
+                # Any section heading ends a returns section ("Consumables" after returns).
                 context.section = text
                 context.returns = bool(SECTION_RETURN.search(text))
                 pending_prefix.clear()
@@ -425,9 +447,14 @@ def _table_rows(
             pending_prefix.clear()
         else:
             flags = ()
-        role, role_flags = _classify_numeric_row(cells, description, context)
         quantity = parse_decimal(_value(cells, columns, "quantity"))
         rate = parse_decimal(_value(cells, columns, "rate"))
+        role, role_flags = _classify_numeric_row(
+            cells,
+            description,
+            context,
+            priced_line=quantity is not None or rate is not None,
+        )
         gross_amount = parse_decimal(_value(cells, columns, "gross_amount"))
         discount = parse_decimal(_value(cells, columns, "discount"))
         amount = parse_decimal(_value(cells, columns, "amount"))

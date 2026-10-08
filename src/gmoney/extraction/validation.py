@@ -37,7 +37,7 @@ from gmoney.contracts.v6 import (
 )
 from gmoney.evaluation.corpus import sha256_file
 from gmoney.extraction.date_context import service_date_from_context
-from gmoney.extraction.reconciliation import signed_field_value
+from gmoney.extraction.reconciliation import return_total_targets, signed_field_value
 from gmoney.extraction.total_labels import (
     TOTAL_LABELS,
     TOTAL_PREFIXES,
@@ -1784,7 +1784,7 @@ def _unlinked_financial_row_is_explained(
                 ),
                 Decimal("0"),
             )
-            == value
+            in return_total_targets(value, pharmacy_rows, pharmacy_summary_sign)
             for field, value in financial_values
         ):
             return True
