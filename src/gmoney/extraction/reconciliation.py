@@ -181,25 +181,60 @@ def _reported_totals(result: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _distinct_rollups(rollups: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    distinct: dict[tuple[str, Decimal | None], dict[str, Any]] = {}
-    for row in rollups:
-        distinct.setdefault(
-            (normalized_label(row.get("description")), _decimal(row.get("net_amount"))), row
+    """Roll-ups with repeated printings removed.
+
+    Package and summary bills can print the same roll-up twice: in a summary table and
+    again above its unpriced inclusions.  A roll-up is a repeat only when an earlier one
+    from a *different* table has the same amount and the same description (or both are
+    package lines, which hospitals relabel).  Two rows of the same table are never
+    collapsed, so genuine identical charges both count.
+    """
+
+    def place(row: dict[str, Any]) -> tuple[object, object] | None:
+        table = row.get("table_id")
+        return (row.get("page_number"), table) if table is not None else None
+
+    def is_repeat(row: dict[str, Any], earlier: dict[str, Any]) -> bool:
+        if place(row) is None or place(earlier) is None or place(row) == place(earlier):
+            return False
+        if _decimal(row.get("net_amount")) != _decimal(earlier.get("net_amount")):
+            return False
+        description = normalized_label(row.get("description"))
+        earlier_description = normalized_label(earlier.get("description"))
+        return description == earlier_description or (
+            "package" in description.split() and "package" in earlier_description.split()
         )
-    return list(distinct.values())
+
+    kept: list[dict[str, Any]] = []
+    for row in rollups:
+        if not any(is_repeat(row, earlier) for earlier in kept):
+            kept.append(row)
+    return kept
+
+
+def _basis_total(basis: list[dict[str, Any]]) -> tuple[Decimal, list[str]]:
+    missing = [str(row.get("id")) for row in basis if signed_amount(row) is None]
+    total = sum((value for row in basis if (value := signed_amount(row)) is not None), Decimal(0))
+    return total, missing
 
 
 def _grand_total_check(
     rows: list[dict[str, Any]], printed: list[dict[str, Any]]
 ) -> tuple[dict[str, Any] | None, Decimal | None]:
     granular = [row for row in rows if row.get("role") in GRANULAR_ROLES]
-    rollups = [row for row in rows if row.get("role") == "category_rollup"]
-    # Without granular rows the roll-ups are the charges.  Package bills can print the
-    # same package roll-up twice (summary and again above its unpriced inclusions); it
-    # is counted once, but every other distinct charge still counts.
-    basis = granular or _distinct_rollups(rollups)
-    missing = [str(row.get("id")) for row in basis if signed_amount(row) is None]
-    total = sum((value for row in basis if (value := signed_amount(row)) is not None), Decimal(0))
+    rollups = _distinct_rollups([row for row in rows if row.get("role") == "category_rollup"])
+    # Without granular rows the (distinct) roll-ups are the charges.  With both, the
+    # roll-ups are usually a summary of the granular rows (checked by C3); a package
+    # bill can instead price a package roll-up *plus* granular extras outside it, which
+    # is tried only when the granular rows alone do not reconcile.
+    bases: list[tuple[str, list[dict[str, Any]]]] = (
+        [("granular_rows", granular)]
+        + ([("granular_plus_rollups", [*rollups, *granular])] if rollups else [])
+        if granular
+        else [("distinct_category_rollups", rollups)]
+    )
+    basis_name, basis = bases[0]
+    total, missing = _basis_total(basis)
     if not printed:
         return None, total
     primary = printed[0]
@@ -217,28 +252,26 @@ def _grand_total_check(
             ),
             total,
         )
-    basis_name = "granular_rows" if granular else "distinct_category_rollups"
-    for candidate in printed:
-        outcome = match_outcome(candidate["amount"], total)
-        if outcome != "fail":
-            return (
-                _check(
-                    "C1",
-                    "grand_total",
-                    expected=candidate["amount"],
-                    actual=total,
-                    outcome=outcome,
-                    label=candidate["label"],
-                    page=candidate["page_number"],
-                    evidence={
-                        "basis": basis_name,
-                        "repeated_rollups_ignored": len(rollups) - len(basis)
-                        if not granular
-                        else 0,
-                    },
-                ),
-                total,
-            )
+    for name, rows_for_basis in bases:
+        basis_sum, basis_missing = _basis_total(rows_for_basis)
+        if basis_missing:
+            continue
+        for candidate in printed:
+            outcome = match_outcome(candidate["amount"], basis_sum)
+            if outcome != "fail":
+                return (
+                    _check(
+                        "C1",
+                        "grand_total",
+                        expected=candidate["amount"],
+                        actual=basis_sum,
+                        outcome=outcome,
+                        label=candidate["label"],
+                        page=candidate["page_number"],
+                        evidence={"basis": name},
+                    ),
+                    basis_sum,
+                )
     return (
         _check(
             "C1",
@@ -382,6 +415,35 @@ def _best_match(
     return rounded or ("fail", None, None, [])
 
 
+DISCOUNT_WORDS = frozenset({"discount", "less", "concession"})
+
+
+def _continuations(
+    closed: list[list[dict[str, Any]]],
+    closed_pages: list[int | None],
+    open_rows: list[dict[str, Any]],
+    page: int | None,
+) -> list[tuple[int, list[dict[str, Any]]]]:
+    """Runs a section total may span: preceding closed segments plus the current rows.
+
+    Allowed only for page-level running totals (each merged segment was closed by a
+    total printed on an earlier page) or when every row belongs to one named section,
+    so a later section can never borrow rows of a different section on the same page.
+    """
+    runs: list[tuple[int, list[dict[str, Any]]]] = []
+    for count in range(1, len(closed) + 1):
+        segments = closed[-count:]
+        rows = [row for segment in segments for row in segment] + open_rows
+        sections = {row.get("section") or None for row in rows}
+        one_section = len(sections) == 1 and None not in sections
+        earlier_pages = page is not None and all(
+            closed_page is not None and closed_page < page for closed_page in closed_pages[-count:]
+        )
+        if one_section or earlier_pages:
+            runs.append((count, rows))
+    return runs
+
+
 def _section_checks(
     result: dict[str, Any],
     rows: list[dict[str, Any]],
@@ -406,6 +468,8 @@ def _section_checks(
     open_rows: list[dict[str, Any]] = []
     section_starts: set[int] = set()
     closed: list[list[dict[str, Any]]] = []
+    # Page of the printed total that closed each segment (None for a printed discount).
+    closed_pages: list[int | None] = []
     checks: list[dict[str, Any]] = []
     reported: list[dict[str, Any]] = []
     for _, table in ordered:
@@ -432,14 +496,28 @@ def _section_checks(
                     section_starts.add(len(open_rows))
                 continue
             if is_settlement_label(label):
+                amount = net_values[0] if net_values else all_values[-1]
                 reported.append(
                     {
                         "label": label,
-                        "amount": _text(net_values[0] if net_values else all_values[-1]),
+                        "amount": _text(amount),
                         "page": page,
                         "kind": "printed_settlement_row",
                     }
                 )
+                if not open_rows and closed and set(label.split()) & DISCOUNT_WORDS:
+                    # "Sub Total / Less Discount / Net Total": the discount is a negative
+                    # segment that only a following aggregate total may use.
+                    closed.append(
+                        [
+                            {
+                                "id": source_row.get("id"),
+                                "role": "printed_discount",
+                                "net_amount": str(-abs(amount)),
+                            }
+                        ]
+                    )
+                    closed_pages.append(None)
                 continue
             if not _is_checkable_total_label(label):
                 continue
@@ -453,7 +531,16 @@ def _section_checks(
                 candidates = [open_rows[start:] for start in starts]
                 outcome, expected, actual, run = _best_match(candidates, targets)
                 scope_rows = open_rows
-                closed.append(open_rows)
+                merged = 0
+                if outcome == "fail":
+                    continuations = _continuations(closed, closed_pages, open_rows, page)
+                    continued = _best_match([rows_ for _, rows_ in continuations], targets)
+                    if continued[0] != "fail":
+                        outcome, expected, actual, run = continued
+                        merged = next(count for count, rows_ in continuations if rows_ is run)
+                        kind = "section_total_continued"
+                closed = [*closed[: len(closed) - merged], [*run] if merged else open_rows]
+                closed_pages = [*closed_pages[: len(closed_pages) - merged], page]
             else:
                 kind = "section_aggregate"
                 candidates = [
@@ -467,9 +554,10 @@ def _section_checks(
                         count for count in range(1, len(closed) + 1) if candidates[count - 1] is run
                     )
                     closed = [*closed[:-count], run]
+                    closed_pages = [*closed_pages[:-count], page]
             if grand_total and outcome == "fail":
                 # The printed bill total is proved (or flagged) by C1; start afresh.
-                open_rows, section_starts, closed = [], set(), []
+                open_rows, section_starts, closed, closed_pages = [], set(), [], []
                 continue
             if outcome == "fail":
                 expected = targets[-1]
@@ -563,7 +651,12 @@ def reconcile(result: dict[str, Any], rows: list[dict[str, Any]] | None = None) 
     checks = [
         *([grand_total] if grand_total else []),
         *section_checks,
-        *([summary] if (summary := _summary_check(active, printed)) else []),
+        *(
+            [summary]
+            if (grand_total or {}).get("evidence", {}).get("basis") != "granular_plus_rollups"
+            and (summary := _summary_check(active, printed))
+            else []
+        ),
         *_row_arithmetic_checks(active),
     ]
     failed = [check for check in checks if check["blocking"] and check["outcome"] == "fail"]

@@ -3,6 +3,8 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Any
 
+import pytest
+
 from gmoney.extraction.reconciliation import match_outcome, reconcile
 
 
@@ -143,8 +145,22 @@ def test_footer_bill_number_emitted_as_charge_is_flagged() -> None:
 
 def test_package_bill_with_unpriced_inclusions_is_verified() -> None:
     rows = [
-        _row("pkg", "11457.00", role="category_rollup", description="Package Charges"),
-        _row("pkg-repeat", "11457.00", role="category_rollup", description="Package Charges"),
+        # Printed in the page-1 summary and again above the inclusions on page 2.
+        _row(
+            "pkg",
+            "11457.00",
+            role="category_rollup",
+            description="Package Charges",
+            table_id="p1-t1",
+        ),
+        _row(
+            "pkg-repeat",
+            "11457.00",
+            role="category_rollup",
+            description="Package Charges",
+            page=2,
+            table_id="p2-t1",
+        ),
         *[
             _row(f"inc{index}", None, role="informational", description=f"Inclusion {index}")
             for index in range(88)
@@ -152,10 +168,8 @@ def test_package_bill_with_unpriced_inclusions_is_verified() -> None:
     ]
     report = reconcile({"document_total": _total("11457.00"), "rows": rows})
     assert report["status"] == "verified"
-    assert report["checks"][0]["evidence"] == {
-        "basis": "distinct_category_rollups",
-        "repeated_rollups_ignored": 1,
-    }
+    assert report["checks"][0]["evidence"] == {"basis": "distinct_category_rollups"}
+    assert report["checks"][0]["actual"] == "11457.00"
 
 
 def test_whole_rupee_rounding_passes_but_fractional_gap_fails() -> None:
@@ -267,7 +281,18 @@ def test_package_rollup_does_not_hide_a_separate_charge() -> None:
     assert report["checks"][0]["actual"] == "150.00"
     assert report["checks"][0]["difference"] == "50.00"
 
-    rows.append(_row("pkg-repeat", "100.00", role="category_rollup", description="PACKAGE charges"))
+    rows[0]["table_id"] = "p1-t1"
+    rows[1]["table_id"] = "p1-t1"
+    rows.append(
+        _row(
+            "pkg-repeat",
+            "100.00",
+            role="category_rollup",
+            description="PACKAGE charges",
+            page=2,
+            table_id="p2-t1",
+        )
+    )
     report = reconcile({"document_total": _total("150.00"), "rows": rows})
     assert report["status"] == "verified"
 
@@ -369,3 +394,118 @@ def test_aggregate_total_uses_only_the_preceding_closed_sections() -> None:
     ]
     assert report["checks"][0]["outcome"] == "pass"
     assert report["status"] == "flagged"
+
+
+def test_package_relabelled_on_its_detail_page_counts_once() -> None:
+    rows = [
+        _row("s", "50000.00", role="category_rollup", description="Package Charges", table_id="t1"),
+        _row(
+            "d",
+            "50000.00",
+            role="category_rollup",
+            description="Knee Replacement Package",
+            page=2,
+            table_id="t2",
+        ),
+    ]
+    report = reconcile({"document_total": _total("50000.00"), "rows": rows})
+    assert report["status"] == "verified"
+
+
+def test_identical_charges_in_one_table_both_count() -> None:
+    rows = [
+        _row("p", "40000.00", role="category_rollup", description="Package Charges", table_id="t1"),
+        _row("c1", "500.00", role="category_rollup", description="Consultation", table_id="t1"),
+        _row("c2", "500.00", role="category_rollup", description="Consultation", table_id="t1"),
+    ]
+    report = reconcile({"document_total": _total("41000.00"), "rows": rows})
+    assert report["status"] == "verified"
+    assert report["checks"][0]["actual"] == "41000.00"
+
+
+def test_package_plus_priced_extras_outside_the_package_reconciles() -> None:
+    rows = [
+        _row("pkg", "50000.00", role="category_rollup", description="Package", table_id="t1"),
+        _row("x1", "3000.00", description="Implant outside package", table_id="t2"),
+        _row("x2", "2000.00", description="Pharmacy outside package", table_id="t2"),
+    ]
+    report = reconcile({"document_total": _total("55000.00"), "rows": rows})
+    assert report["status"] == "verified"
+    assert report["checks"][0]["evidence"] == {"basis": "granular_plus_rollups"}
+    assert not any(check["id"] == "C3" for check in report["checks"])
+    # A summary that does not match is still caught: rows 5000 + roll-up 50000 vs 60000.
+    assert reconcile({"document_total": _total("60000.00"), "rows": rows})["status"] == "flagged"
+
+
+def _multi_page_pharmacy(page_one_label: str, page_two_start: list[tuple[str, ...]]):
+    rows = [
+        _row("a", "100.00", section="Pharmacy"),
+        _row("b", "200.00", section="Pharmacy"),
+        _row("c", "300.00", section="Pharmacy", page=2),
+        _row("d", "100.00", section="Pharmacy", page=2),
+        _row("r1", "500.00", section="Room", page=3),
+    ]
+    tables = [
+        _table("p1-t1", 1, [("row", "a"), ("row", "b"), ("printed", page_one_label, "300.00")]),
+        _table(
+            "p2-t1",
+            2,
+            [*page_two_start, ("row", "c"), ("row", "d"), ("printed", "Pharmacy Total", "700.00")],
+        ),
+        _table("p3-t1", 3, [("row", "r1"), ("printed", "Room Total", "500.00")]),
+    ]
+    return {"document_total": _total("1200.00"), "rows": rows, "source_tables": tables}
+
+
+@pytest.mark.parametrize(
+    ("page_one_label", "page_two_start"),
+    [
+        ("Sub Total", []),
+        ("Page Total", [("printed", "Brought Forward", "300.00")]),
+    ],
+)
+def test_section_spanning_pages_with_page_sub_totals_reconciles(
+    page_one_label: str, page_two_start: list[tuple[str, ...]]
+) -> None:
+    report = reconcile(_multi_page_pharmacy(page_one_label, page_two_start))
+    assert report["status"] == "verified", report["reasons"]
+    kinds = [check["kind"] for check in report["checks"] if check["kind"].startswith("section")]
+    assert kinds == ["section_total", "section_total_continued", "section_total"]
+
+
+def test_wrong_cross_page_section_total_is_still_flagged() -> None:
+    result = _multi_page_pharmacy("Sub Total", [])
+    result["source_tables"][1]["rows"][-1]["cells"][1]["raw_value"] = "650.00"
+    report = reconcile(result)
+    assert report["status"] == "flagged"
+    failed = next(check for check in report["checks"] if check["outcome"] == "fail")
+    assert (failed["expected"], failed["actual"], failed["section"]) == (
+        "650.00",
+        "400.00",
+        "Pharmacy",
+    )
+
+
+def test_discount_between_sub_total_and_net_total_reconciles() -> None:
+    rows = [_row("a", "600.00", section="Room"), _row("b", "400.00", section="Room")]
+    table = _table(
+        "p1-t1",
+        1,
+        [
+            ("row", "a"),
+            ("row", "b"),
+            ("printed", "Sub Total", "1000.00"),
+            ("printed", "Less Discount", "100.00"),
+            ("printed", "Net Total", "900.00"),
+        ],
+    )
+    report = reconcile(
+        {"document_total": _total("1000.00"), "rows": rows, "source_tables": [table]}
+    )
+    outcomes = [
+        (check["kind"], check["outcome"])
+        for check in report["checks"]
+        if check["kind"].startswith("section")
+    ]
+    assert outcomes == [("section_total", "pass"), ("section_aggregate", "pass")]
+    assert report["status"] == "verified"
