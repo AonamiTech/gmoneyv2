@@ -227,9 +227,14 @@ def _grand_total_check(
     # roll-ups are usually a summary of the granular rows (checked by C3); a package
     # bill can instead price a package roll-up *plus* granular extras outside it, which
     # is tried only when the granular rows alone do not reconcile.
+    # Only package lines may be added to granular rows: any other roll-up could be the
+    # summary line of a detail page that was dropped, which must not be hidden.
+    extras = [
+        row for row in rollups if "package" in normalized_label(row.get("description")).split()
+    ]
     bases: list[tuple[str, list[dict[str, Any]]]] = (
         [("granular_rows", granular)]
-        + ([("granular_plus_rollups", [*rollups, *granular])] if rollups else [])
+        + ([("granular_plus_rollups", [*extras, *granular])] if extras else [])
         if granular
         else [("distinct_category_rollups", rollups)]
     )
@@ -415,7 +420,7 @@ def _best_match(
     return rounded or ("fail", None, None, [])
 
 
-DISCOUNT_WORDS = frozenset({"discount", "less", "concession"})
+DISCOUNT_WORDS = frozenset({"discount", "concession"})
 
 
 def _continuations(
@@ -435,11 +440,13 @@ def _continuations(
         segments = closed[-count:]
         rows = [row for segment in segments for row in segment] + open_rows
         sections = {row.get("section") or None for row in rows}
+        named = sections - {None}
         one_section = len(sections) == 1 and None not in sections
         earlier_pages = page is not None and all(
             closed_page is not None and closed_page < page for closed_page in closed_pages[-count:]
         )
-        if one_section or earlier_pages:
+        # Page running totals may span pages, but never rows of two different sections.
+        if one_section or (earlier_pages and len(named) <= 1):
             runs.append((count, rows))
     return runs
 
@@ -543,16 +550,19 @@ def _section_checks(
                 closed_pages = [*closed_pages[: len(closed_pages) - merged], page]
             else:
                 kind = "section_aggregate"
-                candidates = [
-                    [row for segment in closed[-count:] for row in segment]
-                    for count in range(1, len(closed) + 1)
-                ]
-                outcome, expected, actual, run = _best_match(candidates, targets)
-                scope_rows = candidates[-1] if candidates else []
+                # Each span of trailing closed segments, net of printed discounts and, for
+                # a gross sub-total printed after a discount, without them.
+                spans: list[tuple[int, list[dict[str, Any]]]] = []
+                for count in range(1, len(closed) + 1):
+                    span = [row for segment in closed[-count:] for row in segment]
+                    spans.append((count, span))
+                    gross = [row for row in span if row.get("role") != "printed_discount"]
+                    if len(gross) != len(span):
+                        spans.append((count, gross))
+                outcome, expected, actual, run = _best_match([span for _, span in spans], targets)
+                scope_rows = [row for segment in closed for row in segment]
                 if outcome != "fail":
-                    count = next(
-                        count for count in range(1, len(closed) + 1) if candidates[count - 1] is run
-                    )
+                    count = next(count for count, span in spans if span is run)
                     closed = [*closed[:-count], run]
                     closed_pages = [*closed_pages[:-count], page]
             if grand_total and outcome == "fail":

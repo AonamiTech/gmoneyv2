@@ -509,3 +509,61 @@ def test_discount_between_sub_total_and_net_total_reconciles() -> None:
     ]
     assert outcomes == [("section_total", "pass"), ("section_aggregate", "pass")]
     assert report["status"] == "verified"
+
+
+def test_cross_page_total_cannot_borrow_another_sections_rows() -> None:
+    rows = [
+        _row("a", "100.00", section="Room"),
+        _row("b1", "30.00", section="Pharmacy", page=2),
+        _row("a_dup", "100.00", section="Room", page=3),
+    ]
+    tables = [
+        _table("t1", 1, [("row", "a"), ("printed", "Room Total", "100.00")]),
+        _table("t2", 2, [("row", "b1"), ("printed", "Pharmacy Total", "130.00")]),
+        _table("t3", 3, [("row", "a_dup")]),
+    ]
+    report = reconcile({"document_total": _total("230.00"), "rows": rows, "source_tables": tables})
+    assert report["status"] == "flagged"
+    pharmacy = next(check for check in report["checks"] if check["label"] == "pharmacy total")
+    assert (pharmacy["kind"], pharmacy["expected"], pharmacy["actual"]) == (
+        "section_total",
+        "130.00",
+        "30.00",
+    )
+
+
+def test_gross_sub_total_after_an_in_between_discount_reconciles() -> None:
+    rows = [
+        _row("a", "1000.00", section="Room"),
+        _row("b", "500.00", section="Pharmacy"),
+        _row("z", "200.00", section="Lab", page=2),
+    ]
+    tables = [
+        _table(
+            "t",
+            1,
+            [
+                ("row", "a"),
+                ("printed", "Room Total", "1000.00"),
+                ("printed", "Discount", "100.00"),
+                ("row", "b"),
+                ("printed", "Pharmacy Total", "500.00"),
+                ("printed", "Sub Total", "1500.00"),
+            ],
+        ),
+        _table("lab", 2, [("row", "z"), ("printed", "Lab Total", "200.00")]),
+    ]
+    report = reconcile({"document_total": _total("1700.00"), "rows": rows, "source_tables": tables})
+    assert report["status"] == "verified", report["reasons"]
+
+
+def test_summary_rollup_cannot_stand_in_for_dropped_detail_rows() -> None:
+    # Summary lists Pharmacy 300 and Room 700; the Room detail page was dropped, so
+    # granular rows are only the Pharmacy 300.  Rows + Room roll-up would equal 1000.
+    rows = [
+        _row("s1", "300.00", role="category_rollup", description="Pharmacy", section="Pharmacy"),
+        _row("s2", "700.00", role="category_rollup", description="Room", section="Room"),
+        _row("d1", "300.00", section="Pharmacy", page=2),
+    ]
+    report = reconcile({"document_total": _total("1000.00"), "rows": rows})
+    assert report["status"] == "flagged"
