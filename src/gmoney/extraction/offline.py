@@ -127,7 +127,11 @@ from gmoney.extraction.ocr_rows import (
 from gmoney.extraction.ocr_tokens import paddle_ocr_tokens
 from gmoney.extraction.otsl import parse_otsl, split_otsl_tables
 from gmoney.extraction.reader_consensus import PageBudget
-from gmoney.extraction.reader_pipeline import READER_MODES, finish_reader_table
+from gmoney.extraction.reader_pipeline import (
+    READER_MODES,
+    finish_reader_table,
+    reader_table_decision,
+)
 from gmoney.extraction.recovery import (
     decide_recovery,
     description_lane_recovery_regions,
@@ -5152,6 +5156,8 @@ class ExtractionDraft:
     uvdoc_shadow_runs: tuple[UvdocPreparedRun, ...] = ()
     table_selection_runs: tuple[dict[str, Any], ...] = ()
     m5_shadow_projection: M5ShadowProjectionV1 | None = None
+    # Non-heuristic table reader that produced the rows; drives reconciliation enforcement.
+    table_reader: str | None = None
 
     @property
     def result(self) -> dict[str, Any]:
@@ -5279,6 +5285,8 @@ def _project_extraction_draft_v5(draft: ExtractionDraft) -> dict[str, Any]:
         result["worker_release_revision"] = draft.worker_release_revision
     if draft.validation_recovery_attempted is not None:
         result["validation_recovery_attempted"] = draft.validation_recovery_attempted
+    if draft.table_reader is not None:
+        result["table_reader"] = draft.table_reader
     return result
 
 
@@ -8903,13 +8911,13 @@ class OfflineExtractor:
                         )
                     )
                 )
-                reader_table = bool(
-                    reader_mode
-                    and (
-                        reconstruction.schema is None
-                        or reconstruction.schema.table_type is not TableType.METADATA
-                        or (work.page_number, work.table_id) in reader_guard_pages
-                    )
+                # In reader modes TeleOCR reads every detected table; PaddleOCR-VL is never
+                # called.  Tables PP-OCR classifies as metadata (patient header blocks) are
+                # read locally but never sent to Gemini.
+                reader_table = reader_mode
+                header_table = bool(
+                    reconstruction.schema is not None
+                    and reconstruction.schema.table_type is TableType.METADATA
                 )
                 if reader_table:
                     use_vl = True
@@ -9122,6 +9130,9 @@ class OfflineExtractor:
                         )
                     )
                 if reader_table:
+                    charge_roles = {RowRole.DETAIL, RowRole.REFUND, RowRole.CATEGORY_ROLLUP}
+                    ocr_charge_rows = sum(row.role in charge_roles for row in parsed_rows)
+                    reader_charge_rows = 0
                     if reader_candidates:
                         page_budget = reader_budgets.setdefault(
                             work.page_number,
@@ -9155,6 +9166,7 @@ class OfflineExtractor:
                                 else None
                             ),
                             gemini_allowed=allow_gemini,
+                            header_table=header_table,
                             budget=page_budget,
                             crop_path=work.crop_path,
                             crop_tokens=work.canonical_tokens,
@@ -9165,11 +9177,12 @@ class OfflineExtractor:
                                 artifact_root / "crops" / f"{work.table_id}-reader-redacted.png"
                             ),
                         )
-                        # The reader's rows are the primary rows for this table.
-                        parsed_rows = list(reader_outcome.rows)
                         gemini_calls += reader_outcome.gemini_calls
                         gemini_cost += reader_outcome.gemini_cost_usd
                         reader_diagnostic = reader_outcome.diagnostic
+                        reader_charge_rows = sum(
+                            row.role in charge_roles for row in reader_outcome.rows
+                        ) + len(reader_outcome.ungrounded)
                         if reader_outcome.ungrounded:
                             recovery_attempts.append(
                                 RecoveryAttempt(
@@ -9178,16 +9191,29 @@ class OfflineExtractor:
                                     reason="reader_rows_ungrounded",
                                 )
                             )
-                    elif parsed_rows:
-                        # The reader saw no rows where PP-OCR did: keep them, flagged.
+                    use_reader_rows, reader_failure = reader_table_decision(
+                        provider_error=vl_error,
+                        truncated=vl_truncated,
+                        has_candidates=bool(reader_candidates),
+                        ocr_charge_rows=ocr_charge_rows,
+                        reader_charge_rows=reader_charge_rows,
+                    )
+                    if use_reader_rows:
+                        # The reader's rows are the primary rows for this table.
+                        parsed_rows = list(reader_outcome.rows)
+                    if reader_failure is not None:
+                        # A failed, truncated or empty read never passes silently: any
+                        # PP-OCR rows are kept only as a fallback and the table is flagged.
                         recovery_attempts.append(
                             RecoveryAttempt(
                                 stage=RecoveryStage.REVIEW,
                                 status="pending",
-                                reason="reader_no_rows",
+                                reason=reader_failure,
                             )
                         )
-                        reader_diagnostic = {"reader_candidate_count": 0}
+                        if not reader_candidates:
+                            reader_diagnostic = {"reader_candidate_count": 0}
+                        reader_diagnostic["reader_failure"] = reader_failure
                     reader_diagnostic["table_reader"] = self.table_reader
                 profile_heavy_disagreement = bool(
                     profile_heavy_sample and _heavy_disagrees(reconstruction, provider_candidates)
@@ -9996,6 +10022,7 @@ class OfflineExtractor:
             _draft_sink["uvdoc_shadow_runs"] = tuple(uvdoc_shadow_runs)
             _draft_sink["table_selection_runs"] = tuple(table_selection_runs)
             _draft_sink["m5_shadow_projection"] = m5_shadow_projection
+            _draft_sink["table_reader"] = self.table_reader if reader_mode else None
         if _draft_sink is None:
             return _project_result_v6(
                 result,
@@ -10037,6 +10064,7 @@ class OfflineExtractor:
             uvdoc_shadow_runs=sink["uvdoc_shadow_runs"],
             table_selection_runs=sink["table_selection_runs"],
             m5_shadow_projection=sink.get("m5_shadow_projection"),
+            table_reader=sink.get("table_reader"),
         )
 
     def recover_draft(
@@ -10084,6 +10112,7 @@ class OfflineExtractor:
             uvdoc_shadow_runs=draft.uvdoc_shadow_runs,
             table_selection_runs=draft.table_selection_runs,
             m5_shadow_projection=draft.m5_shadow_projection,
+            table_reader=draft.table_reader or sink.get("table_reader"),
         )
         from gmoney.extraction.validation import validate_extraction_result
 
@@ -10269,6 +10298,7 @@ class OfflineExtractor:
             recovery_metadata=recovery_metadata,
             artifact_root=selected.artifact_root,
             m5_shadow_projection=selected.m5_shadow_projection,
+            table_reader=selected.table_reader or candidate.table_reader,
         )
 
 

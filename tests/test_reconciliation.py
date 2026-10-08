@@ -152,7 +152,10 @@ def test_package_bill_with_unpriced_inclusions_is_verified() -> None:
     ]
     report = reconcile({"document_total": _total("11457.00"), "rows": rows})
     assert report["status"] == "verified"
-    assert report["checks"][0]["evidence"] == {"basis": "package_rollup"}
+    assert report["checks"][0]["evidence"] == {
+        "basis": "distinct_category_rollups",
+        "repeated_rollups_ignored": 1,
+    }
 
 
 def test_whole_rupee_rounding_passes_but_fractional_gap_fails() -> None:
@@ -197,8 +200,16 @@ def test_nested_issue_return_and_sub_totals_reconcile() -> None:
         ],
     )
     report = reconcile({"document_total": _total("120.00"), "rows": rows, "source_tables": [table]})
-    section_checks = [check for check in report["checks"] if check["kind"] == "section_total"]
-    assert [check["outcome"] for check in section_checks] == ["pass", "pass", "pass"]
+    section_checks = [
+        check
+        for check in report["checks"]
+        if check["kind"] in {"section_total", "section_aggregate"}
+    ]
+    assert [(check["kind"], check["outcome"]) for check in section_checks] == [
+        ("section_total", "pass"),
+        ("section_total", "pass"),
+        ("section_aggregate", "pass"),
+    ]
     assert report["status"] == "verified"
     assert any(item["label"] == "discount" for item in report["reported"])
 
@@ -244,3 +255,117 @@ def test_summary_rollups_must_equal_grand_total() -> None:
     assert report["status"] == "flagged"
     summary = next(check for check in report["checks"] if check["id"] == "C3")
     assert summary["difference"] == "-100.00"
+
+
+def test_package_rollup_does_not_hide_a_separate_charge() -> None:
+    rows = [
+        _row("pkg", "100.00", role="category_rollup", description="Package Charges"),
+        _row("extra", "50.00", role="category_rollup", description="Pharmacy Outside Package"),
+    ]
+    report = reconcile({"document_total": _total("100.00"), "rows": rows})
+    assert report["status"] == "flagged"
+    assert report["checks"][0]["actual"] == "150.00"
+    assert report["checks"][0]["difference"] == "50.00"
+
+    rows.append(_row("pkg-repeat", "100.00", role="category_rollup", description="PACKAGE charges"))
+    report = reconcile({"document_total": _total("150.00"), "rows": rows})
+    assert report["status"] == "verified"
+
+
+def test_section_total_cannot_reuse_rows_of_a_previous_section() -> None:
+    # Section A prints 50 for rows 100 + 50 (wrong), section B prints 80 for row 30
+    # (wrong; 80 = 50 + 30 borrows A's last row).  The old back-search passed both.
+    rows = [
+        _row("a1", "100.00", section="Room"),
+        _row("a2", "50.00", section="Room"),
+        _row("b1", "30.00", section="Pharmacy"),
+    ]
+    table = _table(
+        "p1-t1",
+        1,
+        [
+            ("row", "a1"),
+            ("row", "a2"),
+            ("printed", "Sub Total", "50.00"),
+            ("row", "b1"),
+            ("printed", "Sub Total", "80.00"),
+        ],
+    )
+    report = reconcile({"document_total": _total("180.00"), "rows": rows, "source_tables": [table]})
+    sections = [check for check in report["checks"] if check["kind"] == "section_total"]
+    assert [(check["outcome"], check["expected"], check["actual"]) for check in sections] == [
+        ("fail", "50.00", "150.00"),
+        ("fail", "80.00", "30.00"),
+    ]
+    assert sections[1]["section"] == "Pharmacy"
+    assert report["status"] == "flagged"
+
+
+def test_section_total_may_start_at_a_section_heading_but_not_mid_section() -> None:
+    rows = [
+        _row("a1", "100.00"),
+        _row("b1", "30.00"),
+        _row("b2", "20.00"),
+    ]
+    entries: list[tuple[str, ...]] = [
+        ("row", "a1"),
+        ("printed", "Pharmacy Charges", ""),
+        ("row", "b1"),
+        ("row", "b2"),
+        ("printed", "Total", "50.00"),
+    ]
+    table = _table("p1-t1", 1, entries)
+    table["rows"][1]["cells"] = [{"column_id": "c0", "raw_value": "Pharmacy Charges"}]
+    report = reconcile({"document_total": _total("150.00"), "rows": rows, "source_tables": [table]})
+    section = next(check for check in report["checks"] if check["kind"] == "section_total")
+    assert section["outcome"] == "pass"
+    assert section["evidence"]["run_row_ids"] == ["b1", "b2"]
+
+    # Without the heading, a printed 20 must not match the trailing row alone.
+    entries = [("row", "b1"), ("row", "b2"), ("printed", "Total", "20.00")]
+    report = reconcile(
+        {
+            "document_total": _total("50.00"),
+            "rows": rows[1:],
+            "source_tables": [_table("p1-t1", 1, entries)],
+        }
+    )
+    section = next(check for check in report["checks"] if check["kind"] == "section_total")
+    assert section["outcome"] == "fail"
+
+
+def test_aggregate_total_uses_only_the_preceding_closed_sections() -> None:
+    rows = [
+        _row("i1", "100.00", section="Item Issues"),
+        _row("r1", "-20.00", role="refund", section="Item Returns"),
+        _row("x1", "40.00", section="Room"),
+    ]
+    table = _table(
+        "p1-t1",
+        1,
+        [
+            ("row", "i1"),
+            ("printed", "Item Issues Total", "100.00"),
+            ("row", "r1"),
+            ("printed", "Item Returns Total", "20.00"),
+            ("printed", "Sub Total", "80.00"),
+            ("row", "x1"),
+            ("printed", "Room Total", "40.00"),
+            ("printed", "Sub Total", "999.00"),
+        ],
+    )
+    report = reconcile({"document_total": _total("120.00"), "rows": rows, "source_tables": [table]})
+    outcomes = [
+        (check["kind"], check["outcome"])
+        for check in report["checks"]
+        if check["kind"].startswith("section")
+    ]
+    assert outcomes == [
+        ("section_total", "pass"),
+        ("section_total", "pass"),
+        ("section_aggregate", "pass"),
+        ("section_total", "pass"),
+        ("section_aggregate", "fail"),
+    ]
+    assert report["checks"][0]["outcome"] == "pass"
+    assert report["status"] == "flagged"

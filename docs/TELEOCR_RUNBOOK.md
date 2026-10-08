@@ -11,6 +11,15 @@ is covered by unit tests with recorded/mocked model replies only.
 | `teleocr` | TeleOCR on every detected table + missed-table full-page guard | enforced |
 | `teleocr_gemini` | TeleOCR, plus Gemini on every redacted table crop with cell-level consensus | enforced |
 
+What still runs from Paddle in the TeleOCR modes, and why:
+
+| Component | Used in TeleOCR modes? | Role |
+| --- | --- | --- |
+| PaddleOCR-VL 1.6 (llama.cpp) | **No** — never called; not started with `compose.teleocr.yaml` | was the VLM fallback |
+| PP-DocLayoutV3 + OCR table proposals | Yes | finds the table boxes TeleOCR reads; amounts outside them trigger the full-page guard |
+| PP-OCRv6 page/crop OCR | Yes | the token evidence every TeleOCR row must be grounded to (V6 evidence, review UI), document totals, hospital name |
+| PP-OCR row builder (`ocr_rows.py`) | Only as printed-table evidence and as a **flagged** fallback | builds the printed source tables used for linking and C2 sub-totals; its rows are used only when TeleOCR failed, truncated, or found no charges where PP-OCR did, and that table is then a blocking review issue (`reader_provider_failed`, `reader_truncated`, `reader_no_rows`) |
+
 "Enforced" means a job is `complete` only when validation passes **and** the bill reconciles
 against its own printed totals; otherwise it is `needs_review` and approval is blocked by
 `reconciliation_unverified` until reviewer edits reconcile it or a reasoned override is
@@ -190,9 +199,14 @@ target (Gemini ≤ ₹0.30/page).
 
 ## 8. Using a mode in the demo stack
 
+`compose.teleocr.yaml` is an overlay for the reader modes: it starts TeleOCR, makes the
+worker wait for it instead of PaddleOCR-VL, and leaves PaddleOCR-VL stopped (it is not used
+in these modes). Without the overlay, starting the worker also starts PaddleOCR-VL.
+
 ```bash
-export GMONEY_TABLE_READER=teleocr          # or teleocr_gemini
-docker compose -f compose.demo.yaml -f compose.gpu.yaml --profile teleocr up -d teleocr worker api
+export GMONEY_TABLE_READER=teleocr          # or teleocr_gemini (overlay default: teleocr)
+docker compose -f compose.demo.yaml -f compose.gpu.yaml -f compose.teleocr.yaml up -d
+docker compose -f compose.demo.yaml -f compose.gpu.yaml stop paddleocr-vl   # if it was running
 ```
 
 The worker status file reports `table_reader`; each result records `table_reader` and its
@@ -202,8 +216,8 @@ The worker status file reports `table_reader`; each result records `table_reader
 
 ```bash
 unset GMONEY_TABLE_READER                   # or export GMONEY_TABLE_READER=heuristic
-docker compose -f compose.demo.yaml -f compose.gpu.yaml up -d worker paddleocr-vl
 docker compose -f compose.demo.yaml -f compose.gpu.yaml --profile teleocr stop teleocr
+docker compose -f compose.demo.yaml -f compose.gpu.yaml up -d   # no overlay: PaddleOCR-VL back
 ```
 
 With the reader unset, extraction is exactly the previous heuristic path and the

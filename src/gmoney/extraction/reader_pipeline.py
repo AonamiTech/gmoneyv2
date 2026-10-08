@@ -83,6 +83,7 @@ def finish_reader_table(
     table_type: TableType | None = None,
     existing_page_rows: tuple[tuple[object, object], ...] = (),
     is_guard: bool = False,
+    header_table: bool = False,
     gemini_reader: TableReader | None = None,
     gemini_allowed: bool = False,
     budget: PageBudget | None = None,
@@ -108,6 +109,9 @@ def finish_reader_table(
             block_reason = "gemini_not_allowed_in_this_stage"
         elif is_guard:
             block_reason = "guard_band_not_sent"
+        elif header_table:
+            # Patient header / metadata blocks never leave the host.
+            block_reason = "header_table_not_sent"
         elif None in (budget, crop_path, crop_size, crop_box, page_size, redaction_output):
             block_reason = "crop_unavailable"
         if block_reason is None:
@@ -180,3 +184,26 @@ def finish_reader_table(
         diagnostic["reader_ungrounded_rows"] = outcome.ungrounded
     diagnostic["reader_published_rows"] = len(outcome.rows)
     return outcome
+
+
+def reader_table_decision(
+    *,
+    provider_error: str | None,
+    truncated: bool,
+    has_candidates: bool,
+    ocr_charge_rows: int,
+    reader_charge_rows: int,
+) -> tuple[bool, str | None]:
+    """Whether the reader's rows replace the PP-OCR rows, and why the table is flagged.
+
+    A failed, truncated or charge-less read never passes silently.  The PP-OCR rows are
+    kept as a flagged fallback only when the reader produced no charges where PP-OCR did.
+    """
+    use_reader_rows = has_candidates and bool(reader_charge_rows or not ocr_charge_rows)
+    if provider_error:
+        return use_reader_rows, "reader_provider_failed"
+    if truncated and not has_candidates:
+        return use_reader_rows, "reader_truncated"
+    if ocr_charge_rows and not reader_charge_rows:
+        return use_reader_rows, "reader_no_rows"
+    return use_reader_rows, None

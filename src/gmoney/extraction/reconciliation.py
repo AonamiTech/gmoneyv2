@@ -180,12 +180,24 @@ def _reported_totals(result: dict[str, Any]) -> list[dict[str, Any]]:
     return reported
 
 
+def _distinct_rollups(rollups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    distinct: dict[tuple[str, Decimal | None], dict[str, Any]] = {}
+    for row in rollups:
+        distinct.setdefault(
+            (normalized_label(row.get("description")), _decimal(row.get("net_amount"))), row
+        )
+    return list(distinct.values())
+
+
 def _grand_total_check(
     rows: list[dict[str, Any]], printed: list[dict[str, Any]]
 ) -> tuple[dict[str, Any] | None, Decimal | None]:
     granular = [row for row in rows if row.get("role") in GRANULAR_ROLES]
     rollups = [row for row in rows if row.get("role") == "category_rollup"]
-    basis = granular or rollups
+    # Without granular rows the roll-ups are the charges.  Package bills can print the
+    # same package roll-up twice (summary and again above its unpriced inclusions); it
+    # is counted once, but every other distinct charge still counts.
+    basis = granular or _distinct_rollups(rollups)
     missing = [str(row.get("id")) for row in basis if signed_amount(row) is None]
     total = sum((value for row in basis if (value := signed_amount(row)) is not None), Decimal(0))
     if not printed:
@@ -205,24 +217,7 @@ def _grand_total_check(
             ),
             total,
         )
-    if not granular:
-        # Package bills can print the package roll-up both in a summary and again
-        # above its unpriced inclusions; one roll-up equal to the bill total proves it.
-        for candidate in printed:
-            if any(_decimal(row.get("net_amount")) == candidate["amount"] for row in rollups):
-                return (
-                    _check(
-                        "C1",
-                        "grand_total",
-                        expected=candidate["amount"],
-                        actual=candidate["amount"],
-                        outcome="pass",
-                        label=candidate["label"],
-                        page=candidate["page_number"],
-                        evidence={"basis": "package_rollup"},
-                    ),
-                    candidate["amount"],
-                )
+    basis_name = "granular_rows" if granular else "distinct_category_rollups"
     for candidate in printed:
         outcome = match_outcome(candidate["amount"], total)
         if outcome != "fail":
@@ -235,7 +230,12 @@ def _grand_total_check(
                     outcome=outcome,
                     label=candidate["label"],
                     page=candidate["page_number"],
-                    evidence={"basis": "granular_rows" if granular else "category_rollups"},
+                    evidence={
+                        "basis": basis_name,
+                        "repeated_rollups_ignored": len(rollups) - len(basis)
+                        if not granular
+                        else 0,
+                    },
                 ),
                 total,
             )
@@ -249,7 +249,7 @@ def _grand_total_check(
             label=primary["label"],
             page=primary["page_number"],
             evidence={
-                "basis": "granular_rows" if granular else "category_rollups",
+                "basis": basis_name,
                 "other_printed_totals": [_text(item["amount"]) for item in printed[1:]],
             },
         ),
@@ -263,14 +263,10 @@ def _summary_check(rows: list[dict[str, Any]], printed: list[dict[str, Any]]) ->
     if not granular or not rollups or not printed:
         return None
     # A summary printed twice (front page and again above components) is one summary.
-    distinct: dict[tuple[str, Decimal | None], dict[str, Any]] = {}
-    for row in rollups:
-        distinct.setdefault(
-            (normalized_label(row.get("description")), _decimal(row.get("net_amount"))), row
-        )
-    missing = [str(row.get("id")) for row in distinct.values() if signed_amount(row) is None]
+    distinct = _distinct_rollups(rollups)
+    missing = [str(row.get("id")) for row in distinct if signed_amount(row) is None]
     total = sum(
-        (value for row in distinct.values() if (value := signed_amount(row)) is not None),
+        (value for row in distinct if (value := signed_amount(row)) is not None),
         Decimal(0),
     )
     expected = printed[0]["amount"]
@@ -288,7 +284,7 @@ def _summary_check(rows: list[dict[str, Any]], printed: list[dict[str, Any]]) ->
         actual=total,
         outcome=outcome,
         label="category roll-ups",
-        evidence={"rollup_row_ids": [str(row.get("id")) for row in distinct.values()]}
+        evidence={"rollup_row_ids": [str(row.get("id")) for row in distinct]}
         | ({"missing_amount_row_ids": missing} if missing else {}),
     )
 
@@ -332,33 +328,108 @@ def _row_label_and_targets(
     return normalized_label(" ".join(labels)), net_values, all_values
 
 
+# Words that make an unlinked, unpriced printed row a section heading (a place where a
+# section sub-total may start), e.g. "Item Issues", "Return Item", "Bed Charges".
+SECTION_HEADING_WORDS = (
+    "bed",
+    "charges",
+    "consultation",
+    "consumable",
+    "investigation",
+    "issue",
+    "laboratory",
+    "medicine",
+    "nursing",
+    "pathology",
+    "pharmacy",
+    "procedure",
+    "radiology",
+    "return",
+    "room",
+    "service",
+    "surgery",
+    "visit",
+)
+
+
+def _is_section_heading(label: str) -> bool:
+    words = label.split()
+    return 0 < len(words) <= 5 and any(word.startswith(SECTION_HEADING_WORDS) for word in words)
+
+
+def _sum(rows: list[dict[str, Any]]) -> Decimal:
+    return sum((value for row in rows if (value := signed_amount(row)) is not None), Decimal(0))
+
+
+def _best_match(
+    candidates: list[list[dict[str, Any]]], targets: list[Decimal]
+) -> tuple[str, Decimal | None, Decimal | None, list[dict[str, Any]]]:
+    """First exact (else first rounded) candidate run whose sum equals a printed value."""
+    rounded: tuple[str, Decimal, Decimal, list[dict[str, Any]]] | None = None
+    for run in candidates:
+        if not any(signed_amount(row) is not None for row in run):
+            continue
+        total = _sum(run)
+        refunds_only = all(row.get("role") == "refund" for row in run)
+        for target in targets:
+            # A returns sub-total is usually printed positive over negative refund rows.
+            for actual in (total, -total) if refunds_only else (total,):
+                outcome = match_outcome(target, actual)
+                if outcome == "pass":
+                    return outcome, target, actual, run
+                if outcome == "rounded" and rounded is None:
+                    rounded = (outcome, target, actual, run)
+    return rounded or ("fail", None, None, [])
+
+
 def _section_checks(
     result: dict[str, Any],
     rows: list[dict[str, Any]],
     printed: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """C2: every printed sub-total must equal the rows of its own section.
+
+    Rows are walked in page/table/row order.  A printed total that follows charge rows is
+    a *leaf* total: it may only use rows printed since the previous printed total, either
+    all of them or a suffix starting at a section start (a section heading, a change of
+    row section, or a new table).  Rows already closed by an earlier total are never
+    reused.  A total printed directly after other totals (no charge rows in between) is
+    an *aggregate* of the immediately preceding closed segments, e.g. "Sub Total" after
+    "Item Issues Total" and "Item Returns Total".  A grand total is left to C1.
+    """
     by_id = {str(row.get("id")): row for row in rows}
     document_amounts = {item["amount"] for item in printed}
     tables = [table for table in result.get("source_tables") or [] if isinstance(table, dict)]
     ordered = sorted(
         enumerate(tables), key=lambda item: (int(item[1].get("page_number") or 0), item[0])
     )
-    stream: list[dict[str, Any]] = []
-    boundary_index = 0
+    open_rows: list[dict[str, Any]] = []
+    section_starts: set[int] = set()
+    closed: list[list[dict[str, Any]]] = []
     checks: list[dict[str, Any]] = []
     reported: list[dict[str, Any]] = []
     for _, table in ordered:
         page = int(table.get("page_number") or 0) or None
+        if open_rows:
+            section_starts.add(len(open_rows))
         source_rows = sorted(table.get("rows") or [], key=lambda row: int(row.get("order") or 0))
         for source_row in source_rows:
             canonical_id = source_row.get("canonical_row_id")
             if canonical_id is not None:
                 canonical = by_id.get(str(canonical_id))
                 if canonical is not None and canonical.get("role") in LEDGER_ROLES:
-                    stream.append(canonical)
+                    if open_rows and (canonical.get("section") or None) != (
+                        open_rows[-1].get("section") or None
+                    ):
+                        section_starts.add(len(open_rows))
+                    open_rows.append(canonical)
                 continue
             label, net_values, all_values = _row_label_and_targets(table, source_row)
-            if not all_values or not label:
+            if not label:
+                continue
+            if not all_values:
+                if open_rows and _is_section_heading(label):
+                    section_starts.add(len(open_rows))
                 continue
             if is_settlement_label(label):
                 reported.append(
@@ -373,30 +444,44 @@ def _section_checks(
             if not _is_checkable_total_label(label):
                 continue
             targets = net_values or all_values
-            check_id = f"C2:p{page}:{table.get('table_id')}:{source_row.get('id')}"
-            outcome, expected, actual, run = _match_contiguous_run(stream, targets)
-            section_rows = stream[boundary_index:]
-            section = next(
-                (str(row["section"]) for row in reversed(section_rows) if row.get("section")),
-                None,
+            grand_total = label.startswith(TOTAL_PREFIXES) or any(
+                value in document_amounts for value in targets
             )
-            if outcome == "fail" and (
-                label.startswith(TOTAL_PREFIXES)
-                or any(value in document_amounts for value in targets)
-            ):
-                # The printed bill total is proved (or flagged) by C1.
-                boundary_index = len(stream)
+            if open_rows:
+                kind = "section_total"
+                starts = [0, *sorted(section_starts)]
+                candidates = [open_rows[start:] for start in starts]
+                outcome, expected, actual, run = _best_match(candidates, targets)
+                scope_rows = open_rows
+                closed.append(open_rows)
+            else:
+                kind = "section_aggregate"
+                candidates = [
+                    [row for segment in closed[-count:] for row in segment]
+                    for count in range(1, len(closed) + 1)
+                ]
+                outcome, expected, actual, run = _best_match(candidates, targets)
+                scope_rows = candidates[-1] if candidates else []
+                if outcome != "fail":
+                    count = next(
+                        count for count in range(1, len(closed) + 1) if candidates[count - 1] is run
+                    )
+                    closed = [*closed[:-count], run]
+            if grand_total and outcome == "fail":
+                # The printed bill total is proved (or flagged) by C1; start afresh.
+                open_rows, section_starts, closed = [], set(), []
                 continue
             if outcome == "fail":
                 expected = targets[-1]
-                actual = sum(
-                    (value for row in section_rows if (value := signed_amount(row)) is not None),
-                    Decimal(0),
-                )
+                actual = _sum(scope_rows)
+            section = next(
+                (str(row["section"]) for row in reversed(scope_rows) if row.get("section")),
+                None,
+            )
             checks.append(
                 _check(
-                    check_id,
-                    "section_total",
+                    f"C2:p{page}:{table.get('table_id')}:{source_row.get('id')}",
+                    kind,
                     expected=expected,
                     actual=actual,
                     outcome=outcome,
@@ -408,37 +493,12 @@ def _section_checks(
                         "table_id": table.get("table_id"),
                         "printed_values": [_text(value) for value in all_values],
                         "run_row_ids": [str(row.get("id")) for row in run],
+                        "scope_row_ids": [str(row.get("id")) for row in scope_rows],
                     },
                 )
             )
-            boundary_index = len(stream)
+            open_rows, section_starts = [], set()
     return checks, reported
-
-
-def _match_contiguous_run(
-    stream: list[dict[str, Any]], targets: list[Decimal]
-) -> tuple[str, Decimal | None, Decimal | None, list[dict[str, Any]]]:
-    """Search back from the row above a printed total for a run whose sum it equals."""
-    best: tuple[str, Decimal, Decimal, list[dict[str, Any]]] | None = None
-    total = Decimal(0)
-    all_refunds = True
-    for start in range(len(stream) - 1, -1, -1):
-        row = stream[start]
-        value = signed_amount(row)
-        if value is None:
-            continue
-        total += value
-        all_refunds = all_refunds and row.get("role") == "refund"
-        for target in targets:
-            for candidate in (total, -total) if all_refunds else (total,):
-                outcome = match_outcome(target, candidate)
-                if outcome == "pass":
-                    return outcome, target, candidate, stream[start:]
-                if outcome == "rounded" and best is None:
-                    best = (outcome, target, candidate, stream[start:])
-    if best is not None:
-        return best
-    return "fail", None, None, []
 
 
 def _row_arithmetic_checks(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
