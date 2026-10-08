@@ -378,3 +378,53 @@ def test_reader_failure_reason_is_named_in_the_review_issue() -> None:
     }
     issues = structural_issues({"diagnostics": [diagnostic]}, {"issue_overrides": {}})
     assert issues[0]["reason_codes"] == ["low_yield", "reader_provider_failed"]
+
+
+def test_positive_printed_refunds_reduce_review_totals_like_reconciliation() -> None:
+    from gmoney.demo.review import totals_summary
+    from gmoney.extraction.reconciliation import signed_field_value
+
+    outcome, _tables, report = _run(PHARMACY_OTSL, _pharmacy_tokens(), printed_total="4873.44")
+    rows = [row.model_dump(mode="json") for row in outcome.rows]
+    result = {
+        "document_total": {"amount": "4873.44", "label": "Total Bill Amount"},
+        "rows": rows,
+    }
+    totals = totals_summary(result, {"row_overrides": {}, "added_rows": {}}, rows)
+    assert (totals["items_total"], totals["comparison"]) == ("4873.44", "match")
+    assert report["status"] == "verified"
+    assert signed_field_value({"role": "refund", "net_amount": "126.56"}) == Decimal("-126.56")
+    # Heuristic refunds are printed negative and are unchanged.
+    assert signed_field_value({"role": "refund", "net_amount": "-126.56"}) == Decimal("-126.56")
+    assert signed_field_value({"role": "detail", "net_amount": "126.56"}) == Decimal("126.56")
+
+
+@pytest.mark.parametrize(
+    "footer",
+    ["Medicines once sold cannot be returned", "No return without bill"],
+)
+def test_return_policy_text_does_not_demand_refund_rows(footer: str) -> None:
+    tokens = _page_tokens(_token("f1", footer, 10, 230, 300))
+    _outcome, _tables, report = _run(RECORDED, tokens)
+    assert not any(check["id"] == "C1R" for check in report["checks"])
+    assert report["status"] == "verified"
+
+
+def test_lab_tests_named_total_stay_charges() -> None:
+    rows = read_otsl_rows(
+        _otsl(
+            ["Test Name", "Amount"],
+            ["Bilirubin Total", "250.00"],
+            ["Protein Total", "150.00"],
+            ["Lab Total", "400.00"],
+            ["Item Issues Total", "400.00"],
+        )
+    )
+    assert [row.description for row in rows if row.role is RowRole.DETAIL] == [
+        "Bilirubin Total",
+        "Protein Total",
+    ]
+    assert [row.description for row in rows if row.role is RowRole.SECTION_TOTAL] == [
+        "Lab Total",
+        "Item Issues Total",
+    ]

@@ -9001,10 +9001,12 @@ class OfflineExtractor:
                         vl_contents.append(response_content)
                         response_candidate_count = 0
                         if reader_table:
-                            # Tiles below the first carry no header row: reuse the first one.
+                            # Tiles below the first carry no header row: reuse the first one
+                            # (tile reads only; a primary read keeps its own headers).
                             reader_header = reader_header or otsl_header(response_content)
                             tile_candidates = read_otsl_rows(
-                                response_content, inherited_header=reader_header
+                                response_content,
+                                inherited_header=reader_header if job_index > 0 else None,
                             )
                             if job_index > 0:
                                 # Overlapping tiles repeat their boundary rows.
@@ -9018,7 +9020,12 @@ class OfflineExtractor:
                                     ),
                                     *tile_candidates[3:],
                                 )
-                                if vl_response.output.get("truncated") or not tile_candidates:
+                                if vl_response.output.get("truncated") or (
+                                    not tile_candidates
+                                    and re.search(r"\d\.\d{2}\b", response_content)
+                                ):
+                                    # Truncated, or amounts that could not be read as rows; an
+                                    # empty or overlap-only last tile is not a partial read.
                                     reader_partial = True
                             reader_candidates.extend(tile_candidates)
                             response_candidate_count = len(tile_candidates)

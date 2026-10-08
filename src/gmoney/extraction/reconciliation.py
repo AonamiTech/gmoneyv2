@@ -94,6 +94,19 @@ def signed_amount(row: dict[str, Any]) -> Decimal | None:
     return -abs(amount) if row.get("role") == "refund" else amount
 
 
+def signed_field_value(row: dict[str, Any], field: str = "net_amount") -> Decimal | None:
+    """A ledger amount with refunds counted negative.
+
+    Refund rows keep the amount exactly as printed (evidence must match the printed
+    token), so a return printed as "126.56" is stored positive with role ``refund``.
+    Heuristic refunds are printed negative already and are unchanged by this.
+    """
+    value = _decimal(row.get(field))
+    if value is not None and row.get("role") == "refund":
+        return -abs(value)
+    return value
+
+
 def _active(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     return [row for row in rows if row.get("review_disposition") != "rejected"]
 
@@ -656,6 +669,7 @@ def _reason(check: dict[str, Any]) -> str:
 
 # Item returns only: "Amount Refunded" (deposit refunds) is a settlement, not a return.
 RETURN_WORDS = frozenset({"return", "returns", "returned"})
+NEGATION_WORDS = frozenset({"not", "cannot", "no", "without", "never", "non"})
 
 
 def _returns_check(result: dict[str, Any], rows: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -668,12 +682,36 @@ def _returns_check(result: dict[str, Any], rows: list[dict[str, Any]]) -> dict[s
     for table in result.get("source_tables") or []:
         if not isinstance(table, dict):
             continue
-        for source_row in table.get("rows") or []:
+        source_rows = sorted(table.get("rows") or [], key=lambda row: int(row.get("order") or 0))
+        for index, source_row in enumerate(source_rows):
             if source_row.get("canonical_row_id") is not None:
                 continue
-            label, _net, _values = _row_label_and_targets(table, source_row)
+            label, _net, values = _row_label_and_targets(table, source_row)
             words = label.split()
-            if RETURN_WORDS & set(words) and len(words) <= 6 and not is_settlement_label(label):
+            if (
+                not RETURN_WORDS & set(words)
+                or len(words) > 6
+                or NEGATION_WORDS & set(words)  # "cannot be returned", "no return without bill"
+                or is_settlement_label(label)
+            ):
+                continue
+            if values:
+                printed_return = any(value != 0 for value in values)
+            else:
+                # A return heading counts only when priced rows follow it.
+                printed_return = False
+                for following in source_rows[index + 1 :]:
+                    _label, _n, following_values = _row_label_and_targets(table, following)
+                    if following.get("canonical_row_id") is None and _is_checkable_total_label(
+                        _label
+                    ):
+                        break
+                    if following.get("canonical_row_id") is not None or any(
+                        value != 0 for value in following_values
+                    ):
+                        printed_return = True
+                        break
+            if printed_return:
                 evidence.append(
                     {"page": table.get("page_number"), "label": label, "row": source_row.get("id")}
                 )

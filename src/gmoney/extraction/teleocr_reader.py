@@ -69,6 +69,28 @@ IDENTIFIER_LABEL = re.compile(
 )
 # Printed bill/gross/payable total labels from the document-total detector.
 DOCUMENT_TOTAL_TERMS = tuple(sorted({spec[0] for spec in FINAL_LABELS}))
+TOTAL_QUALIFIER_WORDS = frozenset(
+    {
+        "item",
+        "items",
+        "page",
+        "grand",
+        "net",
+        "gross",
+        "final",
+        "lab",
+        "drug",
+        "drugs",
+        "category",
+        "section",
+        "package",
+        "department",
+        "ward",
+        "icu",
+        "ot",
+        "sub",
+    }
+)
 TOTAL_TAIL_WORDS = frozenset(
     {"amount", "amt", "value", "rs", "inr", "bill", "of", "the", "for", "charges", "charge"}
 )
@@ -259,11 +281,20 @@ def _is_total_row_label(label: str) -> bool:
     words = label.split()
     if not words:
         return False
+
+    def qualifiers(rest: list[str]) -> bool:
+        # "Pharmacy Total", "Item Issues Total" qualify; "Bilirubin Total" is a lab test.
+        return all(
+            word in TOTAL_TAIL_WORDS
+            or word in TOTAL_QUALIFIER_WORDS
+            or word.startswith(SECTION_WORDS)
+            for word in rest
+        )
+
     if words[-1] in {"total", "totals", "subtotal"}:
-        return True
+        return qualifiers(words[:-2] if words[-2:-1] == ["sub"] else words[:-1])
     if words[0] in {"total", "subtotal"} or words[:2] == ["sub", "total"]:
-        rest = words[2:] if words[:2] == ["sub", "total"] else words[1:]
-        return all(word in TOTAL_TAIL_WORDS or word.startswith(SECTION_WORDS) for word in rest)
+        return qualifiers(words[2:] if words[:2] == ["sub", "total"] else words[1:])
     return False
 
 
@@ -578,6 +609,5 @@ def drop_rows_already_read(
         row
         for row in candidates
         if row.role not in {RowRole.DETAIL, RowRole.REFUND, RowRole.CATEGORY_ROLLUP}
-        or _identity(row.description, row.amount, row.service_date if dated else None)
-        not in seen
+        or _identity(row.description, row.amount, row.service_date if dated else None) not in seen
     )

@@ -335,7 +335,8 @@ def totals_summary(
         if parsed is None or not parsed.is_finite():
             missing_amounts += 1
         else:
-            item_total += parsed
+            # Refunds printed positive are stored as printed; they reduce the total.
+            item_total += -abs(parsed) if row.get("role") == "refund" else parsed
 
     machine_total = result.get("document_total")
     machine_totals = result.get("document_totals")
