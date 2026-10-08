@@ -17,8 +17,8 @@ from gmoney.demo.store import JobStore, JobTransactionError, utc_now
 from gmoney.extraction.reconciliation import (
     is_enforced,
     is_reader_refund,
-    reconcile,
     recorded_or_computed,
+    safe_reconcile,
 )
 
 EDITABLE_TEXT_FIELDS = {
@@ -451,7 +451,7 @@ def reconciliation_summary(
 ) -> dict[str, Any]:
     """Recompute the reconciliation gate on the reviewer-projected rows."""
     projected = rows if rows is not None else project_rows(result, review)
-    report = reconcile(result, projected)
+    report = safe_reconcile(result, projected)
     override = reconciliation_override(review)
     enforced = is_enforced(result)
     return {

@@ -17,7 +17,7 @@ from typing import Any, TextIO
 from gmoney.contracts.phase3 import ProfileRegistrySnapshot
 from gmoney.demo.alias_transactions import AliasTransactionCoordinator
 from gmoney.demo.store import TERMINAL_STATUSES, JobStore, is_gpu_device
-from gmoney.extraction.reconciliation import gate_enforced, reconcile
+from gmoney.extraction.reconciliation import gate_enforced, safe_reconcile
 from gmoney.extraction.validation import (
     ExtractionIntegrityError,
     validate_extraction_result,
@@ -133,17 +133,8 @@ def _extract_and_publish(
     result["worker_release_revision"] = build_revision()
     result["semantic_validation"] = report.model_dump(mode="json")
     result["validation_recovery_attempted"] = recovery_attempted
-    try:
-        reconciliation = reconcile(result)
-    except Exception as error:  # the gate must never fail an extraction
-        logger.exception("reconciliation_failed job_id=%s", job_id)
-        reconciliation = {
-            "status": "unprovable",
-            "checks": [],
-            "reasons": [f"reconciliation_error:{type(error).__name__}"],
-        }
     result["reconciliation"] = {
-        **reconciliation,
+        **safe_reconcile(result),
         "enforced": gate_enforced(result.get("table_reader")),
     }
     hospital = result.get("hospital") or {}

@@ -582,3 +582,15 @@ def test_positive_returns_total_matches_printed_positive_refunds_only() -> None:
     ]
     assert return_total_targets(Decimal("126.56"), heuristic_positive, -1) == {Decimal("126.56")}
     assert return_total_targets(Decimal("500.00"), reader_refunds, 1) == {Decimal("500.00")}
+
+
+def test_safe_reconcile_reports_internal_errors_as_unprovable(monkeypatch) -> None:
+    from gmoney.extraction import reconciliation
+
+    def broken(*_args, **_kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(reconciliation, "reconcile", broken)
+    report = reconciliation.safe_reconcile({"rows": []})
+    assert report["status"] == "unprovable"
+    assert report["reasons"] == ["reconciliation_error:RuntimeError"]

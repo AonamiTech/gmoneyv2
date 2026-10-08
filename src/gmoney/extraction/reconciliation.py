@@ -816,6 +816,23 @@ def reconcile(result: dict[str, Any], rows: list[dict[str, Any]] | None = None) 
     }
 
 
+def safe_reconcile(
+    result: dict[str, Any], rows: list[dict[str, Any]] | None = None
+) -> dict[str, Any]:
+    """``reconcile`` that reports an internal error as ``unprovable`` instead of raising."""
+    try:
+        return reconcile(result, rows)
+    except Exception as error:  # the gate must never break extraction or review
+        return {
+            "reconciliation_version": RECONCILIATION_VERSION,
+            "status": "unprovable",
+            "rows_total": None,
+            "checks": [],
+            "reasons": [f"reconciliation_error:{type(error).__name__}"],
+            "reported": [],
+        }
+
+
 def gate_enforced(table_reader: str | None, gate: str | None = None) -> bool:
     """Whether an unverified reconciliation blocks completion and approval."""
     if gate is None:
@@ -835,7 +852,7 @@ def recorded_or_computed(result: dict[str, Any]) -> dict[str, Any]:
     if isinstance(recorded, dict) and recorded.get("status"):
         return recorded
     return {
-        **reconcile(result),
+        **safe_reconcile(result),
         "enforced": gate_enforced(result.get("table_reader")),
         "computed_on_read": True,
     }
