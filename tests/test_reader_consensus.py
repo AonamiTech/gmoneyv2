@@ -121,7 +121,7 @@ def test_gemini_reader_uses_structured_json_and_reports_cost() -> None:
     assert response.measured_cost_usd == Decimal("0.0011")
     candidates = gemini_candidates(response)
     assert candidates[0].role is RowRole.REFUND
-    assert candidates[0].amount == Decimal("-126.56")
+    assert candidates[0].amount == Decimal("126.56")
     image_part = sent["contents"][1]
     assert image_part.inline_data.data == b"crop-bytes"
 

@@ -112,6 +112,11 @@ def finish_reader_table(
         elif header_table:
             # Patient header / metadata blocks never leave the host.
             block_reason = "header_table_not_sent"
+        elif not any(row.role in {RowRole.DETAIL, RowRole.REFUND} for row in candidates):
+            block_reason = "no_charge_rows_to_compare"
+        elif any("reader_identifier_row" in row.validation_flags for row in candidates):
+            # Identifier lines (bill/UHID numbers) suggest header text inside the crop.
+            block_reason = "identifier_rows_in_crop"
         elif None in (budget, crop_path, crop_size, crop_box, page_size, redaction_output):
             block_reason = "crop_unavailable"
         if block_reason is None:
@@ -131,6 +136,7 @@ def finish_reader_table(
                 except Exception as error:  # a failed second read flags, never blocks rows
                     response, block_reason = None, f"provider_error:{type(error).__name__}"
                     outcome.gemini_calls += 1
+                    budget.record(Decimal(0))
                 if response is not None:
                     outcome.gemini_calls += 1
                     outcome.gemini_cost_usd += response.measured_cost_usd
@@ -202,7 +208,9 @@ def reader_table_decision(
     use_reader_rows = has_candidates and bool(reader_charge_rows or not ocr_charge_rows)
     if provider_error:
         return use_reader_rows, "reader_provider_failed"
-    if truncated and not has_candidates:
+    if truncated:
+        # A partial read (truncated reply or tile, or an unreadable tile) may have
+        # rows, but cannot be complete.
         return use_reader_rows, "reader_truncated"
     if ocr_charge_rows and not reader_charge_rows:
         return use_reader_rows, "reader_no_rows"

@@ -141,6 +141,11 @@ def test_footer_bill_number_does_not_become_a_charge_through_the_flow() -> None:
             (False, "reader_provider_failed"),
         ),
         (dict(truncated=True, ocr_charge_rows=0), (False, "reader_truncated")),
+        # Partial read: rows are used, but the table is still flagged.
+        (
+            dict(truncated=True, has_candidates=True, ocr_charge_rows=2, reader_charge_rows=1),
+            (True, "reader_truncated"),
+        ),
         # Reader read the table but found no charges where PP-OCR did: keep PP-OCR, flag.
         (
             dict(has_candidates=True, ocr_charge_rows=3, reader_charge_rows=0),
@@ -201,3 +206,175 @@ def test_header_tables_are_read_locally_but_never_sent_to_gemini(tmp_path: Path)
     assert reader.sent == []
     assert outcome.diagnostic["gemini_reader_block_reason"] == "header_table_not_sent"
     assert outcome.gemini_calls == 0
+
+
+def _otsl(*rows: list[str]) -> str:
+    return "".join(
+        "".join(f"<fcel>{cell}" if cell else "<ecel>" for cell in row) + "<nl>" for row in rows
+    )
+
+
+def _pharmacy_tokens() -> tuple[OcrToken, ...]:
+    return (
+        _token("h1", "Item Name", 10, 40, 120),
+        _token("h2", "Qty", 420, 40, 40),
+        _token("h3", "Amount", 560, 40, 70),
+        _token("s1", "Item Issues", 10, 70, 120),
+        _token("i1", "Taxol 100mg", 10, 100, 150),
+        _token("iq", "1", 420, 100, 10),
+        _token("ia", "5000.00", 560, 100, 70),
+        _token("it", "Item Issues Total", 10, 130, 180),
+        _token("ita", "5000.00", 560, 130, 70),
+        _token("s2", "Return Item", 10, 160, 120),
+        _token("r1", "Bifilac", 10, 190, 80),
+        _token("rq", "1", 420, 190, 10),
+        _token("ra", "126.56", 560, 190, 70),
+        _token("rt", "Item Returns Total", 10, 220, 180),
+        _token("rta", "126.56", 560, 220, 70),
+    )
+
+
+PHARMACY_OTSL = _otsl(
+    ["Item Name", "Qty", "Amount"],
+    ["Item Issues", "", ""],
+    ["Taxol 100mg", "1", "5000.00"],
+    ["Item Issues Total", "", "5000.00"],
+    ["Return Item", "", ""],
+    ["Bifilac", "1", "126.56"],
+    ["Item Returns Total", "", "126.56"],
+)
+
+
+def test_refund_rows_ground_to_their_printed_amount_and_reconcile() -> None:
+    outcome, _tables, report = _run(PHARMACY_OTSL, _pharmacy_tokens(), printed_total="4873.44")
+    assert outcome.ungrounded == []
+    refunds = [row for row in outcome.rows if row.role is RowRole.REFUND]
+    assert [(row.description, row.net_amount) for row in refunds] == [
+        ("Bifilac", Decimal("126.56"))
+    ]
+    assert report["status"] == "verified", report["reasons"]
+    ids = {check["id"].split(":")[0] for check in report["checks"]}
+    assert {"C1", "C1R", "C2"} <= ids
+
+
+def test_dropped_return_section_cannot_verify_against_the_gross_total() -> None:
+    # TeleOCR omits the returns, so rows equal the printed gross 5000.00, but the
+    # printed "Return Item" rows in the PP-OCR table expose the missing refund.
+    without_returns = PHARMACY_OTSL.split("<fcel>Return Item")[0]
+    _outcome, _tables, report = _run(without_returns, _pharmacy_tokens(), printed_total="5000.00")
+    assert report["status"] == "flagged"
+    returns = next(check for check in report["checks"] if check["id"] == "C1R")
+    assert returns["outcome"] == "fail"
+    assert any("prints returns" in reason for reason in report["reasons"])
+
+
+def test_headerless_tile_reuses_the_first_tile_header() -> None:
+    from gmoney.extraction.teleocr_reader import otsl_header
+
+    first = _otsl(["Description", "Qty", "Amount"], ["Room Rent", "1", "1500.00"])
+    second = _otsl(["Nursing Charges", "1", "800.00"], ["Doctor Visit", "1", "650.00"])
+    assert read_otsl_rows(second) == ()
+    rows = read_otsl_rows(second, inherited_header=otsl_header(first))
+    assert [(row.description, row.amount) for row in rows] == [
+        ("Nursing Charges", Decimal("800.00")),
+        ("Doctor Visit", Decimal("650.00")),
+    ]
+    assert all("reader_inherited_header" in row.validation_flags for row in rows)
+
+
+def test_tile_overlap_dedupe_keeps_same_charge_on_another_day() -> None:
+    from gmoney.extraction.teleocr_reader import drop_rows_already_read
+
+    rows = read_otsl_rows(
+        _otsl(
+            ["Description", "Date", "Amount"],
+            ["Room Rent", "11/02/2026", "1500.00"],
+            ["Room Rent", "12/02/2026", "1500.00"],
+        )
+    )
+    kept = drop_rows_already_read(rows, [("Room Rent", Decimal("1500.00"), "11/02/2026")])
+    assert [row.service_date for row in kept] == ["12/02/2026"]
+
+
+def test_charge_names_containing_total_or_id_words_stay_charges() -> None:
+    rows = read_otsl_rows(
+        _otsl(
+            ["Service Name", "Code", "Amount"],
+            ["Total Knee Replacement Implant", "", "125000.00"],
+            ["IPD Registration", "", "500"],
+            ["Patient ID Band", "", "50"],
+            ["Implant inclusion", "1001", ""],
+            ["Gross Amount", "", "125550.00"],
+            ["Net Amount", "", "125550.00"],
+        )
+    )
+    charges = [(row.description, row.amount) for row in rows if row.role is RowRole.DETAIL]
+    assert charges == [
+        ("Total Knee Replacement Implant", Decimal("125000.00")),
+        ("IPD Registration", Decimal("500")),
+        ("Patient ID Band", Decimal("50")),
+    ]
+    totals = [row.description for row in rows if row.role is RowRole.SECTION_TOTAL]
+    assert totals == ["Gross Amount", "Net Amount"]
+
+
+def test_gemini_skips_tables_with_identifier_rows(tmp_path: Path) -> None:
+    class Recorder:
+        model = "gemini-test"
+
+        def estimated_cost_usd(self, input_tokens: int, output_tokens: int) -> Decimal:
+            return Decimal(0)
+
+        def read_table(self, crop_bytes: bytes, mime_type: str = "image/png"):
+            raise AssertionError("crop with identifier rows sent to Gemini")
+
+    otsl = RECORDED.replace("<|im_end|>", "") + "<fcel>UHID<ecel><ecel><ecel><fcel>88231<nl>"
+    crop = tmp_path / "crop.png"
+    crop.write_bytes(b"x")
+    outcome = finish_reader_table(
+        document_id="d" * 64,
+        page_number=2,
+        table_id="p2-t1",
+        page_artifact_sha256="a" * 64,
+        candidates=read_otsl_rows(otsl),
+        tokens=_page_tokens(),
+        starting_order=0,
+        gemini_reader=Recorder(),
+        gemini_allowed=True,
+        budget=PageBudget.from_inr(0.30, 88),
+        crop_path=crop,
+        crop_tokens=_page_tokens(),
+        crop_size=(700, 260),
+        crop_box=(0, 0, 700, 260),
+        page_size=(1000, 1400),
+        redaction_output=tmp_path / "redacted.png",
+    )
+    assert outcome.diagnostic["gemini_reader_block_reason"] == "identifier_rows_in_crop"
+
+
+def test_teleocr_gemini_without_api_key_fails_instead_of_degrading() -> None:
+    from gmoney.extraction.offline import OfflineExtractor
+    from gmoney.settings import Settings
+
+    with pytest.raises(ValueError, match="teleocr_gemini_requires_gemini_api_key"):
+        OfflineExtractor(
+            "http://vl.invalid",
+            table_reader="teleocr_gemini",
+            settings=Settings(_env_file=None, gemini_api_key=""),
+        )
+
+
+def test_reader_failure_reason_is_named_in_the_review_issue() -> None:
+    from gmoney.demo.review import structural_issues
+
+    diagnostic = {
+        "page_number": 2,
+        "table_id": "p2-t1",
+        "phase3_route": {"reasons": ["low_yield"]},
+        "recovery_attempts": [
+            {"stage": "review", "status": "pending", "reason": "low_yield"},
+            {"stage": "review", "status": "pending", "reason": "reader_provider_failed"},
+        ],
+    }
+    issues = structural_issues({"diagnostics": [diagnostic]}, {"issue_overrides": {}})
+    assert issues[0]["reason_codes"] == ["low_yield", "reader_provider_failed"]

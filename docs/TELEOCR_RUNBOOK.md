@@ -204,7 +204,7 @@ worker wait for it instead of PaddleOCR-VL, and leaves PaddleOCR-VL stopped (it 
 in these modes). Without the overlay, starting the worker also starts PaddleOCR-VL.
 
 ```bash
-export GMONEY_TABLE_READER=teleocr          # or teleocr_gemini (overlay default: teleocr)
+export GMONEY_TELEOCR_STACK_READER=teleocr  # or teleocr_gemini; the overlay ignores GMONEY_TABLE_READER
 docker compose -f compose.demo.yaml -f compose.gpu.yaml -f compose.teleocr.yaml up -d
 docker compose -f compose.demo.yaml -f compose.gpu.yaml stop paddleocr-vl   # if it was running
 ```

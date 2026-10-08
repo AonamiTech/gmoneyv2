@@ -24,6 +24,7 @@ from statistics import median
 
 from gmoney.contracts.evidence import OcrToken
 from gmoney.contracts.extraction import RowRole
+from gmoney.extraction.document_total import FINAL_LABELS
 from gmoney.extraction.otsl import OtslCell, OtslTable, parse_otsl, split_otsl_tables
 from gmoney.extraction.reconciliation import is_settlement_label
 from gmoney.extraction.rows import ROLE_TERMS, CandidateLedgerRow
@@ -60,9 +61,16 @@ DATE_PATTERN = re.compile(
 )
 DATE_GROUP_PATTERN = re.compile(r"^(?:issued?|issue|service|bill|order)?\s*date\b", re.IGNORECASE)
 # Applied to normalized labels ("Bill No.:" -> "bill no").
+# The whole label must be the identifier ("bill no", "uhid"), so "Patient ID Band" or
+# "IPD Registration" stay charges.
 IDENTIFIER_LABEL = re.compile(
-    r"\b(?:uhid|mrn|gstin|ipd|(?:bill|invoice|receipt|ip|op|reg|registration|admission|"
-    r"patient|policy|claim|card|pan|phone|mobile|page)\s*(?:no|number|id))\b"
+    r"(?:uhid|mrn|gstin|(?:bill|invoice|receipt|ip|ipd|op|reg|registration|admission|"
+    r"patient|policy|claim|card|pan|phone|mobile|page|uhid|mrn)\s*(?:no|nos|number|id))"
+)
+# Printed bill/gross/payable total labels from the document-total detector.
+DOCUMENT_TOTAL_TERMS = tuple(sorted({spec[0] for spec in FINAL_LABELS}))
+TOTAL_TAIL_WORDS = frozenset(
+    {"amount", "amt", "value", "rs", "inr", "bill", "of", "the", "for", "charges", "charge"}
 )
 SECTION_RETURN = re.compile(r"\breturn(?:s|ed)?\b", re.IGNORECASE)
 SECTION_WORDS = (
@@ -237,9 +245,26 @@ def _row_label(cells: tuple[str, ...]) -> str:
 
 def _is_identifier_row(label: str, numbers: list[str]) -> bool:
     """Header/footer identifiers such as ``Bill No: 4172`` are never charges."""
-    if not IDENTIFIER_LABEL.search(label):
+    if not IDENTIFIER_LABEL.fullmatch(label):
         return False
     return all("." not in value for value in numbers)
+
+
+def _is_total_row_label(label: str) -> bool:
+    """A printed total, never an item whose name merely contains "total"."""
+    if is_total_label(label) or any(
+        label == term or label.startswith(f"{term} ") for term in DOCUMENT_TOTAL_TERMS
+    ):
+        return True
+    words = label.split()
+    if not words:
+        return False
+    if words[-1] in {"total", "totals", "subtotal"}:
+        return True
+    if words[0] in {"total", "subtotal"} or words[:2] == ["sub", "total"]:
+        rest = words[2:] if words[:2] == ["sub", "total"] else words[1:]
+        return all(word in TOTAL_TAIL_WORDS or word.startswith(SECTION_WORDS) for word in rest)
+    return False
 
 
 def _classify_numeric_row(
@@ -255,7 +280,7 @@ def _classify_numeric_row(
         and (not description or normalized_label(description) == label)
     ):
         return RowRole.PAYMENT, ()
-    if label and (is_total_label(label) or {"total", "totals", "subtotal"} & set(label.split())):
+    if label and _is_total_row_label(label):
         return (
             RowRole.DOCUMENT_TOTAL
             if is_total_label(label) and "grand" in label
@@ -277,8 +302,21 @@ def _heading_only(table: OtslTable) -> str | None:
     return text if len(table.rows) <= 2 and len(text) <= 80 else None
 
 
-def _table_rows(table: OtslTable, *, section: str | None = None) -> tuple[CandidateLedgerRow, ...]:
+def _table_rows(
+    table: OtslTable,
+    *,
+    section: str | None = None,
+    inherited_header: tuple[str, ...] | None = None,
+) -> tuple[CandidateLedgerRow, ...]:
     header_index = _header_index(table)
+    inherited = False
+    if header_index is None and inherited_header and len(inherited_header) == table.column_count:
+        # A headerless tile/continuation read reuses the header of the first read.
+        header = tuple(
+            OtslCell(text=text, row=0, column=index) for index, text in enumerate(inherited_header)
+        )
+        table = OtslTable(rows=(header, *table.rows))
+        header_index, inherited = 0, True
     if header_index is None:
         return ()
     columns = infer_reader_columns(table.rows[header_index])
@@ -362,15 +400,28 @@ def _table_rows(table: OtslTable, *, section: str | None = None) -> tuple[Candid
         gross_amount = parse_decimal(_value(cells, columns, "gross_amount"))
         discount = parse_decimal(_value(cells, columns, "discount"))
         amount = parse_decimal(_value(cells, columns, "amount"))
-        if amount is None:
+        if amount is None and "amount" not in columns:
+            # No amount column: the right-most number that is not a count, code or date.
+            excluded = {
+                columns[role]
+                for role in (
+                    "quantity",
+                    "service_code",
+                    "hsn_code",
+                    "request_no",
+                    "serial",
+                    "batch",
+                )
+                if role in columns
+            }
             numeric = [
                 parse_decimal(cell)
                 for index, cell in enumerate(cells)
-                if index != columns.get("quantity") and _is_number(cell)
+                if index not in excluded and _is_number(cell)
             ]
             amount = numeric[-1] if numeric else None
-        if role is RowRole.REFUND and amount is not None:
-            amount = -abs(amount)
+        # Refunds keep the printed (usually positive) amount so they ground to the printed
+        # token; the refund role carries the sign (reconciliation counts refunds negative).
         if role is RowRole.DETAIL and amount is None:
             role, role_flags = RowRole.METADATA, ("reader_row_without_amount",)
         row_label = description
@@ -394,13 +445,19 @@ def _table_rows(table: OtslTable, *, section: str | None = None) -> tuple[Candid
                 discount=discount,
                 amount=amount,
                 source_route=READER_ROUTE,
-                validation_flags=tuple(dict.fromkeys((*flags, *role_flags))),
+                validation_flags=tuple(
+                    dict.fromkeys(
+                        (*flags, *role_flags, *(("reader_inherited_header",) if inherited else ()))
+                    )
+                ),
             )
         )
     return tuple(output)
 
 
-def read_otsl_rows(content: str) -> tuple[CandidateLedgerRow, ...]:
+def read_otsl_rows(
+    content: str, *, inherited_header: tuple[str, ...] | None = None
+) -> tuple[CandidateLedgerRow, ...]:
     """Candidate rows from one TeleOCR reply (which may contain several OTSL tables)."""
     content = content.split("<|im_end|>", 1)[0]
     rows: list[CandidateLedgerRow] = []
@@ -410,9 +467,19 @@ def read_otsl_rows(content: str) -> tuple[CandidateLedgerRow, ...]:
         if heading is not None:
             section = heading
             continue
-        rows.extend(_table_rows(table, section=section))
+        rows.extend(_table_rows(table, section=section, inherited_header=inherited_header))
         section = None
     return tuple(rows)
+
+
+def otsl_header(content: str) -> tuple[str, ...] | None:
+    """Header cells of the first table in a reply, for headerless tile reads."""
+    content = content.split("<|im_end|>", 1)[0]
+    for table in split_otsl_tables(parse_otsl(content)):
+        index = _header_index(table)
+        if index is not None:
+            return tuple(cell.text for cell in table.rows[index])
+    return None
 
 
 def charge_rows(rows: Iterable[CandidateLedgerRow]) -> tuple[CandidateLedgerRow, ...]:
@@ -484,20 +551,33 @@ def uncovered_band(
     return 0, max(0, round(top)), width, min(height, round(bottom))
 
 
-def _identity(description: object, amount: object) -> tuple[str, Decimal | None]:
+def _identity(
+    description: object, amount: object, service_date: object = None
+) -> tuple[str, Decimal | None, str]:
     value = parse_decimal(str(amount)) if amount is not None else None
-    return normalized_label(description), abs(value) if value is not None else None
+    return (
+        normalized_label(description),
+        abs(value) if value is not None else None,
+        normalized_label(service_date),
+    )
 
 
 def drop_rows_already_read(
     candidates: Iterable[CandidateLedgerRow],
-    existing: Iterable[tuple[object, object]],
+    existing: Iterable[tuple[object, ...]],
 ) -> tuple[CandidateLedgerRow, ...]:
-    """Dedupe a full-page read against rows already read from detected tables."""
-    seen = {_identity(description, amount) for description, amount in existing}
+    """Dedupe a re-read (full-page guard, overlapping tile) against rows already read.
+
+    ``existing`` holds ``(description, amount)`` or ``(description, amount, date)``; with a
+    date, a same-named charge on another day is kept.
+    """
+    existing = list(existing)
+    seen = {_identity(*item) for item in existing}
+    dated = any(len(item) > 2 for item in existing)
     return tuple(
         row
         for row in candidates
         if row.role not in {RowRole.DETAIL, RowRole.REFUND, RowRole.CATEGORY_ROLLUP}
-        or _identity(row.description, row.amount) not in seen
+        or _identity(row.description, row.amount, row.service_date if dated else None)
+        not in seen
     )

@@ -161,6 +161,7 @@ from gmoney.extraction.table_selection import (
 from gmoney.extraction.teleocr_reader import (
     drop_rows_already_read,
     needs_full_page_read,
+    otsl_header,
     read_otsl_rows,
     uncovered_band,
 )
@@ -6918,6 +6919,13 @@ class OfflineExtractor:
         self.table_reader = table_reader or getattr(self.settings, "table_reader", "heuristic")
         if self.table_reader not in READER_MODES:
             raise ValueError("table_reader_invalid")
+        if (
+            self.table_reader == "teleocr_gemini"
+            and gemini_table_reader is None
+            and not self.settings.gemini_api_key
+        ):
+            # Never degrade silently to single-reader extraction.
+            raise ValueError("teleocr_gemini_requires_gemini_api_key")
         self.uvdoc_mode = uvdoc_mode or self.settings.uvdoc_mode
         self.table_selection_mode = table_selection_mode or getattr(
             self.settings, "table_selection_mode", "off"
@@ -7004,6 +7012,7 @@ class OfflineExtractor:
                 input_cost_usd_per_million=self.settings.gemini_input_cost_usd_per_million,
                 output_cost_usd_per_million=self.settings.gemini_output_cost_usd_per_million,
             )
+
         self.profile_registry_revision: int | None = None
         if profiles is not None:
             self.profiles = profiles
@@ -8924,6 +8933,8 @@ class OfflineExtractor:
                 table_vl = self.teleocr if reader_table else self.vl
                 reader_candidates: list[CandidateLedgerRow] = []
                 reader_diagnostic: dict[str, Any] = {}
+                reader_header: tuple[str, ...] | None = None
+                reader_partial = False
                 rows_before_vl = len(parsed_rows)
                 if use_vl:
                     scoped_tokens = work.tokens
@@ -8990,19 +9001,25 @@ class OfflineExtractor:
                         vl_contents.append(response_content)
                         response_candidate_count = 0
                         if reader_table:
-                            tile_candidates = read_otsl_rows(response_content)
+                            # Tiles below the first carry no header row: reuse the first one.
+                            reader_header = reader_header or otsl_header(response_content)
+                            tile_candidates = read_otsl_rows(
+                                response_content, inherited_header=reader_header
+                            )
                             if job_index > 0:
                                 # Overlapping tiles repeat their boundary rows.
                                 tile_candidates = (
                                     *drop_rows_already_read(
                                         tile_candidates[:3],
                                         [
-                                            (row.description, row.amount)
+                                            (row.description, row.amount, row.service_date)
                                             for row in reader_candidates[-3:]
                                         ],
                                     ),
                                     *tile_candidates[3:],
                                 )
+                                if vl_response.output.get("truncated") or not tile_candidates:
+                                    reader_partial = True
                             reader_candidates.extend(tile_candidates)
                             response_candidate_count = len(tile_candidates)
                         for table in (
@@ -9094,10 +9111,12 @@ class OfflineExtractor:
                                     work.table_id,
                                 )
                                 vl_tile_count = len(tiles)
+                                if reader_table and response_truncated and not tiles:
+                                    reader_partial = True
                                 vl_jobs.extend(
                                     (
                                         tile_asset,
-                                        f"{work.table_id}.tile-{index}.vl.json",
+                                        f"{work.table_id}.tile-{index}.{vl_suffix}.json",
                                         index,
                                     )
                                     for index, tile_asset in enumerate(tiles, start=1)
@@ -9193,7 +9212,7 @@ class OfflineExtractor:
                             )
                     use_reader_rows, reader_failure = reader_table_decision(
                         provider_error=vl_error,
-                        truncated=vl_truncated,
+                        truncated=reader_partial or bool(vl_truncated and not vl_tile_count),
                         has_candidates=bool(reader_candidates),
                         ocr_charge_rows=ocr_charge_rows,
                         reader_charge_rows=reader_charge_rows,
@@ -9249,7 +9268,9 @@ class OfflineExtractor:
                     profile_match=profile_match,
                 )
                 needs_gemini_recovery = bool(
-                    not is_terminal_non_ledger(reconstruction)
+                    # Reader modes use Gemini only as the second table reader above.
+                    not reader_table
+                    and not is_terminal_non_ledger(reconstruction)
                     and (not parsed_rows or is_implausibly_low_yield(reconstruction))
                 )
                 gemini_block_reason: str | None = None

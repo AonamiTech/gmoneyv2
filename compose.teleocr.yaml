@@ -18,4 +18,6 @@ services:
       teleocr:
         condition: service_healthy
     environment:
-      GMONEY_TABLE_READER: "${GMONEY_TABLE_READER:-teleocr}"
+      # Own variable so a GMONEY_TABLE_READER=heuristic in .env cannot start a heuristic
+      # worker without PaddleOCR-VL. Allowed: teleocr | teleocr_gemini.
+      GMONEY_TABLE_READER: "${GMONEY_TELEOCR_STACK_READER:-teleocr}"

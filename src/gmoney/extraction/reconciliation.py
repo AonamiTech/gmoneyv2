@@ -631,7 +631,9 @@ def _reason(check: dict[str, Any]) -> str:
         if part
     )
     evidence = check.get("evidence") or {}
-    if isinstance(evidence, dict) and evidence.get("missing_amount_row_ids"):
+    if check.get("kind") == "printed_returns":
+        detail = "the bill prints returns but no refund row was extracted"
+    elif isinstance(evidence, dict) and evidence.get("missing_amount_row_ids"):
         detail = f"{len(evidence['missing_amount_row_ids'])} row(s) have no amount"
     else:
         detail = (
@@ -642,6 +644,52 @@ def _reason(check: dict[str, Any]) -> str:
     return f"{check['id']} {check['kind']}{label}{' ' + where if where else ''}: {detail}"
 
 
+# Item returns only: "Amount Refunded" (deposit refunds) is a settlement, not a return.
+RETURN_WORDS = frozenset({"return", "returns", "returned"})
+
+
+def _returns_check(result: dict[str, Any], rows: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """C1R: printed returns must appear as refund rows.
+
+    A read that drops a "Return Item" section entirely can match the gross bill total
+    and pass C1; the bill's own printed return heading or return total exposes it.
+    """
+    evidence = []
+    for table in result.get("source_tables") or []:
+        if not isinstance(table, dict):
+            continue
+        for source_row in table.get("rows") or []:
+            if source_row.get("canonical_row_id") is not None:
+                continue
+            label, _net, _values = _row_label_and_targets(table, source_row)
+            words = label.split()
+            if RETURN_WORDS & set(words) and len(words) <= 6 and not is_settlement_label(label):
+                evidence.append(
+                    {"page": table.get("page_number"), "label": label, "row": source_row.get("id")}
+                )
+    if not evidence:
+        return None
+    refunds = [
+        row
+        for row in rows
+        if row.get("role") == "refund"
+        or ((amount := _decimal(row.get("net_amount"))) is not None and amount < 0)
+    ]
+    return _check(
+        "C1R",
+        "printed_returns",
+        expected=None,
+        actual=None,
+        outcome="pass" if refunds else "fail",
+        label=evidence[0]["label"],
+        page=evidence[0]["page"],
+        evidence={
+            "printed_return_rows": evidence,
+            "refund_row_ids": [r.get("id") for r in refunds],
+        },
+    )
+
+
 def reconcile(result: dict[str, Any], rows: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """Return a verified/flagged/unprovable report for an extraction result."""
     active = _active(rows if rows is not None else result.get("rows") or [])
@@ -650,6 +698,7 @@ def reconcile(result: dict[str, Any], rows: list[dict[str, Any]] | None = None) 
     section_checks, reported = _section_checks(result, active, printed)
     checks = [
         *([grand_total] if grand_total else []),
+        *([returns] if (returns := _returns_check(result, active)) else []),
         *section_checks,
         *(
             [summary]

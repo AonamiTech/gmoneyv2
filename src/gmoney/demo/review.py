@@ -501,6 +501,13 @@ def structural_issues(result: dict[str, Any], review: dict[str, Any]) -> list[di
         route = diagnostic.get("phase3_route", {})
         reasons = route.get("reasons") or [attempt.get("reason") for attempt in pending]
         reasons = [str(reason) for reason in reasons if reason]
+        # Table-reader failures are always named (heuristic issue IDs are unchanged).
+        reasons += [
+            str(attempt["reason"])
+            for attempt in pending
+            if str(attempt.get("reason") or "").startswith("reader_")
+            and str(attempt["reason"]) not in reasons
+        ]
         page_number = int(diagnostic.get("page_number") or 1)
         table_id = str(diagnostic.get("table_id") or f"page-{page_number}")
         issue_key = f"{page_number}:{table_id}:{','.join(reasons)}"
