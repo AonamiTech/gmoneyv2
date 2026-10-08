@@ -2138,7 +2138,7 @@ export default function Home() {
         </section>
       )}
         </main>
-        <footer><span>GMoney · BY AONAMI</span><span>Machine output remains immutable · reviewer changes are revisioned</span></footer>
+        <footer><span>GMoney · BY AONAMI TECHNOLOGIES</span><span>Machine output remains immutable · reviewer changes are revisioned</span></footer>
       </div>
       {error && <div className="toast" role="alert"><span>{error}</span><button aria-label="Dismiss notification" onClick={() => setError(null)}><Icon name="close" size={16} /></button></div>}
     </div>
