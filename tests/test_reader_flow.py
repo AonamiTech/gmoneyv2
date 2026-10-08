@@ -499,3 +499,24 @@ def test_returns_context_ends_at_the_next_section_heading() -> None:
         )
     )
     assert [(row.role, row.section) for row in rows] == [(RowRole.DETAIL, "Consumables")]
+
+
+def test_amount_only_lab_table_keeps_tests_named_total_as_charges() -> None:
+    rows = read_otsl_rows(
+        _otsl(
+            ["Test Name", "Amount"],
+            ["Bilirubin Total", "250.00"],
+            ["Protein Total", "150.00"],
+            ["Blood Bank Total", "400.00"],
+            ["Lab Total", "400.00"],
+        )
+    )
+    # "Blood Bank Total" equals the rows above it, so it closes them like "Lab Total".
+    assert [row.description for row in rows if row.role is RowRole.DETAIL] == [
+        "Bilirubin Total",
+        "Protein Total",
+    ]
+    assert [row.description for row in rows if row.role is RowRole.SECTION_TOTAL] == [
+        "Blood Bank Total",
+        "Lab Total",
+    ]

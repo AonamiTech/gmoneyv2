@@ -273,12 +273,21 @@ def _is_identifier_row(label: str, numbers: list[str]) -> bool:
     return all("." not in value for value in numbers)
 
 
-def _is_total_row_label(label: str, *, priced_line: bool = False) -> bool:
+def _is_total_row_label(
+    label: str,
+    *,
+    priced_line: bool = False,
+    shape_known: bool = True,
+    closes_open_rows: bool = False,
+) -> bool:
     """A printed total, never an item whose name merely contains "total".
 
-    ``priced_line`` is True when the row prints a quantity or rate: a label ending in
-    "total" on such a row is an item ("Bilirubin Total"), otherwise a section total
-    ("Blood Bank Total").
+    A label ending in "total" is a section total when its qualifier words are section
+    words, when its amount equals the charge rows printed above it since the previous
+    total (``closes_open_rows``), or, in a table with quantity/rate columns
+    (``shape_known``), when the row prints neither (``priced_line`` False).  So
+    "Bilirubin Total 1 x 250.00" or an amount-only "Bilirubin Total 250.00" under other
+    tests stays a charge, while "Blood Bank Total" closing its rows is a total.
     """
     if is_total_label(label) or any(
         label == term or label.startswith(f"{term} ") for term in DOCUMENT_TOTAL_TERMS
@@ -298,7 +307,11 @@ def _is_total_row_label(label: str, *, priced_line: bool = False) -> bool:
         )
 
     if words[-1] in {"total", "totals", "subtotal"}:
-        return not priced_line or qualifiers(words[:-2] if words[-2:-1] == ["sub"] else words[:-1])
+        return (
+            qualifiers(words[:-2] if words[-2:-1] == ["sub"] else words[:-1])
+            or closes_open_rows
+            or (shape_known and not priced_line)
+        )
     if RETURN_WORDS_SET & set(words) and set(words) <= RETURN_WORDS_SET | {"amount", "value"}:
         return len(words) > 1  # "Return Amount", "Returns Value"
 
@@ -313,6 +326,8 @@ def _classify_numeric_row(
     context: _Context,
     *,
     priced_line: bool = False,
+    shape_known: bool = True,
+    closes_open_rows: bool = False,
 ) -> tuple[RowRole, tuple[str, ...]]:
     label = _row_label(cells)
     numbers = [cell for cell in cells if _is_number(cell)]
@@ -324,7 +339,12 @@ def _classify_numeric_row(
         and (not description or normalized_label(description) == label)
     ):
         return RowRole.PAYMENT, ()
-    if label and _is_total_row_label(label, priced_line=priced_line):
+    if label and _is_total_row_label(
+        label,
+        priced_line=priced_line,
+        shape_known=shape_known,
+        closes_open_rows=closes_open_rows,
+    ):
         return (
             RowRole.DOCUMENT_TOTAL
             if is_total_label(label) and "grand" in label
@@ -376,6 +396,8 @@ def _table_rows(
             context.section = text
             context.returns = bool(SECTION_RETURN.search(text))
     output: list[CandidateLedgerRow] = []
+    # Charge amounts printed since the previous total (refunds negative).
+    open_charges: list[Decimal] = []
     pending_prefix: list[str] = []
     for position, (source_row, cells, raw) in enumerate(data):
         populated = [(index, cell) for index, cell in enumerate(cells) if cell]
@@ -449,12 +471,6 @@ def _table_rows(
             flags = ()
         quantity = parse_decimal(_value(cells, columns, "quantity"))
         rate = parse_decimal(_value(cells, columns, "rate"))
-        role, role_flags = _classify_numeric_row(
-            cells,
-            description,
-            context,
-            priced_line=quantity is not None or rate is not None,
-        )
         gross_amount = parse_decimal(_value(cells, columns, "gross_amount"))
         discount = parse_decimal(_value(cells, columns, "discount"))
         amount = parse_decimal(_value(cells, columns, "amount"))
@@ -478,6 +494,16 @@ def _table_rows(
                 if index not in excluded and _is_number(cell)
             ]
             amount = numeric[-1] if numeric else None
+        role, role_flags = _classify_numeric_row(
+            cells,
+            description,
+            context,
+            priced_line=quantity is not None or rate is not None,
+            shape_known="quantity" in columns or "rate" in columns,
+            closes_open_rows=bool(
+                open_charges and amount is not None and abs(amount) == abs(sum(open_charges))
+            ),
+        )
         # Refunds keep the printed (usually positive) amount so they ground to the printed
         # token; the refund role carries the sign (reconciliation counts refunds negative).
         if role is RowRole.DETAIL and amount is None:
@@ -510,6 +536,10 @@ def _table_rows(
                 ),
             )
         )
+        if role in {RowRole.SECTION_TOTAL, RowRole.DOCUMENT_TOTAL}:
+            open_charges.clear()
+        elif role in {RowRole.DETAIL, RowRole.REFUND} and amount is not None:
+            open_charges.append(-abs(amount) if role is RowRole.REFUND else amount)
     return tuple(output)
 
 
