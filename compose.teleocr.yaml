@@ -1,0 +1,23 @@
+# TeleOCR reader stack overlay (see docs/TELEOCR_RUNBOOK.md):
+#   docker compose -f compose.demo.yaml -f compose.gpu.yaml -f compose.teleocr.yaml up -d
+# In the teleocr / teleocr_gemini modes PaddleOCR-VL is never called, so it is not started
+# (it would only compete for T4 memory) and the worker waits for TeleOCR instead.
+# PP-OCRv6 and PP-DocLayoutV3 still run inside the worker: they find the tables and supply
+# the OCR tokens every TeleOCR row is grounded to.
+name: gmoney-v2-demo
+
+services:
+  paddleocr-vl:
+    profiles: ["paddleocr-vl"]
+
+  teleocr:
+    profiles: !reset []
+
+  worker:
+    depends_on: !override
+      teleocr:
+        condition: service_healthy
+    environment:
+      # Own variable so a GMONEY_TABLE_READER=heuristic in .env cannot start a heuristic
+      # worker without PaddleOCR-VL. Allowed: teleocr | teleocr_gemini.
+      GMONEY_TABLE_READER: "${GMONEY_TELEOCR_STACK_READER:-teleocr}"

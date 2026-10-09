@@ -2237,3 +2237,59 @@ def test_validator_is_total_for_arbitrary_nested_json(
 
     assert report.status == "failed"
     assert report.fatal
+
+
+def test_table_reader_survives_extract_draft_and_targeted_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gmoney.extraction.reconciliation import gate_enforced
+
+    source, artifact_root, baseline_result = _fixture(tmp_path)
+    template = _draft_from_result(baseline_result)
+    extractor = object.__new__(OfflineExtractor)
+
+    def sink_fields(draft: ExtractionDraft) -> dict[str, object]:
+        return {
+            "document_id": draft.document_id,
+            "source_sha256": draft.source_sha256,
+            "source_name": draft.source_name,
+            "page_units": draft.page_units,
+            "provider_usage": draft.provider_usage,
+            "hospital": draft.hospital,
+            "hospital_id": draft.hospital_id,
+            "alias_registry_revision": draft.alias_registry_revision,
+            "profile_registry_revision": draft.profile_registry_revision,
+            "applied_alias_ids": draft.applied_alias_ids,
+            "suppressed_repeated_source_tables": draft.suppressed_repeated_source_tables,
+            "recovery_metadata": draft.recovery_metadata,
+            "artifact_root": artifact_root,
+            "uvdoc_shadow_runs": (),
+            "table_selection_runs": (),
+        }
+
+    def initial_extract(*args: object, **kwargs: object) -> None:
+        kwargs["_draft_sink"].update(sink_fields(template), table_reader="teleocr")
+
+    monkeypatch.setattr(extractor, "extract", initial_extract)
+    draft = extractor.extract_draft(source, artifact_root)
+    assert draft.table_reader == "teleocr"
+    assert draft.result["table_reader"] == "teleocr"
+    assert gate_enforced(draft.result["table_reader"], "auto") is True
+
+    candidate_result = json.loads(json.dumps(baseline_result))
+    _as_recovery_candidate(candidate_result)
+    candidate = _draft_from_result(candidate_result)
+    _copy_recovery_artifacts(artifact_root)
+
+    def recovery_extract(*args: object, **kwargs: object) -> None:
+        # Recovery sinks come from the same extractor; the baseline draft's mode must win.
+        kwargs["_draft_sink"].update(sink_fields(candidate))
+
+    monkeypatch.setattr(extractor, "extract", recovery_extract)
+    recovered = extractor.recover_draft(source, artifact_root, draft, ((1, "p1-t1"),))
+    assert recovered.table_reader == "teleocr"
+    assert recovered.result["table_reader"] == "teleocr"
+
+    heuristic = replace(draft, table_reader=None)
+    assert "table_reader" not in heuristic.result

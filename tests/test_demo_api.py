@@ -3367,3 +3367,99 @@ def test_worker_restart_requeues_interrupted_job(tmp_path: Path) -> None:
     recovered = store.read(state["id"])
     assert recovered["status"] == "queued"
     assert recovered["page"] == 0
+
+
+def _enforce_reconciliation(monkeypatch) -> None:
+    from gmoney.settings import get_settings
+
+    monkeypatch.setenv("GMONEY_RECONCILIATION_GATE", "enforce")
+    get_settings.cache_clear()
+    monkeypatch.setattr("gmoney.settings.get_settings", get_settings)
+
+
+def test_reconciliation_is_reported_and_reviewer_edit_clears_enforced_blocker(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _enforce_reconciliation(monkeypatch)
+    client, store = client_for(tmp_path, monkeypatch)
+    job_id, _ = completed_job(store)
+    try:
+        rows = client.get(f"/api/v2/documents/{job_id}/rows").json()
+        assert rows["reconciliation"]["status"] == "flagged"
+        assert rows["reconciliation"]["machine_status"] == "flagged"
+        assert rows["reconciliation"]["checks"][0]["difference"] == "-20.00"
+        review = client.get(f"/api/v2/documents/{job_id}/review").json()
+        assert "reconciliation_unverified" in review["approval_blockers"]
+        assert review["reconciliation"]["blocking"] is True
+
+        edited = client.patch(
+            f"/api/v2/documents/{job_id}/rows/machine-row",
+            headers={"If-Match": "0"},
+            json={"changes": {"net_amount": "120.00"}, "reason": "Printed amount is 120"},
+        )
+        assert edited.status_code == 200
+        review = client.get(f"/api/v2/documents/{job_id}/review").json()
+        assert review["reconciliation"]["status"] == "verified"
+        assert "reconciliation_unverified" not in review["approval_blockers"]
+    finally:
+        from gmoney.settings import get_settings
+
+        get_settings.cache_clear()
+
+
+def test_reconciliation_override_requires_reason_and_clears_blocker(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _enforce_reconciliation(monkeypatch)
+    client, store = client_for(tmp_path, monkeypatch)
+    job_id, _ = completed_job(store)
+    try:
+        url = f"/api/v2/documents/{job_id}/reconciliation"
+        empty = client.patch(
+            url, headers={"If-Match": "0"}, json={"status": "overridden", "reason": ""}
+        )
+        assert empty.status_code == 422
+        blank = client.patch(
+            url, headers={"If-Match": "0"}, json={"status": "overridden", "reason": "     "}
+        )
+        assert blank.status_code == 422
+
+        overridden = client.patch(
+            url,
+            headers={"If-Match": "0"},
+            json={"status": "overridden", "reason": "Hospital adds a fee not itemised"},
+        )
+        assert overridden.status_code == 200
+        assert overridden.json()["review_revision"] == 1
+        assert overridden.json()["reconciliation"]["override"]["reason"] == (
+            "Hospital adds a fee not itemised"
+        )
+        review = client.get(f"/api/v2/documents/{job_id}/review").json()
+        assert review["reconciliation"]["status"] == "flagged"
+        assert "reconciliation_unverified" not in review["approval_blockers"]
+        assert client.post(
+            f"/api/v2/documents/{job_id}/approval", headers={"If-Match": "1"}
+        ).status_code == 200
+
+        cleared = client.patch(
+            url, headers={"If-Match": "2"}, json={"status": "cleared", "reason": "Reopened"}
+        )
+        assert cleared.status_code == 200
+        review = client.get(f"/api/v2/documents/{job_id}/review").json()
+        assert review["approval"] is None
+        assert "reconciliation_unverified" in review["approval_blockers"]
+    finally:
+        from gmoney.settings import get_settings
+
+        get_settings.cache_clear()
+
+
+def test_default_heuristic_reader_reports_but_does_not_enforce_reconciliation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    client, store = client_for(tmp_path, monkeypatch)
+    job_id, _ = completed_job(store)
+    review = client.get(f"/api/v2/documents/{job_id}/review").json()
+    assert review["reconciliation"]["status"] == "flagged"
+    assert review["reconciliation"]["enforced"] is False
+    assert "reconciliation_unverified" not in review["approval_blockers"]

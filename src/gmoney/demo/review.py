@@ -14,6 +14,12 @@ from typing import Any
 from uuid import uuid4
 
 from gmoney.demo.store import JobStore, JobTransactionError, utc_now
+from gmoney.extraction.reconciliation import (
+    is_enforced,
+    is_reader_refund,
+    recorded_or_computed,
+    safe_reconcile,
+)
 
 EDITABLE_TEXT_FIELDS = {
     "description",
@@ -334,7 +340,8 @@ def totals_summary(
         if parsed is None or not parsed.is_finite():
             missing_amounts += 1
         else:
-            item_total += parsed
+            # Table-reader refunds are stored as printed (positive); they reduce the total.
+            item_total += -abs(parsed) if is_reader_refund(row) else parsed
 
     machine_total = result.get("document_total")
     machine_totals = result.get("document_totals")
@@ -430,6 +437,32 @@ def totals_summary(
     }
 
 
+def reconciliation_override(review: dict[str, Any]) -> dict[str, Any] | None:
+    override = review.get("reconciliation_override")
+    if isinstance(override, dict) and str(override.get("reason") or "").strip():
+        return override
+    return None
+
+
+def reconciliation_summary(
+    result: dict[str, Any],
+    review: dict[str, Any],
+    rows: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Recompute the reconciliation gate on the reviewer-projected rows."""
+    projected = rows if rows is not None else project_rows(result, review)
+    report = safe_reconcile(result, projected)
+    override = reconciliation_override(review)
+    enforced = is_enforced(result)
+    return {
+        **report,
+        "machine_status": recorded_or_computed(result)["status"],
+        "enforced": enforced,
+        "override": override,
+        "blocking": bool(enforced and report["status"] != "verified" and override is None),
+    }
+
+
 def structural_issues(result: dict[str, Any], review: dict[str, Any]) -> list[dict[str, Any]]:
     issues: list[dict[str, Any]] = []
     overrides = review.get("issue_overrides", {})
@@ -474,6 +507,13 @@ def structural_issues(result: dict[str, Any], review: dict[str, Any]) -> list[di
         route = diagnostic.get("phase3_route", {})
         reasons = route.get("reasons") or [attempt.get("reason") for attempt in pending]
         reasons = [str(reason) for reason in reasons if reason]
+        # Table-reader failures are always named (heuristic issue IDs are unchanged).
+        reasons += [
+            str(attempt["reason"])
+            for attempt in pending
+            if str(attempt.get("reason") or "").startswith("reader_")
+            and str(attempt["reason"]) not in reasons
+        ]
         page_number = int(diagnostic.get("page_number") or 1)
         table_id = str(diagnostic.get("table_id") or f"page-{page_number}")
         issue_key = f"{page_number}:{table_id}:{','.join(reasons)}"
@@ -701,6 +741,8 @@ def approval_blockers(
         for issue in structural_issues(result, review)
     ):
         blockers.append("open_structural_issues")
+    if reconciliation_summary(result, review, rows)["blocking"]:
+        blockers.append("reconciliation_unverified")
     assets = result.get("page_assets", [])
     if len(assets) != int(result.get("pages") or 0):
         blockers.append("incomplete_page_inventory")

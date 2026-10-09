@@ -37,6 +37,12 @@ from gmoney.contracts.v6 import (
 )
 from gmoney.evaluation.corpus import sha256_file
 from gmoney.extraction.date_context import service_date_from_context
+from gmoney.extraction.reconciliation import return_total_targets, signed_field_value
+from gmoney.extraction.total_labels import (
+    TOTAL_LABELS,
+    TOTAL_PREFIXES,
+    is_section_subtotal_label,
+)
 from gmoney.extraction.typed_values import parse_decimal, parse_quantity, parse_service_date
 from gmoney.geometry.artifacts import map_polygon_to_source, max_round_trip_error
 from gmoney.geometry.dense import DenseGridError, DenseGridResolver, analyze_dense_grid
@@ -1488,24 +1494,8 @@ def _unlinked_financial_row_is_explained(
         "hsn_code",
     }
     fields_by_column = {column.id: column.canonical_field for column in table.columns}
-    total_labels = {
-        "bill amount",
-        "bill total",
-        "total",
-        "totals",
-        "sub total",
-        "subtotal",
-    }
-    total_prefixes = (
-        "grand total",
-        "gross bill amount",
-        "net bill amount",
-        "net medical amount",
-        "net payable",
-        "total bill amount",
-        "total gross bill value",
-        "total payable amount",
-    )
+    total_labels = TOTAL_LABELS
+    total_prefixes = TOTAL_PREFIXES
 
     def is_structured_identifier_cell(cell: Any) -> bool:
         return fields_by_column.get(cell.column_id) in structured_fields
@@ -1514,11 +1504,6 @@ def _unlinked_financial_row_is_explained(
         if not is_structured_identifier_cell(cell):
             return True
         return _normalized(cell.raw_value or "") in total_labels
-
-    def is_section_subtotal_label(value: str) -> bool:
-        return value in {"bill total", "sub total", "subtotal"} or value.startswith(
-            ("sub total ", "subtotal ")
-        )
 
     label_values = tuple(
         cell.raw_value.strip()
@@ -1794,12 +1779,12 @@ def _unlinked_financial_row_is_explained(
                 (
                     parsed
                     for row in pharmacy_rows
-                    if (parsed := parse_decimal(str(row.get(field)))) is not None
+                    if (parsed := signed_field_value(row, field)) is not None
                     and (parsed > 0 if pharmacy_summary_sign > 0 else parsed < 0)
                 ),
                 Decimal("0"),
             )
-            == value
+            in return_total_targets(value, pharmacy_rows, pharmacy_summary_sign)
             for field, value in financial_values
         ):
             return True
@@ -1820,7 +1805,7 @@ def _unlinked_financial_row_is_explained(
                     (
                         parsed
                         for row in physical_table_rows
-                        if (parsed := parse_decimal(str(row.get(field)))) is not None
+                        if (parsed := signed_field_value(row, field)) is not None
                     ),
                     Decimal("0"),
                 )
@@ -1937,7 +1922,7 @@ def _unlinked_financial_row_is_explained(
                     (
                         parsed
                         for row in section_rows
-                        if (parsed := parse_decimal(str(row.get(field)))) is not None
+                        if (parsed := signed_field_value(row, field)) is not None
                     ),
                     Decimal("0"),
                 )

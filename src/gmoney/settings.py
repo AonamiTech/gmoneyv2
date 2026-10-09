@@ -35,6 +35,18 @@ class Settings(BaseSettings):
     uvdoc_mode: Literal["off", "shadow", "enabled"] = "off"
     uvdoc_model_dir: Path | None = None
     uvdoc_preregistration_path: Path | None = None
+    # Table reader: "heuristic" keeps the PP-OCR row builder; "teleocr" reads every table
+    # with the TeleOCR service; "teleocr_gemini" adds Gemini as an independent second reader.
+    table_reader: Literal["heuristic", "teleocr", "teleocr_gemini"] = "heuristic"
+    teleocr_url: str = "http://teleocr:8112"
+    teleocr_timeout_seconds: float = Field(default=900, gt=0)
+    teleocr_max_tokens: int = Field(default=8192, ge=256, le=32768)
+    # Gemini second-reader budget (teleocr_gemini only), converted with inr_per_usd.
+    gemini_reader_max_cost_inr_per_page: float = Field(default=0.30, ge=0)
+    inr_per_usd: float = Field(default=88.0, gt=0)
+    # Reconciliation gate: "auto" enforces it for the VLM readers and only reports it for
+    # the heuristic reader; "enforce"/"report" force either behaviour.
+    reconciliation_gate: Literal["auto", "enforce", "report"] = "auto"
 
 
 @lru_cache
