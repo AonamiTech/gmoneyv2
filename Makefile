@@ -42,3 +42,4 @@ compose-config:
 	docker compose -f compose.demo.yaml -f compose.gpu.yaml config --quiet
 	docker compose -f compose.demo.yaml --profile admin config --quiet
 	docker compose -f compose.demo.yaml -f compose.gpu.yaml --profile admin config --quiet
+	docker compose -f compose.demo.yaml -f compose.gpu.yaml -f compose.teleocr.yaml config --quiet

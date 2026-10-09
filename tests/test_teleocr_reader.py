@@ -82,7 +82,7 @@ def test_issued_date_group_rows_become_service_date_context() -> None:
     assert len(rows) == 2
 
 
-def test_rows_under_return_heading_are_negative_refunds() -> None:
+def test_rows_under_return_heading_are_refunds_with_printed_amount() -> None:
     rows = read_otsl_rows(
         _otsl(
             ["Item Name", "Qty", "Amount"],
@@ -97,7 +97,7 @@ def test_rows_under_return_heading_are_negative_refunds() -> None:
     details = charge_rows(rows)
     assert [(row.role, row.description, row.amount) for row in details] == [
         (RowRole.DETAIL, "Taxol 100mg", Decimal("5000.00")),
-        (RowRole.REFUND, "Bifilac", Decimal("-126.56")),
+        (RowRole.REFUND, "Bifilac", Decimal("126.56")),
     ]
     assert details[1].section == "Return Item"
     assert [row.description for row in printed_total_rows(rows)] == [

@@ -22,6 +22,7 @@ from gmoney.demo.store import JobStore, is_gpu_device, utc_now
 from gmoney.evaluation.corpus import sha256_file
 from gmoney.extraction.ocr_rows import DATE_PREFIX, DATE_SPAN
 from gmoney.extraction.offline import OfflineExtractor
+from gmoney.extraction.reconciliation import return_total_targets, signed_field_value
 from gmoney.extraction.typed_values import (
     parse_decimal,
     parse_quantity,
@@ -634,7 +635,7 @@ def _unlinked_financial_row_is_explained(
                 (
                     parsed
                     for row in pharmacy_rows
-                    if (parsed := parse_decimal(str(row.get(field)))) is not None
+                    if (parsed := signed_field_value(row, field)) is not None
                     and (
                         parsed > 0
                         if pharmacy_summary_sign > 0
@@ -643,7 +644,7 @@ def _unlinked_financial_row_is_explained(
                 ),
                 Decimal("0"),
             )
-            == value
+            in return_total_targets(value, pharmacy_rows, pharmacy_summary_sign)
             for field, value in financial_values
         ):
             return True
@@ -664,7 +665,7 @@ def _unlinked_financial_row_is_explained(
                     (
                         parsed
                         for row in physical_table_rows
-                        if (parsed := parse_decimal(str(row.get(field)))) is not None
+                        if (parsed := signed_field_value(row, field)) is not None
                     ),
                     Decimal("0"),
                 )
@@ -788,7 +789,7 @@ def _unlinked_financial_row_is_explained(
                 (
                     parsed
                     for row in section_rows
-                    if (parsed := parse_decimal(str(row.get(field)))) is not None
+                    if (parsed := signed_field_value(row, field)) is not None
                 ),
                 Decimal("0"),
             )

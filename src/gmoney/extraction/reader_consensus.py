@@ -117,8 +117,8 @@ def _candidate(index: int, row: TableReaderRow) -> CandidateLedgerRow:
     if row.is_total:
         role = RowRole.SECTION_TOTAL
     elif row.is_return:
+        # Printed amount kept, as for TeleOCR rows; the refund role carries the sign.
         role = RowRole.REFUND
-        amount = -abs(amount) if amount is not None else None
     return CandidateLedgerRow(
         source_row=index,
         role=role,
